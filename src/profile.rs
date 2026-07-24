@@ -11,11 +11,20 @@ pub struct FilesystemSlice {
     pub deny: Vec<PathBuf>,
 }
 
+/// The network slice of a profile, after merging `extends` and CLI flags.
+#[derive(Debug, Default, Clone)]
+pub struct NetworkSlice {
+    pub block_net: bool,
+    pub allow_domain: Vec<String>,
+    pub profile_name: Option<String>,
+}
+
 /// The full resolved profile (filesystem slice only for this MVP slice).
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedProfile {
     pub name: String,
     pub filesystem: FilesystemSlice,
+    pub network: NetworkSlice,
 }
 
 /// Raw profile JSON (v1 schema).
@@ -31,7 +40,7 @@ pub struct RawProfile {
     #[serde(default)]
     pub filesystem: Option<RawFilesystem>,
     #[serde(default)]
-    pub network: Option<serde_json::Value>,
+    pub network: Option<RawNetwork>,
     #[serde(default)]
     pub workdir: Option<serde_json::Value>,
 }
@@ -63,6 +72,17 @@ pub struct RawFilesystem {
     pub read_only: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawNetwork {
+    #[serde(default)]
+    pub block_net: bool,
+    #[serde(default)]
+    pub allow_domain: Vec<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Load a profile by name or path, resolve `extends`, expand variables, and
@@ -104,6 +124,7 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     Ok(ResolvedProfile {
         name: resolved_name,
         filesystem: fs,
+        network: resolve_network_slice(&raw.network),
     })
 }
 
@@ -164,6 +185,16 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
         (None, Some(c)) => Some(c),
         (None, None) => None,
     };
+    let network = match (parent.network, child.network) {
+        (Some(p), Some(c)) => Some(RawNetwork {
+            block_net: c.block_net || p.block_net,
+            allow_domain: dedupe_concat(p.allow_domain, c.allow_domain),
+            profile: c.profile.or(p.profile),
+        }),
+        (Some(p), None) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
     RawProfile {
         meta: child.meta.or(parent.meta),
         extends: None, // chain already resolved
@@ -176,7 +207,7 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
             (None, None) => None,
         },
         filesystem,
-        network: child.network.or(parent.network),
+        network,
         workdir: child.workdir.or(parent.workdir),
     }
 }
@@ -206,6 +237,18 @@ fn resolve_filesystem(raw: &Option<RawFilesystem>, cwd: &Path) -> Result<Filesys
         read_only: expand_paths(&raw.read_only, cwd)?,
         deny: expand_paths(&raw.deny, cwd)?,
     })
+}
+
+/// Resolve a network slice from the raw profile (no variable expansion; the
+/// proxy layer consumes `profile_name` + `allow_domain` directly).
+fn resolve_network_slice(raw: &Option<RawNetwork>) -> NetworkSlice {
+    let empty = RawNetwork::default();
+    let raw = raw.as_ref().unwrap_or(&empty);
+    NetworkSlice {
+        block_net: raw.block_net,
+        allow_domain: raw.allow_domain.clone(),
+        profile_name: raw.profile.clone(),
+    }
 }
 
 /// Expand `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`, `$SID` in each path string.

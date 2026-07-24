@@ -21,6 +21,7 @@ fn main() {
             read_only,
             block_net,
             allow_domain,
+            network_profile,
             print_sid,
             sid,
             cmd,
@@ -31,6 +32,7 @@ fn main() {
             read_only,
             block_net,
             allow_domain,
+            network_profile,
             print_sid,
             sid,
             cmd,
@@ -62,6 +64,7 @@ fn run_cmd(
     read_only: Vec<String>,
     block_net: bool,
     allow_domain: Vec<String>,
+    network_profile: Option<String>,
     print_sid: bool,
     sid: Option<String>,
     cmd: Vec<String>,
@@ -86,6 +89,9 @@ fn run_cmd(
         allow_cwd,
         &allow,
         &read_only,
+        block_net,
+        &allow_domain,
+        network_profile.as_deref(),
         print_sid,
         sid.as_deref(),
         &cmd,
@@ -98,11 +104,15 @@ fn run_cmd(
     }
 }
 
+#[allow(unused_variables)]
 fn run_inner(
     profile_name: Option<&str>,
     allow_cwd: bool,
     allow: &[String],
     read_only: &[String],
+    block_net: bool,
+    allow_domain: &[String],
+    network_profile: Option<&str>,
     print_sid: bool,
     sid: Option<&str>,
     cmd: &[String],

@@ -42,6 +42,10 @@ pub enum Cmd {
         #[arg(long, value_name = "DOMAIN")]
         allow_domain: Vec<String>,
 
+        /// Network profile name: none | minimal | developer.
+        #[arg(long, value_name = "NAME")]
+        network_profile: Option<String>,
+
         /// Print only the session id and exit 0 without spawning.
         #[arg(long, hide = true)]
         print_sid: bool,
@@ -119,6 +123,7 @@ pub struct RunArgs {
     pub read_only: Vec<String>,
     pub block_net: bool,
     pub allow_domain: Vec<String>,
+    pub network_profile: Option<String>,
     pub print_sid: bool,
     pub sid: Option<String>,
     pub cmd: Vec<String>,
@@ -132,6 +137,7 @@ impl RunArgs {
         read_only: Vec<String>,
         block_net: bool,
         allow_domain: Vec<String>,
+        network_profile: Option<String>,
         print_sid: bool,
         sid: Option<String>,
         cmd: Vec<String>,
@@ -143,6 +149,7 @@ impl RunArgs {
             read_only,
             block_net,
             allow_domain,
+            network_profile,
             print_sid,
             sid,
             cmd,
