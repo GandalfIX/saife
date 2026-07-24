@@ -7,11 +7,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Always-denied IPv4 CIDRs (AC-3.6, AC-3.7). Link-local + AWS/GCP/Azure
 /// metadata.
-pub const ALWAYS_DENIED_V4_CIDRS: &[(&str, u8)] = &[("169.254.0.0", 16)];
+pub const ALWAYS_DENIED_V4_CIDRS: &[(Ipv4Addr, u8)] = &[(Ipv4Addr::new(169, 254, 0, 0), 16)];
 /// Always-denied IPv4 literals.
 pub const ALWAYS_DENIED_V4_HOSTS: &[&str] = &["169.254.169.254"];
 /// Always-denied IPv6 CIDRs (link-local).
-pub const ALWAYS_DENIED_V6_CIDRS: &[(&str, u8)] = &[("fe80::", 10)];
+pub const ALWAYS_DENIED_V6_CIDRS: &[(Ipv6Addr, u8)] = &[(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xfe80, 0), 10)];
 /// Always-denied DNS names (checked pre-resolution, AC-3.7).
 pub const ALWAYS_DENIED_DNS: &[&str] = &["metadata.google.internal"];
 
@@ -70,14 +70,14 @@ pub fn is_always_denied(host: &str, resolved_ips: &[IpAddr]) -> bool {
                     return true;
                 }
                 for (net, prefix) in ALWAYS_DENIED_V4_CIDRS {
-                    if in_v4_cidr(*v, net.parse().unwrap(), *prefix) {
+                    if in_v4_cidr(*v, *net, *prefix) {
                         return true;
                     }
                 }
             }
             IpAddr::V6(v) => {
                 for (net, prefix) in ALWAYS_DENIED_V6_CIDRS {
-                    if in_v6_cidr(*v, net.parse().unwrap(), *prefix) {
+                    if in_v6_cidr(*v, *net, *prefix) {
                         return true;
                     }
                 }
