@@ -252,12 +252,259 @@ loopback exemption is granted, all `connect()` returns
 `--block-net` works but is the only network option) and equivalent to nono
 on native Linux.
 
-## Implementation-ready detail (to be filled in last step)
+## Implementation-ready detail
 
-TODO: exact AppContainer network capability flags, loopback exemption API,
-proxy implementation, domain matching algorithm, audit event shape.
+### Capability / network-cap layer
 
-## Implementation-ready detail (to be filled in last step)
+AppContainer processes are **deny-by-default for network** — a fresh
+AppContainer SID with no capability SIDs in its `SECURITY_CAPABILITIES`
+list cannot `connect()` to anything (kernel returns `WSAEACCES` /
+`ERROR_ACCESS_DENIED`). We exploit this:
 
-TODO: exact AppContainer network capability flags, loopback exemption API,
-proxy implementation, domain matching algorithm, audit event shape.
+- **`--block-net` / `none` profile**: pass `Capabilities = null,
+  CapabilityCount = 0` to `CreateProcessW` via
+  `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. No loopback exemption
+  is registered. Every `connect()` (raw socket or proxied) is
+  kernel-denied. No proxy is started. (AC-3.1, AC-3.2, AC-3.13.)
+- **`--allow-domain` / `--network-profile` (non-`none`)**: still pass no
+  internet capability SIDs (so direct connects to the internet fail
+  closed), but register a **loopback exemption** for the AppContainer SID
+  via `NetworkIsolationSetAppContainerConfig` /
+  `Win32::Networking::WinSock::NetworkIsolation`, scoped to the
+  AppContainer SID. The sandboxed process can then `connect()` to
+  `127.0.0.1` (the proxy) but still nothing else.
+
+> **AC-3.15 deferred to F-6.** Native AppContainer loopback exemption is
+> all-or-nothing per SID — it cannot be scoped to a single port. Per-port
+> loopback scoping requires a Windows Filtering Platform (WFP) callout
+> driver (future-ideas **F-6**). For the MVP we grant full loopback and
+> rely on the proxy's `X-Sandbox-Token` gate (AC-3.12) plus the fact that
+> other loopback services won't honor our token to provide the
+> practical isolation. The acceptance test for AC-3.15 is **deferred**
+> and marked SKIP in the harness with `Detail='deferred to F-6 (WFP
+> driver)'`.
+
+### Proxy
+
+- **Runtime**: tokio (mt, multi-thread scheduler, 1 worker thread —
+  enough for a single agent's traffic).
+- **HTTP stack**: hyper 1.x server on `tokio::net::TcpListener` bound to
+  `127.0.0.1:0` (OS-assigned port, AC-3.11). The bound port is read back
+  after bind and injected into the child env.
+- **TLS to upstream**: rustls with `rustls-native-certs` to load the
+  system root store. The proxy terminates TLS to the upstream host for
+  `CONNECT` tunnels (it speaks plain HTTP to the sandboxed process, TLS
+  to the real host). Plain HTTP requests (non-CONNECT, rare) are
+  forwarded as-is.
+- **Request handling**:
+  1. Read request line + headers.
+  2. Check `X-Sandbox-Token` header. If absent or ≠ session token →
+     respond `407 Proxy Authentication Required` and close (AC-3.12).
+  3. For `CONNECT host:port`: extract `host`. For plain `GET/POST
+     http://host/...`: extract `host` from the URL. Strip any
+     `:port` suffix for domain matching; keep `host:port` for the log.
+  4. Resolve `host`:
+     - If `host` is a literal IP → check against always-denied CIDRs.
+     - If `host` is `metadata.google.internal` → deny (AC-3.7).
+     - Else → DNS-resolve to IpAddr(s); each resolved IP is checked
+       against always-denied CIDRs (catches DNS names that resolve into
+       link-local, e.g. a poisoned `/etc/hosts`).
+  5. Domain allow-list check: exact match (case-insensitive, trailing
+     dot stripped) OR wildcard suffix match (see "Domain matching"
+     below). If neither → deny with `reason=domain_not_allowed`
+     (AC-3.4).
+  6. If all checks pass → forward (CONNECT: open TCP to `host:port`,
+     upgrade to TLS via rustls, splice bytes; HTTP: forward request),
+     emit `ALLOW CONNECT host:port` (AC-3.3). Else → drop, emit
+     `DENY CONNECT host:port reason=...` (AC-3.4, AC-3.6).
+- **Lifecycle**: tokio task runs on a dedicated std thread spawned
+  before `CreateProcessW`. A `tokio_util::sync::CancellationToken` (or
+  a `oneshot::Sender`) is held by the supervisor; on `Drop` of the
+  `ProxyHandle` the token is cancelled, the listener stops accepting,
+  in-flight connections are given 200 ms to drain, then the port is
+  released (AC-3.14). The handle is dropped when `sandbox.exe` returns
+  or panics, and the Job Object's `KILL_ON_JOB_CLOSE` handles
+  Ctrl-C / forced kill.
+
+### Domain matching
+
+```
+fn matches(host: &str, entry: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    let e = entry.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = e.strip_prefix("*.") {
+        // *.anthropic.com matches api.anthropic.com and
+        // console.anthropic.com but NOT anthropic.com.evil.io
+        // (the latter's last two labels are evil.io, not anthropic.com)
+        // and NOT anthropic.com (the bare apex).
+        let dot = format!(".{suffix}");
+        h.ends_with(&dot)
+    } else {
+        h == e
+    }
+}
+```
+
+The host is allowed if it matches **any** entry in the merged
+allow-list. The always-denied list is checked first and overrides any
+allow-list match (AC-3.6, AC-3.7).
+
+### Always-denied destinations
+
+```
+const ALWAYS_DENIED_V4_CIDRS: &[&str] = &["169.254.0.0/16"];
+const ALWAYS_DENIED_V4_HOSTS: &[&str] = &["169.254.169.254"];
+const ALWAYS_DENIED_V6_CIDRS: &[&str] = &["fe80::/10"];
+const ALWAYS_DENIED_DNS: &[&str] = &["metadata.google.internal"];
+```
+
+CIDR matching: parse IpAddr, mask by prefix length, compare to the
+network address. Hand-rolled (no `ipnet` dep) — 30 lines.
+
+### Session token
+
+256-bit random, hex-encoded (64 chars). Generated with
+`BCryptGenRandom` from the `windows` crate (`Win32_Security_Cryptography::BCryptGenRandom`)
+— no extra `rand` dep. Injected as `X-Sandbox-Token` env var in the
+child and required on every request to the proxy (AC-3.12).
+
+### Env injection
+
+`build_env_block` (in `src/sandbox/appcontainer.rs`) gains an optional
+`ProxyConfig { port, token }` parameter. When present, the env block
+gets:
+
+- `HTTP_PROXY=http://127.0.0.1:<port>`
+- `HTTPS_PROXY=http://127.0.0.1:<port>`  (scheme is `http` even for
+  HTTPS — the proxy is plain HTTP; TLS is between proxy and upstream)
+- `X-Sandbox-Token=<hex>`
+- `NO_PROXY=`  (empty — make sure nothing bypasses the proxy; some
+  tools default `NO_PROXY=localhost,127.0.0.1` which would defeat us)
+
+When `--block-net`, none of these are set (and the proxy isn't started).
+
+### Profiles
+
+Profile JSON gains a `network` slice. Schema:
+
+```json
+{
+  "network": {
+    "blockNet": false,
+    "allowDomain": ["api.anthropic.com", "*.anthropic.com"],
+    "profile": "minimal"
+  }
+}
+```
+
+- `network.blockNet` (bool) — equivalent to `--block-net`.
+- `network.allowDomain` (string array) — equivalent to repeatable
+  `--allow-domain`. Concatenates with CLI flags (dedupe,
+  case-insensitive).
+- `network.profile` (string) — one of `none`, `minimal`, `developer`.
+  Resolves to a built-in allow-list (see below) and merges with
+  `allowDomain` and CLI flags.
+
+CLI precedence: `--network-profile` flag overrides `network.profile`
+in the JSON; `--block-net` flag forces `none` regardless of profile;
+`--allow-domain` flags concatenate with `network.allowDomain`.
+
+Built-in profiles (live in code, not on disk):
+
+- `none` → `blockNet=true`, no proxy, no allow-list.
+- `minimal` → `["api.openai.com", "api.anthropic.com",
+  "generativelanguage.googleapis.com"]`.
+- `developer` → `minimal` + `["registry.npmjs.org",
+  "registry.npmjs.com", "pypi.org", "files.pythonhosted.org",
+  "crates.io", "static.crates.io", "github.com",
+  "objects.githubusercontent.com", "raw.githubusercontent.com",
+  "codeload.github.com"]`.
+
+### Audit event emission
+
+US-3 emits `CONNECT` events; US-4 owns the hash chain and signing. The
+seam is a single function in a new `src/audit.rs`:
+
+```rust
+pub fn emit_connect(session_id: &str, host: &str, port: u16,
+                    disposition: Allow, reason: Option<&str>);
+```
+
+For US-3, this writes one NDJSON line to
+`%LOCALAPPDATA%\sandbox\audit\<sid>.ndjson` (creating the dir if
+missing) and also to stderr under `SANDBOX_DIAG`. The line shape matches
+the US-4 `CONNECT` schema:
+
+```json
+{"ts":"2026-07-25T14:45:21Z","seq":12,"op":"CONNECT",
+ "host":"api.anthropic.com","port":443,"disposition":"allow",
+ "reason":null}
+```
+
+(US-4 will later wrap this writer to add `parent`/`hash` fields and
+sign the root. US-3 deliberately does not compute the hash chain.)
+
+### Test commands (integration tests S-25 .. S-38)
+
+| AC | Scenario | Command in harness | Assert |
+|---|---|---|---|
+| 3.1 | S-25 | `sandbox run --allow-cwd --block-net -- cmd /c python -c "import urllib.request,sys; urllib.request.urlopen('https://api.openai.com')"` (skip if no python) | exit ≠ 0, stderr matches `(?i)(access is denied|connection|urLError|PermissionError)` |
+| 3.2 | S-26 | `sandbox run --allow-cwd --block-net -- cmd /c python -c "import socket; socket.create_connection(('169.254.169.254',80))"` (skip if no python) | exit ≠ 0, no packet leaves |
+| 3.3 | S-27 | `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s -o NUL -w "%{http_code}" https://api.anthropic.com/v1/messages` (skip if no curl) | http_code in 4xx (anthropic returns 401 without auth — the *connection* succeeded) |
+| 3.4 | S-28 | same as 3.3 but `--allow-domain api.anthropic.com` and `curl https://evil.example.com` | curl exits non-zero, proxy log shows `DENY CONNECT evil.example.com:443 reason=domain_not_allowed` (under `SANDBOX_DIAG`) |
+| 3.5 | S-29 | `--allow-domain *.anthropic.com`, curl `api.anthropic.com` and `console.anthropic.com` then `anthropic.com.evil.io` | first two connect, third denied |
+| 3.6 | S-30 | `--allow-domain 169.254.169.254 --allow-domain api.anthropic.com`, connect to `169.254.169.254` | denied with `reason=denied_cidr` in the diag log |
+| 3.7 | S-31 | any profile, connect to `metadata.google.internal` | denied with `reason=denied_dns` |
+| 3.8 | S-32 | `--network-profile minimal`, connect to `api.openai.com`, `api.anthropic.com`, `generativelanguage.googleapis.com`, then `github.com` | first three connect, github denied |
+| 3.9 | S-33 | `--network-profile developer`, connect to all of the above plus `registry.npmjs.org`, `github.com` | all connect |
+| 3.10 | S-34 | profile JSON with `network.allowDomain=["api.anthropic.com"]` + CLI `--allow-domain github.com`, connect to both | both connect |
+| 3.11 | S-35 | two concurrent `sandbox run` invocations | proxy ports differ, neither fails with EADDRINUSE |
+| 3.12 | S-36 | sandboxed process knows port but not token, sends request without `X-Sandbox-Token` | proxy responds `407` |
+| 3.13 | S-37 | `--allow-domain api.openai.com`, sandboxed raw-socket python app ignores `HTTPS_PROXY` and `connect()`s directly | `connect()` raises `PermissionError`; log records `DENY CONNECT api.openai.com:443 reason=direct_connect_blocked` (this is the AppContainer network cap, not the proxy) |
+| 3.14 | S-38 | start sandbox w/ proxy, kill `sandbox.exe`, check the proxy port is released within 1 s | port closed (next `Test-NetConnection` or `Get-NetTCPConnection` returns no listener) |
+| 3.15 | (SKIP) | — | `Detail='deferred to F-6 (WFP driver)'` |
+
+Tests that need python/curl skip cleanly when the binary is missing,
+mirroring the existing S-8/S-9/S-19 pattern.
+
+### File map
+
+- `Cargo.toml` — add `tokio`, `hyper`, `hyper-util`, `rustls`,
+  `rustls-native-certs`, `http`, `bytes`, `http-body-util`,
+  `tokio-util` (CancellationToken), `h2` optional (skip for MVP — HTTP/1.1
+  only). New windows features: `Win32_Networking_WinSock` for
+  `NetworkIsolation` (loopback exemption) and
+  `Win32_Security_Cryptography` for `BCryptGenRandom`.
+- `src/cli.rs` — add `--network-profile <name>`, keep `--block-net`
+  and `--allow-domain`. Update `RunArgs` + `from_cli`.
+- `src/profile.rs` — add `NetworkSlice` to `ResolvedProfile`, parse
+  `network` JSON (currently a `serde_json::Value` black box), merge
+  with CLI flags, expose `NetworkSlice::allow_domain`, `block_net`,
+  `profile_name`.
+- `src/net/mod.rs` (new) — facade: `NetworkConfig`, `resolve_network()`,
+  re-exports.
+- `src/net/matcher.rs` (new) — `matches(host, entry)`, `is_allowed(host,
+  &allow_list)`, `is_always_denied(host_or_ip)`. Pure functions, unit
+  tests inline.
+- `src/net/profile.rs` (new) — `builtin_profile(name) -> Vec<String>`
+  for `minimal`/`developer`/`none`.
+- `src/net/proxy.rs` (new) — tokio/hyper/rustls CONNECT proxy,
+  `ProxyHandle`, `spawn(token, allow_list, audit_sink) -> ProxyHandle`.
+- `src/net/token.rs` (new) — `gen_token()` via BCryptGenRandom,
+  hex-encode.
+- `src/net/loopback.rs` (new) — `register_loopback(ac_sid)` via
+  `NetworkIsolationSetAppContainerConfig`. (Best-effort; failures
+  logged under `SANDBOX_DIAG`.)
+- `src/audit.rs` (new) — `emit_connect(...)`. Thin; US-4 owns the rest.
+- `src/sandbox/appcontainer.rs` — `build_env_block` gains optional
+  `ProxyConfig { port, token }`.
+- `src/sandbox/spawn.rs` — pass `SECURITY_CAPABILITIES` with no internet
+  caps (already does — verify). Loopback exemption registered before
+  spawn when a proxy is configured.
+- `src/main.rs` — wire `--block-net` / `--allow-domain` /
+  `--network-profile` into `run_inner`; start the proxy (or not), build
+  the env block, pass the proxy port+token to spawn.
+- `src/setup.rs` — `setup --check-only` now reports the proxy / network
+  cap status (replace the "not yet implemented" lines).
+- `tests/run-tests.ps1` — add S-25 .. S-38, mark S-39 (AC-3.15) as
+  SKIP.
