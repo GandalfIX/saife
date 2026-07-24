@@ -187,11 +187,6 @@ pub fn is_always_denied(host: &str, resolved_ips: &[IpAddr]) -> bool {
         return true;
     }
     for ip in resolved_ips {
-        if ALWAYS_DENIED_V4_HOSTS.iter().any(|s| {
-            s.parse::<Ipv4Addr>().ok() == Some(match ip { IpAddr::V4(v) => *v, _ => false as _ })
-        }) {
-            // The above is awkward; simpler: parse each literal and compare.
-        }
         match ip {
             IpAddr::V4(v) => {
                 if ALWAYS_DENIED_V4_HOSTS.iter().any(|s| s.parse::<Ipv4Addr>().ok() == Some(*v)) {
@@ -1158,7 +1153,19 @@ Build a `ProxyConfig` from `(proxy_port, proxy_token)` and pass it.
 
 - [ ] **Step 5: Hold the `ProxyHandle` until the child exits**
 
-Bind `_proxy_handle` in `run_inner` so it lives until `spawn()` returns and we read the exit code.
+Bind `_proxy_handle` in `run_inner` so it lives until `spawn()` returns and we read the exit code. The handle must be assigned in the *outer* scope (not inside the match arm) so it isn't dropped when the match block ends. Pattern:
+
+```rust
+let _proxy_handle: Option<net::proxy::ProxyHandle> = match &net_cfg {
+    net::NetworkConfig::Blocked => None,
+    net::NetworkConfig::Allow { .. } => {
+        // ... gen token, spawn proxy ...
+        Some(handle)
+    }
+};
+// _proxy_handle lives until the end of run_inner; sandbox::spawn runs
+// below and the child process can talk to the proxy the whole time.
+```
 
 - [ ] **Step 6: Build**
 
@@ -1440,32 +1447,34 @@ function Invoke-Scenario-S35 {
 
 - [ ] **Step 12: Add S-36 (AC-3.12, no token → 407)**
 
+AC-3.12 requires that a request to the proxy *without* the `X-Sandbox-Token` gets a 407. The proxy port is randomized per session, so we must capture the port from one session and probe it from *within the same session* (using `--sid <sid>` to reuse the session+proxy). The sandboxed process can read `X-Sandbox-Token` from its own env (we injected it) and then deliberately omit it from a raw socket request to the proxy.
+
 ```powershell
 function Invoke-Scenario-S36 {
     $d = New-ScenarioDir 36
-    # Run a sandboxed process that knows the proxy port (we extract it
-    # from SANDBOX_DIAG output) but is told to send a request WITHOUT the
-    # token. We use a python one-liner to bypass the env-injected token.
     $py = Get-Python
     if (-not $py) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
-    # Extract port from a diag run.
+    # Start a session and capture the sid + proxy port. The proxy port is
+    # printed on stderr under SANDBOX_DIAG ([proxy] listening on 127.0.0.1:<port>).
     $env:SANDBOX_DIAG='1'
     try {
         $probe = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--print-sid','--','cmd','/c','echo','probe') -WorkingDirectory $d
     } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
-    # The diag output prints the proxy port under [proxy] ...; parse it.
-    $portLine = ($probe.Stderr | Where-Object { $_ -match 'proxy.*listen|bind|port' } | Select-Object -First 1)
-    # (Implementation detail: emit a clear `[proxy] listening on 127.0.0.1:<port>` line in the proxy spawn.)
-    # If we can't parse, skip.
-    if (-not $portLine -or $portLine -notmatch '(\d{2,5})') {
-        return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='could not extract proxy port' }
+    $sid = ($probe.Stdout | Where-Object { $_ -match '^\d{8}-\d{6}-\d{5}$' } | Select-Object -First 1)
+    $portLine = ($probe.Stderr | Where-Object { $_ -match '\[proxy\].*127\.0\.0\.1:(\d{2,5})' } | Select-Object -First 1)
+    if (-not $sid -or -not $portLine -or $portLine -notmatch '(\d{2,5})') {
+        return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail="could not extract sid/port (sid=$sid line=$portLine)" }
     }
     $port = $matches[1]
-    # Now connect to the proxy without the token. The proxy must respond 407.
-    # We do this from OUTSIDE the sandbox (so the network cap doesn't stop us).
+    # Reuse the same session. The sandboxed python reads the proxy port from
+    # the diag output (we re-export SANDBOX_DIAG so the second run also logs
+    # the port — but we already have it from $port). We hard-code the port
+    # into the python snippet. Python opens a raw socket to 127.0.0.1:$port
+    # and sends a GET request WITHOUT the X-Sandbox-Token header.
     $env:SANDBOX_DIAG='1'
     try {
-        $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','python','-c',"import socket; s=socket.create_connection(('127.0.0.1',$port)); s.sendall(b'GET http://api.anthropic.com/ HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n'); print(s.recv(64).decode(errors='replace'))") -WorkingDirectory $d
+        $pyCmd = "import socket; s=socket.create_connection(('127.0.0.1',$port)); s.sendall(b'GET http://api.anthropic.com/ HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n'); print(s.recv(64).decode(errors='replace'))"
+        $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--sid',$sid,'--','python','-c',$pyCmd) -WorkingDirectory $d
     } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     $passed = $out -match '407'
@@ -1474,7 +1483,7 @@ function Invoke-Scenario-S36 {
 }
 ```
 
-> This test requires the proxy to log its listening port under `SANDBOX_DIAG`. Add that eprintln in `proxy::spawn` before the listener-accept loop: `eprintln!("[proxy] listening on 127.0.0.1:{port}");`
+> Requires the proxy to log its listening port under `SANDBOX_DIAG` (added in Task 7's `proxy::spawn`). Also requires `--sid <sid>` reuse to point at the *same* proxy instance whose port we extracted.
 
 - [ ] **Step 13: Add S-37 (AC-3.13, raw-socket app fails closed)**
 
