@@ -1,19 +1,24 @@
 # PRD: `sandbox` — Native Windows Process Sandbox for AI Agents
 
-> **STATUS NOTE (2026-07-23):** This PRD predates the critical review
-> (`../critical-review.md`) which found that the AppContainer + RuleSet
-> mechanism choice is contested by OpenAI's Codex Windows sandbox findings.
-> Several decisions have been made after this PRD was written:
-> - **Mechanism (FR-2)**: pending the spike
->   (`../spike-appcontainer-option-e.md`). If the spike passes, AppContainer
->   + Option E stands; if it fails, pivot to OpenAI's write-restricted
->   token composition.
+> **STATUS NOTE (2026-07-24):** The AppContainer + Option E spike
+> (`../spike-appcontainer-option-e.md`) has **PASSED**. The gate test
+> (S-6) confirmed that a binary downloaded at runtime into a
+> RuleSet-allowed per-session directory (`.sandbox/<sid>/bin/`) is
+> executable by the sandboxed AppContainer process, and per-session
+> isolation (S-13) is enforced. OpenAI's finding that AppContainer does
+> not fit the open-ended-binary workload is **not** confirmed for the
+> Option E directory model. **AppContainer + Option E is the MVP
+> mechanism; no Option A fallback is triggered.**
+>
+> Earlier decisions (retained):
+> - **Mechanism (FR-2)**: AppContainer + Option E **confirmed** by the
+>   spike. (Previously: pending the spike.)
 > - **Admin for setup (G4, FR-6)**: accepted — "admin for setup,
 >   unprivileged to run." Matches OpenAI's shipped design.
 > - **Option E sanctioned install dirs**: per-session
 >   `.sandbox/<sid>/{bin,venv,npm,cargo,tmp}/` for open-ended binary
 >   execution. Plus opt-in `persist`/`reuse` for caching. See
->   `../critical-review.md` Option E.
+>   `../critical-review.md` Option E. **Validated by S-6 and S-13.**
 > - **Profiles location (FR-5.1)**: confirmed user-global only
 >   (`%USERPROFILE%\.sandbox\profiles\`); no repo-local search path
 >   (CR-10 config-based sandbox escape).
@@ -140,12 +145,30 @@ and console processes** that real Windows developers actually run.
   other commands are read-only metadata / log accessors.
 
 ### FR-2 — Filesystem Isolation (MVP core)
+> **Spike-validated (2026-07-24).** The AppContainer + Option E spike
+> (`../spike-appcontainer-option-e.md`) confirmed S-6 (a binary downloaded
+> at runtime into `.sandbox/<sid>/bin/` is executable) and S-13 (per-session
+> isolation). See `../spike/RESULTS.md`. Implementation notes below encode
+> the spike's findings.
+
 - **FR-2.1** The sandboxed process is launched inside an **AppContainer**
-  profile with a freshly-generated per-session **AppContainer SID**.
-- **FR-2.2** A **RuleSet** (Windows 10 1709+, `NtCreateFile` /
-  `CreateAppContainerProfile` + `AppContainer` capability rules) is built from
-  the resolved allow-list and applied to the process token before
-  `CreateProcessW` runs.
+  profile with a freshly-generated per-session **AppContainer SID**
+  (`CreateAppContainerProfile`; re-derived via
+  `DeriveAppContainerSidFromAppContainerName` on `--sid`/`--reuse`). The
+  child is a genuine AppContainer process: its token has
+  `TokenIsAppContainer = 1` and the AppContainer SID in
+  `TokenAppContainerSid`. (Note: AppContainer SIDs do **not** appear in
+  `TokenGroups`/`whoami /groups`; verify via `GetTokenInformation`.)
+- **FR-2.2** A **RuleSet** is built from the resolved allow-list and
+  applied to the process token before `CreateProcessW` runs. The spike
+  validated two equivalent grant mechanisms:
+  (a) per-directory DACL Allow ACEs for the AppContainer SID (what `icacls
+  /grant` / Add-AppxPackage-style setup do), and
+  (b) the formal AppContainer capability-rule RuleSet (`NtCreateFile` /
+  `CreateAppContainerProfile` + capability SIDs).
+  Both rely on the AppContainer SID being a restricting identity
+  (deny-by-default); the MVP picks one (recommend (b) for purity, (a) for
+  simplicity — the spike used (a)).
 - **FR-2.3** Allow-list entries support:
   - directory path, recursive flag
   - file path
@@ -159,11 +182,50 @@ and console processes** that real Windows developers actually run.
   automatically inherit the same AppContainer token and Job Object, so the
   same rules apply transitively. Verified by a test that launches `cmd /c
   python -c "open(r'C:\Users\marku\.ssh\id_rsa').read()"` and asserts it fails.
+  (Spike S-10 confirmed denial at depth 3: `cmd /c cmd /c cmd /c type …`.)
 - **FR-2.6** A **Job Object** is attached with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
   so that when the parent `sandbox.exe` exits, all descendants are killed — no
-  orphaned sandboxed processes survive.
+  orphaned sandboxed processes survive. `JOB_OBJECT_LIMIT_BREAKAWAY_OK` is
+  **not** set, so children cannot escape the job. (Spike S-11 confirmed the
+  kill-the-tree property; S-12 breakaway-blocking is deferred pending a
+  dedicated helper binary.)
 - **FR-2.7** Default-deny: paths not in the allow-list return
-  `ERROR_ACCESS_DENIED` to the sandboxed process.
+  `ERROR_ACCESS_DENIED` to the sandboxed process. (Spike S-2/S-3/S-5
+  confirmed `.ssh` reads and sibling-project reads/writes are denied.)
+
+#### FR-2.8 — Option E sanctioned install directories (spike-validated)
+
+The profile enumerates **directories**, not **tools**, so the agent can
+install arbitrary binaries mid-session into the sanctioned install roots
+and run them without re-profiling. Install roots are scoped by session id
+(DECISION 2026-07-23): two concurrent agents get distinct trees — no
+races, no cross-session poisoning.
+
+- **FR-2.8.1** Per-session install roots under `$CWD/.sandbox/<sid>/`:
+  - `bin/` — general binaries; prepended to the child's `PATH`
+    (`Read | Write | Execute`)
+  - `venv/` — per-session Python virtualenvs (`R | W | X`)
+  - `npm/`, `cargo/`, `tmp/` — runtime-specific install/cache dirs
+    (same model; MVP includes at least `bin/` and `venv/`)
+- **FR-2.8.2** **Per-session isolation (S-13, validated):** each
+  `.sandbox/<sid>/` subtree is granted to its owning AppContainer SID
+  with a **PROTECTED_DACL** (`PROTECTED_DACL_SECURITY_INFORMATION`) so it
+  does **not** inherit the broad `$CWD` Allow. Session B's AppContainer
+  SID therefore has no Allow ACE on session A's subtree → denied by
+  default. The subtree's DACL explicitly grants Full Control to the
+  owner (user), SYSTEM, Administrators, and `R|W|X` to the owning
+  AppContainer SID. (The naive "Deny on `.sandbox/`" approach **failed**
+  in the spike — the inherited `$CWD` Allow overrode the deny; PROTECTED
+  is the correct mechanism.)
+- **FR-2.8.3** The sandboxed process "downloads" a binary by writing into
+  `bin/` (e.g. `copy`, `pip install`, `cargo install`); the binary is
+  immediately executable. (Spike S-6 gate test.)
+- **FR-2.8.4** **Opt-in caching (`persist`/`reuse`)**: a session's `bin/`
+  may be persisted to `%USERPROFILE%/.sandbox/stores/<name>/bin/` and
+  reused (read-only) by a later session via `--reuse <name>`. With
+  `--reuse`, the per-session `bin/` IS the store dir (aliased). Not
+  required for the open-ended-binary property; deferred from the spike
+  (stubbed).
 
 ### FR-3 — Network Filtering (MVP)
 - **FR-3.1** `--block-net` mode: the AppContainer's default network capability

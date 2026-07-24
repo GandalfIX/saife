@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target/
+
+# Per-session sandbox runtime dirs (created by `sandbox run`)
+/.sandbox/
+
+# Local diagnostics env (set by SANDBOX_DIAG)
+# (no file — environment variable only)

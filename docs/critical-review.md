@@ -583,12 +583,66 @@ store dir); `--reuse-rw` adds Write.
 
 ## Recommendation
 
+> **UPDATED (2026-07-24):** The AppContainer + Option E spike **PASSED**
+> (`../spike-appcontainer-option-e.md`; results in `../spike/RESULTS.md`).
+> The gate test (S-6) confirmed that a binary downloaded at runtime into a
+> RuleSet-allowed per-session directory (`.sandbox/<sid>/bin/`) is executable
+> by the sandboxed AppContainer process, and per-session isolation (S-13)
+> is enforced. **AppContainer + Option E is the MVP mechanism; the Option A
+> fallback is NOT triggered.** OpenAI's CR-1 objection ("AppContainer is the
+> wrong primitive for an open-ended coding agent") does **not** hold for the
+> Option E directory model: the profile enumerates *directories*, not
+> *tools*, so the agent installs arbitrary binaries mid-session into
+> `.sandbox/<sid>/bin/` and runs them without re-profiling.
+
 > **UPDATED (2026-07-23):** Option E (constrained-open-ended via sanctioned
 > install directories) is the chosen direction, combined with admin-for-setup
 > (per OQ-2 decision) and native-Windows-only (per OQ-3 decision).
 
+### Spike outcome (2026-07-24)
+
+1. **Spike**: built a minimal AppContainer + per-directory RuleSet that
+   grants `Read/Write/Execute` on `.sandbox/<sid>/bin/`, `$CWD`, and
+   `Read/Execute` on the system python install. Launched a sandboxed
+   process that copies `hostname.exe` into `.sandbox/<sid>/bin/` and runs
+   it. **It works** → AppContainer + Option E is viable. (The plan's
+   `where.exe cmd` was replaced with `hostname.exe`: `where.exe` walks PATH
+   into non-allow-listed dirs and fails spuriously; `hostname.exe` runs
+   standalone and proves the same gate property.)
+2. **Per-session isolation (S-13) passes**: two sessions in the same `$CWD`
+   get distinct sids; session B is denied read of session A's
+   `.sandbox/<sidA>/bin/`. The spike validated that the naive "Deny on
+   `.sandbox/`" approach **fails** (the inherited `$CWD` Allow overrides
+   it); the correct mechanism is `PROTECTED_DACL` on `.sandbox/<sid>/*` so
+   the broad `$CWD` Allow does not inherit into sibling session subtrees.
+3. **Security properties pass**: S-2/S-3/S-5 (denial of `.ssh` and sibling
+   projects) and S-10 (depth-3 inheritance) pass via genuine AppContainer
+   deny-by-default. S-11 (Job Object `KILL_ON_JOB_CLOSE`) passes.
+4. **No Option A fallback needed.** Option E is mechanism-agnostic — it
+   would work with Option A too — but AppContainer suffices.
+
+### Implementation notes for the MVP (from the spike)
+
+- The child is a genuine AppContainer: `TokenIsAppContainer = 1`,
+  AppContainer SID in `TokenAppContainerSid`. **Do not verify AppContainer
+  identity with `whoami /groups`** — AppContainer SIDs live in
+  `TokenAppContainerSid`, not `TokenGroups`; `whoami /groups` never shows
+  them for any AppContainer process.
+- Two equivalent grant mechanisms were validated: (a) per-directory DACL
+  Allow ACEs for the AppContainer SID (what `icacls /grant` does), and
+  (b) the formal AppContainer capability-rule RuleSet. The AppContainer
+  SID is a restricting identity (deny-by-default) in both. The MVP may use
+  either.
+- Per-session isolation requires `PROTECTED_DACL` on `.sandbox/<sid>/*`
+  (not a Deny-on-parent). See `../spike/RESULTS.md` FR-2.8.2.
+- S-9 (venv creation) failed against the test machine's uv-shim python
+  install but S-8 (direct python execution) passed; treat venv as
+  follow-up with a standard CPython install.
+
+### Prior plan (retained for reference)
+
 **Spike Option E with AppContainer first; fall back to the OpenAI composition
-if the spike fails.** The plan:
+if the spike fails.** The plan was:
 
 1. **Spike**: build a minimal AppContainer + RuleSet that grants
    `Read/Write/Execute` on `.sandbox/bin/`, `$CWD`, and `Read/Execute` on
@@ -608,8 +662,8 @@ if the spike fails.** The plan:
 
 The worst outcome is to ship AppContainer pretending it solves the
 open-ended coding-agent problem when OpenAI has already shown it doesn't —
-Option E is our answer to that objection, and the spike will tell us if it
-holds.
+Option E is our answer to that objection, and **the spike confirmed it
+holds**.
 
 ## Open questions for the user
 
