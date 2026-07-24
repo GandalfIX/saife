@@ -1,6 +1,7 @@
 mod cli;
 mod profile;
 mod sandbox;
+mod security_groups;
 mod setup;
 
 use anyhow::{Context, Result};

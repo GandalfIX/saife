@@ -294,9 +294,28 @@ function Invoke-Scenario-S11 {
         Detail = if ($passed) { 'Job Object killed child tree' } else { 'ping.exe still alive' } }
 }
 
-# S-12: breakaway blocked (SKIP — needs helper binary).
+# S-12: breakaway blocked (AC-2.5) — requires the breakaway-helper.exe binary.
+# The helper calls CreateProcessW with CREATE_BREAKAWAY_FROM_JOB and prints
+# `CREATEPROCESS_FAILED <code>` when the call is denied. Under the sandbox's
+# Job Object (no BREAKAWAY_OK), the call fails with ERROR_ACCESS_DENIED (5).
 function Invoke-Scenario-S12 {
-    return @{ Num=12; Name='S-12'; Passed=$true; Skipped=$true; Detail='deferred - requires breakaway helper binary' }
+    $d = New-ScenarioDir 12
+    $helperSrc = [System.IO.Path]::GetFullPath((Join-Path $script:ThisDir '..\target\release\breakaway-helper.exe'))
+    if (-not (Test-Path -LiteralPath $helperSrc)) {
+        return @{ Num=12; Name='S-12'; Passed=$true; Skipped=$true; Detail='breakaway-helper.exe not built (run: cargo build --release --bin breakaway-helper)' }
+    }
+    # Copy the helper into $CWD so the sandboxed process (allow-cwd) can execute it.
+    $helperDst = Join-Path $d 'breakaway-helper.exe'
+    Copy-Item -LiteralPath $helperSrc -Destination $helperDst -Force
+    # Invoke the helper directly (not via `cmd /c`): cmd's command resolution
+    # triggers an extra access path that the AppContainer denies, which would
+    # mask the helper's own CREATEPROCESS_FAILED output. The helper is a
+    # standalone exe, so direct invocation is the faithful test.
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--',$helperDst) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($out -match 'CREATEPROCESS_FAILED\s+5')
+    return @{ Num=12; Name='S-12 (AC-2.5)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'breakaway denied with ERROR_ACCESS_DENIED (5)' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
 # S-13: per-session isolation — two sessions get distinct install trees.
@@ -382,6 +401,84 @@ function Invoke-Scenario-S18 {
         Detail = if ($passed) { 'setup --check-only reported' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
+# S-19: python_runtime security group makes python usable (AC-2.9).
+# Skips cleanly if python is not on PATH.
+function Invoke-Scenario-S19 {
+    $d = New-ScenarioDir 19
+    if (-not (Get-Python)) { return @{ Num=19; Name='S-19'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'py-runtime.json'
+    $profileJson = @{
+        meta = @{ name = 'py-runtime'; version = '1.0.0' }
+        security = @{ groups = @('python_runtime') }
+        filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--allow-cwd','--','python','-c',"print('python-runtime-ok')") -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'python-runtime-ok')
+    return @{ Num=19; Name='S-19 (AC-2.9 py)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'python_runtime group let python run' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-20: node_runtime security group makes node usable (AC-2.9).
+# Skips cleanly if node is not on PATH.
+function Invoke-Scenario-S20 {
+    $d = New-ScenarioDir 20
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) { return @{ Num=20; Name='S-20'; Passed=$true; Skipped=$true; Detail='node not on PATH' } }
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'node-runtime.json'
+    $profileJson = @{
+        meta = @{ name = 'node-runtime'; version = '1.0.0' }
+        security = @{ groups = @('node_runtime') }
+        filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--allow-cwd','--','node','-e',"console.log('node-runtime-ok')") -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'node-runtime-ok')
+    return @{ Num=20; Name='S-20 (AC-2.9 node)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'node_runtime group let node run' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-21: shell wrapper stays confined (AC-2.6). The agent writes a .bat inside
+# $CWD that shells out to powershell to read .ssh\id_rsa; the read must be
+# denied because the wrapper inherits the restricted token.
+function Invoke-Scenario-S21 {
+    $d = New-ScenarioDir 21
+    $target = Join-Path $env:USERPROFILE '.ssh\id_rsa'
+    $wrapper = Join-Path $d 'wrapper.bat'
+    # Use a here-string to avoid quoting headaches; the .bat calls powershell.
+    $batContent = "@echo off`r`npowershell -NoProfile -Command `"try { Get-Content -LiteralPath '$target' -ErrorAction Stop } catch { exit 1 }`""
+    Set-Content -LiteralPath $wrapper -Value $batContent -Encoding ASCII
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','wrapper.bat') -WorkingDirectory $d
+    $passed = ($r.ExitCode -ne 0)
+    return @{ Num=21; Name='S-21 (AC-2.6)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'shell wrapper denied .ssh read' } else { "exit=$($r.ExitCode) (expected non-zero)" } }
+}
+
+# S-22: gradle/javac worker stays confined (AC-2.3) — deferred (needs java + gradle fixture).
+function Invoke-Scenario-S22 {
+    return @{ Num=22; Name='S-22'; Passed=$true; Skipped=$true; Detail='AC-2.3 gradle scenario deferred (needs java + gradle fixture)' }
+}
+
+# S-23: reserved for a future US-2 scenario slot.
+function Invoke-Scenario-S23 {
+    return @{ Num=23; Name='S-23'; Passed=$true; Skipped=$true; Detail='reserved' }
+}
+
+# S-24: exit code propagation (AC-2.8).
+function Invoke-Scenario-S24 {
+    $d = New-ScenarioDir 24
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','exit','42') -WorkingDirectory $d
+    $passed = ($r.ExitCode -eq 42)
+    return @{ Num=24; Name='S-24 (AC-2.8)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'exit code 42 propagated' } else { "exit=$($r.ExitCode) (expected 42)" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -391,7 +488,9 @@ $script:Scenarios = @(
     { Invoke-Scenario-S7 },  { Invoke-Scenario-S8 },  { Invoke-Scenario-S9 },
     { Invoke-Scenario-S10 }, { Invoke-Scenario-S11 }, { Invoke-Scenario-S12 },
     { Invoke-Scenario-S13 }, { Invoke-Scenario-S14 }, { Invoke-Scenario-S15 },
-    { Invoke-Scenario-S16 }, { Invoke-Scenario-S17 }, { Invoke-Scenario-S18 }
+    { Invoke-Scenario-S16 }, { Invoke-Scenario-S17 }, { Invoke-Scenario-S18 },
+    { Invoke-Scenario-S19 }, { Invoke-Scenario-S20 }, { Invoke-Scenario-S21 },
+    { Invoke-Scenario-S22 }, { Invoke-Scenario-S23 }, { Invoke-Scenario-S24 }
 )
 
 function Invoke-Scenario { param([int]$Number)
@@ -441,7 +540,7 @@ function Main {
     if ($gateFailed) {
         Write-Host "SANDBOX: FAIL (gate test S-6 failed)" -ForegroundColor Red
     } else {
-        $required = 1,2,3,4,5,6,7,10,11,13,16,17,18
+        $required = 1,2,3,4,5,6,7,10,11,12,13,16,17,18,21,24
         $hardFail = $false
         foreach ($n in $required) {
             $r = $results | Where-Object { $_.Num -eq $n } | Select-Object -First 1

@@ -65,17 +65,42 @@ pub struct RawFilesystem {
     pub deny: Vec<String>,
 }
 
-/// Load a profile by name or path, resolve `extends`, expand variables.
+/// Load a profile by name or path, resolve `extends`, expand variables, and
+/// expand `security.groups` into concrete filesystem paths.
 pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     let mut seen: Vec<String> = Vec::new();
     let raw = load_raw_chain(name, cwd, &mut seen)?;
-    let fs = resolve_filesystem(&raw.filesystem, cwd)?;
+    let mut fs = resolve_filesystem(&raw.filesystem, cwd)?;
     let resolved_name = raw
         .meta
         .as_ref()
         .map(|m| m.name.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| name.to_string());
+
+    // Expand security groups (FR-5.4). Group paths are RX (read_only
+    // semantics). They are appended after the profile's own read_only entries
+    // so that dedupe_paths — which preserves the first occurrence — keeps any
+    // path already granted RWX (in `allow`) at RWX, not downgraded to RX.
+    if let Some(sec) = &raw.security {
+        if !sec.groups.is_empty() {
+            let probe = crate::security_groups::HostEnv;
+            let grants = crate::security_groups::resolve_groups(&probe, &sec.groups);
+            for g in grants {
+                fs.read_only.push(g.path);
+            }
+            fs.read_only = dedupe_paths(fs.read_only);
+            // Also drop group paths that already appear in `allow` (RWX),
+            // since dedupe_paths only dedupes within one vector.
+            let allow_keys: std::collections::BTreeSet<String> = fs
+                .allow
+                .iter()
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .collect();
+            fs.read_only.retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+        }
+    }
+
     Ok(ResolvedProfile {
         name: resolved_name,
         filesystem: fs,
