@@ -1,4 +1,5 @@
 mod cli;
+mod net;
 mod profile;
 mod sandbox;
 mod security_groups;
