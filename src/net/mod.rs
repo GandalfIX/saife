@@ -169,4 +169,39 @@ mod tests {
         let cfg = resolve_network(&slice, false, &[], None);
         assert!(cfg.is_blocked());
     }
+
+    #[test]
+    fn json_allow_domain_only_propagates() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["api.anthropic.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &[], None);
+        match cfg {
+            NetworkConfig::Allow { allow_domain, .. } => {
+                assert_eq!(allow_domain, vec!["api.anthropic.com".to_string()]);
+            }
+            NetworkConfig::Blocked => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn cli_profile_name_overrides_slice_profile_name() {
+        let slice = NetworkSlice {
+            profile_name: Some("minimal".into()),
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &[], Some("developer"));
+        match cfg {
+            NetworkConfig::Allow { allow_domain, .. } => {
+                // developer includes github.com, minimal does not.
+                assert!(allow_domain.iter().any(|d| d == "github.com"));
+                assert_eq!(
+                    allow_domain.len(),
+                    crate::net::profile::builtin_profile("developer").unwrap().len()
+                );
+            }
+            NetworkConfig::Blocked => panic!("expected Allow"),
+        }
+    }
 }

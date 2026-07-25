@@ -69,16 +69,6 @@ fn run_cmd(
     sid: Option<String>,
     cmd: Vec<String>,
 ) -> i32 {
-    if block_net {
-        eprintln!("[sandbox] --block-net accepted (network filtering not yet implemented)");
-    }
-    if !allow_domain.is_empty() {
-        eprintln!(
-            "[sandbox] --allow-domain accepted (network filtering not yet implemented): {}",
-            allow_domain.join(", ")
-        );
-    }
-
     if let Err(e) = setup::check_runtime() {
         eprintln!("[sandbox] {e:#}");
         return 1;
@@ -104,7 +94,6 @@ fn run_cmd(
     }
 }
 
-#[allow(unused_variables)]
 fn run_inner(
     profile_name: Option<&str>,
     allow_cwd: bool,
@@ -124,6 +113,16 @@ fn run_inner(
         Some(name) => profile::load_and_resolve(name, &cwd)?,
         None => profile::ResolvedProfile::default(),
     };
+
+    // Resolve the network configuration from the profile slice + CLI flags.
+    // Task 9 wires net_cfg into the proxy spawn + env injection.
+    // For now, hold it so the params are used and the resolution path is exercised.
+    let _net_cfg = net::resolve_network(
+        &resolved.network,
+        block_net,
+        allow_domain,
+        network_profile,
+    );
 
     // Merge CLI flags on top of the profile.
     let fs = profile::merge_filesystem(&resolved.filesystem, allow_cwd, allow, read_only, &cwd)?;
