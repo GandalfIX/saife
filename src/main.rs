@@ -1,3 +1,4 @@
+mod audit;
 mod cli;
 mod net;
 mod profile;

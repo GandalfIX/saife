@@ -1,0 +1,110 @@
+//! Minimal audit emitter for US-3. US-4 owns the hash chain + signing; US-3
+//! just appends a NDJSON line per CONNECT event.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub fn audit_log_path(session_id: &str) -> PathBuf {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = local.join("sandbox").join("audit");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{session_id}.ndjson"))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Disposition { Allow, Deny }
+
+impl Disposition {
+    fn as_str(&self) -> &'static str { match self { Self::Allow => "allow", Self::Deny => "deny" } }
+}
+
+pub fn emit_connect(
+    session_id: &str,
+    host: &str,
+    port: u16,
+    disposition: Disposition,
+    reason: Option<&str>,
+) {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = iso8601_utc();
+    let line = format!(
+        "{{\"ts\":\"{ts}\",\"seq\":{seq},\"op\":\"CONNECT\",\"host\":\"{host}\",\"port\":{port},\"disposition\":\"{disp}\"{reason}}}\n",
+        host = host.replace('"', "\\\""),
+        disp = disposition.as_str(),
+        reason = match reason { Some(r) => format!(",\"reason\":\"{}\"", r.replace('"', "\\\"")), None => String::new() }
+    );
+
+    if std::env::var_os("SANDBOX_DIAG").is_some() {
+        eprint!("[proxy] {line}");
+    }
+    let path = audit_log_path(session_id);
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn iso8601_utc() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = (secs % 86_400) as u64;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn civil_from_days(z_off: i64) -> (i64, u32, u32) {
+    let z = z_off + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_known() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+    }
+
+    #[test]
+    fn emit_connect_produces_valid_json() {
+        // Use a temp session id so we don't collide with real sessions.
+        let sid = format!("test-{}-{}", std::process::id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        emit_connect(&sid, "api.anthropic.com", 443, Disposition::Allow, None);
+        emit_connect(&sid, "evil.example.com", 443, Disposition::Deny, Some("domain_not_allowed"));
+        let path = audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("line is valid JSON");
+            assert_eq!(v["op"], "CONNECT");
+            assert!(v["host"].as_str().unwrap().contains("anthropic.com") || v["host"].as_str().unwrap().contains("evil.example.com"));
+            assert_eq!(v["port"], 443);
+        }
+        // The deny line must have a reason field.
+        let deny_line: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(deny_line["disposition"], "deny");
+        assert_eq!(deny_line["reason"], "domain_not_allowed");
+    }
+}
