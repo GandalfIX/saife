@@ -32,12 +32,17 @@ pub fn emit_connect(
 ) {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = iso8601_utc();
-    let line = format!(
-        "{{\"ts\":\"{ts}\",\"seq\":{seq},\"op\":\"CONNECT\",\"host\":\"{host}\",\"port\":{port},\"disposition\":\"{disp}\"{reason}}}\n",
-        host = host.replace('"', "\\\""),
-        disp = disposition.as_str(),
-        reason = match reason { Some(r) => format!(",\"reason\":\"{}\"", r.replace('"', "\\\"")), None => String::new() }
-    );
+    let event = serde_json::json!({
+        "ts": ts,
+        "seq": seq,
+        "op": "CONNECT",
+        "host": host,
+        "port": port,
+        "disposition": disposition.as_str(),
+        "reason": reason,
+    });
+    let mut line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+    line.push('\n');
 
     if std::env::var_os("SANDBOX_DIAG").is_some() {
         eprint!("[proxy] {line}");
@@ -106,5 +111,27 @@ mod tests {
         let deny_line: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(deny_line["disposition"], "deny");
         assert_eq!(deny_line["reason"], "domain_not_allowed");
+    }
+
+    #[test]
+    fn emit_connect_escapes_malicious_host() {
+        let sid = format!("test-escape-{}-{}", std::process::id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        emit_connect(&sid, "evil\\\nhost", 443, Disposition::Deny, Some("a\"b"));
+        let path = audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // The event must occupy exactly one line in the file (no newline injection).
+        let trimmed = content.strip_suffix('\n').unwrap_or(&content);
+        let lines: Vec<&str> = trimmed.lines().collect();
+        assert_eq!(lines.len(), 1, "event must occupy exactly one line");
+
+        // The single line must parse as valid JSON.
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("line is valid JSON");
+        assert_eq!(v["host"], "evil\\\nhost", "host backslash + newline preserved literally");
+        assert_eq!(v["reason"], "a\"b", "reason quote preserved literally");
+        assert_eq!(v["port"], 443);
+        assert_eq!(v["disposition"], "deny");
     }
 }
