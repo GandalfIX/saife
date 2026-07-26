@@ -9,11 +9,10 @@ pub mod verify;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn audit_log_path(session_id: &str) -> PathBuf {
     let local = std::env::var_os("LOCALAPPDATA")
@@ -38,27 +37,90 @@ pub fn emit_connect(
     disposition: Disposition,
     reason: Option<&str>,
 ) {
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let ts = iso8601_utc();
-    let event = serde_json::json!({
-        "ts": ts,
-        "seq": seq,
-        "op": "CONNECT",
-        "host": host,
-        "port": port,
-        "disposition": disposition.as_str(),
-        "reason": reason,
-    });
-    let mut line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
-    line.push('\n');
+    let writer = AuditWriter::open(session_id);
+    let mut event = Map::new();
+    event.insert("op".into(), serde_json::json!("CONNECT"));
+    event.insert("host".into(), serde_json::json!(host));
+    event.insert("port".into(), serde_json::json!(port));
+    event.insert("disposition".into(), serde_json::json!(disposition.as_str()));
+    event.insert("reason".into(), serde_json::json!(reason));
+    writer.append(event);
+}
 
-    if std::env::var_os("SANDBOX_DIAG").is_some() {
-        eprint!("[proxy] {line}");
+pub struct AuditWriter {
+    path: PathBuf,
+    last_hash: Mutex<Option<String>>,
+    seq: AtomicU64,
+}
+
+impl AuditWriter {
+    /// Open the writer for a session. If the log file already exists (e.g.
+    /// `--reuse <sid>` or crash recovery), scan existing lines to recover
+    /// `last_hash` and `seq`. If it doesn't exist, start fresh.
+    pub fn open(session_id: &str) -> Self {
+        let path = audit_log_path(session_id);
+        let (last_hash, next_seq) = if path.exists() {
+            scan_existing(&path).unwrap_or((None, 0))
+        } else {
+            (None, 0)
+        };
+        Self {
+            path,
+            last_hash: Mutex::new(last_hash),
+            seq: AtomicU64::new(next_seq),
+        }
     }
-    let path = audit_log_path(session_id);
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&path) {
-        let _ = f.write_all(line.as_bytes());
+
+    /// Append a leaf. `event` is the op-specific payload (op, host, path,
+    /// etc.) WITHOUT seq/ts/hash/parent — those are computed here.
+    pub fn append(&self, mut event: Map<String, Value>) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let ts = iso8601_utc();
+        event.insert("seq".into(), serde_json::json!(seq));
+        event.insert("ts".into(), serde_json::json!(ts));
+        let canonical = canonicalize(&event);
+        let hash = sha256_hex(&canonical);
+        let parent = self.last_hash.lock().unwrap().take();
+        event.insert("hash".into(), serde_json::json!(hash));
+        event.insert("parent".into(), serde_json::json!(parent));
+        let mut line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+        line.push('\n');
+
+        if std::env::var_os("SANDBOX_DIAG").is_some() {
+            eprint!("[proxy] {line}");
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&self.path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+        *self.last_hash.lock().unwrap() = Some(hash);
     }
+
+    /// The current chain root (last leaf's hash). None if no leaves yet.
+    pub fn current_root(&self) -> Option<String> {
+        self.last_hash.lock().unwrap().clone()
+    }
+}
+
+/// Scan an existing .ndjson file to recover the last hash + next seq for
+/// crash recovery / --reuse.
+fn scan_existing(path: &std::path::Path) -> Option<(Option<String>, u64)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut last_hash: Option<String> = None;
+    let mut max_seq: Option<u64> = None;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        if let Some(h) = v.get("hash").and_then(|x| x.as_str()) {
+            last_hash = Some(h.to_string());
+        }
+        if let Some(s) = v.get("seq").and_then(|x| x.as_u64()) {
+            max_seq = Some(max_seq.map_or(s, |m| m.max(s)));
+        }
+    }
+    let next_seq = max_seq.map_or(0, |m| m + 1);
+    Some((last_hash, next_seq))
 }
 
 fn iso8601_utc() -> String {
@@ -226,5 +288,66 @@ mod tests {
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn hash_chain_links_correctly() {
+        let sid = format!("test-chain-{}-{}", std::process::id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let writer = AuditWriter::open(&sid);
+        let mut e1 = Map::new();
+        e1.insert("op".into(), serde_json::json!("CONNECT"));
+        e1.insert("host".into(), serde_json::json!("a.com"));
+        writer.append(e1);
+        let mut e2 = Map::new();
+        e2.insert("op".into(), serde_json::json!("CONNECT"));
+        e2.insert("host".into(), serde_json::json!("b.com"));
+        writer.append(e2);
+
+        let path = audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let l1: Value = serde_json::from_str(lines[0]).unwrap();
+        let l2: Value = serde_json::from_str(lines[1]).unwrap();
+
+        // First leaf: parent is null.
+        assert_eq!(l1["parent"], Value::Null);
+        let h1 = l1["hash"].as_str().unwrap();
+
+        // Second leaf: parent == hash of first.
+        assert_eq!(l2["parent"], h1);
+
+        // seq monotonic from 0.
+        assert_eq!(l1["seq"], 0);
+        assert_eq!(l2["seq"], 1);
+
+        // Recompute hash of leaf 1 from its canonical body.
+        let m1 = l1.as_object().unwrap().clone();
+        let c1 = canonicalize(&m1);
+        let recomputed1 = sha256_hex(&c1);
+        assert_eq!(recomputed1, h1);
+    }
+
+    #[test]
+    fn scan_existing_recovers_state() {
+        let sid = format!("test-scan-{}-{}", std::process::id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        {
+            let w = AuditWriter::open(&sid);
+            for host in ["a", "b", "c"] {
+                let mut e = Map::new();
+                e.insert("op".into(), serde_json::json!("CONNECT"));
+                e.insert("host".into(), serde_json::json!(host));
+                w.append(e);
+            }
+        }
+        let path = audit_log_path(&sid);
+        let (last_hash, next_seq) = scan_existing(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(last_hash.is_some());
+        assert_eq!(next_seq, 3);
     }
 }
