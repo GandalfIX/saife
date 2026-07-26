@@ -298,3 +298,65 @@ TODO: exact Win32 calls, data structures, error codes, test commands.
 ## Implementation-ready detail (to be filled in last step)
 
 TODO: exact Win32 calls, data structures, error codes, test commands.
+
+## Known issues
+
+### KI-1.1 — `cmd /c dir` fails with "Access is denied" under `--allow-cwd`
+
+**Status:** Reproduces on `feature/windows-sandbox` (pre-US-3 and post-US-3
+merge). Not caused by US-3.
+
+**Reproduce:**
+```powershell
+sandbox run --allow-cwd -- cmd /c dir
+# -> "Zugriff verweigert" (Access is denied), exit 1
+```
+
+**What works:** `cmd /c echo works` succeeds. `powershell -NoProfile -Command
+"Get-ChildItem"` succeeds (lists the cwd contents, including `.sandbox` and
+files). `cmd /c type <file-in-cwd>` succeeds. So the cwd IS readable and
+listable via PowerShell — the failure is specific to `cmd /c dir`.
+
+**What fails:** `cmd /c dir .`, `cmd /c dir <abs-path-to-cwd>`, `cmd /c dir
+..\..` — all return "Access is denied".
+
+**Diagnostic evidence (`SANDBOX_DIAG=1`):**
+- The `System32` and `SystemRoot` ACL grants fail with `0x80070005` (Access
+  denied) — expected, since you can't write ACLs on `C:\WINDOWS`. The spike
+  doc noted these failures are "harmless because those dirs are
+  world-readable." `cmd.exe` itself starts fine (`echo` works), so `cmd.exe`
+  is reachable.
+- `dir` (unlike `echo`) is a builtin that calls `FindFirstFileW`/
+  `FindNextFileW` on the cwd and likely traverses toward the drive root
+  (`C:\`) or reads drive/system metadata that the AppContainer SID can't
+  reach. PowerShell's `Get-ChildItem` opens the directory directly and
+  stays within the granted path.
+
+**Likely root cause (unconfirmed):** `cmd /c dir` traverses parent
+directories (to print volume labels / free space) or reads the drive root,
+neither of which is on the AppContainer allow-list. The `--allow-cwd` grant
+covers the cwd but not `C:\` or intermediate ancestors. `FindFirstFileW`
+on `.` may also need traverse rights on parent dirs that aren't granted.
+
+**Integration-suite gap:** no existing scenario (S-1..S-24) runs `cmd /c
+dir` on the cwd — S-1 uses `echo`, S-2/S-3 use `type`, S-4 uses a
+redirect. The bug went undetected because the harness never exercises
+directory enumeration via cmd.
+
+**Suggested investigation:**
+1. Add a scenario `S-X` that runs `cmd /c dir` under `--allow-cwd` and
+   asserts the listing contains a known file (red-green: it fails today).
+2. Diagnose with `procmon`: filter by `sandbox.exe` + the sandboxed `cmd`
+   PID, watch which path access returns `ACCESS_DENIED`. Confirm whether
+   it's the drive root, an intermediate parent, or `FindFirstFileW` on the
+   cwd itself.
+3. If it's ancestor traversal: grant traverse rights (`FILE_TRAVERSE` /
+   `FILE_LIST_DIRECTORY` on each ancestor up to the drive root) — or rely
+   on the AppContainer's default traverse right (which may be missing).
+4. If it's `FindFirstFileW` access: check whether the cwd grant needs
+   `FILE_LIST_DIRECTORY` explicitly (it's in `FILE_GENERIC_READ` for
+   directories, but the AC restricting token may not map it as expected).
+
+**Severity:** Medium. `cmd /c dir` is a common operation; agents and users
+hit it. Workaround today: use `powershell -Command "Get-ChildItem"` (or
+`ls`) instead of `cmd /c dir`.
