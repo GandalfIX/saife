@@ -29,13 +29,28 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::audit::{self, Disposition};
+use crate::audit::AuditWriter;
 use crate::net::matcher::{self, Verdict};
 
 pub struct ProxyConfig {
     pub session_id: String,
     pub token: String,
     pub allow_domain: Vec<String>,
+    pub writer: Arc<AuditWriter>,
+}
+
+/// Emit a CONNECT audit leaf directly through the threaded `AuditWriter`
+/// (replaces the per-call `audit::emit_connect` wrapper, which opened the
+/// writer fresh on each event).
+fn emit_connect(writer: &AuditWriter, host: &str, port: u16, disposition: &str, reason: Option<&str>) {
+    use serde_json::{json, Map};
+    let mut e = Map::new();
+    e.insert("op".into(), json!("CONNECT"));
+    e.insert("host".into(), json!(host));
+    e.insert("port".into(), json!(port));
+    e.insert("disposition".into(), json!(disposition));
+    e.insert("reason".into(), json!(reason));
+    writer.append(e);
 }
 
 pub struct ProxyHandle {
@@ -88,10 +103,11 @@ impl Drop for ProxyHandle {
 /// process). The runtime is owned by the returned `ProxyHandle` and is
 /// shut down when the handle is dropped.
 pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
-    let ProxyConfig { session_id, token, allow_domain } = cfg;
+    // `session_id` is retained in ProxyConfig for diagnostics/future use but
+    // is not threaded into handle_conn: the AuditWriter holds the log path.
+    let ProxyConfig { session_id: _session_id, token, allow_domain, writer } = cfg;
     let allow = Arc::new(allow_domain);
     let token = Arc::new(token);
-    let sid = Arc::new(session_id);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -129,9 +145,9 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
                     };
                     let allow = allow.clone();
                     let token = token.clone();
-                    let sid = sid.clone();
+                    let writer = writer.clone();
                     tokio::spawn(async move {
-                        let _ = handle_conn(sock, sid, token, allow).await;
+                        let _ = handle_conn(sock, token, allow, writer).await;
                     });
                 }
             }
@@ -153,9 +169,9 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
 
 async fn handle_conn(
     mut sock: tokio::net::TcpStream,
-    sid: Arc<String>,
     token: Arc<String>,
     allow: Arc<Vec<String>>,
+    writer: Arc<AuditWriter>,
 ) -> Result<()> {
     // Read up to 8 KiB of headers (request line + headers, terminated by \r\n\r\n).
     let mut buf = vec![0u8; 8192];
@@ -184,7 +200,7 @@ async fn handle_conn(
     });
     if !token_ok {
         let _ = sock.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n").await;
-        audit::emit_connect(sid.as_str(), "<unknown>", 0, Disposition::Deny, Some("no_token"));
+        emit_connect(&writer, "<unknown>", 0, "deny", Some("no_token"));
         return Ok(());
     }
 
@@ -220,7 +236,7 @@ async fn handle_conn(
     let verdict = matcher::check(&host, &resolved, &allow);
     match verdict {
         Verdict::Allow => {
-            audit::emit_connect(sid.as_str(), &host, port, Disposition::Allow, None);
+            emit_connect(&writer, &host, port, "allow", None);
             if method == "CONNECT" {
                 let upstream = match tokio::net::TcpStream::connect(format!("{host}:{port}")).await {
                     Ok(s) => s,
@@ -256,7 +272,7 @@ async fn handle_conn(
         }
         Verdict::Deny(reason) => {
             let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
-            audit::emit_connect(sid.as_str(), &host, port, Disposition::Deny, Some(reason.as_str()));
+            emit_connect(&writer, &host, port, "deny", Some(reason.as_str()));
             Ok(())
         }
     }

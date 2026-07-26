@@ -147,6 +147,21 @@ fn run_inner(
         return Ok(0);
     }
 
+    // Open the audit writer for this session and emit a SESSION_START leaf so
+    // every session has at least one audit event (ensures `verify` can always
+    // produce a root, even under the US-3 loopback downgrade where no proxy
+    // starts and thus no CONNECT events fire).
+    let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid));
+    {
+        use serde_json::{json, Map};
+        let mut e = Map::new();
+        e.insert("op".into(), json!("SESSION_START"));
+        e.insert("sid".into(), json!(sid));
+        e.insert("command".into(), json!(cmd.join(" ")));
+        e.insert("disposition".into(), json!("allow"));
+        audit_writer.append(e);
+    }
+
     // The localhost-proxy + loopback-exemption mechanism for --allow-domain /
     // --network-profile requires `NetworkIsolationSetAppContainerConfig`, which
     // is admin-only (it sets a system-wide loopback-allow list "for debugging
@@ -203,6 +218,7 @@ fn run_inner(
                 session_id: sid.clone(),
                 token: token.clone(),
                 allow_domain: allow_domain.clone(),
+                writer: audit_writer.clone(),
             })
             .context("start localhost proxy")?;
             proxy_env = Some(net::ProxyEnv { port: handle.port, token });
