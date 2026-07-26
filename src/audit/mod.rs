@@ -1,9 +1,13 @@
-//! Minimal audit emitter for US-3. US-4 owns the hash chain + signing; US-3
-//! just appends a NDJSON line per CONNECT event.
+//! US-4a audit core: hash-chain NDJSON leaves, canonicalization, hashing.
+//! This module grows across tasks; for now it holds the pure canonicalization
+//! logic. The existing writer code from US-3 is folded in by Task 5.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -79,6 +83,29 @@ fn civil_from_days(z_off: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
+/// Canonicalize a leaf for hashing: remove `hash` and `parent` keys, sort the
+/// remaining keys alphabetically (via BTreeMap), serialize compactly (no
+/// whitespace). Deterministic across implementations regardless of insertion
+/// order.
+pub fn canonicalize(leaf: &Map<String, Value>) -> String {
+    let mut copy = leaf.clone();
+    copy.remove("hash");
+    copy.remove("parent");
+    // serde_json::Map with the "preserve_order" feature off defaults to
+    // BTreeMap-backed, producing alphabetical keys. But to be explicit and
+    // safe across feature flags, route through a BTreeMap:
+    let btree: std::collections::BTreeMap<String, Value> = copy.into_iter().collect();
+    serde_json::to_string(&btree).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// SHA-256 of the canonical bytes, returned as lowercase hex.
+pub fn sha256_hex(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let digest = h.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +160,67 @@ mod tests {
         assert_eq!(v["reason"], "a\"b", "reason quote preserved literally");
         assert_eq!(v["port"], 443);
         assert_eq!(v["disposition"], "deny");
+    }
+
+    #[test]
+    fn canonicalize_strips_hash_and_parent() {
+        let m: Map<String, Value> = [
+            ("op", Value::String("CONNECT".into())),
+            ("host", Value::String("a.com".into())),
+            ("hash", Value::String("deadbeef".into())),
+            ("parent", Value::Null),
+        ].iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let c = canonicalize(&m);
+        let v: Value = serde_json::from_str(&c).unwrap();
+        assert!(v.get("hash").is_none());
+        assert!(v.get("parent").is_none());
+        assert_eq!(v["op"], "CONNECT");
+    }
+
+    #[test]
+    fn canonicalize_is_alphabetical() {
+        let m: Map<String, Value> = [
+            ("op", Value::String("X".into())),
+            ("host", Value::String("a".into())),
+        ].iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let c = canonicalize(&m);
+        // "host" sorts before "op"
+        let host_pos = c.find("\"host\"").unwrap();
+        let op_pos = c.find("\"op\"").unwrap();
+        assert!(host_pos < op_pos);
+    }
+
+    #[test]
+    fn canonicalize_is_compact() {
+        let m: Map<String, Value> = [("op", Value::String("X".into()))]
+            .iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let c = canonicalize(&m);
+        assert!(!c.contains(' '), "no whitespace: got {c:?}");
+        assert_eq!(c, "{\"op\":\"X\"}");
+    }
+
+    #[test]
+    fn canonicalize_is_insertion_order_independent() {
+        let mut m1: Map<String, Value> = Map::new();
+        m1.insert("a".to_string(), Value::String("1".into()));
+        m1.insert("b".to_string(), Value::String("2".into()));
+        let mut m2: Map<String, Value> = Map::new();
+        m2.insert("b".to_string(), Value::String("2".into()));
+        m2.insert("a".to_string(), Value::String("1".into()));
+        assert_eq!(canonicalize(&m1), canonicalize(&m2));
+    }
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }
