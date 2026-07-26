@@ -34,7 +34,7 @@ pub fn check(check_only: bool) -> Result<()> {
         if build >= MIN_BUILD { "available" } else { "MISSING" }
     );
     println!("Job Object                 : available (always, Win9x+)");
-    println!("Reverse proxy (network)    : not yet implemented in this slice");
+    println!("Reverse proxy (network)    : available (US-3)");
     println!("ETW audit                  : not yet implemented in this slice");
     println!("Ed25519 signing key        : not yet implemented in this slice");
 
