@@ -2,6 +2,10 @@
 //! This module grows across tasks; for now it holds the pure canonicalization
 //! logic. The existing writer code from US-3 is folded in by Task 5.
 
+pub mod filter;
+pub mod show;
+pub mod verify;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
