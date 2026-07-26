@@ -67,6 +67,14 @@ pub fn resolve_network(
     allow.extend(cli_allow_domain.iter().cloned());
     allow = dedupe(allow);
 
+    // Deny-by-default: an empty allow-list is semantically identical to
+    // Blocked (the proxy would deny every host), so skip the proxy entirely.
+    // This also avoids spurious "deferred" warnings when the user passes no
+    // network flags at all (the common case).
+    if allow.is_empty() {
+        return NetworkConfig::Blocked;
+    }
+
     NetworkConfig::Allow {
         allow_domain: allow,
         proxy_port: None,
@@ -157,16 +165,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_everything_yields_allow_empty() {
+    fn empty_everything_yields_blocked() {
+        // Deny-by-default: no flags + no profile + no allow-list → Blocked
+        // (not Allow-with-empty-list, which would spuriously trigger the
+        // proxy + deferred-warning path).
         let cfg = resolve_network(&empty_slice(), false, &[], None);
-        match cfg {
-            NetworkConfig::Allow { allow_domain, proxy_port, token } => {
-                assert!(allow_domain.is_empty());
-                assert!(proxy_port.is_none());
-                assert!(token.is_none());
-            }
-            NetworkConfig::Blocked => panic!("expected Allow"),
-        }
+        assert!(matches!(cfg, NetworkConfig::Blocked));
     }
 
     #[test]
