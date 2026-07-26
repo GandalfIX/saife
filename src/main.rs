@@ -116,7 +116,7 @@ fn run_inner(
     };
 
     // Resolve the network configuration from the profile slice + CLI flags.
-    let net_cfg = net::resolve_network(
+    let net_cfg_resolved = net::resolve_network(
         &resolved.network,
         block_net,
         allow_domain,
@@ -143,6 +143,33 @@ fn run_inner(
     if cmd.is_empty() {
         return Ok(0);
     }
+
+    // The localhost-proxy + loopback-exemption mechanism for --allow-domain /
+    // --network-profile requires `NetworkIsolationSetAppContainerConfig`, which
+    // is admin-only (it sets a system-wide loopback-allow list "for debugging
+    // purposes" per MSDN). The unprivileged alternative (a
+    // `privateNetworkClientServer` capability SID on the AppContainer token) is
+    // tracked as a follow-up. Until that lands, --allow-domain /
+    // --network-profile are accepted but downgraded to block-net semantics with
+    // a clear warning. --block-net itself works fully unprivileged.
+    let net_cfg = match &net_cfg_resolved {
+        net::NetworkConfig::Allow { .. } => {
+            eprintln!(
+                "[sandbox] warning: --allow-domain / --network-profile are deferred in this slice"
+            );
+            eprintln!(
+                "[sandbox]          (the loopback exemption API is admin-only; the unprivileged"
+            );
+            eprintln!(
+                "[sandbox]          privateNetworkClientServer-capability path is a follow-up)."
+            );
+            eprintln!(
+                "[sandbox]          Downgrading this session to --block-net semantics."
+            );
+            net::NetworkConfig::Blocked
+        }
+        other => other.clone(),
+    };
 
     // Build the AppContainer session.
     let session = sandbox::create_session(&sid)
