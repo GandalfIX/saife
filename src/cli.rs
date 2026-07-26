@@ -86,6 +86,16 @@ pub enum Cmd {
         /// Only check and report; do not make changes.
         #[arg(long)]
         check_only: bool,
+
+        /// Grant FILE_READ_ATTRIBUTES on every fixed drive root (C:\, D:\, …)
+        /// to S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES). One-time,
+        /// idempotent, requires elevation. Fixes KI-1.1: `cmd /c dir` and
+        /// PowerShell filesystem-provider init read drive-root volume metadata
+        /// via GetVolumeInformationW, which the AppContainer can't reach
+        /// without this ACE (the drive root is TrustedInstaller-owned and
+        /// cannot be granted per-session unprivileged).
+        #[arg(long)]
+        grant_drive_root: bool,
     },
 }
 

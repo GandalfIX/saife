@@ -41,8 +41,8 @@ fn main() {
         Cmd::Ps { .. } => stub_not_implemented("ps"),
         Cmd::Audit { .. } => stub_not_implemented("audit"),
         Cmd::Profile { .. } => stub_not_implemented("profile"),
-        Cmd::Setup { check_only } => {
-            if let Err(e) = setup::check(check_only) {
+        Cmd::Setup { check_only, grant_drive_root } => {
+            if let Err(e) = setup::check(check_only, grant_drive_root) {
                 eprintln!("[sandbox] setup check failed: {e:#}");
                 std::process::exit(1);
             }

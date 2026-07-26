@@ -594,6 +594,105 @@ function Invoke-Scenario-S39 {
 }
 
 # ---------------------------------------------------------------------------
+# KI-1.1 scenarios — `cmd /c dir` and PowerShell `Get-ChildItem` (no path)
+# require the AppContainer to read drive-root volume metadata via
+# GetVolumeInformationW("C:\"). The drive root (C:\) is TrustedInstaller-owned
+# and cannot be granted unprivileged, so the fix is a one-time admin grant of
+# FILE_READ_ATTRIBUTES for S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES) on
+# each fixed drive root, applied by `sandbox setup --grant-drive-root`.
+#
+# These scenarios SKIP cleanly when the drive-root grant is absent (so the
+# suite stays green on unconfigured machines) and PASS once it has been
+# applied. S-42 (sibling still denied) is unconditional.
+# ---------------------------------------------------------------------------
+
+# Detect whether the cwd's drive root carries an Allow ACE for
+# S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES). Used by S-40/S-41 to decide
+# pass-vs-skip. We read the DACL's SDDL form and match the SID string directly,
+# because Get-Acl renders the well-known SID as a localized NTAccount name
+# (e.g. "ZERTIFIZIERUNGSSTELLE FÜR ANWENDUNGSPAKETE\ALLE EINGESCHRÄNKTEN
+# ANWENDUNGSPAKETE") whose back-translation to a SID fails on non-English
+# locales. The SDDL text always carries the raw SID (e.g. "S-1-15-2-2").
+function Test-DriveRootGranted { param([string]$DriveRoot)
+    if (-not $DriveRoot) { return $false }
+    if (-not (Test-Path -LiteralPath $DriveRoot)) { return $false }
+    try {
+        $acl = Get-Acl -LiteralPath $DriveRoot -ErrorAction Stop
+        $sddl = $acl.Sddl
+        # SDDL ACEs look like "(A;...;SID)" — match the SID anywhere in the string.
+        return $sddl -match 'S-1-15-2-2\b'
+    } catch {
+        return $false
+    }
+}
+
+# Resolve the drive root (e.g. "C:\") of a given path.
+function Get-DriveRootOf { param([string]$Path)
+    if (-not $Path) { return $null }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if ($full.Length -ge 2 -and $full[1] -eq [char]':') { return "$($full[0]):\" }
+    return $null
+}
+
+# S-40: KI-1.1 — `cmd /c dir` lists the cwd (volume header + entries).
+# Requires the drive-root grant (run `sandbox setup --grant-drive-root` once).
+function Invoke-Scenario-S40 {
+    $d = New-ScenarioDir 40
+    'ki11-marker' | Set-Content -LiteralPath (Join-Path $d 'marker.txt') -Encoding ASCII
+    $root = Get-DriveRootOf $d
+    if (-not (Test-DriveRootGranted $root)) {
+        return @{ Num=40; Name='S-40 (KI-1.1 cmd dir)'; Passed=$true; Skipped=$true; DriveRootSkipped=$true
+                  Detail="drive root '$root' not granted; run 'sandbox setup --grant-drive-root' (admin)" }
+    }
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','dir') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'marker.txt')
+    return @{ Num=40; Name='S-40 (KI-1.1 cmd dir)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'cmd /c dir listed cwd' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-41: KI-1.1 — PowerShell `Get-ChildItem` with an explicit path lists the cwd.
+# The no-path form (`Get-ChildItem`) is blocked by PowerShell's PSDrive init:
+# `InitializeDefaultDrives` walks every drive root, and `Set-Location` to the
+# cwd walks ancestor dirs (`C:\Users`, `C:\Users\<user>`) which are
+# SYSTEM/TrustedInstaller-owned and ungrantable unprivileged. The supported
+# pattern under the sandbox is to pass the cwd explicitly. We use
+# `[Environment]::CurrentDirectory` (the real Win32 cwd, which the sandbox sets
+# correctly) rather than `$PWD` (PowerShell's PSDrive location, which is
+# pinned to a broken drive root).
+function Invoke-Scenario-S41 {
+    $d = New-ScenarioDir 41
+    'ki11-marker' | Set-Content -LiteralPath (Join-Path $d 'marker.txt') -Encoding ASCII
+    $root = Get-DriveRootOf $d
+    if (-not (Test-DriveRootGranted $root)) {
+        return @{ Num=41; Name='S-41 (KI-1.1 PS gci)'; Passed=$true; Skipped=$true; DriveRootSkipped=$true
+                  Detail="drive root '$root' not granted; run 'sandbox setup --grant-drive-root' (admin)" }
+    }
+    $cmd = "Get-ChildItem -LiteralPath ([Environment]::CurrentDirectory) | Select-Object -ExpandProperty Name"
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','powershell','-NoProfile','-Command',$cmd) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'marker.txt')
+    return @{ Num=41; Name='S-41 (KI-1.1 PS gci)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'PS Get-ChildItem -LiteralPath cwd listed cwd' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-42: KI-1.1 regression guard — the drive-root grant must NOT weaken the
+# sibling-isolation guarantee. Reading a sibling project's .env stays denied.
+function Invoke-Scenario-S42 {
+    $d = New-ScenarioDir 42
+    $parent = Split-Path -Parent $d
+    $other = Join-Path $parent 'other-project-42'
+    if (-not (Test-Path -LiteralPath $other)) { New-Item -ItemType Directory -Path $other -Force | Out-Null }
+    $envFile = Join-Path $other '.env'
+    Set-Content -LiteralPath $envFile -Value 'DUMMY_SECRET=do-not-read' -Encoding ASCII
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','type','..\other-project-42\.env') -WorkingDirectory $d
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -ne 0) -and (Test-Denied $err)
+    return @{ Num=42; Name='S-42 (KI-1.1 sibling)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'sibling .env still denied (grant did not weaken isolation)' } else { "exit=$($r.ExitCode) stderr=$err" } }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -609,7 +708,8 @@ $script:Scenarios = @(
     { Invoke-Scenario-S28 }, { Invoke-Scenario-S29 }, { Invoke-Scenario-S30 },
     { Invoke-Scenario-S31 }, { Invoke-Scenario-S32 }, { Invoke-Scenario-S33 },
     { Invoke-Scenario-S34 }, { Invoke-Scenario-S35 }, { Invoke-Scenario-S36 },
-    { Invoke-Scenario-S37 }, { Invoke-Scenario-S38 }, { Invoke-Scenario-S39 }
+    { Invoke-Scenario-S37 }, { Invoke-Scenario-S38 }, { Invoke-Scenario-S39 },
+    { Invoke-Scenario-S40 }, { Invoke-Scenario-S41 }, { Invoke-Scenario-S42 }
 )
 
 function Invoke-Scenario { param([int]$Number)
@@ -659,7 +759,7 @@ function Main {
     if ($gateFailed) {
         Write-Host "SANDBOX: FAIL (gate test S-6 failed)" -ForegroundColor Red
     } else {
-        $required = 1,2,3,4,5,6,7,10,11,12,13,16,17,18,21,24,35
+        $required = 1,2,3,4,5,6,7,10,11,12,13,16,17,18,21,24,35,42
         $hardFail = $false
         foreach ($n in $required) {
             $r = $results | Where-Object { $_.Num -eq $n } | Select-Object -First 1

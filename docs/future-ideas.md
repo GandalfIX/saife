@@ -7,6 +7,71 @@ recorded here so they are not lost, with a rough ordering by likely phase.
 
 ## Phase 1 — Security hardening & parity with nono
 
+### F-21. AppContainer RuleSet API (kernel-level NT-path grants)
+
+Replace or augment the per-directory-DACL grant mechanism (`grant_one` in
+`src/sandbox/appcontainer.rs`, which writes an Allow ACE onto each target
+directory — "what `icacls /grant` does") with the kernel-level AppContainer
+RuleSet that grants NT paths (`\Device\HarddiskVolume3\…`) without writing on
+the target object's DACL.
+
+**Why:** the per-directory-DACL approach cannot grant access to objects the
+user does not own (no `WRITE_DAC`). This blocks:
+
+- `C:\` (drive root, TrustedInstaller-owned) — causes KI-1.1; currently worked
+  around by the one-time elevated `sandbox setup --grant-drive-root` (F-style
+  setup step, grants `S-1-15-2-2:FILE_READ_ATTRIBUTES` on fixed drive roots).
+- `C:\Users`, `C:\Users\<user>` (SYSTEM-owned) — causes KI-1.2 (PowerShell
+  no-path commands resolve to `C:\` because `Set-Location` can't walk
+  ancestors). Not fixable by the one-time drive-root grant; needs per-user
+  ancestor grants (admin) OR the RuleSet API.
+- `C:\Windows\System32` (TrustedInstaller-owned) — the `System32` grant in
+  `allowlist.rs` fails with Access Denied today; harmless because System32 is
+  world-readable and the AppContainer can read it via inherited `Users:RX`,
+  but explicit-ACE-requiring calls (e.g. `where`'s stat path, KI-1.4) fail.
+
+**Design:**
+
+- `src/sandbox/allowlist.rs` already has a `to_nt_path` helper (currently
+  `#[allow(dead_code)]`) that resolves `C:\foo` → `\Device\HarddiskVolumeN\foo`
+  via `QueryDosDeviceW`, reserved for this future implementation.
+- Build a RuleSet object, add per-path rules (`Read` / `Write` / `Execute`
+  capability bits at `IRP_MJ_CREATE` time — coarser than Landlock's
+  per-syscall-type rules, documented as a fidelity gap in the US-1 nono
+  comparison), and apply it to the process token before `CreateProcessW`.
+- The RuleSet is enforced by the object manager, so it grants access to paths
+  the user doesn't own — no `WRITE_DAC` needed, no admin.
+- Keeps the default-deny model: paths not on the RuleSet are denied (the
+  AppContainer SID is still a restricting identity).
+
+**Scope:** architectural change to the sandbox core (`grant_access` /
+`build_allowlist` / `spawn`). The per-directory-DACL path can remain as a
+fallback or for user-owned paths where inheritance is desired, but the
+RuleSet becomes the primary grant mechanism for system-owned roots and
+ancestors.
+
+**Resolves:** KI-1.1 fully (no setup-time admin step needed), KI-1.2 (ancestor
+traversal/listing for `Set-Location`), KI-1.4 partially (`System32` access for
+`where`).
+
+### F-22. Ancestor traverse grants (admin, per-user)
+
+Companion to F-21 for environments where the RuleSet API is not yet available.
+A `sandbox setup --grant-ancestors <workspace-root>` step (elevated) grants
+`S-1-15-2-2` `FILE_TRAVERSE` (traverse-only, **no** `FILE_LIST_DIRECTORY`) on
+each ancestor directory of the configured workspace root up to the drive root,
+plus `FILE_LIST_DIRECTORY` on the drive root (already done by
+`--grant-drive-root`). Per-user (each user's home dir path differs), not
+one-time.
+
+**Why:** fixes KI-1.2 (PowerShell `Set-Location` to the cwd) without the full
+RuleSet rewrite. Traverse-only on ancestors preserves the sibling-isolation
+guarantee (the AppContainer can walk *through* `C:\Users\<user>` but cannot
+*list* its contents or read sibling projects).
+
+**Resolves:** KI-1.2 (the `Set-Location` part; `InitializeDefaultDrives`
+enumerating other drives may still warn).
+
 ### F-1. Undo & Rollback
 SHA-256 content-addressed snapshots of every file in the sandbox scope taken
 **before** the agent starts and **after** it exits. Stored in a deduplicating

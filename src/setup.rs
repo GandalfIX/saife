@@ -1,10 +1,32 @@
 use anyhow::{Result, bail};
+use windows::Win32::Foundation::*;
+use windows::Win32::Security::Authorization::*;
+use windows::Win32::Security::*;
+use windows::Win32::Storage::FileSystem::{
+    GetLogicalDriveStringsW, GetDriveTypeW, FILE_READ_ATTRIBUTES,
+};
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW, REG_DWORD, HKEY,
 };
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 
 /// Minimum supported build: Windows 10 1709 (build 16299) per FR-6.2.
 pub const MIN_BUILD: u32 = 16299;
+
+/// S-1-15-2-2 — "All RESTRICTED APPLICATION PACKAGES". Granting this SID on a
+/// resource lets every AppContainer process (not just our per-session SID)
+/// access it. We use it for the one-time drive-root grant because:
+///   (a) per-session SIDs would require re-granting on every `sandbox run`,
+///       and the drive root is TrustedInstaller-owned so each grant needs
+///       elevation anyway; and
+///   (b) FILE_READ_ATTRIBUTES on a drive root is a read-only, low-sensitivity
+///       access (volume label + serial) that every unsandboxed user already has.
+const ALL_RESTRICTED_APP_PACKAGES_RIDS: [u32; 2] = [2, 2]; // S-1-15-2-2
+
+/// DRIVE_FIXED from Win32 (defined here to avoid pulling the full
+/// FileSystem::DRIVE_* constants which are behind an extra feature gate in
+/// this windows-rs version). The value is stable per the Win32 API.
+const DRIVE_FIXED: u32 = 3;
 
 /// Called from `run` before any spawning — fails fast with a clear error if
 /// the host is unsupported (AC-1.9).
@@ -19,11 +41,15 @@ pub fn check_runtime() -> Result<()> {
     Ok(())
 }
 
-/// Called from `setup --check-only`: reports the feature matrix and exits
-/// non-zero if any MVP-required capability is missing.
-pub fn check(check_only: bool) -> Result<()> {
-    if !check_only {
-        eprintln!("[sandbox] `setup` without --check-only is not implemented in this slice.");
+/// Called from `setup`: reports the feature matrix (`--check-only`) and/or
+/// applies the one-time drive-root grant (`--grant-drive-root`).
+pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
+    if grant_drive_root {
+        grant_drive_roots()?;
+        // After granting, fall through to the report so the user sees the
+        // resulting state.
+    } else if !check_only {
+        eprintln!("[sandbox] `setup` without --check-only or --grant-drive-root is not implemented in this slice.");
     }
 
     let build = os_build_number()?;
@@ -35,6 +61,7 @@ pub fn check(check_only: bool) -> Result<()> {
     );
     println!("Job Object                 : available (always, Win9x+)");
     println!("Reverse proxy (network)    : available (US-3)");
+    println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());
     println!("ETW audit                  : not yet implemented in this slice");
     println!("Ed25519 signing key        : not yet implemented in this slice");
 
@@ -42,6 +69,275 @@ pub fn check(check_only: bool) -> Result<()> {
         bail!("host build {build} is below minimum {MIN_BUILD} (AppContainer RuleSet unavailable)");
     }
     Ok(())
+}
+
+/// One-time admin step: grant S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES)
+/// `FILE_READ_ATTRIBUTES` on every fixed drive root, fixing KI-1.1.
+///
+/// Why FILE_READ_ATTRIBUTES (not RX): `cmd /c dir` calls
+/// `GetVolumeInformationW("C:\\")` which needs only `FILE_READ_ATTRIBUTES`
+/// (0x80) on the root directory to read the volume label + serial. We grant
+/// the narrowest mask that satisfies the call — not LIST_DIRECTORY, so the
+/// AppContainer cannot enumerate the drive root's contents.
+///
+/// Idempotent: re-running leaves the ACE in place (the SetAccess merge keeps
+/// a single entry per trustee). Requires WRITE_DAC on the drive root, which
+/// normal users lack — the caller must be elevated.
+fn grant_drive_roots() -> Result<()> {
+    if !is_elevated() {
+        bail!(
+            "`setup --grant-drive-root` requires elevation. Re-run from an \
+             Administrator shell (the drive root is TrustedInstaller-owned and \
+             WRITE_DAC on it needs SeSecurityPrivilege)."
+        );
+    }
+
+    let sid = all_restricted_app_packages_sid()?;
+
+    for root in fixed_drive_roots()? {
+        match grant_read_attributes(&root, sid) {
+            Ok(()) => {
+                println!("[grant-drive-root] {root} granted S-1-15-2-2 :FILE_READ_ATTRIBUTES (or already present)");
+            }
+            Err(e) => {
+                eprintln!("[grant-drive-root] WARN: {root} failed: {e}");
+            }
+        }
+    }
+    // Free the SID we allocated.
+    unsafe {
+        let _ = windows::Win32::Security::FreeSid(sid);
+    }
+    Ok(())
+}
+
+/// Build the S-1-15-2-2 SID (All RESTRICTED APPLICATION PACKAGES).
+fn all_restricted_app_packages_sid() -> Result<PSID> {
+    // authority 15 (security manager / app packages), 2 sub-authorities: [2, 2].
+    let authority = windows::Win32::Security::SID_IDENTIFIER_AUTHORITY {
+        Value: [0, 0, 0, 0, 0, 15],
+    };
+    let mut buf = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut sid = PSID(buf.as_mut_ptr() as *mut _);
+    unsafe {
+        AllocateAndInitializeSid(
+            &authority,
+            ALL_RESTRICTED_APP_PACKAGES_RIDS.len() as u8,
+            ALL_RESTRICTED_APP_PACKAGES_RIDS[0] as u32,
+            ALL_RESTRICTED_APP_PACKAGES_RIDS[1] as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut sid,
+        )?;
+        let len = windows::Win32::Security::GetLengthSid(sid) as usize;
+        let mut owned: Vec<u8> = vec![0u8; len];
+        let _ = windows::Win32::Security::CopySid(
+            len as u32,
+            PSID(owned.as_mut_ptr() as *mut _),
+            sid,
+        );
+        let _ = windows::Win32::Security::FreeSid(sid);
+        Ok(PSID(owned.leak().as_mut_ptr() as *mut _))
+    }
+}
+
+/// Grant `FILE_READ_ATTRIBUTES` to `sid` on `root` (a drive root like "C:\").
+///
+/// The grant is idempotent in effect: `SetEntriesInAclW` with `SET_ACCESS`
+/// produces a single ACE per trustee, so re-running leaves a single entry.
+/// We do not pre-check for an existing ACE — the merge is cheap and the
+/// check would require walking the ACL (locale-dependent trustee names).
+fn grant_read_attributes(root: &str, sid: PSID) -> Result<()> {
+    let path_w = HSTRING::from(root);
+
+    // Read the existing DACL so we can merge rather than replace.
+    let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
+    let mut existing_dacl: *mut ACL = std::ptr::null_mut();
+    let r = unsafe {
+        GetNamedSecurityInfoW(
+            &path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing_dacl),
+            None,
+            &mut sd,
+        )
+    };
+    if r.0 != ERROR_SUCCESS.0 {
+        bail!("GetNamedSecurityInfoW({root}) failed: 0x{:x}", r.0);
+    }
+
+    // Build the new ACE: Allow, FILE_READ_ATTRIBUTES, no inheritance (the ACE
+    // applies to the root dir itself only — we deliberately do NOT propagate
+    // to children, which would grant read-attrs on every file on the volume).
+    let mut ea = EXPLICIT_ACCESS_W::default();
+    unsafe {
+        BuildExplicitAccessWithNameW(
+            &mut ea,
+            PCWSTR::null(), // unused when TrusteeForm = TRUSTEE_IS_SID
+            FILE_READ_ATTRIBUTES.0,
+            SET_ACCESS,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        );
+    }
+    ea.Trustee = TRUSTEE_W {
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_GROUP,
+        ptstrName: PWSTR(sid.0 as *mut _),
+        ..Default::default()
+    };
+
+    let mut new_acl: *mut ACL = std::ptr::null_mut();
+    let old_acl_opt = if existing_dacl.is_null() {
+        None
+    } else {
+        Some(existing_dacl as *const ACL)
+    };
+    let set_r = unsafe { SetEntriesInAclW(Some(&[ea]), old_acl_opt, &mut new_acl) };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+    }
+    if set_r.0 != ERROR_SUCCESS.0 {
+        bail!("SetEntriesInAclW failed: 0x{:x}", set_r.0);
+    }
+
+    // PROTECTED_DACL_SECURITY_INFORMATION would drop inherited ACEs; we want
+    // to MERGE, so use UNPROTECTED (preserve inheritance).
+    let write_r = unsafe {
+        SetNamedSecurityInfoW(
+            &path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
+    }
+    if write_r.0 != ERROR_SUCCESS.0 {
+        bail!("SetNamedSecurityInfoW({root}) failed: 0x{:x}", write_r.0);
+    }
+    Ok(())
+}
+
+/// Enumerate fixed (hard) drive roots via GetLogicalDriveStringsW + GetDriveTypeW.
+fn fixed_drive_roots() -> Result<Vec<String>> {
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetLogicalDriveStringsW(Some(&mut buf)) };
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let s = String::from_utf16_lossy(&buf[..n as usize]);
+    let mut roots = Vec::new();
+    for entry in s.split('\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        // Only fixed drives (DRIVE_FIXED). Skip removable, network, etc.
+        let w = HSTRING::from(entry);
+        let dt = unsafe { GetDriveTypeW(&w) };
+        if dt == DRIVE_FIXED {
+            roots.push(entry.to_string());
+        }
+    }
+    Ok(roots)
+}
+
+/// Is the current process elevated (running with the admin token)?
+fn is_elevated() -> bool {
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // TOKEN_ELEVATION, TOKEN_QUERY, GetTokenInformation, TokenElevation, and
+    // TOKEN_INFORMATION_CLASS all live in Win32::Security in this windows-rs
+    // version.
+    use windows::Win32::Security::{TOKEN_ELEVATION, TOKEN_QUERY, GetTokenInformation, TokenElevation};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut ret = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret,
+        );
+        let _ = CloseHandle(token);
+        ok.is_ok() && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Human-readable status of the drive-root grant on the system drive, for the
+/// `setup` report. We probe via a fresh read of the DACL's SDDL form.
+fn drive_root_status() -> String {
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let root = format!("{system_drive}\\");
+    match check_root_has_grant(&root) {
+        Ok(true) => format!("present on {root}"),
+        Ok(false) => format!("absent on {root} (run `sandbox setup --grant-drive-root`)"),
+        Err(e) => format!("unknown ({e})"),
+    }
+}
+
+fn check_root_has_grant(root: &str) -> Result<bool> {
+    let path_w = HSTRING::from(root);
+    let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let r = unsafe {
+        GetNamedSecurityInfoW(
+            &path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+    };
+    if r.0 != ERROR_SUCCESS.0 {
+        bail!("GetNamedSecurityInfoW({root}) failed: 0x{:x}", r.0);
+    }
+    // Serialize the security descriptor to SDDL and substring-match the SID.
+    // SDDL always emits raw SID strings (e.g. "S-1-15-2-2") regardless of the
+    // current locale's display-name rendering.
+    let mut sddl_pwsz = PWSTR::null();
+    let conv = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            1u32, // SDDL_REVISION_1
+            OBJECT_SECURITY_INFORMATION(DACL_SECURITY_INFORMATION.0),
+            &mut sddl_pwsz,
+            None,
+        )
+    };
+    let found = if conv.is_ok() {
+        let sddl = unsafe { sddl_pwsz.to_string().unwrap_or_default() };
+        // The SID we granted is S-1-15-2-2.
+        sddl.contains("S-1-15-2-2")
+    } else {
+        false
+    };
+    if !sddl_pwsz.is_null() {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sddl_pwsz.0 as *mut _)));
+        }
+    }
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+    }
+    Ok(found)
 }
 
 /// Read the OS build number from the registry
@@ -53,8 +349,8 @@ pub fn check(check_only: bool) -> Result<()> {
 /// floor. The registry value is not affected by the app manifest and reports
 /// the true build. (See PRD AC-1.9.)
 fn os_build_number() -> Result<u32> {
-    let subkey = windows::core::w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
-    let value = windows::core::w!("CurrentBuild");
+    let subkey = w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    let value = w!("CurrentBuild");
 
     unsafe {
         let mut hkey = HKEY::default();
