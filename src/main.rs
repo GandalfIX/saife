@@ -116,9 +116,7 @@ fn run_inner(
     };
 
     // Resolve the network configuration from the profile slice + CLI flags.
-    // Task 9 wires net_cfg into the proxy spawn + env injection.
-    // For now, hold it so the params are used and the resolution path is exercised.
-    let _net_cfg = net::resolve_network(
+    let net_cfg = net::resolve_network(
         &resolved.network,
         block_net,
         allow_domain,
@@ -150,6 +148,38 @@ fn run_inner(
     let session = sandbox::create_session(&sid)
         .with_context(|| format!("create AppContainer session for {sid}"))?;
 
+    // Register loopback for the AC SID BEFORE spawning the proxy (the proxy
+    // doesn't need it, but registering before the child starts is the safe
+    // order). Skip when blocked (no proxy to reach).
+    if !net_cfg.is_blocked() {
+        if let Err(e) = net::loopback::register_loopback(&session.ac_sid) {
+            eprintln!("[sandbox] warning: loopback exemption failed: {e}");
+            eprintln!("[sandbox]          direct connects to the proxy will be denied.");
+        }
+    }
+
+    // Start the proxy (if not blocked) and hold the handle until the child
+    // exits. The handle MUST outlive `sandbox::spawn` below so the proxy
+    // stays up while the child runs.
+    let proxy_env: Option<net::ProxyEnv>;
+    let _proxy_handle: Option<net::proxy::ProxyHandle> = match &net_cfg {
+        net::NetworkConfig::Blocked => {
+            proxy_env = None;
+            None
+        }
+        net::NetworkConfig::Allow { allow_domain, .. } => {
+            let token = net::token::gen_token().context("generate session token")?;
+            let handle = net::proxy::spawn(net::proxy::ProxyConfig {
+                session_id: sid.clone(),
+                token: token.clone(),
+                allow_domain: allow_domain.clone(),
+            })
+            .context("start localhost proxy")?;
+            proxy_env = Some(net::ProxyEnv { port: handle.port, token });
+            Some(handle)
+        }
+    };
+
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
 
@@ -157,7 +187,7 @@ fn run_inner(
         eprintln!("[sandbox] warning: some ACL grants failed: {e}");
     }
 
-    let env_block = sandbox::build_env_block(&sid, &cwd);
+    let env_block = sandbox::build_env_block(&sid, &cwd, proxy_env.as_ref());
 
     let cmdline = join_cmdline(cmd);
 

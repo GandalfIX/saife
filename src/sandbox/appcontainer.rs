@@ -5,6 +5,7 @@ use windows::Win32::Security::*;
 use windows::Win32::System::Threading::*;
 use windows::core::*;
 
+use crate::net::ProxyEnv;
 use crate::sandbox::allowlist::AllowEntry;
 
 pub struct AppContainerSession {
@@ -263,23 +264,70 @@ fn builtin_admins_sid() -> Option<PSID> {
 }
 
 /// Build the child environment block: parent env + `PATH` prepended with
-/// `.sandbox\<sid>\bin`.
-pub fn build_env_block(sid: &str, cwd: &std::path::Path) -> Vec<u16> {
+/// `.sandbox\<sid>\bin`, plus the proxy env vars.
+///
+/// `proxy: Some(ProxyEnv)` injects `HTTP_PROXY`/`HTTPS_PROXY`/`X-Sandbox-Token`
+/// pointing at the localhost proxy and clears `NO_PROXY` (forces the proxy to
+/// be used for everything, including localhost — some tools default
+/// `NO_PROXY=localhost,127.0.0.1` which would bypass our proxy).
+/// `proxy: None` (block-net case) explicitly clears all four vars so a
+/// parent shell's proxy settings don't leak into the sandboxed process.
+pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv>) -> Vec<u16> {
     let bin_abs = cwd.join(format!(".\\.sandbox\\{sid}\\bin"));
     let bin_path = bin_abs.to_string_lossy().to_string();
 
+    // Decide the value (or absence) of the four proxy-related env vars.
+    // `Some` → inject proxy URL + token, empty NO_PROXY.
+    // `None` → set all four to empty (override any inherited parent values).
+    let (http_proxy, https_proxy, token_val, no_proxy): (String, String, String, String) =
+        match proxy {
+            Some(p) => (
+                format!("http://127.0.0.1:{}", p.port),
+                format!("http://127.0.0.1:{}", p.port),
+                p.token.clone(),
+                String::new(),
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        };
+    // Names of the four proxy vars, in the order we post-process them.
+    // Comparison is case-insensitive (Windows env vars are case-insensitive).
+    const PROXY_VARS: [&str; 4] =
+        ["HTTP_PROXY", "HTTPS_PROXY", "X-Sandbox-Token", "NO_PROXY"];
+
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
+    // Track which of the 4 proxy vars we've already emitted (by index) so we
+    // can fill in any that were missing from the parent env afterwards.
+    let mut proxy_seen = [false; 4];
     for (k, v) in std::env::vars() {
         if k.eq_ignore_ascii_case("PATH") {
             vars.push((k, format!("{};{}", bin_path, v)));
             path_overridden = true;
+            continue;
+        }
+        // Check if this is one of the proxy vars we manage.
+        if let Some(idx) = PROXY_VARS.iter().position(|name| k.eq_ignore_ascii_case(name)) {
+            proxy_seen[idx] = true;
+            let replacement = [http_proxy.clone(), https_proxy.clone(), token_val.clone(), no_proxy.clone()][idx].clone();
+            vars.push((k, replacement));
         } else {
             vars.push((k, v));
         }
     }
     if !path_overridden {
         vars.push(("PATH".to_string(), bin_path));
+    }
+    // Append any proxy vars that were not present in the parent env.
+    let proxy_values = [http_proxy, https_proxy, token_val, no_proxy];
+    for (idx, name) in PROXY_VARS.iter().enumerate() {
+        if !proxy_seen[idx] {
+            vars.push((name.to_string(), proxy_values[idx].clone()));
+        }
     }
 
     let mut block: Vec<u16> = Vec::new();

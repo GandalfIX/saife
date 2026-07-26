@@ -24,6 +24,15 @@ impl NetworkConfig {
     pub fn needs_proxy(&self) -> bool { matches!(self, NetworkConfig::Allow { .. }) }
 }
 
+/// Proxy configuration injected into the sandboxed child's environment.
+/// Carries only what the env block needs; `ProxyConfig` (used by
+/// `net::proxy::spawn`) additionally holds the session id and allow-list
+/// which the child process does not see.
+pub struct ProxyEnv {
+    pub port: u16,
+    pub token: String,
+}
+
 /// Merge profile network slice + CLI flags into a `NetworkConfig` (with
 /// port/token placeholders filled in by the proxy layer later).
 pub fn resolve_network(
