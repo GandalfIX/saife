@@ -232,7 +232,14 @@ async fn handle_conn(
                 let u2c = tokio::io::copy(&mut ro, &mut wi);
                 let _ = tokio::join!(c2u, u2c);
             } else {
-                let upstream = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+                let upstream = match tokio::net::TcpStream::connect(format!("{host}:{port}")).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await;
+                        eprintln!("[proxy] upstream connect to {host}:{port} failed: {e}");
+                        return Ok(());
+                    }
+                };
                 let (mut ri, mut wi) = sock.into_split();
                 let (mut ro, mut wo) = upstream.into_split();
                 let _ = wo.write_all(&buf[..filled]).await;
