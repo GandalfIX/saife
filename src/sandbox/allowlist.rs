@@ -13,7 +13,6 @@ pub struct AllowEntry {
 }
 
 pub const RWX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
-pub const RW: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
 pub const RX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 
 /// Ensure the per-session install dirs exist on disk (Option E roots).
@@ -94,8 +93,8 @@ fn push_entry(
 /// (we grant via per-directory DACLs, not the formal RuleSet API), but kept
 /// for the future RuleSet implementation.
 #[allow(dead_code)]
-pub fn to_nt_path(win32: &std::path::PathBuf) -> Result<String> {
-    let mut win32_clean = win32.clone();
+pub fn to_nt_path(win32: &std::path::Path) -> Result<String> {
+    let mut win32_clean = win32.to_path_buf();
     while win32_clean.to_string_lossy().ends_with('\\') && win32_clean.parent().is_some() {
         win32_clean = win32_clean.parent().unwrap().to_path_buf();
     }

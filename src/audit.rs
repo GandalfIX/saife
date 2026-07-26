@@ -57,7 +57,7 @@ fn iso8601_utc() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let days = (secs / 86_400) as i64;
-    let rem = (secs % 86_400) as u64;
+    let rem = secs % 86_400;
     let h = rem / 3600;
     let m = (rem % 3600) / 60;
     let s = rem % 60;

@@ -123,8 +123,8 @@ fn all_restricted_app_packages_sid() -> Result<PSID> {
         AllocateAndInitializeSid(
             &authority,
             ALL_RESTRICTED_APP_PACKAGES_RIDS.len() as u8,
-            ALL_RESTRICTED_APP_PACKAGES_RIDS[0] as u32,
-            ALL_RESTRICTED_APP_PACKAGES_RIDS[1] as u32,
+            ALL_RESTRICTED_APP_PACKAGES_RIDS[0],
+            ALL_RESTRICTED_APP_PACKAGES_RIDS[1],
             0,
             0,
             0,

@@ -22,6 +22,11 @@ pub struct NetworkSlice {
 /// The full resolved profile (filesystem slice only for this MVP slice).
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedProfile {
+    /// Profile display name (from `meta.name`, falling back to the
+    /// `--profile` argument). Populated by `load_and_resolve` but not
+    /// consumed by the supervisor yet — reserved for the `profile show`
+    /// subcommand and audit log enrichment.
+    #[allow(dead_code)]
     pub name: String,
     pub filesystem: FilesystemSlice,
     pub network: NetworkSlice,
@@ -50,9 +55,14 @@ pub struct RawProfile {
 pub struct Meta {
     #[serde(default)]
     pub name: String,
+    /// `meta.version` / `meta.description` are parsed for schema completeness
+    /// and the future `profile show` / `profile list` subcommands; not read
+    /// by the supervisor path today.
     #[serde(default)]
+    #[allow(dead_code)]
     pub version: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub description: String,
 }
 
@@ -102,23 +112,23 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     // semantics). They are appended after the profile's own read_only entries
     // so that dedupe_paths — which preserves the first occurrence — keeps any
     // path already granted RWX (in `allow`) at RWX, not downgraded to RX.
-    if let Some(sec) = &raw.security {
-        if !sec.groups.is_empty() {
-            let probe = crate::security_groups::HostEnv;
-            let grants = crate::security_groups::resolve_groups(&probe, &sec.groups);
-            for g in grants {
-                fs.read_only.push(g.path);
-            }
-            fs.read_only = dedupe_paths(fs.read_only);
-            // Also drop group paths that already appear in `allow` (RWX),
-            // since dedupe_paths only dedupes within one vector.
-            let allow_keys: std::collections::BTreeSet<String> = fs
-                .allow
-                .iter()
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .collect();
-            fs.read_only.retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+    if let Some(sec) = &raw.security
+        && !sec.groups.is_empty()
+    {
+        let probe = crate::security_groups::HostEnv;
+        let grants = crate::security_groups::resolve_groups(&probe, &sec.groups);
+        for g in grants {
+            fs.read_only.push(g.path);
         }
+        fs.read_only = dedupe_paths(fs.read_only);
+        // Also drop group paths that already appear in `allow` (RWX),
+        // since dedupe_paths only dedupes within one vector.
+        let allow_keys: std::collections::BTreeSet<String> = fs
+            .allow
+            .iter()
+            .map(|p| p.to_string_lossy().to_lowercase())
+            .collect();
+        fs.read_only.retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
     }
 
     Ok(ResolvedProfile {
@@ -218,11 +228,11 @@ fn dedupe_concat(a: Vec<String>, b: Vec<String>) -> Vec<String> {
     let mut seen: BTreeMap<String, ()> = BTreeMap::new();
     all.retain(|x| {
         let key = x.to_lowercase();
-        if seen.contains_key(&key) {
-            false
-        } else {
-            seen.insert(key, ());
+        if let std::collections::btree_map::Entry::Vacant(e) = seen.entry(key) {
+            e.insert(());
             true
+        } else {
+            false
         }
     });
     all
@@ -369,10 +379,6 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn cwd() -> PathBuf {
-        PathBuf::from("C:\\projekte\\myapp")
-    }
 
     #[test]
     fn expand_basic() {

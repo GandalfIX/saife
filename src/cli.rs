@@ -126,6 +126,12 @@ pub enum ProfileAction {
 }
 
 /// Resolved CLI inputs for `run`, after parsing flags into a single struct.
+///
+/// Not yet wired into the supervisor: `main.rs` currently threads the parsed
+/// clap fields directly into `run_cmd` / `run_inner`. This struct exists so
+/// the US-3 plan's "Update `RunArgs` + `from_cli`" step can land without
+/// touching the clap layer. See `docs/specs/us-3-network-exfiltration-blocked/spec.md`.
+#[allow(dead_code)]
 pub struct RunArgs {
     pub profile: Option<String>,
     pub allow_cwd: bool,
@@ -140,6 +146,8 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn from_cli(
         profile: Option<String>,
         allow_cwd: bool,
@@ -168,6 +176,9 @@ impl RunArgs {
 }
 
 /// Where profile files live.
+///
+/// Reserved for the `profile` subcommand (currently a stub in `main.rs`).
+#[allow(dead_code)]
 pub fn profiles_dir() -> PathBuf {
     let userprofile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)

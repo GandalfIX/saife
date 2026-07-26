@@ -53,6 +53,11 @@ impl ProxyHandle {
     /// `.await` of the JoinHandle here: `shutdown` may be called from a
     /// sync context (the supervisor is sync), and a JoinHandle cannot be
     /// awaited synchronously.
+    ///
+    /// Not invoked today: `main.rs` drops `ProxyHandle` directly (the
+    /// `Drop` impl already cancels the accept loop). Kept for the
+    /// graceful-shutdown path that lands with the loopback exemption.
+    #[allow(dead_code)]
     pub fn shutdown(&mut self) {
         self.cancel.cancel();
     }

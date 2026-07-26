@@ -78,7 +78,7 @@ pub fn spawn(
             CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             Some(env_block.as_ptr() as *const _),
             &cwd_w,
-            &mut si.StartupInfo as *mut _ as *mut STARTUPINFOW,
+            &mut si.StartupInfo as *mut _,
             &mut pi,
         );
 

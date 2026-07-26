@@ -12,6 +12,12 @@ pub enum NetworkConfig {
     /// `--block-net` / `none` profile: no proxy, no network capability.
     Blocked,
     /// Allow-list mode: proxy started on a random loopback port.
+    ///
+    /// `proxy_port` and `token` are placeholders filled in by the proxy
+    /// layer when the loopback-exemption path lands (currently deferred —
+    /// see `main.rs`). Held in the config so the resolved form stays
+    /// self-describing for diagnostics and the US-3 follow-up.
+    #[allow(dead_code)]
     Allow {
         allow_domain: Vec<String>,
         proxy_port: Option<u16>,
@@ -21,6 +27,9 @@ pub enum NetworkConfig {
 
 impl NetworkConfig {
     pub fn is_blocked(&self) -> bool { matches!(self, NetworkConfig::Blocked) }
+    /// Reserved for the proxy-bootstrap path (currently the supervisor
+    /// dispatches on `is_blocked` alone). Tracked by the US-3 follow-up.
+    #[allow(dead_code)]
     pub fn needs_proxy(&self) -> bool { matches!(self, NetworkConfig::Allow { .. }) }
 }
 

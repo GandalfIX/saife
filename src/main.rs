@@ -58,6 +58,7 @@ fn stub_not_implemented(name: &str) -> i32 {
     2
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cmd(
     profile: Option<String>,
     allow_cwd: bool,
@@ -95,6 +96,7 @@ fn run_cmd(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     profile_name: Option<&str>,
     allow_cwd: bool,
@@ -178,11 +180,11 @@ fn run_inner(
     // Register loopback for the AC SID BEFORE spawning the proxy (the proxy
     // doesn't need it, but registering before the child starts is the safe
     // order). Skip when blocked (no proxy to reach).
-    if !net_cfg.is_blocked() {
-        if let Err(e) = net::loopback::register_loopback(&session.ac_sid) {
-            eprintln!("[sandbox] warning: loopback exemption failed: {e}");
-            eprintln!("[sandbox]          direct connects to the proxy will be denied.");
-        }
+    if !net_cfg.is_blocked()
+        && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
+    {
+        eprintln!("[sandbox] warning: loopback exemption failed: {e}");
+        eprintln!("[sandbox]          direct connects to the proxy will be denied.");
     }
 
     // Start the proxy (if not blocked) and hold the handle until the child
@@ -247,7 +249,7 @@ fn new_session_id() -> String {
 /// implementing a tiny civil-from-days conversion.
 fn chrono_from_unix(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
-    let rem = (secs % 86_400) as u64;
+    let rem = secs % 86_400;
     let hour = rem / 3600;
     let minute = (rem % 3600) / 60;
     let second = rem % 60;

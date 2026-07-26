@@ -8,6 +8,9 @@ use windows::core::*;
 use crate::net::ProxyEnv;
 use crate::sandbox::allowlist::AllowEntry;
 
+/// Fields `sid` and `ac_name` are retained for diagnostics and future
+/// tear-down/audit wiring; only `ac_sid` is consumed by `spawn` today.
+#[allow(dead_code)]
 pub struct AppContainerSession {
     pub sid: String,
     pub ac_sid: PSID,
@@ -104,26 +107,28 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
             return Err(HRESULT::from_win32(r.0).into());
         }
 
-        let mut ea = EXPLICIT_ACCESS_W::default();
-        ea.grfAccessPermissions = e.access;
-        ea.grfAccessMode = if e.deny { DENY_ACCESS } else { SET_ACCESS };
-        ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-        ea.Trustee = TRUSTEE_W {
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_GROUP,
-            ptstrName: PWSTR(ac_sid.0 as *mut _),
-            ..Default::default()
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: e.access,
+            grfAccessMode: if e.deny { DENY_ACCESS } else { SET_ACCESS },
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_GROUP,
+                ptstrName: PWSTR(ac_sid.0 as *mut _),
+                ..Default::default()
+            },
         };
 
         let mut new_acl: *mut ACL = std::ptr::null_mut();
         let set_r = if e.protected {
             let mut all_entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
             for trustee in owner_trustees() {
-                let mut owner_ea = EXPLICIT_ACCESS_W::default();
-                owner_ea.grfAccessPermissions = 0x1f01ff; // FILE_ALL_ACCESS
-                owner_ea.grfAccessMode = SET_ACCESS;
-                owner_ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-                owner_ea.Trustee = trustee;
+                let owner_ea = EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: 0x1f01ff, // FILE_ALL_ACCESS
+                    grfAccessMode: SET_ACCESS,
+                    grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+                    Trustee: trustee,
+                };
                 all_entries.push(owner_ea);
             }
             all_entries.push(ea);
@@ -228,7 +233,7 @@ fn current_user_sid() -> Option<PSID> {
 }
 
 fn well_known_sid(rid: u32) -> Option<PSID> {
-    let mut size = SECURITY_MAX_SID_SIZE;
+    let size = SECURITY_MAX_SID_SIZE;
     let mut buf = vec![0u8; size as usize];
     let mut sid = PSID(buf.as_mut_ptr() as *mut _);
     let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 5] };
@@ -246,7 +251,7 @@ fn well_known_sid(rid: u32) -> Option<PSID> {
 }
 
 fn builtin_admins_sid() -> Option<PSID> {
-    let mut size = SECURITY_MAX_SID_SIZE;
+    let size = SECURITY_MAX_SID_SIZE;
     let mut buf = vec![0u8; size as usize];
     let mut sid = PSID(buf.as_mut_ptr() as *mut _);
     let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 5] };
