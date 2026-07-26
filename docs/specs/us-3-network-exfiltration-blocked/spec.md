@@ -1,6 +1,18 @@
 # US-3: Network exfiltration blocked
 
-> **Status:** Draft — narrative + acceptance criteria stage.
+> **Status:** Implemented (partial) — `--block-net` works unprivileged;
+> `--allow-domain` / `--network-profile` / proxy deferred pending
+> unprivileged loopback mechanism.
+> **Implementation finding (2026-07-26):** the spec's chosen loopback
+> mechanism (`NetworkIsolationSetAppContainerConfig`) is admin-only — MSDN
+> documents it as "used for debugging purposes" and it sets a system-wide
+> loopback-allow list. Running unprivileged it returns
+> `ERROR_ACCESS_DENIED (0x5)`, making `--allow-domain` non-functional
+> without admin. `--block-net` needs no loopback exemption and works
+> fully unprivileged. The unprivileged alternative (a
+> `privateNetworkClientServer` capability SID on the AppContainer token)
+> is tracked as a follow-up. See "Implementation-ready detail → Loopback
+> exemption deferral" below.
 > Next: compare with nono, then expand to implementation-ready.
 
 ## User Story
@@ -283,6 +295,29 @@ list cannot `connect()` to anything (kernel returns `WSAEACCES` /
 > practical isolation. The acceptance test for AC-3.15 is **deferred**
 > and marked SKIP in the harness with `Detail='deferred to F-6 (WFP
 > driver)'`.
+
+> **Loopback exemption deferral (implementation finding 2026-07-26).**
+> The `NetworkIsolationSetAppContainerConfig` API chosen above is
+> **admin-only** — MSDN documents it as "used for debugging purposes"
+> and it sets a system-wide loopback-allow list. Running unprivileged it
+> returns `ERROR_ACCESS_DENIED (0x5)`, so `--allow-domain` /
+> `--network-profile` are non-functional without admin. The current
+> implementation:
+> - **`--block-net` works fully unprivileged** (no loopback exemption
+>   needed; AC-3.1, AC-3.2, AC-3.13 hold).
+> - **`--allow-domain` / `--network-profile` are accepted but downgraded**
+>   to block-net semantics with a clear warning, so the flags don't
+>   silently fail. The proxy, token, env injection, and audit plumbing
+>   are all implemented and unit-tested, but the loopback exemption gate
+>   blocks them from being exercised end-to-end unprivileged.
+> - The **unprivileged fix** is to add a `privateNetworkClientServer`
+>   capability SID to the AppContainer token in `spawn.rs` (instead of
+>   the admin-only `NetworkIsolationSetAppContainerConfig` call). This
+>   capability allows loopback + intranet but NOT public internet, so
+>   raw-socket direct connects to public hosts still fail closed
+>   (AC-3.13 holds) and the proxy enforces the allow-list. This is
+>   tracked as a follow-up; when it lands, the S-27..S-34, S-36, S-38
+>   integration scenarios flip from SKIP to active.
 
 ### Proxy
 
