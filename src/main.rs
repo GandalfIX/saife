@@ -5,6 +5,7 @@ mod profile;
 mod sandbox;
 mod security_groups;
 mod setup;
+mod signing;
 
 use anyhow::{Context, Result};
 use clap::Parser;
