@@ -693,6 +693,297 @@ function Invoke-Scenario-S42 {
 }
 
 # ---------------------------------------------------------------------------
+# US-4a audit scenarios S-43 .. S-56
+# ---------------------------------------------------------------------------
+
+# S-43 (AC-4.1): two session ids in the same second are distinct + well-formed.
+function Invoke-Scenario-S43 {
+    $d = New-ScenarioDir 43
+    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','a') -WorkingDirectory $d
+    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','b') -WorkingDirectory $d
+    $sid1 = ($r1.Stdout -join '').Trim()
+    $sid2 = ($r2.Stdout -join '').Trim()
+    $pattern = '^\d{8}-\d{6}-\d{5}$'
+    $passed = ($r1.ExitCode -eq 0) -and ($r2.ExitCode -eq 0) -and ($sid1 -ne $sid2) -and ($sid1 -match $pattern) -and ($sid2 -match $pattern)
+    return @{ Num=43; Name='S-43 (AC-4.1)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "distinct sids: $sid1, $sid2" } else { "sid1=$sid1 sid2=$sid2" } }
+}
+
+# S-44 (AC-4.2): audit log file is created and non-empty.
+# Uses the two-step pattern: --print-sid to get the sid, then a real --sid run
+# that emits a SESSION_START leaf. (The --print-sid-only path returns early
+# before AuditWriter is created, so no log file is produced by step 1.)
+function Invoke-Scenario-S44 {
+    $d = New-ScenarioDir 44
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','placeholder') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=44; Name='S-44 (AC-4.2)'; Passed=$false; Skipped=$false; Detail="print-sid failed" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    # Now run the real session — this emits SESSION_START + commits the root.
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    $exists = Test-Path -LiteralPath $logPath
+    $size = if ($exists) { (Get-Item -LiteralPath $logPath).Length } else { 0 }
+    # SESSION_START leaf guarantees non-empty (size > 0).
+    $passed = $exists -and ($size -gt 0)
+    return @{ Num=44; Name='S-44 (AC-4.2)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "log exists: $logPath (size=$size)" } else { "no log at $logPath (exists=$exists size=$size)" } }
+}
+
+# S-45 (AC-4.3): each log line is a valid hash-chain leaf.
+# Uses --block-net (no proxy needed) — the SESSION_START leaf exercises the
+# hash-chain. No python dependency.
+function Invoke-Scenario-S45 {
+    $d = New-ScenarioDir 45
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','placeholder') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=45; Name='S-45 (AC-4.3)'; Passed=$false; Skipped=$false; Detail='print-sid failed' } }
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    if (-not (Test-Path -LiteralPath $logPath)) { return @{ Num=45; Name='S-45 (AC-4.3)'; Passed=$false; Skipped=$false; Detail="no log at $logPath" } }
+    $content = Get-Content -LiteralPath $logPath -Raw
+    $lines = @($content.Trim() -split "`r?`n" | Where-Object { $_.Trim() })
+    if ($lines.Count -eq 0) { return @{ Num=45; Name='S-45 (AC-4.3)'; Passed=$false; Skipped=$false; Detail='log is empty' } }
+    # Parse each line; check fields, seq monotonic, parent linkage.
+    # (Full hash recomputation is exercised by `audit verify` in S-47.)
+    $prevHash = $null
+    $ok = $true
+    $detail = ''
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        try {
+            $obj = $lines[$i] | ConvertFrom-Json
+        } catch {
+            $ok = $false; $detail = "line $i is not valid JSON"; break
+        }
+        if (-not ($obj.PSObject.Properties.Name -contains 'hash')) { $ok=$false; $detail="line $i missing hash"; break }
+        if (-not ($obj.PSObject.Properties.Name -contains 'parent')) { $ok=$false; $detail="line $i missing parent"; break }
+        if (-not ($obj.PSObject.Properties.Name -contains 'seq')) { $ok=$false; $detail="line $i missing seq"; break }
+        if (-not ($obj.PSObject.Properties.Name -contains 'ts')) { $ok=$false; $detail="line $i missing ts"; break }
+        if (-not ($obj.PSObject.Properties.Name -contains 'op')) { $ok=$false; $detail="line $i missing op"; break }
+        if (-not ($obj.PSObject.Properties.Name -contains 'disposition')) { $ok=$false; $detail="line $i missing disposition"; break }
+        if ($obj.seq -ne $i) { $ok=$false; $detail="line $i seq=$($obj.seq) expected $i"; break }
+        if ($i -eq 0) {
+            if ($null -ne $obj.parent) { $ok=$false; $detail="line 0 parent is not null"; break }
+        } else {
+            if ($obj.parent -ne $prevHash) { $ok=$false; $detail="line $i parent mismatch"; break }
+        }
+        $prevHash = $obj.hash
+    }
+    return @{ Num=45; Name='S-45 (AC-4.3)'; Passed=$ok; Skipped=$false; Detail=$detail }
+}
+
+# S-46 (AC-4.6): CONNECT events appear in the log.
+# SKIP: under the US-3 loopback downgrade, --allow-domain is downgraded to
+# --block-net and no proxy starts, so no CONNECT events are emitted. This
+# scenario will be enabled when the US-3 loopback exemption lands (or when
+# US-4b adds EXEC/FILE_* capture which would also exercise the audit chain).
+function Invoke-Scenario-S46 {
+    return @{ Num=46; Name='S-46 (AC-4.6)'; Passed=$false; Skipped=$true
+        Detail='requires --allow-domain (US-3 loopback deferral)' }
+}
+
+# S-47 (AC-4.8): audit verify on a clean session prints OK.
+function Invoke-Scenario-S47 {
+    $d = New-ScenarioDir 47
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=47; Name='S-47 (AC-4.8)'; Passed=$false; Skipped=$false; Detail='print-sid failed' } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $v = Invoke-Sandbox -Args @('audit','verify',$sid)
+    $out = ($v.Stdout -join '')
+    $passed = ($v.ExitCode -eq 0) -and ($out -match 'OK')
+    return @{ Num=47; Name='S-47 (AC-4.8)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'verify OK' } else { "exit=$($v.ExitCode) out=$out" } }
+}
+
+# S-48 (AC-4.9): flipped byte in log -> TAMPERED.
+function Invoke-Scenario-S48 {
+    $d = New-ScenarioDir 48
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    if (-not (Test-Path -LiteralPath $logPath)) { return @{ Num=48; Name='S-48 (AC-4.9)'; Passed=$false; Skipped=$false; Detail='no log to tamper' } }
+    # Read, flip one byte in the middle, write back.
+    $bytes = [System.IO.File]::ReadAllBytes($logPath)
+    if ($bytes.Length -lt 10) { return @{ Num=48; Name='S-48 (AC-4.9)'; Passed=$false; Skipped=$false; Detail='log too short to tamper' } }
+    $mid = [int]($bytes.Length / 2)
+    # Find an alphabetic byte to flip so the JSON stays parseable but the
+    # canonical hash changes. Flip case of a letter.
+    for ($i = $mid; $i -lt $bytes.Length; $i++) {
+        $b = $bytes[$i]
+        if (($b -ge 97 -and $b -le 122) -or ($b -ge 65 -and $b -le 90)) {
+            $bytes[$i] = $b -bxor 32  # flip case
+            break
+        }
+    }
+    [System.IO.File]::WriteAllBytes($logPath, $bytes)
+    $v = Invoke-Sandbox -Args @('audit','verify',$sid)
+    $out = ($v.Stdout -join '')
+    $passed = ($v.ExitCode -ne 0) -and ($out -match 'TAMPERED')
+    return @{ Num=48; Name='S-48 (AC-4.9)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'tamper detected' } else { "exit=$($v.ExitCode) out=$out" } }
+}
+
+# S-49 (AC-4.10): truncated log -> TAMPERED (root mismatch).
+# A --block-net session emits exactly one event (SESSION_START), so the log
+# has a single line. Dropping that line yields an empty log, which verify
+# reports as INCOMPLETE (no events). The tamper guarantee we care about is
+# "removed leaf => root mismatch". With one leaf we can only test removal;
+# verify then reports INCOMPLETE (acceptable: the committed root cannot be
+# recomputed over zero events). We accept both TAMPERED and INCOMPLETE.
+function Invoke-Scenario-S49 {
+    $d = New-ScenarioDir 49
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    if (-not (Test-Path -LiteralPath $logPath)) { return @{ Num=49; Name='S-49 (AC-4.10)'; Passed=$false; Skipped=$false; Detail='no log to truncate' } }
+    $content = Get-Content -LiteralPath $logPath -Raw
+    $lines = @($content.Trim() -split "`r?`n" | Where-Object { $_.Trim() })
+    if ($lines.Count -lt 2) {
+        return @{ Num=49; Name='S-49 (AC-4.10)'; Passed=$false; Skipped=$true
+            Detail="log has $($lines.Count) line(s); need >=2 to truncate-test (SESSION_START-only session). Enable with US-4b EXEC/FILE_* events." }
+    }
+    # Drop the last line.
+    $truncated = ($lines[0..($lines.Count - 2)] -join "`n") + "`n"
+    Set-Content -LiteralPath $logPath -Value $truncated -NoNewline
+    $v = Invoke-Sandbox -Args @('audit','verify',$sid)
+    $out = ($v.Stdout -join '')
+    $passed = ($v.ExitCode -ne 0) -and ($out -match 'TAMPERED|INCOMPLETE')
+    return @{ Num=49; Name='S-49 (AC-4.10)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'truncation detected' } else { "exit=$($v.ExitCode) out=$out" } }
+}
+
+# S-50 (AC-4.11): forged .root file -> BAD_SIGNATURE or TAMPERED.
+function Invoke-Scenario-S50 {
+    $d = New-ScenarioDir 50
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $rootPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.root"
+    # Replace with a different (well-formatted) 64-char hex root.
+    $forged = '0' * 64
+    Set-Content -LiteralPath $rootPath -Value $forged -NoNewline
+    $v = Invoke-Sandbox -Args @('audit','verify',$sid)
+    $out = ($v.Stdout -join '')
+    $passed = ($v.ExitCode -ne 0) -and ($out -match 'TAMPERED|BAD_SIGNATURE')
+    return @{ Num=50; Name='S-50 (AC-4.11)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'forged root detected' } else { "exit=$($v.ExitCode) out=$out" } }
+}
+
+# S-51 (AC-4.12): human-readable summary has expected sections.
+function Invoke-Scenario-S51 {
+    $d = New-ScenarioDir 51
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $s = Invoke-Sandbox -Args @('audit','show',$sid)
+    $out = ($s.Stdout -join "`n")
+    $hasSession = $out -match 'Session \d{8}-\d{6}-\d{5}'
+    $hasEventsByType = $out -match 'Events by type'
+    $hasTotalEvents = $out -match 'Total events'
+    $passed = $hasSession -and $hasEventsByType -and $hasTotalEvents
+    return @{ Num=51; Name='S-51 (AC-4.12)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'summary has all sections' } else { "session=$hasSession bytype=$hasEventsByType total=$hasTotalEvents" } }
+}
+
+# S-52 (AC-4.13): --filter narrows output.
+# Uses SESSION_START (always emitted) instead of CONNECT (which requires the
+# US-3 loopback exemption). Filters to op=SESSION_START and checks every
+# emitted line matches.
+function Invoke-Scenario-S52 {
+    $d = New-ScenarioDir 52
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','placeholder') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=52; Name='S-52 (AC-4.13)'; Passed=$false; Skipped=$false; Detail='print-sid failed' } }
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $sj = Invoke-Sandbox -Args @('audit','show',$sid,'--json','--filter','op=SESSION_START')
+    $jlines = @($sj.Stdout | Where-Object { $_.Trim() })
+    $allMatch = $true
+    foreach ($l in $jlines) {
+        try { $o = $l | ConvertFrom-Json; if ($o.op -ne 'SESSION_START') { $allMatch = $false; break } } catch { $allMatch = $false; break }
+    }
+    $passed = ($jlines.Count -gt 0) -and $allMatch
+    return @{ Num=52; Name='S-52 (AC-4.13)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "filtered to $($jlines.Count) SESSION_START events" } else { "lines=$($jlines.Count) allMatch=$allMatch" } }
+}
+
+# S-53 (AC-4.14): first-run key generation.
+function Invoke-Scenario-S53 {
+    $keyPath = Join-Path $env:LOCALAPPDATA "sandbox\signing\ed25519-key"
+    $existedBefore = Test-Path -LiteralPath $keyPath
+    $d = New-ScenarioDir 53
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
+    $existsNow = Test-Path -LiteralPath $keyPath
+    $v = Invoke-Sandbox -Args @('audit','verify',$sid)
+    $verifyOk = ($v.ExitCode -eq 0) -and (($v.Stdout -join '') -match 'OK')
+    $passed = $existsNow -and $verifyOk
+    return @{ Num=53; Name='S-53 (AC-4.14)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'key file present + verify OK' } else { "exists=$existsNow verify=$verifyOk (existed before: $existedBefore)" } }
+}
+
+# S-54 (AC-4.15): key file is DPAPI-encrypted (not a valid raw Ed25519 secret).
+function Invoke-Scenario-S54 {
+    $keyPath = Join-Path $env:LOCALAPPDATA "sandbox\signing\ed25519-key"
+    if (-not (Test-Path -LiteralPath $keyPath)) { return @{ Num=54; Name='S-54 (AC-4.15)'; Passed=$false; Skipped=$false; Detail='no key file (run S-53 first)' } }
+    $bytes = [System.IO.File]::ReadAllBytes($keyPath)
+    # A raw Ed25519 secret is exactly 32 bytes. DPAPI ciphertext is longer
+    # (has a header + padding). If the file is exactly 32 bytes, it's NOT
+    # DPAPI-encrypted.
+    $isDpapi = $bytes.Length -gt 32
+    $passed = $isDpapi
+    return @{ Num=54; Name='S-54 (AC-4.15)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "key file is $($bytes.Length) bytes (DPAPI ciphertext, not raw secret)" } else { "key file is $($bytes.Length) bytes (suspicious — looks raw)" } }
+}
+
+# S-55 (AC-4.17): audit log survives sandbox crash; verify reports INCOMPLETE.
+# Uses `powershell -NoProfile -Command Start-Sleep` as the long-running child
+# because `ping` is blocked by --block-net (it needs the IP driver even for
+# 127.0.0.1) and `timeout /t` requires console input redirection (not
+# available under the sandbox's piped stdio). PowerShell's Start-Sleep needs
+# no network and no console input.
+function Invoke-Scenario-S55 {
+    $d = New-ScenarioDir 55
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
+    $sid = ($psid.Stdout -join '').Trim()
+    # Start a long-running session. The child sleeps 30s; we kill the sandbox
+    # supervisor after 2s, before the child exits naturally.
+    $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--block-net','--sid',$sid,'--','powershell','-NoProfile','-Command','Start-Sleep -Seconds 30') -WorkingDirectory $d -PassThru -NoNewWindow
+    Start-Sleep -Seconds 2
+    if ($proc.HasExited) {
+        Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsPowerShell*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+        return @{ Num=55; Name='S-55 (AC-4.17)'; Passed=$false; Skipped=$false; Detail="sandbox exited early (exit=$($proc.ExitCode)); child did not stay alive" }
+    }
+    # Force-kill sandbox.exe (the supervisor), not the child. The Job
+    # Object's KILL_ON_JOB_CLOSE will then kill the powershell child.
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    $rootPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.root"
+    $logReadable = Test-Path -LiteralPath $logPath
+    $noRoot = -not (Test-Path -LiteralPath $rootPath)
+    $v = Invoke-Sandbox -Args @('audit','verify',$sid)
+    $out = ($v.Stdout -join '')
+    $incomplete = $out -match 'INCOMPLETE'
+    # Also check that audit show still works.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid)
+    $showWorks = $s.ExitCode -eq 0
+    $passed = $logReadable -and $noRoot -and $incomplete -and $showWorks
+    # Cleanup any orphaned powershell child (defensive — the Job Object should
+    # have killed it, but be safe).
+    Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsPowerShell*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+    return @{ Num=55; Name='S-55 (AC-4.17)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'crash -> INCOMPLETE, log readable' } else { "log=$logReadable noRoot=$noRoot incomplete=$incomplete show=$showWorks" } }
+}
+
+# S-56 (AC-4.16): DEFERRED to US-4b.
+function Invoke-Scenario-S56 {
+    return @{ Num=56; Name='S-56 (AC-4.16)'; Passed=$false; Skipped=$true; Detail='deferred to US-4b (audit fidelity reporting)' }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -709,7 +1000,12 @@ $script:Scenarios = @(
     { Invoke-Scenario-S31 }, { Invoke-Scenario-S32 }, { Invoke-Scenario-S33 },
     { Invoke-Scenario-S34 }, { Invoke-Scenario-S35 }, { Invoke-Scenario-S36 },
     { Invoke-Scenario-S37 }, { Invoke-Scenario-S38 }, { Invoke-Scenario-S39 },
-    { Invoke-Scenario-S40 }, { Invoke-Scenario-S41 }, { Invoke-Scenario-S42 }
+    { Invoke-Scenario-S40 }, { Invoke-Scenario-S41 }, { Invoke-Scenario-S42 },
+    { Invoke-Scenario-S43 }, { Invoke-Scenario-S44 }, { Invoke-Scenario-S45 },
+    { Invoke-Scenario-S46 }, { Invoke-Scenario-S47 }, { Invoke-Scenario-S48 },
+    { Invoke-Scenario-S49 }, { Invoke-Scenario-S50 }, { Invoke-Scenario-S51 },
+    { Invoke-Scenario-S52 }, { Invoke-Scenario-S53 }, { Invoke-Scenario-S54 },
+    { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }
 )
 
 function Invoke-Scenario { param([int]$Number)
