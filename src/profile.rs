@@ -50,7 +50,7 @@ pub struct RawProfile {
     pub workdir: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Meta {
     #[serde(default)]
@@ -64,6 +64,31 @@ pub struct Meta {
     #[serde(default)]
     #[allow(dead_code)]
     pub description: String,
+    /// Profile schema version (FR-5.2). Required. Only `1` is supported in
+    /// this build (AC-5.16). Validated by [`validate_schema_version`].
+    #[serde(default, alias = "schema_version")]
+    pub schema_version: Option<u32>,
+}
+
+/// The schema version this build of `sandbox` understands.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Validate that the profile declares a supported `meta.schema_version`.
+/// Called after parsing, before resolution, so a bad version is reported
+/// with a clear message (AC-5.16).
+pub fn validate_schema_version(raw: &RawProfile) -> Result<()> {
+    let Some(meta) = raw.meta.as_ref() else {
+        bail!("missing required field `meta` (schema_version 1 required)");
+    };
+    let Some(v) = meta.schema_version else {
+        bail!("missing required field `meta.schema_version`");
+    };
+    if v != SUPPORTED_SCHEMA_VERSION {
+        bail!(
+            "Unsupported profile schema version {v}. This build of sandbox supports schema version {SUPPORTED_SCHEMA_VERSION}."
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -100,6 +125,7 @@ pub struct RawNetwork {
 pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     let mut seen: Vec<String> = Vec::new();
     let raw = load_raw_chain(name, cwd, &mut seen)?;
+    validate_schema_version(&raw)?;
     let mut fs = resolve_filesystem(&raw.filesystem, cwd)?;
     let resolved_name = raw
         .meta
@@ -426,6 +452,7 @@ mod tests {
                 name: "parent".into(),
                 version: "1".into(),
                 description: "p".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -434,6 +461,7 @@ mod tests {
                 name: "child".into(),
                 version: "2".into(),
                 description: "c".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -456,6 +484,33 @@ mod tests {
     #[test]
     fn parse_allow_bad_mode() {
         assert!(parse_allow_entry("C:/foo:bad").is_err());
+    }
+
+    #[test]
+    fn schema_version_supported_passes() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"filesystem":{"allow":["$CWD"]}}"#;
+        let p: RawProfile = serde_json::from_str(raw).expect("v1 parses");
+        assert_eq!(p.meta.as_ref().unwrap().schema_version, Some(1));
+        validate_schema_version(&p).expect("v1 is supported");
+    }
+
+    #[test]
+    fn schema_version_unsupported_errors() {
+        let raw = r#"{"meta":{"name":"x","schema_version":99}}"#;
+        let p: RawProfile = serde_json::from_str(raw).expect("parses structurally");
+        let err = validate_schema_version(&p).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Unsupported profile schema version 99"), "got: {msg}");
+        assert!(msg.contains("supports schema version 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn schema_version_absent_is_treated_as_error() {
+        let raw = r#"{"meta":{"name":"x"},"filesystem":{"allow":["$CWD"]}}"#;
+        let p: RawProfile = serde_json::from_str(raw).expect("parses structurally");
+        let err = validate_schema_version(&p).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing required field `meta.schema_version`"), "got: {msg}");
     }
 
     #[test]

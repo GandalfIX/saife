@@ -10,6 +10,7 @@
   The suite PASSES iff S-1..S-7, S-10, S-11, S-13 pass (the core FS pillar),
   and S-16..S-18 pass (profile loading, new in this slice). S-8/S-9 are
   python-dependent and skip cleanly. S-12/S-14/S-15 are skipped.
+  S-57 (AC-5.16) covers schema_version gate rejection.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -360,7 +361,7 @@ function Invoke-Scenario-S16 {
     New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
     $profilePath = Join-Path $profileDir 'test.json'
     $profileJson = @{
-        meta = @{ name = 'test'; version = '1.0.0'; description = 'test profile' }
+        meta = @{ name = 'test'; schema_version = 1; version = '1.0.0'; description = 'test profile' }
         filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
     } | ConvertTo-Json -Depth 5
     Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
@@ -410,7 +411,7 @@ function Invoke-Scenario-S19 {
     New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
     $profilePath = Join-Path $profileDir 'py-runtime.json'
     $profileJson = @{
-        meta = @{ name = 'py-runtime'; version = '1.0.0' }
+        meta = @{ name = 'py-runtime'; schema_version = 1; version = '1.0.0' }
         security = @{ groups = @('python_runtime') }
         filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
     } | ConvertTo-Json -Depth 5
@@ -432,7 +433,7 @@ function Invoke-Scenario-S20 {
     New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
     $profilePath = Join-Path $profileDir 'node-runtime.json'
     $profileJson = @{
-        meta = @{ name = 'node-runtime'; version = '1.0.0' }
+        meta = @{ name = 'node-runtime'; schema_version = 1; version = '1.0.0' }
         security = @{ groups = @('node_runtime') }
         filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
     } | ConvertTo-Json -Depth 5
@@ -983,6 +984,21 @@ function Invoke-Scenario-S56 {
     return @{ Num=56; Name='S-56 (AC-4.16)'; Passed=$false; Skipped=$true; Detail='deferred to US-4b (audit fidelity reporting)' }
 }
 
+# S-57 (AC-5.16): unsupported schema_version is rejected with a clear message.
+function Invoke-Scenario-S57 {
+    $d = New-ScenarioDir 57
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'bad-schema.json'
+    $profileJson = '{"meta":{"name":"bad","schema_version":99},"filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--','cmd','/c','echo','x') -WorkingDirectory $d
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -ne 0) -and ($err -match 'Unsupported profile schema version 99') -and ($err -match 'supports schema version 1')
+    return @{ Num=57; Name='S-57 (AC-5.16)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'unsupported schema_version rejected' } else { "exit=$($r.ExitCode) stderr=$err" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1005,7 +1021,7 @@ $script:Scenarios = @(
     { Invoke-Scenario-S46 }, { Invoke-Scenario-S47 }, { Invoke-Scenario-S48 },
     { Invoke-Scenario-S49 }, { Invoke-Scenario-S50 }, { Invoke-Scenario-S51 },
     { Invoke-Scenario-S52 }, { Invoke-Scenario-S53 }, { Invoke-Scenario-S54 },
-    { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }
+    { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 }
 )
 
 function Invoke-Scenario { param([int]$Number)
