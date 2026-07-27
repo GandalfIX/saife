@@ -39,8 +39,8 @@ fn main() {
             sid,
             cmd,
         ),
-        Cmd::Ps { .. } => stub_not_implemented("ps"),
-        Cmd::Audit { .. } => stub_not_implemented("audit"),
+        Cmd::Ps { json, .. } => ps_cmd(json),
+        Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { .. } => stub_not_implemented("profile"),
         Cmd::Setup { check_only, grant_drive_root } => {
             if let Err(e) = setup::check(check_only, grant_drive_root) {
@@ -57,6 +57,70 @@ fn main() {
 fn stub_not_implemented(name: &str) -> i32 {
     eprintln!("[sandbox] `{name}` is not implemented in this MVP slice.");
     2
+}
+
+fn ps_cmd(json: bool) -> i32 {
+    // Minimal: list the most recent audit log's sid.
+    let dir = match std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
+        Some(p) => p.join("sandbox").join("audit"),
+        None => { eprintln!("[sandbox] LOCALAPPDATA not set"); return 1; }
+    };
+    let mut entries: Vec<(std::time::SystemTime, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if let Some(sid) = name.strip_suffix(".ndjson") {
+                    if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
+                        entries.push((mtime, sid.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    if json {
+        if let Some((_, sid)) = entries.first() {
+            println!(r#"{{"session_id":"{sid}","running":false}}"#);
+        } else {
+            println!(r#"{{"session_id":null,"running":false}}"#);
+        }
+    } else {
+        if let Some((_, sid)) = entries.first() {
+            println!("{sid}");
+        } else {
+            println!("(no sessions)");
+        }
+    }
+    0
+}
+
+fn audit_cmd(action: cli::AuditAction) -> i32 {
+    use cli::AuditAction;
+    match action {
+        AuditAction::Show { session_id, json, filter } => {
+            audit::show::run_show(&session_id, json, filter.as_deref())
+        }
+        AuditAction::Verify { session_id } => {
+            audit::verify::run_verify(&session_id)
+        }
+    }
+}
+
+fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
+    let key = signing::KeyMaterial::ensure()?;
+    let root_bytes = decode_hex_vec(root)
+        .ok_or_else(|| anyhow::anyhow!("root is not valid hex: {root}"))?;
+    let sig = key.sign_root(&root_bytes);
+    let sig_hex: String = sig.iter().map(|b| format!("{:02x}", b)).collect();
+    let log_path = audit::audit_log_path(sid);
+    std::fs::write(log_path.with_extension("root"), root)?;
+    std::fs::write(log_path.with_extension("sig"), &sig_hex)?;
+    Ok(())
+}
+
+fn decode_hex_vec(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,6 +305,44 @@ fn run_inner(
 
     let exit_code = sandbox::spawn(&session, &job, &cwd, env_block, &cmdline)
         .context("spawn sandboxed process")?;
+
+    // US-4a: commit the audit root + signature on clean child exit.
+    //
+    // IMPORTANT — ProxyHandle::drop does NOT join the proxy thread (it cancels
+    // the token and detaches the JoinHandle, then shutdown_background — non-
+    // blocking). So if we dropped the proxy handle and then re-opened the log
+    // to read the root, we'd race the proxy thread's last `append`. To avoid
+    // that, we capture `current_root()` from the still-alive Arc<AuditWriter>
+    // BEFORE dropping anything. The `last_hash` Mutex inside the writer is
+    // updated synchronously by `append`, so `current_root()` always reflects
+    // the latest committed leaf — even if the proxy thread is still flushing
+    // the file write (the in-memory hash is set before the file write returns).
+    //
+    // We then drop the proxy handle + our Arc<AuditWriter> (releasing the file
+    // handle) and write the root+sig using the captured root string. No reopen
+    // needed.
+    let captured_root = audit_writer.current_root();
+
+    // Drop the proxy handle (cancels token, detaches the task — non-blocking).
+    // The proxy thread may still be mid-`append` to the file, but the in-memory
+    // `last_hash` is already captured above. We sleep briefly to let the proxy
+    // thread finish its in-flight file writes after cancellation.
+    drop(_proxy_handle);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Drop our Arc<AuditWriter>. The proxy thread's Arc may still be alive (it
+    // was detached), but `AuditWriter::append` holds the file open with
+    // `OpenOptions::append(true).create(true)` per call (no long-lived handle),
+    // so dropping the Arc just releases the in-memory state. The file on disk
+    // is already consistent up to the last `append`.
+    drop(audit_writer);
+
+    if let Some(root) = captured_root {
+        if let Err(e) = commit_audit_root(&sid, &root) {
+            eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
+            // The log is still readable; verify will report INCOMPLETE.
+        }
+    }
 
     Ok(exit_code as i32)
 }
