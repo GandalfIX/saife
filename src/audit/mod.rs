@@ -24,12 +24,15 @@ pub fn audit_log_path(session_id: &str) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub enum Disposition { Allow, Deny }
 
+#[cfg(test)]
 impl Disposition {
     fn as_str(&self) -> &'static str { match self { Self::Allow => "allow", Self::Deny => "deny" } }
 }
 
+#[cfg(test)]
 pub fn emit_connect(
     session_id: &str,
     host: &str,
