@@ -13,6 +13,8 @@
   S-57 (AC-5.16) covers schema_version gate rejection.
   S-58 (AC-5.12) covers wrong-type field rejection with line/col pointer.
   S-59 (AC-5.13) covers unknown-key rejection with a "Did you mean" suggestion.
+  S-60 (AC-5.7) covers the git_runtime security group (skips if git absent).
+  S-61 (AC-5.7) covers the dotnet_runtime security group (skips if dotnet absent).
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -1031,6 +1033,50 @@ function Invoke-Scenario-S59 {
         Detail = if ($passed) { 'unknown key + suggestion' } else { "exit=$($r.ExitCode) stderr=$err" } }
 }
 
+# S-60 (AC-5.7): git_runtime group makes git usable. Skips if git absent.
+function Invoke-Scenario-S60 {
+    $d = New-ScenarioDir 60
+    if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
+        return @{ Num=60; Name='S-60 (AC-5.7)'; Passed=$true; Skipped=$true; Detail='git not on PATH' }
+    }
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'git-runtime.json'
+    $profileJson = @{
+        meta = @{ name = 'git-runtime'; schema_version = 1 }
+        security = @{ groups = @('git_runtime') }
+        filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--allow-cwd','--','git','--version') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'git version')
+    return @{ Num=60; Name='S-60 (AC-5.7)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'git ran under git_runtime group' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-61 (AC-5.7): dotnet_runtime group makes dotnet usable. Skips if dotnet absent.
+function Invoke-Scenario-S61 {
+    $d = New-ScenarioDir 61
+    if (-not (Get-Command dotnet.exe -ErrorAction SilentlyContinue)) {
+        return @{ Num=61; Name='S-61 (AC-5.7)'; Passed=$true; Skipped=$true; Detail='dotnet not on PATH' }
+    }
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'dotnet-runtime.json'
+    $profileJson = @{
+        meta = @{ name = 'dotnet-runtime'; schema_version = 1 }
+        security = @{ groups = @('dotnet_runtime') }
+        filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @() }
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--allow-cwd','--','dotnet','--version') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match '^\s*\d+\.\d+\.\d+')
+    return @{ Num=61; Name='S-61 (AC-5.7)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'dotnet ran under dotnet_runtime group' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1054,7 +1100,8 @@ $script:Scenarios = @(
     { Invoke-Scenario-S49 }, { Invoke-Scenario-S50 }, { Invoke-Scenario-S51 },
     { Invoke-Scenario-S52 }, { Invoke-Scenario-S53 }, { Invoke-Scenario-S54 },
     { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 },
-    { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 }
+    { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 },
+    { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }
 )
 
 function Invoke-Scenario { param([int]$Number)

@@ -92,6 +92,8 @@ pub fn resolve_groups(probe: &dyn EnvProbe, groups: &[String]) -> Vec<GroupGrant
             "node_runtime" => resolve_node(probe),
             "rust_runtime" => resolve_rust(probe),
             "java_runtime" => resolve_java(probe),
+            "git_runtime" => resolve_git(probe),
+            "dotnet_runtime" => resolve_dotnet(probe),
             "windows_common" => {
                 // Implicit — added by the allowlist builder, not by profile
                 // expansion. Treat as a no-op here so profiles that list it
@@ -163,6 +165,27 @@ fn resolve_java(probe: &dyn EnvProbe) -> Vec<GroupGrant> {
         LABEL,
         &mut out,
     );
+    out
+}
+
+fn resolve_git(probe: &dyn EnvProbe) -> Vec<GroupGrant> {
+    const LABEL: &str = "git_runtime";
+    let mut out = Vec::new();
+    if let Some(dir) = probe.find_in_path("git.exe") {
+        out.push(GroupGrant { path: dir, recursive: false, label: LABEL });
+    }
+    push_env_dir(probe, "USERPROFILE", &[".gitconfig"], false, LABEL, &mut out);
+    push_env_dir(probe, "LOCALAPPDATA", &["Programs", "Git"], false, LABEL, &mut out);
+    out
+}
+
+fn resolve_dotnet(probe: &dyn EnvProbe) -> Vec<GroupGrant> {
+    const LABEL: &str = "dotnet_runtime";
+    let mut out = Vec::new();
+    if let Some(dir) = probe.find_in_path("dotnet.exe") {
+        out.push(GroupGrant { path: dir, recursive: false, label: LABEL });
+    }
+    push_env_dir(probe, "USERPROFILE", &[".nuget", "packages"], true, LABEL, &mut out);
     out
 }
 
@@ -422,5 +445,63 @@ mod tests {
         // The first PATH entry containing python.exe wins.
         assert!(grants.iter().any(|g| g.path == Path::new(r"C:\first")));
         assert!(!grants.iter().any(|g| g.path == Path::new(r"C:\second")));
+    }
+
+    // --- git_runtime -------------------------------------------------------
+
+    #[test]
+    fn git_runtime_resolves_git_exe_and_config() {
+        let env = FakeEnv::new()
+            .path(&[r"C:\Program Files\Git\cmd"])
+            .exists_at(r"C:\Program Files\Git\cmd\git.exe")
+            .set("USERPROFILE", r"C:\Users\test")
+            .set("LOCALAPPDATA", r"C:\Users\test\AppData\Local")
+            .exists_at(r"C:\Users\test\.gitconfig")
+            .exists_at(r"C:\Users\test\AppData\Local\Programs\Git");
+        let grants = resolve_groups(&env, &["git_runtime".into()]);
+        let paths: Vec<PathBuf> = grants.iter().map(|g| g.path.clone()).collect();
+        assert!(paths.contains(&PathBuf::from(r"C:\Program Files\Git\cmd")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\test\.gitconfig")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\test\AppData\Local\Programs\Git")));
+        for g in &grants {
+            assert!(!g.recursive, "git_runtime grants should be non-recursive, got {:?}", g);
+        }
+    }
+
+    #[test]
+    fn git_runtime_skips_when_git_not_installed() {
+        let env = FakeEnv::new()
+            .set("USERPROFILE", r"C:\Users\test")
+            .set("LOCALAPPDATA", r"C:\Users\test\AppData\Local");
+        // No git.exe on PATH, no existing config/install dirs.
+        let grants = resolve_groups(&env, &["git_runtime".into()]);
+        assert!(grants.is_empty());
+    }
+
+    // --- dotnet_runtime ----------------------------------------------------
+
+    #[test]
+    fn dotnet_runtime_resolves_dotnet_exe_and_nuget_cache() {
+        let env = FakeEnv::new()
+            .path(&[r"C:\Program Files\dotnet"])
+            .exists_at(r"C:\Program Files\dotnet\dotnet.exe")
+            .set("USERPROFILE", r"C:\Users\test")
+            .exists_at(r"C:\Users\test\.nuget\packages");
+        let grants = resolve_groups(&env, &["dotnet_runtime".into()]);
+        let paths: Vec<PathBuf> = grants.iter().map(|g| g.path.clone()).collect();
+        assert!(paths.contains(&PathBuf::from(r"C:\Program Files\dotnet")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\test\.nuget\packages")));
+        let dotnet_grant = grants.iter().find(|g| g.path == Path::new(r"C:\Program Files\dotnet")).unwrap();
+        assert!(!dotnet_grant.recursive);
+        let nuget_grant = grants.iter().find(|g| g.path == Path::new(r"C:\Users\test\.nuget\packages")).unwrap();
+        assert!(nuget_grant.recursive);
+    }
+
+    #[test]
+    fn dotnet_runtime_skips_when_dotnet_missing() {
+        let env = FakeEnv::new()
+            .set("USERPROFILE", r"C:\Users\test");
+        let grants = resolve_groups(&env, &["dotnet_runtime".into()]);
+        assert!(grants.is_empty());
     }
 }
