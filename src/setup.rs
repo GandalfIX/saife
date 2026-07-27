@@ -63,7 +63,7 @@ pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
     println!("Reverse proxy (network)    : available (US-3)");
     println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());
     println!("ETW audit                  : not yet implemented in this slice");
-    println!("Ed25519 signing key        : not yet implemented in this slice");
+    println!("Ed25519 signing key        : {}", if crate::signing::key_exists() { "present" } else { "absent (will be generated on first run)" });
 
     if build < MIN_BUILD {
         bail!("host build {build} is below minimum {MIN_BUILD} (AppContainer RuleSet unavailable)");
