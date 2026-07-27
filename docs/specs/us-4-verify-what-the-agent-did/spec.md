@@ -1,15 +1,7 @@
 # US-4: Verify what the agent did
 
-> **Status:** Spec complete (US-4a implementation-ready). US-4b (FILE_*/EXEC
-> event capture via ETW or userspace hook) is **split out** as a separate
-> follow-up plan because the AppContainer enforcement model means the
-> supervisor never observes denied file operations in-band — they return
-> `EACCES` to the sandboxed process directly. Event capture therefore
-> requires either ETW (admin) or Detours-style DLL injection (non-admin),
-> both of which are large research-heavy subsystems. US-4a delivers the
-> cryptographic core, signing, `audit show`, `audit verify`, the filter
-> grammar, and full CONNECT-event coverage (CONNECT events already flow
-> from US-3 via `src/audit.rs`).
+> **Status:** US-4a (crypto core) implemented. US-4b (FILE_*/EXEC capture
+> via ETW/hook) pending.
 >
 > **Decisions locked (2026-07-27 review):**
 > - **Split:** US-4a (crypto core) now; US-4b (FILE_*/EXEC capture) later.

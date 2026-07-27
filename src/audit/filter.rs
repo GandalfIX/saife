@@ -13,7 +13,7 @@
 //! Multiple clauses AND together.
 
 use anyhow::{bail, Result};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,7 +145,7 @@ mod tests {
     use serde_json::json;
 
     fn leaf(pairs: &[(&str, Value)]) -> Value {
-        let m: Map<String, Value> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let m: serde_json::Map<String, Value> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         Value::Object(m)
     }
 

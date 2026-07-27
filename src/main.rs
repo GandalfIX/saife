@@ -68,13 +68,11 @@ fn ps_cmd(json: bool) -> i32 {
     let mut entries: Vec<(std::time::SystemTime, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
-            if let Some(name) = e.file_name().to_str() {
-                if let Some(sid) = name.strip_suffix(".ndjson") {
-                    if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
+            if let Some(name) = e.file_name().to_str()
+                && let Some(sid) = name.strip_suffix(".ndjson")
+                    && let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
                         entries.push((mtime, sid.to_string()));
                     }
-                }
-            }
         }
     }
     entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
@@ -119,7 +117,7 @@ fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
 }
 
 fn decode_hex_vec(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
+    if !s.len().is_multiple_of(2) { return None; }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect()
 }
 
@@ -337,12 +335,11 @@ fn run_inner(
     // is already consistent up to the last `append`.
     drop(audit_writer);
 
-    if let Some(root) = captured_root {
-        if let Err(e) = commit_audit_root(&sid, &root) {
+    if let Some(root) = captured_root
+        && let Err(e) = commit_audit_root(&sid, &root) {
             eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
             // The log is still readable; verify will report INCOMPLETE.
         }
-    }
 
     Ok(exit_code as i32)
 }

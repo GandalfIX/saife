@@ -35,7 +35,7 @@ fn run_show_inner(session_id: &str, json: bool, filter_expr: Option<&str>) -> Re
             if line.trim().is_empty() { continue; }
             let v: serde_json::Value = serde_json::from_str(line)
                 .map_err(|e| anyhow::anyhow!("invalid JSON in log at line `{line}`: {e}"))?;
-            if filter.as_ref().map_or(true, |f| f.matches(&v)) {
+            if filter.as_ref().is_none_or(|f| f.matches(&v)) {
                 writeln!(out, "{line}")?;
             }
         }
@@ -51,7 +51,7 @@ fn run_show_inner(session_id: &str, json: bool, filter_expr: Option<&str>) -> Re
         events.push(v);
     }
     let filtered: Vec<&serde_json::Value> = events.iter()
-        .filter(|v| filter.as_ref().map_or(true, |f| f.matches(v)))
+        .filter(|v| filter.as_ref().is_none_or(|f| f.matches(v)))
         .collect();
 
     print_summary(session_id, &filtered);
@@ -60,11 +60,10 @@ fn run_show_inner(session_id: &str, json: bool, filter_expr: Option<&str>) -> Re
 
 fn print_summary(session_id: &str, events: &[&serde_json::Value]) {
     println!("Session {session_id}");
-    if let Some(first) = events.first() {
-        if let Some(ts) = first.get("ts").and_then(|t| t.as_str()) {
+    if let Some(first) = events.first()
+        && let Some(ts) = first.get("ts").and_then(|t| t.as_str()) {
             println!("Started  {ts}");
         }
-    }
 
     // Events by type.
     let mut by_op: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
