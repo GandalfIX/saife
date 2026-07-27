@@ -11,6 +11,8 @@
   and S-16..S-18 pass (profile loading, new in this slice). S-8/S-9 are
   python-dependent and skip cleanly. S-12/S-14/S-15 are skipped.
   S-57 (AC-5.16) covers schema_version gate rejection.
+  S-58 (AC-5.12) covers wrong-type field rejection with line/col pointer.
+  S-59 (AC-5.13) covers unknown-key rejection with a "Did you mean" suggestion.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -999,6 +1001,36 @@ function Invoke-Scenario-S57 {
         Detail = if ($passed) { 'unsupported schema_version rejected' } else { "exit=$($r.ExitCode) stderr=$err" } }
 }
 
+# S-58 (AC-5.12): wrong-type field is rejected with line/col pointer.
+function Invoke-Scenario-S58 {
+    $d = New-ScenarioDir 58
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'bad-type.json'
+    $profileJson = '{"meta":{"name":"x","schema_version":1},"filesystem":{"allow":42}}'
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--','cmd','/c','echo','x') -WorkingDirectory $d
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -ne 0) -and ($err -match 'expected a sequence' -or $err -match 'integer') -and ($err -match 'line' -or $err -match 'col')
+    return @{ Num=58; Name='S-58 (AC-5.12)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'wrong-type rejected with line/col' } else { "exit=$($r.ExitCode) stderr=$err" } }
+}
+
+# S-59 (AC-5.13): unknown key rejected with "Did you mean" suggestion.
+function Invoke-Scenario-S59 {
+    $d = New-ScenarioDir 59
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'typo.json'
+    $profileJson = '{"meta":{"name":"x","schema_version":1},"netwrok":{"block":false}}'
+    Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--','cmd','/c','echo','x') -WorkingDirectory $d
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -ne 0) -and ($err -match 'netwrok') -and ($err -match 'Did you mean .network.')
+    return @{ Num=59; Name='S-59 (AC-5.13)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'unknown key + suggestion' } else { "exit=$($r.ExitCode) stderr=$err" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1021,7 +1053,8 @@ $script:Scenarios = @(
     { Invoke-Scenario-S46 }, { Invoke-Scenario-S47 }, { Invoke-Scenario-S48 },
     { Invoke-Scenario-S49 }, { Invoke-Scenario-S50 }, { Invoke-Scenario-S51 },
     { Invoke-Scenario-S52 }, { Invoke-Scenario-S53 }, { Invoke-Scenario-S54 },
-    { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 }
+    { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 },
+    { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 }
 )
 
 function Invoke-Scenario { param([int]$Number)

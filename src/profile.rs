@@ -34,7 +34,7 @@ pub struct ResolvedProfile {
 
 /// Raw profile JSON (v1 schema).
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RawProfile {
     #[serde(default)]
     pub meta: Option<Meta>,
@@ -47,11 +47,11 @@ pub struct RawProfile {
     #[serde(default)]
     pub network: Option<RawNetwork>,
     #[serde(default)]
-    pub workdir: Option<serde_json::Value>,
+    pub workdir: Option<Workdir>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Meta {
     #[serde(default)]
     pub name: String,
@@ -66,7 +66,9 @@ pub struct Meta {
     pub description: String,
     /// Profile schema version (FR-5.2). Required. Only `1` is supported in
     /// this build (AC-5.16). Validated by [`validate_schema_version`].
-    #[serde(default, alias = "schema_version")]
+    /// Accepts both `schema_version` (canonical v1) and `schemaVersion`
+    /// (legacy camelCase) for backward compatibility.
+    #[serde(default, alias = "schemaVersion")]
     pub schema_version: Option<u32>,
 }
 
@@ -92,14 +94,14 @@ pub fn validate_schema_version(raw: &RawProfile) -> Result<()> {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Security {
     #[serde(default)]
     pub groups: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RawFilesystem {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -110,7 +112,7 @@ pub struct RawFilesystem {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RawNetwork {
     #[serde(default)]
     pub block_net: bool,
@@ -118,6 +120,87 @@ pub struct RawNetwork {
     pub allow_domain: Vec<String>,
     #[serde(default)]
     pub profile: Option<String>,
+}
+
+/// `workdir` block. `access` is the only documented key in v1
+/// (`readwrite` | `readonly` | `none`). Parsed but not yet enforced
+/// beyond the implicit `--allow-cwd` grant; reserved for the profile
+/// show / list subcommands and future enforcement.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct Workdir {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub access: Option<String>,
+}
+
+/// The set of top-level keys a v1 profile accepts. Used by
+/// [`suggest_unknown_key`] to emit "Did you mean X?" hints (AC-5.13).
+pub const KNOWN_TOP_LEVEL_KEYS: &[&str] =
+    &["meta", "extends", "security", "filesystem", "network", "workdir"];
+
+/// Suggest a known key close to `unknown` (case-insensitive). Returns
+/// `Some(known)` when, compared case-insensitively, the lowercased unknown
+/// and the known key satisfy any of: Levenshtein edit distance <= 2, the
+/// unknown is a prefix of the known key, or the known key is a prefix of
+/// the unknown.
+///
+/// Returns `None` otherwise — so a totally bogus key like `zzzzz`
+/// produces no suggestion (still rejected, just without a hint).
+pub fn suggest_unknown_key(unknown: &str) -> Option<String> {
+    let lower = unknown.to_ascii_lowercase();
+    for &known in KNOWN_TOP_LEVEL_KEYS {
+        if levenshtein(&lower, known) <= 2
+            || lower.starts_with(known)
+            || known.starts_with(&lower)
+        {
+            return Some(known.to_string());
+        }
+    }
+    None
+}
+
+/// Iterative Levenshtein edit distance. Sufficient for short strings
+/// (top-level keys are ≤ 10 chars); no need for a crate.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 { return m; }
+    if m == 0 { return n; }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr = vec![0usize; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
+}
+
+/// Post-process a serde error to append a "Did you mean X?" hint when the
+/// error is an unknown-field rejection (AC-5.13). serde's message already
+/// includes `unknown field `KEY``; we append `\n  Did you mean \`SUGGEST\`?`
+/// when a close match exists.
+pub fn with_suggestion(err: serde_json::Error) -> anyhow::Error {
+    let msg = format!("{err}");
+    if let Some(unknown) = extract_unknown_field(&msg)
+        && let Some(sugg) = suggest_unknown_key(&unknown)
+    {
+        return anyhow::anyhow!("{err}\n  Did you mean `{sugg}`?");
+    }
+    anyhow::Error::from(err)
+}
+
+/// Extract the field name from a serde `unknown field `X`` message.
+fn extract_unknown_field(msg: &str) -> Option<String> {
+    let marker = "unknown field `";
+    let start = msg.find(marker)? + marker.len();
+    let end = msg[start..].find('`')?;
+    Some(msg[start..start + end].to_string())
 }
 
 /// Load a profile by name or path, resolve `extends`, expand variables, and
@@ -177,6 +260,7 @@ fn load_raw_chain(name: &str, cwd: &Path, seen: &mut Vec<String>) -> Result<RawP
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read profile {}", path.display()))?;
     let raw: RawProfile = serde_json::from_str(&text)
+        .map_err(with_suggestion)
         .with_context(|| format!("parse profile {}", path.display()))?;
 
     let merged = match raw.extends.as_ref() {
@@ -522,5 +606,41 @@ mod tests {
         ];
         let out = dedupe_paths(paths);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected_with_suggestion() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"netwrok":{"block":false}}"#;
+        let err = serde_json::from_str::<RawProfile>(raw).unwrap_err();
+        let msg = format!("{}", with_suggestion(err));
+        assert!(msg.contains("unknown field `netwrok`"), "got: {msg}");
+        assert!(msg.contains("Did you mean `network`"), "got: {msg}");
+    }
+
+    #[test]
+    fn unknown_key_no_close_match_still_rejects() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"zzzzz":1}"#;
+        let err = serde_json::from_str::<RawProfile>(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field `zzzzz`"), "got: {msg}");
+        assert!(!msg.contains("Did you mean"), "got: {msg}");
+    }
+
+    #[test]
+    fn wrong_type_carries_line_col() {
+        let raw = "{\"meta\":{\"name\":\"x\",\"schema_version\":1},\"filesystem\":{\"allow\":42}}";
+        let err = serde_json::from_str::<RawProfile>(raw).unwrap_err();
+        let msg = format!("{}", with_suggestion(err));
+        assert!(msg.contains("expected a sequence") || msg.contains("integer"), "got: {msg}");
+        assert!(msg.contains("line") || msg.contains("col"), "got: {msg}");
+    }
+
+    #[test]
+    fn suggest_closest_known_key() {
+        assert_eq!(suggest_unknown_key("netwrok"), Some("network".to_string()));
+        assert_eq!(suggest_unknown_key("filesystemm"), Some("filesystem".to_string()));
+        assert_eq!(suggest_unknown_key("metaa"), Some("meta".to_string()));
+        assert_eq!(suggest_unknown_key("zzzzz"), None);
+        assert_eq!(suggest_unknown_key("sec"), Some("security".to_string()));
     }
 }
