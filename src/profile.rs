@@ -247,13 +247,22 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     })
 }
 
+/// Detect a profile `extends` cycle and format the error per AC-5.6:
+/// `Profile cycle detected: a → b → a` (the repeated name closes the loop).
+fn check_cycle(name: &str, seen: &[String]) -> Result<()> {
+    if seen.iter().any(|s| s == name) {
+        let mut chain: Vec<&str> = seen.iter().map(|s| s.as_str()).collect();
+        chain.push(name);
+        bail!("Profile cycle detected: {}", chain.join(" → "));
+    }
+    Ok(())
+}
+
 /// Recursively load a profile and its `extends` chain. The deepest parent is
 /// loaded first; the child is merged on top (child keys override, arrays
 /// concatenate for filesystem.allow / read_only / deny).
 fn load_raw_chain(name: &str, cwd: &Path, seen: &mut Vec<String>) -> Result<RawProfile> {
-    if seen.iter().any(|s| s == name) {
-        bail!("profile `extends` cycle detected: {}", seen.join(" -> "));
-    }
+    check_cycle(name, seen)?;
     seen.push(name.to_string());
 
     let path = resolve_profile_path(name, cwd)?;
@@ -642,5 +651,28 @@ mod tests {
         assert_eq!(suggest_unknown_key("metaa"), Some("meta".to_string()));
         assert_eq!(suggest_unknown_key("zzzzz"), None);
         assert_eq!(suggest_unknown_key("sec"), Some("security".to_string()));
+    }
+
+    #[test]
+    fn cycle_message_matches_spec_format() {
+        let seen: Vec<String> = vec!["a".into(), "b".into()];
+        let next = "a";
+        let err = check_cycle(next, &seen).unwrap_err();
+        let msg = format!("{err:#}");
+        assert_eq!(msg, "Profile cycle detected: a → b → a");
+    }
+
+    #[test]
+    fn cycle_message_three_deep() {
+        let seen: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let err = check_cycle("a", &seen).unwrap_err();
+        let msg = format!("{err:#}");
+        assert_eq!(msg, "Profile cycle detected: a → b → c → a");
+    }
+
+    #[test]
+    fn no_cycle_when_name_not_seen() {
+        let seen: Vec<String> = vec!["a".into(), "b".into()];
+        assert!(check_cycle("c", &seen).is_ok());
     }
 }

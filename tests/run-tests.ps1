@@ -15,6 +15,7 @@
   S-59 (AC-5.13) covers unknown-key rejection with a "Did you mean" suggestion.
   S-60 (AC-5.7) covers the git_runtime security group (skips if git absent).
   S-61 (AC-5.7) covers the dotnet_runtime security group (skips if dotnet absent).
+  S-62 (AC-5.6) covers the profile `extends` cycle detection error format.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -1077,6 +1078,27 @@ function Invoke-Scenario-S61 {
         Detail = if ($passed) { 'dotnet ran under dotnet_runtime group' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
+# S-62 (AC-5.6): extends cycle is detected and reported with the spec format.
+# Uses absolute paths in `extends` so the cycle detector sees the same string
+# on the second visit (bare names resolve to %USERPROFILE%\.sandbox\profiles\
+# and would not reach the local fixture).
+function Invoke-Scenario-S62 {
+    $d = New-ScenarioDir 62
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $aPath = Join-Path $profileDir 'a.json'
+    $bPath = Join-Path $profileDir 'b.json'
+    $aJson = '{"meta":{"name":"a","schema_version":1},"extends":"' + ($bPath -replace '\\','\\') + '","filesystem":{"allow":["$CWD"]}}'
+    $bJson = '{"meta":{"name":"b","schema_version":1},"extends":"' + ($aPath -replace '\\','\\') + '","filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath $aPath -Value $aJson -Encoding UTF8
+    Set-Content -LiteralPath $bPath -Value $bJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$aPath,'--','cmd','/c','echo','x') -WorkingDirectory $d
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -ne 0) -and ($err -match 'Profile cycle detected') -and ($err -match 'a\.json.*b\.json.*a\.json')
+    return @{ Num=62; Name='S-62 (AC-5.6)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'cycle detected + formatted' } else { "exit=$($r.ExitCode) stderr=$err" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1101,7 +1123,7 @@ $script:Scenarios = @(
     { Invoke-Scenario-S52 }, { Invoke-Scenario-S53 }, { Invoke-Scenario-S54 },
     { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 },
     { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 },
-    { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }
+    { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }, { Invoke-Scenario-S62 }
 )
 
 function Invoke-Scenario { param([int]$Number)
