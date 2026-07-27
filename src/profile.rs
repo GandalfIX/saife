@@ -3,6 +3,46 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// One entry in the `profile list` output.
+#[derive(Debug, Clone)]
+pub struct ProfileEntry {
+    pub name: String,
+    pub source_path: PathBuf,
+}
+
+/// List all profiles in the user-global directory (AC-5.14).
+/// Reads `%USERPROFILE%\.sandbox\profiles\*.json`, parsing each just enough
+/// to extract `meta.name` (falling back to the filename stem). Non-`.json`
+/// files and unparseable JSON are skipped silently — `list` is best-effort.
+pub fn list_profiles() -> Vec<ProfileEntry> {
+    let dir = crate::cli::profiles_dir();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else { return out; };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        let name = name_from_profile_file(&path).unwrap_or_else(|| {
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string()
+        });
+        out.push(ProfileEntry { name, source_path: path });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn name_from_profile_file(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let raw: RawProfile = serde_json::from_str(&text).ok()?;
+    raw.meta.and_then(|m| if m.name.is_empty() { None } else { Some(m.name) })
+}
+
+/// `sandbox profile show <name> [--expanded]`. Filled in by Task 6.
+pub fn show_profile(_name: &str, _expanded: bool) -> i32 {
+    eprintln!("[sandbox] profile show: not implemented in this slice");
+    2
+}
+
+
 /// The filesystem slice of a profile, after merging `extends` and CLI flags.
 #[derive(Debug, Default, Clone)]
 pub struct FilesystemSlice {
@@ -674,5 +714,27 @@ mod tests {
     fn no_cycle_when_name_not_seen() {
         let seen: Vec<String> = vec!["a".into(), "b".into()];
         assert!(check_cycle("c", &seen).is_ok());
+    }
+
+    #[test]
+    fn list_profiles_returns_user_global_json_files() {
+        let tmp = std::env::temp_dir().join(format!("sb-list-test-{}", std::process::id()));
+        let profiles_dir = tmp.join(".sandbox").join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("alpha.json"), r#"{"meta":{"name":"alpha","schema_version":1}}"#).unwrap();
+        std::fs::write(profiles_dir.join("beta.json"), r#"{"meta":{"name":"beta","schema_version":1}}"#).unwrap();
+        std::fs::write(profiles_dir.join("not-json.txt"), "garbage").unwrap();
+        let prev = std::env::var_os("USERPROFILE");
+        unsafe { std::env::set_var("USERPROFILE", &tmp); }
+        let result = list_profiles();
+        if let Some(p) = prev {
+            unsafe { std::env::set_var("USERPROFILE", p); }
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+
+        let names: Vec<String> = result.into_iter().map(|p| p.name).collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+        assert!(!names.iter().any(|n| n == "not-json"), "non-.json files excluded");
     }
 }

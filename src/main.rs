@@ -41,7 +41,7 @@ fn main() {
         ),
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
-        Cmd::Profile { .. } => stub_not_implemented("profile"),
+        Cmd::Profile { action } => profile_cmd(action),
         Cmd::Setup { check_only, grant_drive_root } => {
             if let Err(e) = setup::check(check_only, grant_drive_root) {
                 eprintln!("[sandbox] setup check failed: {e:#}");
@@ -51,12 +51,6 @@ fn main() {
         }
     };
     std::process::exit(rc);
-}
-
-/// Stub for subcommands that aren't implemented in this slice.
-fn stub_not_implemented(name: &str) -> i32 {
-    eprintln!("[sandbox] `{name}` is not implemented in this MVP slice.");
-    2
 }
 
 fn ps_cmd(json: bool) -> i32 {
@@ -100,6 +94,27 @@ fn audit_cmd(action: cli::AuditAction) -> i32 {
         }
         AuditAction::Verify { session_id } => {
             audit::verify::run_verify(&session_id)
+        }
+    }
+}
+
+fn profile_cmd(action: cli::ProfileAction) -> i32 {
+    use cli::ProfileAction;
+    match action {
+        ProfileAction::List => {
+            let entries = profile::list_profiles();
+            if entries.is_empty() {
+                let dir = cli::profiles_dir();
+                println!("(no profiles in {})", dir.display());
+                return 0;
+            }
+            for e in &entries {
+                println!("{}\t{}", e.name, e.source_path.display());
+            }
+            0
+        }
+        ProfileAction::Show { name, expanded } => {
+            profile::show_profile(&name, expanded)
         }
     }
 }

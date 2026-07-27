@@ -122,6 +122,10 @@ pub enum ProfileAction {
     /// Show a profile's resolved contents.
     Show {
         name: String,
+        /// Show the fully-resolved profile (extends flattened, security
+        /// groups expanded to concrete paths, variables expanded).
+        #[arg(long)]
+        expanded: bool,
     },
 }
 
@@ -175,10 +179,7 @@ impl RunArgs {
     }
 }
 
-/// Where profile files live.
-///
-/// Reserved for the `profile` subcommand (currently a stub in `main.rs`).
-#[allow(dead_code)]
+/// Where profile files live (`%USERPROFILE%\.sandbox\profiles`).
 pub fn profiles_dir() -> PathBuf {
     let userprofile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)

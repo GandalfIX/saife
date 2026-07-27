@@ -16,6 +16,7 @@
   S-60 (AC-5.7) covers the git_runtime security group (skips if git absent).
   S-61 (AC-5.7) covers the dotnet_runtime security group (skips if dotnet absent).
   S-62 (AC-5.6) covers the profile `extends` cycle detection error format.
+  S-63 (AC-5.14) covers `profile list` showing all user-global profiles.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -1099,6 +1100,32 @@ function Invoke-Scenario-S62 {
         Detail = if ($passed) { 'cycle detected + formatted' } else { "exit=$($r.ExitCode) stderr=$err" } }
 }
 
+# S-63 (AC-5.14): profile list shows all user-global profiles.
+function Invoke-Scenario-S63 {
+    $d = New-ScenarioDir 63
+    $fakeHome = Join-Path $d 'fake-home'
+    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $profilesDir 'alpha.json') -Value '{"meta":{"name":"alpha","schema_version":1}}' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $profilesDir 'beta.json') -Value '{"meta":{"name":"beta","schema_version":1}}' -Encoding UTF8
+    # Invoke-Sandbox doesn't expose env-var overrides, so invoke directly.
+    # `$SandboxExe` is the script-scope param (see harness top-level param block).
+    $pi = New-Object System.Diagnostics.ProcessStartInfo
+    $pi.FileName = $SandboxExe
+    $pi.Arguments = 'profile list'
+    $pi.UseShellExecute = $false
+    $pi.RedirectStandardOutput = $true
+    $pi.RedirectStandardError = $true
+    $pi.EnvironmentVariables['USERPROFILE'] = $fakeHome
+    $proc = [System.Diagnostics.Process]::Start($pi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    $passed = ($proc.ExitCode -eq 0) -and ($stdout -match 'alpha') -and ($stdout -match 'beta')
+    return @{ Num=63; Name='S-63 (AC-5.14)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'list shows both profiles' } else { "exit=$($proc.ExitCode) stdout=$stdout stderr=$stderr" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1123,7 +1150,8 @@ $script:Scenarios = @(
     { Invoke-Scenario-S52 }, { Invoke-Scenario-S53 }, { Invoke-Scenario-S54 },
     { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 },
     { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 },
-    { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }, { Invoke-Scenario-S62 }
+    { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }, { Invoke-Scenario-S62 },
+    { Invoke-Scenario-S63 }
 )
 
 function Invoke-Scenario { param([int]$Number)
