@@ -3,6 +3,30 @@
 > **Status:** US-4a (crypto core) implemented. US-4b (FILE_*/EXEC capture
 > via ETW/hook) pending.
 >
+> **Known follow-ups (from US-4a final code review):**
+> - **Concurrent-append race** (`src/audit/mod.rs:append`): the `last_hash`
+>   mutex is released between computing the hash and writing the file. Two
+>   concurrent `append` calls (from two proxy connections) can interleave
+>   and produce a chain with out-of-order seq or a broken parent link.
+>   Unreachable today (the US-3 loopback downgrade means the proxy rarely
+>   starts), but **must be fixed before US-4b**. Fix: hold the mutex across
+>   the entire `append` (including the file write) or use a single-writer
+>   mpsc channel so appends are serialized.
+> - **Root-commit race** (`src/main.rs:run_inner`): the 50ms sleep after
+>   `drop(_proxy_handle)` is a heuristic, not a guarantee. If the OS schedules
+>   the detached proxy thread slowly, the last leaf might not be flushed to
+>   disk before `commit_audit_root` writes `.root`. Fails safe (false
+>   `TAMPERED`), but should be fixed by making `ProxyHandle::drop` block on
+>   the join (a US-3 change) or by `fsync`-ing the audit log before writing
+>   `.root`.
+> - **Key file ACL** (`src/signing.rs`): the Ed25519 key file inherits the
+>   parent dir's DACL rather than having an explicit restrictive ACL
+>   (owner + SYSTEM only). DPAPI user-scope is the primary protection, so
+>   this is acceptable for MVP. Tighten the ACL post-MVP.
+> - **`zeroize` not enabled** on `ed25519-dalek` — the 32-byte secret sits in
+>   heap memory until dropped without zeroing. Enable the `zeroize` feature
+>   for good hygiene post-MVP.
+>
 > **Decisions locked (2026-07-27 review):**
 > - **Split:** US-4a (crypto core) now; US-4b (FILE_*/EXEC capture) later.
 > - **Leaf canonicalization (AC-4.3):** SHA-256 over the leaf re-serialized
