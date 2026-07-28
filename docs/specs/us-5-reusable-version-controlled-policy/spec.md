@@ -339,14 +339,17 @@ list, and `network.profile` (nono relies on CLI `--network-profile` flag or
 a `network.network_profile` field — we support both). `undo` is omitted
 (deferred). `read_file` → `read_only` (renamed).
 
-## Implementation-ready detail (to be filled in last step)
+## Implementation-ready detail
 
-TODO: exact JSON schema (as serde struct + validation), security group
-resolver implementation, extends-merge algorithm, variable expansion
-implementation, search-path resolution order, error message format.
+Implemented in `docs/superpowers/plans/2026-07-28-us-5-reusable-version-controlled-policy.md`. Summary of what landed:
 
-## Implementation-ready detail (to be filled in last step)
-
-TODO: exact JSON schema (as serde struct + validation), security group
-resolver implementation, extends-merge algorithm, variable expansion
-implementation, search-path resolution order, error message format.
+- **JSON schema (serde):** `RawProfile`, `Meta`, `Security`, `RawFilesystem`, `RawNetwork`, `Workdir` — all `#[serde(rename_all = "snake_case", deny_unknown_fields)]`. `meta.schema_version: Option<u32>` is required at validation time (validated by `validate_schema_version`; only `1` supported). `Meta` derives `Default` so struct-literal tests can use `..Default::default()`.
+- **Typo suggester:** `suggest_unknown_key` (Levenshtein ≤ 2 OR either string is a prefix of the other; case-insensitive; over `KNOWN_TOP_LEVEL_KEYS`). Wired via `with_suggestion` at the parse call site. AC-5.13.
+- **Extends-merge:** `merge_profiles` — child overrides scalars, `filesystem.*` / `network.allow_domain` / `security.groups` arrays concatenate via `dedupe_concat` (case-insensitive de-dup).
+- **Variable expansion:** `expand_vars` — `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`. Forward slashes normalized to backslashes.
+- **Security groups:** `resolve_groups` in `src/security_groups.rs` — `python_runtime`, `node_runtime`, `rust_runtime`, `java_runtime`, `git_runtime`, `dotnet_runtime`. `windows_common` is implicit (added by `sandbox::allowlist::build_allowlist`, not expandable here).
+- **Cycle detection:** `check_cycle` formats `Profile cycle detected: a → b → a` (U+2192 arrow) per AC-5.6.
+- **Search-path resolution:** `resolve_profile_path` — absolute path or `*.json`-suffixed name used as-is; bare name → `%USERPROFILE%\.sandbox\profiles\<name>.json`.
+- **`profile list`:** `list_profiles` reads `*.json` from the user-global dir, extracts `meta.name` (falls back to filename stem), sorts alphabetically.
+- **`profile show`:** raw view prints the file verbatim (AC-5.15); `--expanded` emits `to_expanded_json` — a single JSON object with `extends` flattened, `security.groups` expanded to per-group concrete path lists, variables expanded.
+- **Error message format:** `anyhow` chains with `with_context`; parse errors carry serde's line/col; cycle + schema-version errors use the exact spec wording.
