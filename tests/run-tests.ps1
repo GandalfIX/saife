@@ -17,6 +17,8 @@
   S-61 (AC-5.7) covers the dotnet_runtime security group (skips if dotnet absent).
   S-62 (AC-5.6) covers the profile `extends` cycle detection error format.
   S-63 (AC-5.14) covers `profile list` showing all user-global profiles.
+  S-64 (AC-5.15) covers `profile show` printing the file as-authored (raw view).
+  S-65 covers `profile show --expanded` emitting fully-resolved JSON.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -1126,6 +1128,53 @@ function Invoke-Scenario-S63 {
         Detail = if ($passed) { 'list shows both profiles' } else { "exit=$($proc.ExitCode) stdout=$stdout stderr=$stderr" } }
 }
 
+# S-64 (AC-5.15): profile show (raw) prints the file as-authored.
+function Invoke-Scenario-S64 {
+    $d = New-ScenarioDir 64
+    $fakeHome = Join-Path $d 'fake-home'
+    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
+    $rawJson = '{"meta":{"name":"raw","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath (Join-Path $profilesDir 'raw.json') -Value $rawJson -Encoding UTF8
+    $pi = New-Object System.Diagnostics.ProcessStartInfo
+    $pi.FileName = $SandboxExe
+    $pi.Arguments = 'profile show raw'
+    $pi.UseShellExecute = $false
+    $pi.RedirectStandardOutput = $true
+    $pi.RedirectStandardError = $true
+    $pi.EnvironmentVariables['USERPROFILE'] = $fakeHome
+    $proc = [System.Diagnostics.Process]::Start($pi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $proc.WaitForExit()
+    $passed = ($proc.ExitCode -eq 0) -and ($stdout -match 'python_runtime') -and ($stdout -match '\$CWD') -and ($stdout -notmatch 'security_groups_expanded')
+    return @{ Num=64; Name='S-64 (AC-5.15)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'raw view printed as-authored' } else { "exit=$($proc.ExitCode) stdout=$stdout" } }
+}
+
+# S-65 (expanded): profile show --expanded emits resolved JSON.
+function Invoke-Scenario-S65 {
+    $d = New-ScenarioDir 65
+    $fakeHome = Join-Path $d 'fake-home'
+    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
+    $rawJson = '{"meta":{"name":"expanded","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath (Join-Path $profilesDir 'expanded.json') -Value $rawJson -Encoding UTF8
+    $pi = New-Object System.Diagnostics.ProcessStartInfo
+    $pi.FileName = $SandboxExe
+    $pi.Arguments = 'profile show expanded --expanded'
+    $pi.UseShellExecute = $false
+    $pi.RedirectStandardOutput = $true
+    $pi.RedirectStandardError = $true
+    $pi.EnvironmentVariables['USERPROFILE'] = $fakeHome
+    $pi.WorkingDirectory = $d
+    $proc = [System.Diagnostics.Process]::Start($pi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $proc.WaitForExit()
+    $passed = ($proc.ExitCode -eq 0) -and ($stdout -match 'security_groups_expanded') -and ($stdout -notmatch '\$CWD') -and ($stdout -match '"name": "expanded"')
+    return @{ Num=65; Name='S-65 (expanded)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'expanded view emitted resolved JSON' } else { "exit=$($proc.ExitCode) stdout=$stdout" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1151,7 +1200,7 @@ $script:Scenarios = @(
     { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 },
     { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 },
     { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }, { Invoke-Scenario-S62 },
-    { Invoke-Scenario-S63 }
+    { Invoke-Scenario-S63 }, { Invoke-Scenario-S64 }, { Invoke-Scenario-S65 }
 )
 
 function Invoke-Scenario { param([int]$Number)

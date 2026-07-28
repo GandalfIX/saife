@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -36,10 +37,107 @@ fn name_from_profile_file(path: &Path) -> Option<String> {
     raw.meta.and_then(|m| if m.name.is_empty() { None } else { Some(m.name) })
 }
 
-/// `sandbox profile show <name> [--expanded]`. Filled in by Task 6.
-pub fn show_profile(_name: &str, _expanded: bool) -> i32 {
-    eprintln!("[sandbox] profile show: not implemented in this slice");
-    2
+/// `sandbox profile show <name> [--expanded]`.
+/// - Raw view (default): prints the file contents verbatim (AC-5.15).
+/// - Expanded view (`--expanded`): prints the fully-resolved JSON.
+pub fn show_profile(name: &str, expanded: bool) -> i32 {
+    match show_profile_inner(name, expanded) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("[sandbox] profile show: {e:#}");
+            1
+        }
+    }
+}
+
+fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
+    let cwd = std::env::current_dir().context("get current directory")?;
+    if expanded {
+        let mut seen: Vec<String> = Vec::new();
+        let raw = load_raw_chain(name, &cwd, &mut seen)?;
+        validate_schema_version(&raw)?;
+        let groups = raw.security.as_ref().map(|s| s.groups.clone()).unwrap_or_default();
+        let mut fs = resolve_filesystem(&raw.filesystem, &cwd)?;
+        let resolved_name = raw.meta.as_ref()
+            .map(|m| m.name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.to_string());
+        if let Some(sec) = &raw.security
+            && !sec.groups.is_empty()
+        {
+            let probe = crate::security_groups::HostEnv;
+            let grants = crate::security_groups::resolve_groups(&probe, &sec.groups);
+            for g in grants {
+                fs.read_only.push(g.path);
+            }
+            fs.read_only = dedupe_paths(fs.read_only);
+            let allow_keys: std::collections::BTreeSet<String> = fs
+                .allow.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
+            fs.read_only.retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+        }
+        let resolved = ResolvedProfile {
+            name: resolved_name,
+            filesystem: fs,
+            network: resolve_network_slice(&raw.network),
+        };
+        let groups_expanded = expand_groups_for_show(&groups);
+        println!("{}", to_expanded_json(&resolved, &groups_expanded));
+    } else {
+        let path = resolve_profile_path(name, &cwd)?;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read profile {}", path.display()))?;
+        println!("{text}");
+    }
+    Ok(0)
+}
+
+/// Render a resolved profile + expanded group paths as a single JSON object
+/// (the `--expanded` view). Shape:
+/// ```json
+/// {
+///   "meta": { "name": "..." },
+///   "filesystem": { "allow": [...], "read_only": [...], "deny": [...] },
+///   "security_groups_expanded": { "python_runtime": ["C:\\..."], ... },
+///   "network": { "block": false, "allow_domain": [...], "profile": "..." }
+/// }
+/// ```
+pub fn to_expanded_json(
+    resolved: &ResolvedProfile,
+    groups_expanded: &[(String, Vec<std::path::PathBuf>)],
+) -> String {
+    let mut groups_obj = serde_json::Map::new();
+    for (name, paths) in groups_expanded {
+        let arr: Vec<Value> = paths.iter().map(|p| json!(p.to_string_lossy().to_string())).collect();
+        groups_obj.insert(name.clone(), Value::Array(arr));
+    }
+    let expanded = json!({
+        "meta": { "name": resolved.name },
+        "filesystem": {
+            "allow": resolved.filesystem.allow.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "read_only": resolved.filesystem.read_only.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "deny": resolved.filesystem.deny.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        },
+        "security_groups_expanded": groups_obj,
+        "network": {
+            "block": resolved.network.block_net,
+            "allow_domain": resolved.network.allow_domain,
+            "profile": resolved.network.profile_name,
+        }
+    });
+    serde_json::to_string_pretty(&expanded).unwrap_or_else(|_| "{}".into())
+}
+
+/// Compute the per-group expanded paths for a resolved profile, keyed by
+/// group name. Used by `show_profile --expanded` so each group's concrete
+/// paths are visible separately (not just folded into read_only).
+fn expand_groups_for_show(sec_groups: &[String]) -> Vec<(String, Vec<std::path::PathBuf>)> {
+    let probe = crate::security_groups::HostEnv;
+    let grants = crate::security_groups::resolve_groups(&probe, sec_groups);
+    let mut by_group: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = std::collections::BTreeMap::new();
+    for g in grants {
+        by_group.entry(g.label.to_string()).or_default().push(g.path);
+    }
+    by_group.into_iter().collect()
 }
 
 
@@ -66,7 +164,6 @@ pub struct ResolvedProfile {
     /// `--profile` argument). Populated by `load_and_resolve` but not
     /// consumed by the supervisor yet — reserved for the `profile show`
     /// subcommand and audit log enrichment.
-    #[allow(dead_code)]
     pub name: String,
     pub filesystem: FilesystemSlice,
     pub network: NetworkSlice,
@@ -736,5 +833,34 @@ mod tests {
         assert!(names.contains(&"alpha".to_string()));
         assert!(names.contains(&"beta".to_string()));
         assert!(!names.iter().any(|n| n == "not-json"), "non-.json files excluded");
+    }
+
+    #[test]
+    fn expanded_profile_flattens_extends_and_expands_groups() {
+        let resolved = ResolvedProfile {
+            name: "child".into(),
+            filesystem: FilesystemSlice {
+                allow: vec![PathBuf::from(r"C:\proj")],
+                read_only: vec![PathBuf::from(r"C:\Users\test\.gitconfig")],
+                deny: vec![PathBuf::from(r"C:\Users\test\.ssh")],
+            },
+            network: NetworkSlice {
+                block_net: false,
+                allow_domain: vec!["api.anthropic.com".into()],
+                profile_name: Some("minimal".into()),
+            },
+        };
+        let groups_expanded: Vec<(String, Vec<PathBuf>)> = vec![
+            ("python_runtime".into(), vec![PathBuf::from(r"C:\Py312")]),
+        ];
+        let json = to_expanded_json(&resolved, &groups_expanded);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["meta"]["name"], "child");
+        assert_eq!(v["filesystem"]["allow"][0], r"C:\proj");
+        assert_eq!(v["filesystem"]["read_only"][0], r"C:\Users\test\.gitconfig");
+        assert_eq!(v["security_groups_expanded"]["python_runtime"][0], r"C:\Py312");
+        assert_eq!(v["network"]["block"], false);
+        assert_eq!(v["network"]["allow_domain"][0], "api.anthropic.com");
+        assert_eq!(v["network"]["profile"], "minimal");
     }
 }
