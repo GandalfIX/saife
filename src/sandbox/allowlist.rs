@@ -15,6 +15,13 @@ pub struct AllowEntry {
 pub const RWX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
 pub const RX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 
+/// Minimal ancestor mask: `FILE_READ_ATTRIBUTES` (stat the dir itself) +
+/// `FILE_TRAVERSE` (walk through it to reach children). Does NOT include
+/// `FILE_LIST_DIRECTORY`, so sibling directory contents stay hidden.
+/// Fixes KI-1.2's `lstat` failures (e.g. Node `fs.lstatSync` on the user
+/// home) without weakening sibling isolation.
+const ANCESTOR_MASK: u32 = FILE_READ_ATTRIBUTES.0 | FILE_TRAVERSE.0;
+
 /// Ensure the per-session install dirs exist on disk (Option E roots).
 pub fn ensure_session_dirs(cwd: &std::path::Path, sid: &str) -> std::io::Result<()> {
     let base = cwd.join(".sandbox").join(sid);
@@ -36,18 +43,40 @@ pub fn build_allowlist(
     fs: &FilesystemSlice,
 ) -> Result<Vec<AllowEntry>> {
     let mut entries = Vec::new();
+    let mut ancestor_set: Vec<std::path::PathBuf> = Vec::new();
 
     // Profile allow entries (readwrite = RWX).
     for p in &fs.allow {
         push_entry(&mut entries, p.clone(), RWX, format!("allow:{}", p.display()), false, false);
+        collect_ancestors(p, &mut ancestor_set);
     }
     // Profile read-only entries (RX).
     for p in &fs.read_only {
         push_entry(&mut entries, p.clone(), RX, format!("ro:{}", p.display()), false, false);
+        collect_ancestors(p, &mut ancestor_set);
     }
     // Profile deny entries (deny ACE).
     for p in &fs.deny {
         push_entry(&mut entries, p.clone(), 0, format!("deny:{}", p.display()), true, false);
+    }
+    // Ancestor traverse grants (KI-1.2 fix): for every allowed/RO path, grant
+    // the AppContainer SID `FILE_READ_ATTRIBUTES | FILE_TRAVERSE` on each
+    // ancestor directory up to the drive root. This lets sandboxed tools stat
+    // and traverse their own home directory (`C:\Users\<user>`) without listing
+    // sibling contents. Does NOT grant `FILE_LIST_DIRECTORY` on ancestors, so
+    // sibling isolation is preserved. Ancestors owned by the current user are
+    // grantable unprivileged at run time (no admin needed); grants on
+    // system-owned ancestors are attempted and silently skipped if they fail
+    // (see `grant_access`).
+    for ancestor in &ancestor_set {
+        push_entry(
+            &mut entries,
+            ancestor.clone(),
+            ANCESTOR_MASK,
+            format!("ancestor:{}", ancestor.display()),
+            false,
+            false,
+        );
     }
 
     // .sandbox: minimal RX so the owning session can traverse to reach its own
@@ -86,6 +115,28 @@ fn push_entry(
         deny,
         protected,
     });
+}
+
+/// Collect every ancestor directory of `path` up to (but not including) the
+/// drive root. The drive root itself is covered by the one-time
+/// `setup --grant-drive-root` ACE (or by inheritance on user-owned drives),
+/// so we stop there. Dedupes against `out` to avoid redundant ACE writes when
+/// multiple granted paths share ancestors (e.g. `$HOME/.local/share/opencode`
+/// and `$HOME/.config/opencode` both live under `C:\Users\<user>`).
+fn collect_ancestors(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut cur = path.parent();
+    while let Some(parent) = cur {
+        // Stop at the drive root (e.g. `C:\`): it's handled by the
+        // `--grant-drive-root` setup step and is TrustedInstaller-owned.
+        let s = parent.to_string_lossy();
+        if s.len() <= 3 && s.chars().nth(1) == Some(':') {
+            break;
+        }
+        if !out.iter().any(|e| e.eq(parent)) {
+            out.push(parent.to_path_buf());
+        }
+        cur = parent.parent();
+    }
 }
 
 /// Resolve a Win32 path (e.g. `C:\foo`) to its NT device path
