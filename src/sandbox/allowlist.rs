@@ -120,3 +120,22 @@ pub fn to_nt_path(win32: &std::path::Path) -> Result<String> {
         Ok(format!("{dev}\\{rest}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::FilesystemSlice;
+
+    #[test]
+    fn windows_common_system32_always_in_allowlist() {
+        let fs = FilesystemSlice::default();
+        let entries = build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs).unwrap();
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let system32 = std::path::PathBuf::from(&sysroot).join("System32");
+        assert!(
+            entries.iter().any(|e| e.win32_path == system32),
+            "System32 must always be in the allowlist; got: {:?}",
+            entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
+        );
+    }
+}

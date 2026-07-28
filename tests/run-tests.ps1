@@ -19,6 +19,12 @@
   S-63 (AC-5.14) covers `profile list` showing all user-global profiles.
   S-64 (AC-5.15) covers `profile show` printing the file as-authored (raw view).
   S-65 covers `profile show --expanded` emitting fully-resolved JSON.
+  S-66 (AC-5.3) covers `extends` concatenating allow arrays (de-duped).
+  S-67 (AC-5.5) covers multi-level extends (a -> b -> c) resolution.
+  S-68 (AC-5.8) covers `$HOME` per-user variable expansion at runtime.
+  S-69 (AC-5.9) covers windows_common (System32) reachable from an empty profile.
+  S-70 (AC-5.10) covers CLI `--allow` merging on top of the profile.
+  S-71 (AC-5.17) covers a portable profile (only $HOME/$CWD/groups, no abs paths).
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -1175,6 +1181,106 @@ function Invoke-Scenario-S65 {
         Detail = if ($passed) { 'expanded view emitted resolved JSON' } else { "exit=$($proc.ExitCode) stdout=$stdout" } }
 }
 
+# S-66 (AC-5.3): extends concatenates allow arrays (de-duped).
+function Invoke-Scenario-S66 {
+    $d = New-ScenarioDir 66
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $basePath = Join-Path $profileDir 'base.json'
+    $childPath = Join-Path $profileDir 'child.json'
+    Set-Content -LiteralPath $basePath -Value '{"meta":{"name":"base","schema_version":1},"filesystem":{"allow":["$CWD"]}}' -Encoding UTF8
+    $childJson = '{"meta":{"name":"child","schema_version":1},"extends":"' + ($basePath -replace '\\','\\') + '","filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath $childPath -Value $childJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$childPath,'--','cmd','/c','echo','extends-ok') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'extends-ok')
+    return @{ Num=66; Name='S-66 (AC-5.3)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'extends merged' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-67 (AC-5.5): multi-level extends (a -> b -> c).
+function Invoke-Scenario-S67 {
+    $d = New-ScenarioDir 67
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $cPath = Join-Path $profileDir 'c.json'
+    $bPath = Join-Path $profileDir 'b.json'
+    $aPath = Join-Path $profileDir 'a.json'
+    Set-Content -LiteralPath $cPath -Value '{"meta":{"name":"c","schema_version":1},"filesystem":{"allow":["$CWD"]}}' -Encoding UTF8
+    $bJson = '{"meta":{"name":"b","schema_version":1},"extends":"' + ($cPath -replace '\\','\\') + '","filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath $bPath -Value $bJson -Encoding UTF8
+    $aJson = '{"meta":{"name":"a","schema_version":1},"extends":"' + ($bPath -replace '\\','\\') + '","filesystem":{"allow":["$CWD"]}}'
+    Set-Content -LiteralPath $aPath -Value $aJson -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$aPath,'--','cmd','/c','echo','multi-ok') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'multi-ok')
+    return @{ Num=67; Name='S-67 (AC-5.5)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { '3-deep extends resolved' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-68 (AC-5.8): $HOME expands per-user.
+function Invoke-Scenario-S68 {
+    $d = New-ScenarioDir 68
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $profileDir 'home.json') -Value '{"meta":{"name":"home","schema_version":1},"filesystem":{"allow":["$HOME/.sandbox-test-marker"]}}' -Encoding UTF8
+    $markerDir = Join-Path $env:USERPROFILE '.sandbox-test-marker'
+    New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
+    $markerFile = Join-Path $markerDir 'hi.txt'
+    Set-Content -LiteralPath $markerFile -Value 'home-expanded' -Encoding ASCII
+    $r = Invoke-Sandbox -Args @('run','--profile',(Join-Path $profileDir 'home.json'),'--','cmd','/c','type',$markerFile) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    Remove-Item -LiteralPath $markerDir -Recurse -Force -ErrorAction SilentlyContinue
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'home-expanded')
+    return @{ Num=68; Name='S-68 (AC-5.8)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { '$HOME expanded' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-69 (AC-5.9): windows_common (System32) is reachable even with an empty profile.
+function Invoke-Scenario-S69 {
+    $d = New-ScenarioDir 69
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $profileDir 'empty.json') -Value '{"meta":{"name":"empty","schema_version":1}}' -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',(Join-Path $profileDir 'empty.json'),'--','cmd','/c','echo','sys32-ok') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'sys32-ok')
+    return @{ Num=69; Name='S-69 (AC-5.9)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'System32 reachable from empty profile' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-70 (AC-5.10): CLI --allow merges on top of profile.
+function Invoke-Scenario-S70 {
+    $d = New-ScenarioDir 70
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $profileDir 'p.json') -Value '{"meta":{"name":"p","schema_version":1},"filesystem":{"allow":["$CWD"]}}' -Encoding UTF8
+    $extraDir = Join-Path (Split-Path -Parent $d) 'cli-merge-70'
+    New-Item -ItemType Directory -Path $extraDir -Force | Out-Null
+    $extraFile = Join-Path $extraDir 'merged.txt'
+    Set-Content -LiteralPath $extraFile -Value 'cli-merge-ok' -Encoding ASCII
+    $r = Invoke-Sandbox -Args @('run','--profile',(Join-Path $profileDir 'p.json'),'--allow-cwd','--allow',$extraDir,'--','cmd','/c','type',$extraFile) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'cli-merge-ok')
+    return @{ Num=70; Name='S-70 (AC-5.10)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'CLI --allow merged' } else { "exit=$($r.ExitCode) stdout=$out" } }
+}
+
+# S-71 (AC-5.17): a profile using only $HOME/$CWD/groups is portable (no edits).
+function Invoke-Scenario-S71 {
+    $d = New-ScenarioDir 71
+    $profileDir = Join-Path $d 'profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $portableJson = '{"meta":{"name":"portable","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$HOME/.claude","$CWD"],"read_only":["$HOME/.gitconfig"],"deny":["$HOME/.ssh"]}}'
+    Set-Content -LiteralPath (Join-Path $profileDir 'portable.json') -Value $portableJson -Encoding UTF8
+    $hasAbs = $portableJson -match '[A-Z]:\\\\'
+    $r = Invoke-Sandbox -Args @('run','--profile',(Join-Path $profileDir 'portable.json'),'--allow-cwd','--','cmd','/c','echo','portable-ok') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = (-not $hasAbs) -and ($r.ExitCode -eq 0) -and ($out -match 'portable-ok')
+    return @{ Num=71; Name='S-71 (AC-5.17)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'portable profile ran' } else { "hasAbs=$hasAbs exit=$($r.ExitCode) stdout=$out" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -1200,7 +1306,9 @@ $script:Scenarios = @(
     { Invoke-Scenario-S55 }, { Invoke-Scenario-S56 }, { Invoke-Scenario-S57 },
     { Invoke-Scenario-S58 }, { Invoke-Scenario-S59 },
     { Invoke-Scenario-S60 }, { Invoke-Scenario-S61 }, { Invoke-Scenario-S62 },
-    { Invoke-Scenario-S63 }, { Invoke-Scenario-S64 }, { Invoke-Scenario-S65 }
+    { Invoke-Scenario-S63 }, { Invoke-Scenario-S64 }, { Invoke-Scenario-S65 },
+    { Invoke-Scenario-S66 }, { Invoke-Scenario-S67 }, { Invoke-Scenario-S68 },
+    { Invoke-Scenario-S69 }, { Invoke-Scenario-S70 }, { Invoke-Scenario-S71 }
 )
 
 function Invoke-Scenario { param([int]$Number)
