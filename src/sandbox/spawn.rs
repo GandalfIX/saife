@@ -201,7 +201,7 @@ pub fn spawn(
     cwd: &std::path::Path,
     env_block: Vec<u16>,
     cmdline: &str,
-    network_active: bool,
+    is_network_active: bool,
 ) -> Result<u32> {
     let mut cmdw: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -230,7 +230,7 @@ pub fn spawn(
 
         // Allocate the capability SID if network is active. The SID must
         // outlive CreateProcessW, so it's held in a local.
-        let cap_sid: Option<PSID> = if network_active {
+        let cap_sid: Option<PSID> = if is_network_active {
             crate::sandbox::appcontainer::allocate_private_network_capability_sid()
         } else {
             None
@@ -241,10 +241,9 @@ pub fn spawn(
             Attributes: 0,
         }];
 
-        let (caps_ptr, caps_count) = if network_active {
-            (cap_attrs.as_mut_ptr() as *mut _, 1)
-        } else {
-            (std::ptr::null_mut(), 0)
+        let (caps_ptr, caps_count) = match cap_sid {
+            Some(_) => (cap_attrs.as_mut_ptr() as *mut _, 1),
+            None => (std::ptr::null_mut(), 0),
         };
 
         let mut sec_caps = SECURITY_CAPABILITIES {
@@ -289,9 +288,8 @@ pub fn spawn(
 
         DeleteProcThreadAttributeList(attr_list);
 
-        // Free the capability SID after CreateProcessW has consumed it
-        // (UpdateProcThreadAttribute copies the pointer into the attribute
-        // list, so the SID memory only needs to be valid through this point).
+        // All capability locals (cap_sid, cap_attrs, sec_caps) outlive
+        // CreateProcessW as stack locals in this block; free the SID now.
         if let Some(sid) = cap_sid {
             let _ = FreeSid(sid);
         }
