@@ -34,11 +34,11 @@ pub enum Cmd {
         #[arg(long, value_name = "PATH")]
         read_only: Vec<String>,
 
-        /// Block all outbound network (stub for this slice: accepted, logged, ignored).
+        /// Block all outbound network (no proxy, no network capability SIDs, all connect() kernel-denied).
         #[arg(long)]
         block_net: bool,
 
-        /// Allow a domain (repeatable) (stub for this slice: accepted, logged, ignored).
+        /// Allow a domain (repeatable). Requires network capability (privateNetworkClientServer SID).
         #[arg(long, value_name = "DOMAIN")]
         allow_domain: Vec<String>,
 

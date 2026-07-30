@@ -1,7 +1,6 @@
 pub mod matcher;
 pub mod profile;
 pub mod token;
-pub mod loopback;
 pub mod proxy;
 
 use crate::profile::NetworkSlice;
@@ -14,7 +13,7 @@ pub enum NetworkConfig {
     /// Allow-list mode: proxy started on a random loopback port.
     ///
     /// `proxy_port` and `token` are placeholders filled in by the proxy
-    /// layer when the loopback-exemption path lands (currently deferred —
+    /// layer when the proxy-bootstrap path lands (currently deferred —
     /// see `main.rs`). Held in the config so the resolved form stays
     /// self-describing for diagnostics and the US-3 follow-up.
     #[allow(dead_code)]

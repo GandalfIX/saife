@@ -71,7 +71,7 @@ impl ProxyHandle {
     ///
     /// Not invoked today: `main.rs` drops `ProxyHandle` directly (the
     /// `Drop` impl already cancels the accept loop). Kept for the
-    /// graceful-shutdown path that lands with the loopback exemption.
+    /// graceful-shutdown path that lands with the proxy follow-up.
     #[allow(dead_code)]
     pub fn shutdown(&mut self) {
         self.cancel.cancel();

@@ -257,8 +257,8 @@ fn run_inner(
 
     // Open the audit writer for this session and emit a SESSION_START leaf so
     // every session has at least one audit event (ensures `verify` can always
-    // produce a root, even under the US-3 loopback downgrade where no proxy
-    // starts and thus no CONNECT events fire).
+    // produce a root, even under --block-net where no proxy starts and
+    // thus no CONNECT events fire).
     let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid));
     {
         use serde_json::{Map, json};
@@ -270,44 +270,11 @@ fn run_inner(
         audit_writer.append(e);
     }
 
-    // The localhost-proxy + loopback-exemption mechanism for --allow-domain /
-    // --network-profile requires `NetworkIsolationSetAppContainerConfig`, which
-    // is admin-only (it sets a system-wide loopback-allow list "for debugging
-    // purposes" per MSDN). The unprivileged alternative (a
-    // `privateNetworkClientServer` capability SID on the AppContainer token) is
-    // tracked as a follow-up. Until that lands, --allow-domain /
-    // --network-profile are accepted but downgraded to block-net semantics with
-    // a clear warning. --block-net itself works fully unprivileged.
-    let net_cfg = match &net_cfg_resolved {
-        net::NetworkConfig::Allow { .. } => {
-            eprintln!(
-                "[sandbox] warning: --allow-domain / --network-profile are deferred in this slice"
-            );
-            eprintln!(
-                "[sandbox]          (the loopback exemption API is admin-only; the unprivileged"
-            );
-            eprintln!(
-                "[sandbox]          privateNetworkClientServer-capability path is a follow-up)."
-            );
-            eprintln!("[sandbox]          Downgrading this session to --block-net semantics.");
-            net::NetworkConfig::Blocked
-        }
-        other => other.clone(),
-    };
+    let net_cfg = net_cfg_resolved.clone();
 
     // Build the AppContainer session.
     let session = sandbox::create_session(&sid)
         .with_context(|| format!("create AppContainer session for {sid}"))?;
-
-    // Register loopback for the AC SID BEFORE spawning the proxy (the proxy
-    // doesn't need it, but registering before the child starts is the safe
-    // order). Skip when blocked (no proxy to reach).
-    if !net_cfg.is_blocked()
-        && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
-    {
-        eprintln!("[sandbox] warning: loopback exemption failed: {e}");
-        eprintln!("[sandbox]          direct connects to the proxy will be denied.");
-    }
 
     // Start the proxy (if not blocked) and hold the handle until the child
     // exits. The handle MUST outlive `sandbox::spawn` below so the proxy
