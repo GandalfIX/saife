@@ -1,5 +1,5 @@
 use windows::Win32::Foundation::*;
-use windows::Win32::Security::SECURITY_CAPABILITIES;
+use windows::Win32::Security::{FreeSid, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES};
 use windows::Win32::System::Threading::*;
 use windows::core::*;
 
@@ -201,6 +201,7 @@ pub fn spawn(
     cwd: &std::path::Path,
     env_block: Vec<u16>,
     cmdline: &str,
+    network_active: bool,
 ) -> Result<u32> {
     let mut cmdw: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -227,10 +228,29 @@ pub fn spawn(
             None,
         )?;
 
+        // Allocate the capability SID if network is active. The SID must
+        // outlive CreateProcessW, so it's held in a local.
+        let cap_sid: Option<PSID> = if network_active {
+            crate::sandbox::appcontainer::allocate_private_network_capability_sid()
+        } else {
+            None
+        };
+
+        let mut cap_attrs: [SID_AND_ATTRIBUTES; 1] = [SID_AND_ATTRIBUTES {
+            Sid: cap_sid.unwrap_or(PSID(std::ptr::null_mut())),
+            Attributes: 0,
+        }];
+
+        let (caps_ptr, caps_count) = if network_active {
+            (cap_attrs.as_mut_ptr() as *mut _, 1)
+        } else {
+            (std::ptr::null_mut(), 0)
+        };
+
         let mut sec_caps = SECURITY_CAPABILITIES {
             AppContainerSid: session.ac_sid,
-            Capabilities: std::ptr::null_mut(),
-            CapabilityCount: 0,
+            Capabilities: caps_ptr,
+            CapabilityCount: caps_count,
             Reserved: 0,
         };
         UpdateProcThreadAttribute(
@@ -268,6 +288,13 @@ pub fn spawn(
         );
 
         DeleteProcThreadAttributeList(attr_list);
+
+        // Free the capability SID after CreateProcessW has consumed it
+        // (UpdateProcThreadAttribute copies the pointer into the attribute
+        // list, so the SID memory only needs to be valid through this point).
+        if let Some(sid) = cap_sid {
+            let _ = FreeSid(sid);
+        }
 
         if let Err(e) = result {
             if std::env::var_os("SANDBOX_DIAG").is_some() {

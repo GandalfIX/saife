@@ -348,7 +348,7 @@ fn run_inner(
 
     let job = sandbox::Job::create().context("create Job Object")?;
 
-    let exit_code = sandbox::spawn(&session, &job, &cwd, env_block, &cmdline)
+    let exit_code = sandbox::spawn(&session, &job, &cwd, env_block, &cmdline, !net_cfg.is_blocked())
         .context("spawn sandboxed process")?;
 
     // US-4a: commit the audit root + signature on clean child exit.

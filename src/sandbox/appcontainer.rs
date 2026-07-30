@@ -915,6 +915,33 @@ fn builtin_admins_sid() -> Option<PSID> {
     }
 }
 
+/// Allocate the `privateNetworkClientServer` capability SID (`S-1-15-3-7`).
+/// Returns a raw `PSID` that must be freed with `FreeSid` by the caller.
+/// Returns `None` if the SID allocation fails (should not happen on any
+/// supported Windows build).
+pub(crate) fn allocate_private_network_capability_sid() -> Option<PSID> {
+    let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 15] };
+    let mut sid_ptr: PSID = PSID(std::ptr::null_mut());
+    // S-1-15-3-7: authority 15 (security manager), 2 sub-authorities.
+    // SubAuthority[0] = 3 (capability group), [1] = 7 (privateNetworkClientServer).
+    let sub_authorities: [u32; 2] = [3, 7];
+    unsafe {
+        if AllocateAndInitializeSid(
+            &authority,
+            sub_authorities.len() as u8,
+            sub_authorities[0],
+            sub_authorities[1],
+            0, 0, 0, 0, 0, 0,
+            &mut sid_ptr,
+        ).is_ok()
+        {
+            Some(sid_ptr)
+        } else {
+            None
+        }
+    }
+}
+
 /// Build the child environment block: parent env + `PATH` prepended with
 /// `.sandbox\<sid>\bin`, `PYTHONPATH` prepended with `.sandbox\<sid>\pyshim`
 /// (the CPython 0o700-mkdir interposition — see sitecustomize.py), plus the
@@ -1343,5 +1370,19 @@ mod env_block_tests {
         // child-side env sanitization (venv strips PYTHONPATH but copies
         // every other var).
         assert_eq!(get("SANDBOX_SESSION_SID"), "testsid");
+    }
+}
+
+#[test]
+fn private_network_capability_sid_is_s_1_15_3_7() {
+    let sid = allocate_private_network_capability_sid()
+        .expect("SID allocation should succeed");
+    unsafe {
+        let mut pwstr = PWSTR::null();
+        assert!(ConvertSidToStringSidW(sid, &mut pwstr).is_ok());
+        let s = pwstr.to_string().unwrap();
+        assert_eq!(s, "S-1-15-3-7");
+        let _ = LocalFree(Some(HLOCAL(pwstr.0 as *mut _)));
+        let _ = FreeSid(sid);
     }
 }
