@@ -954,10 +954,12 @@ pub(crate) fn allocate_private_network_capability_sid() -> Option<PSID> {
 /// ensured by an inheritable allow-list grant on it instead
 /// (see `build_allowlist`).
 ///
-/// `proxy: Some(ProxyEnv)` injects `HTTP_PROXY`/`HTTPS_PROXY`/`X-Sandbox-Token`
-/// pointing at the localhost proxy and clears `NO_PROXY` (forces the proxy to
-/// be used for everything, including localhost — some tools default
-/// `NO_PROXY=localhost,127.0.0.1` which would bypass our proxy).
+/// `proxy: Some(ProxyEnv)` injects `HTTP_PROXY`/`HTTPS_PROXY` with the proxy
+/// URL containing userinfo (`http://sandbox:<token>@127.0.0.1:<port>`) so
+/// standard HTTP clients auto-send `Proxy-Authorization: Basic`. Also sets
+/// `SANDBOX_PROXY_PORT` (for discoverability) and `NO_PROXY=localhost,127.0.0.1,::1`
+/// so the child can reach intent endpoints directly (bypassing the proxy —
+/// routing through it would loop).
 /// `proxy: None` (block-net case) explicitly clears all four vars so a
 /// parent shell's proxy settings don't leak into the sandboxed process.
 pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv>) -> Vec<u16> {
@@ -969,21 +971,30 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         .to_string();
 
     // Decide the value (or absence) of the four proxy-related env vars.
-    // `Some` → inject proxy URL + token, empty NO_PROXY.
+    // `Some` → inject proxy URL (with userinfo), port, loopback NO_PROXY.
     // `None` → set all four to empty (override any inherited parent values).
-    let (http_proxy, https_proxy, token_val, no_proxy): (String, String, String, String) =
+    let (http_proxy, https_proxy, sandbox_proxy_port, no_proxy): (String, String, String, String) =
         match proxy {
-            Some(p) => (
-                format!("http://127.0.0.1:{}", p.port),
-                format!("http://127.0.0.1:{}", p.port),
-                p.token.clone(),
+            Some(p) => {
+                let proxy_url = format!("http://sandbox:{}@127.0.0.1:{}", p.token, p.port);
+                (
+                    proxy_url.clone(),
+                    proxy_url,
+                    format!("{}", p.port),
+                    "localhost,127.0.0.1,::1".to_string(),
+                )
+            }
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
                 String::new(),
             ),
-            None => (String::new(), String::new(), String::new(), String::new()),
         };
     // Names of the four proxy vars, in the order we post-process them.
     // Comparison is case-insensitive (Windows env vars are case-insensitive).
-    const PROXY_VARS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "X-Sandbox-Token", "NO_PROXY"];
+    const PROXY_VARS: [&str; 4] =
+        ["HTTP_PROXY", "HTTPS_PROXY", "SANDBOX_PROXY_PORT", "NO_PROXY"];
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
@@ -1017,13 +1028,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
             .position(|name| k.eq_ignore_ascii_case(name))
         {
             proxy_seen[idx] = true;
-            let replacement = [
-                http_proxy.clone(),
-                https_proxy.clone(),
-                token_val.clone(),
-                no_proxy.clone(),
-            ][idx]
-                .clone();
+            let replacement = [http_proxy.clone(), https_proxy.clone(), sandbox_proxy_port.clone(), no_proxy.clone()][idx].clone();
             vars.push((k, replacement));
         } else {
             vars.push((k, v));
@@ -1039,7 +1044,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         vars.push(("SANDBOX_SESSION_SID".to_string(), sid.to_string()));
     }
     // Append any proxy vars that were not present in the parent env.
-    let proxy_values = [http_proxy, https_proxy, token_val, no_proxy];
+    let proxy_values = [http_proxy, https_proxy, sandbox_proxy_port, no_proxy];
     for (idx, name) in PROXY_VARS.iter().enumerate() {
         if !proxy_seen[idx] {
             vars.push((name.to_string(), proxy_values[idx].clone()));

@@ -23,6 +23,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -167,6 +168,46 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
     })
 }
 
+/// Check `Proxy-Authorization: Basic <base64(sandbox:token)>` against the
+/// session token. Constant-time comparison via `subtle::ConstantTimeEq`.
+/// Returns false if the header is missing, malformed, or the token doesn't match.
+fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
+    // Find the Proxy-Authorization header (case-insensitive).
+    let auth_value = head.lines().skip(1).find_map(|l| {
+        let lower = l.to_ascii_lowercase();
+        if lower.starts_with("proxy-authorization:") {
+            Some(l[21..].trim().to_string()) // 21 = len("proxy-authorization:")
+        } else {
+            None
+        }
+    });
+
+    let Some(auth_value) = auth_value else { return false; };
+
+    // Expect "Basic <base64>".
+    let mut parts = auth_value.splitn(2, ' ');
+    let scheme = parts.next().unwrap_or("");
+    let b64 = parts.next().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("Basic") || b64.is_empty() {
+        return false;
+    }
+
+    // Decode base64 -> "sandbox:<token>".
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let decoded_str = match std::str::from_utf8(&decoded) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let (_, password) = decoded_str.split_once(':').unwrap_or(("", ""));
+
+    // Constant-time compare.
+    use subtle::ConstantTimeEq;
+    password.as_bytes().ct_eq(expected_token.as_bytes()).into()
+}
+
 async fn handle_conn(
     mut sock: tokio::net::TcpStream,
     token: Arc<String>,
@@ -191,15 +232,15 @@ async fn handle_conn(
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
 
-    // Token check (AC-3.12). The header is matched case-insensitively on
-    // the field name; the value is compared exactly (tokens are generated
-    // by `net::token` and are case-sensitive hex).
-    let token_ok = head.lines().skip(1).any(|l| {
-        let l = l.to_ascii_lowercase();
-        l.starts_with("x-sandbox-token:") && l[16..].trim() == *token
-    });
+    // Parse Proxy-Authorization: Basic <base64(sandbox:token)>
+    // Standard HTTP clients auto-send this when HTTP_PROXY has userinfo.
+    let token_ok = check_proxy_auth(head, &token);
     if !token_ok {
-        let _ = sock.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n").await;
+        let _ = sock.write_all(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"sandbox\"\r\n\
+              Content-Length: 0\r\n\r\n"
+        ).await;
         emit_connect(&writer, "<unknown>", 0, "deny", Some("no_token"));
         return Ok(());
     }
@@ -275,5 +316,50 @@ async fn handle_conn(
             emit_connect(&writer, &host, port, "deny", Some(reason.as_str()));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_head(auth: &str) -> String {
+        format!("CONNECT api.example.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n")
+    }
+
+    #[test]
+    fn valid_basic_auth() {
+        let token = "abc123";
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+        let head = make_head(&format!("Basic {creds}"));
+        assert!(check_proxy_auth(&head, token));
+    }
+
+    #[test]
+    fn missing_auth_header() {
+        let head = "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert!(!check_proxy_auth(head, "abc123"));
+    }
+
+    #[test]
+    fn wrong_token() {
+        let creds = base64::engine::general_purpose::STANDARD.encode("sandbox:wrong");
+        let head = make_head(&format!("Basic {creds}"));
+        assert!(!check_proxy_auth(&head, "abc123"));
+    }
+
+    #[test]
+    fn wrong_scheme() {
+        let creds = base64::engine::general_purpose::STANDARD.encode("sandbox:abc123");
+        let head = make_head(&format!("Bearer {creds}"));
+        assert!(!check_proxy_auth(&head, "abc123"));
+    }
+
+    #[test]
+    fn case_insensitive_header_name() {
+        let token = "abc123";
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+        let head = format!("CONNECT x:443 HTTP/1.1\r\nproxy-AUTHORIZATION: Basic {creds}\r\n\r\n");
+        assert!(check_proxy_auth(&head, token));
     }
 }

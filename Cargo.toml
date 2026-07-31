@@ -44,6 +44,8 @@ http-body-util = "0.1"
 bytes = "1"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 sha2 = "0.10"
+subtle = "2"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 2
