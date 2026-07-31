@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -174,9 +175,10 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
 fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
     // Find the Proxy-Authorization header (case-insensitive).
     let auth_value = head.lines().skip(1).find_map(|l| {
-        let lower = l.to_ascii_lowercase();
-        if lower.starts_with("proxy-authorization:") {
-            Some(l[21..].trim().to_string()) // 21 = len("proxy-authorization:")
+        // Match the header name case-insensitively, but slice the *original*
+        // line — base64 payload is case-sensitive.
+        if l.to_ascii_lowercase().starts_with("proxy-authorization:") {
+            Some(l["proxy-authorization:".len()..].trim().to_string())
         } else {
             None
         }
@@ -184,8 +186,8 @@ fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
 
     let Some(auth_value) = auth_value else { return false; };
 
-    // Expect "Basic <base64>".
-    let mut parts = auth_value.splitn(2, ' ');
+    // Expect "Basic <base64>" — accept any whitespace (RFC 7230 allows 1*SP).
+    let mut parts = auth_value.split_whitespace();
     let scheme = parts.next().unwrap_or("");
     let b64 = parts.next().unwrap_or("");
     if !scheme.eq_ignore_ascii_case("Basic") || b64.is_empty() {
@@ -204,7 +206,8 @@ fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
     let (_, password) = decoded_str.split_once(':').unwrap_or(("", ""));
 
     // Constant-time compare.
-    use subtle::ConstantTimeEq;
+    // NOTE: ct_eq leaks length on unequal-length slices; acceptable for a
+    // localhost proxy with a fixed-length session token.
     password.as_bytes().ct_eq(expected_token.as_bytes()).into()
 }
 
