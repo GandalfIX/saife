@@ -68,6 +68,8 @@ pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
             "MISSING (requires Windows 10 1709+)"
         }
     );
+    println!("  WARNING (intranet leak)  : raw-socket apps can reach LAN hosts without proxy filtering.");
+    println!("    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)");
     println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());
     println!(
         "Audit (hash-chain + Ed25519): {}",
@@ -77,9 +79,6 @@ pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
             "available (signing key generated on first run)"
         }
     );
-    println!("Ed25519 signing key        : {}", if crate::signing::key_exists() { "present" } else { "absent (will be generated on first run)" });
-    println!("  WARNING (intranet leak)  : raw-socket apps can reach LAN hosts without proxy filtering.");
-    println!("    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)");
 
     if build < MIN_BUILD {
         bail!("host build {build} is below minimum {MIN_BUILD} (AppContainer RuleSet unavailable)");
