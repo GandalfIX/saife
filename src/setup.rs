@@ -60,10 +60,26 @@ pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
         if build >= MIN_BUILD { "available" } else { "MISSING" }
     );
     println!("Job Object                 : available (always, Win9x+)");
-    println!("Reverse proxy (network)    : available (US-3)");
+    println!(
+        "Network (loopback+intranet) : {}",
+        if build >= MIN_BUILD {
+            "available via privateNetworkClientServer capability (unprivileged)"
+        } else {
+            "MISSING (requires Windows 10 1709+)"
+        }
+    );
     println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());
-    println!("ETW audit                  : not yet implemented in this slice");
+    println!(
+        "Audit (hash-chain + Ed25519): {}",
+        if crate::signing::key_exists() {
+            "available (signing key present)"
+        } else {
+            "available (signing key generated on first run)"
+        }
+    );
     println!("Ed25519 signing key        : {}", if crate::signing::key_exists() { "present" } else { "absent (will be generated on first run)" });
+    println!("  WARNING (intranet leak)  : raw-socket apps can reach LAN hosts without proxy filtering.");
+    println!("    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)");
 
     if build < MIN_BUILD {
         bail!("host build {build} is below minimum {MIN_BUILD} (AppContainer RuleSet unavailable)");
