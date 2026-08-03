@@ -1,7 +1,8 @@
+pub mod loopback;
 pub mod matcher;
 pub mod profile;
-pub mod token;
 pub mod proxy;
+pub mod token;
 
 use crate::profile::NetworkSlice;
 

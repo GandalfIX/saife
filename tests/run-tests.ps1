@@ -12,7 +12,7 @@
   python-dependent and skip cleanly. S-12/S-14/S-15 are skipped.
   S-27..S-34, S-36, S-38, S-46 exercise the US-3 network allow-list + proxy
   (AC-3.3..3.14, AC-4.6) and skip cleanly when curl.exe is absent or the
-  AppContainer loopback-to-proxy path is blocked by Windows Firewall.
+  AppContainer loopback path is blocked by Windows Firewall (run elevated).
   S-57 (AC-5.16) covers schema_version gate rejection.
   S-58 (AC-5.12) covers wrong-type field rejection with line/col pointer.
   S-59 (AC-5.13) covers unknown-key rejection with a "Did you mean" suggestion.
@@ -664,7 +664,7 @@ function Invoke-Scenario-S26 {
 # expected). Skip if curl.exe is absent or loopback-to-proxy is blocked.
 function Invoke-Scenario-S27 {
     if (-not (Get-Curl)) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall); run needs loopback exemption' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 27
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
     $code = (($r.Stdout -join '') -replace '\s','')
@@ -679,7 +679,7 @@ function Invoke-Scenario-S27 {
 # PASS if curl fails to connect (non-zero exit, empty/error output).
 function Invoke-Scenario-S28 {
     if (-not (Get-Curl)) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 28
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://evil.example.com') -WorkingDirectory $d
     $code = (($r.Stdout -join '') -replace '\s','')
@@ -695,7 +695,7 @@ function Invoke-Scenario-S28 {
 # connection succeeds (http_code is 4xx/5xx = reached the server).
 function Invoke-Scenario-S29 {
     if (-not (Get-Curl)) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 29
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
     $code = (($r.Stdout -join '') -replace '\s','')
@@ -710,7 +710,7 @@ function Invoke-Scenario-S29 {
 # overridden. PASS if curl fails (denied).
 function Invoke-Scenario-S30 {
     if (-not (Get-Curl)) { return @{ Num=30; Name='S-30 (AC-3.6)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=30; Name='S-30 (AC-3.6)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=30; Name='S-30 (AC-3.6)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 30
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','169.254.169.254','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://169.254.169.254') -WorkingDirectory $d
     $code = (($r.Stdout -join '') -replace '\s','')
@@ -725,7 +725,7 @@ function Invoke-Scenario-S30 {
 # curl fails (denied).
 function Invoke-Scenario-S31 {
     if (-not (Get-Curl)) { return @{ Num=31; Name='S-31 (AC-3.7)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=31; Name='S-31 (AC-3.7)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=31; Name='S-31 (AC-3.7)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 31
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','metadata.google.internal','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://metadata.google.internal') -WorkingDirectory $d
     $code = (($r.Stdout -join '') -replace '\s','')
@@ -740,7 +740,7 @@ function Invoke-Scenario-S31 {
 # not github.com. PASS if the first curl succeeds AND the second fails.
 function Invoke-Scenario-S32 {
     if (-not (Get-Curl)) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 32
     $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
     $code1 = (($r1.Stdout -join '') -replace '\s','')
@@ -758,7 +758,7 @@ function Invoke-Scenario-S32 {
 # if both curls succeed (reach the server).
 function Invoke-Scenario-S33 {
     if (-not (Get-Curl)) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 33
     $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','developer','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com') -WorkingDirectory $d
     $code1 = (($r1.Stdout -join '') -replace '\s','')
@@ -776,7 +776,7 @@ function Invoke-Scenario-S33 {
 # api.anthropic.com, CLI flag adds github.com. PASS if both succeed.
 function Invoke-Scenario-S34 {
     if (-not (Get-Curl)) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 34
     $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--allow-domain','github.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com') -WorkingDirectory $d
     $code1 = (($r1.Stdout -join '') -replace '\s','')
@@ -817,7 +817,7 @@ function Invoke-Scenario-S35 {
 # response contains 407 or curl exits with a proxy-auth error.
 function Invoke-Scenario-S36 {
     if (-not (Get-Curl)) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 36
     # %SANDBOX_PROXY_PORT% is injected by the sandbox env block. curl -x takes
     # precedence over HTTP_PROXY; a URL without userinfo sends no auth header.
@@ -849,7 +849,7 @@ function Invoke-Scenario-S37 {
 # is released. PASS if no TCP listener remains on the port.
 function Invoke-Scenario-S38 {
     if (-not (Get-Curl)) { return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 38
     $oldDiag = $env:SANDBOX_DIAG
     $env:SANDBOX_DIAG = '1'
@@ -1066,7 +1066,7 @@ function Invoke-Scenario-S45 {
 # writer is created (the --print-sid-only path returns early before opening it).
 function Invoke-Scenario-S46 {
     if (-not (Get-Curl)) { return @{ Num=46; Name='S-46 (AC-4.6)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=46; Name='S-46 (AC-4.6)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback-to-proxy blocked (firewall)' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=46; Name='S-46 (AC-4.6)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 46
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--print-sid','--','cmd','/c','echo','placeholder') -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=46; Name='S-46 (AC-4.6)'; Passed=$false; Skipped=$false; Detail='print-sid failed' } }
@@ -1794,7 +1794,7 @@ function Main {
         $loopbackSkipped = $false
         foreach ($r in $results) {
             if ($r.PythonSkipped) { $pythonSkipped = $true }
-            if ($r.Detail -match 'loopback-to-proxy blocked') { $loopbackSkipped = $true }
+            if ($r.Detail -match 'loopback blocked') { $loopbackSkipped = $true }
         }
         if ($hardFail) { Write-Host "SANDBOX: FAIL" -ForegroundColor Red }
         elseif ($loopbackSkipped -and $pythonSkipped) { Write-Host "SANDBOX: PASS (loopback + python scenarios skipped)" -ForegroundColor Yellow }

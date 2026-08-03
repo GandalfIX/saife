@@ -42,11 +42,8 @@ fn main() {
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { action } => profile_cmd(action),
-        Cmd::Setup {
-            check_only,
-            grant_drive_root,
-        } => {
-            if let Err(e) = setup::check(check_only, grant_drive_root) {
+        Cmd::Setup { check_only, grant_drive_root, enable_loopback } => {
+            if let Err(e) = setup::check(check_only, grant_drive_root, enable_loopback) {
                 eprintln!("[sandbox] setup check failed: {e:#}");
                 std::process::exit(1);
             }
@@ -275,6 +272,21 @@ fn run_inner(
     // Build the AppContainer session.
     let session = sandbox::create_session(&sid)
         .with_context(|| format!("create AppContainer session for {sid}"))?;
+
+    // Register loopback for the AC SID before spawning the proxy. The
+    // privateNetworkClientServer capability SID (Task D-0.1) grants network
+    // API rights but does NOT add a Windows Firewall loopback exemption —
+    // these are separate mechanisms. This admin-only call adds the SID to
+    // the loopback exempt list so the sandboxed process can reach the proxy
+    // on 127.0.0.1:<port>. Fails gracefully when unprivileged (degrades to
+    // block-net behavior with a warning).
+    if !net_cfg.is_blocked()
+        && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
+    {
+        eprintln!("[sandbox] warning: loopback exemption failed: {e}");
+        eprintln!("[sandbox]          Run 'sandbox setup --enable-loopback' as administrator");
+        eprintln!("[sandbox]          to enable network access, or use --block-net.");
+    }
 
     // Start the proxy (if not blocked) and hold the handle until the child
     // exits. The handle MUST outlive `sandbox::spawn` below so the proxy

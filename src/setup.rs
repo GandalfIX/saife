@@ -43,13 +43,42 @@ pub fn check_runtime() -> Result<()> {
 
 /// Called from `setup`: reports the feature matrix (`--check-only`) and/or
 /// applies the one-time drive-root grant (`--grant-drive-root`).
-pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
+pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) -> Result<()> {
     if grant_drive_root {
         grant_drive_roots()?;
         // After granting, fall through to the report so the user sees the
         // resulting state.
+    } else if enable_loopback {
+        // Diagnostic: list the current loopback exempt list. The actual
+        // per-session SID does not exist yet (it is created at `sandbox run`
+        // time), so we cannot pre-register it here. Runtime registration is
+        // performed in `main.rs` after the AppContainer session is created;
+        // it succeeds only when elevated and degrades to block-net otherwise.
+        println!("[loopback] current LoopbackExempt list (CheckNetIsolation):");
+        let out = std::process::Command::new("CheckNetIsolation")
+            .args(["LoopbackExempt", "-s"])
+            .output();
+        match out {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if !stdout.trim().is_empty() {
+                    print!("{stdout}");
+                }
+                if !stderr.trim().is_empty() {
+                    eprint!("{stderr}");
+                }
+            }
+            Err(e) => {
+                eprintln!("[loopback] CheckNetIsolation not available: {e}");
+            }
+        }
+        println!("[loopback] loopback is registered automatically at runtime when");
+        println!("[loopback] `sandbox run` is invoked elevated. Unprivileged users");
+        println!("[loopback] need to either run elevated or use --block-net.");
+        // Fall through to the report.
     } else if !check_only {
-        eprintln!("[sandbox] `setup` without --check-only or --grant-drive-root is not implemented in this slice.");
+        eprintln!("[sandbox] `setup` without --check-only, --grant-drive-root, or --enable-loopback is not implemented in this slice.");
     }
 
     let build = os_build_number()?;
@@ -63,11 +92,12 @@ pub fn check(check_only: bool, grant_drive_root: bool) -> Result<()> {
     println!(
         "Network (loopback+intranet) : {}",
         if build >= MIN_BUILD {
-            "available via privateNetworkClientServer capability (unprivileged)"
+            "available via privateNetworkClientServer capability"
         } else {
             "MISSING (requires Windows 10 1709+)"
         }
     );
+    println!("  NOTE                     : loopback firewall exemption required (admin). Run elevated for --allow-domain.");
     println!("  WARNING (intranet leak)  : raw-socket apps can reach LAN hosts without proxy filtering.");
     println!("    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)");
     println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());

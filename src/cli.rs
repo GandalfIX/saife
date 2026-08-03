@@ -96,6 +96,15 @@ pub enum Cmd {
         /// cannot be granted per-session unprivileged).
         #[arg(long)]
         grant_drive_root: bool,
+
+        /// Enable AppContainer loopback access (one-time, requires elevation).
+        /// Adds the current user's AppContainer SIDs to the Windows Firewall
+        /// loopback exempt list. Required for --allow-domain / --network-profile
+        /// to work. Without this, the sandboxed process cannot reach the proxy.
+        /// Note: per-session SIDs still need runtime registration; this command
+        /// is a diagnostic that checks the current loopback exempt state.
+        #[arg(long)]
+        enable_loopback: bool,
     },
 }
 
