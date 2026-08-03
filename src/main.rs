@@ -284,8 +284,8 @@ fn run_inner(
         && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
     {
         eprintln!("[sandbox] warning: loopback exemption failed: {e}");
-        eprintln!("[sandbox]          Run 'sandbox setup --enable-loopback' as administrator");
-        eprintln!("[sandbox]          to enable network access, or use --block-net.");
+        eprintln!("[sandbox]          Re-run 'sandbox run' as administrator (loopback is");
+        eprintln!("[sandbox]          registered automatically when elevated), or use --block-net.");
     }
 
     // Start the proxy (if not blocked) and hold the handle until the child
