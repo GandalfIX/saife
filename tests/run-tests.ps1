@@ -1809,5 +1809,37 @@ function Main {
     return 0
 }
 
-$rc = Main
+function Cleanup-Acls {
+    # Remove AppContainer (S-1-15-2-*) ACEs that sandbox runs added to the
+    # ancestor directories. These persist and accumulate; if left they
+    # eventually cause SetNamedSecurityInfoW to hang (see AGENTS.md).
+    $paths = @(
+        $env:USERPROFILE,
+        (Join-Path $env:USERPROFILE "AppData"),
+        (Join-Path $env:USERPROFILE "AppData\Local"),
+        $env:TEMP
+    )
+    $removed = 0
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+            $stale = @($acl.Access | Where-Object { $_.IdentityReference.Value -match '^S-1-15-2-\d+-\d+-\d+-\d+-\d+-\d+-\d+' })
+            if ($stale.Count -eq 0) { continue }
+            foreach ($ace in $stale) { $acl.RemoveAccessRuleSpecific($ace) | Out-Null }
+            Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+            $removed += $stale.Count
+        } catch {
+            Write-Host "[cleanup] WARN: failed to clean ACL on ${path}: $_" -ForegroundColor Yellow
+        }
+    }
+    if ($removed -gt 0) { Write-Host "[cleanup] removed $removed AppContainer ACEs from ancestor dirs" -ForegroundColor DarkGray }
+}
+
+$rc = 0
+try {
+    $rc = Main
+} finally {
+    Cleanup-Acls
+}
 exit $rc

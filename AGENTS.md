@@ -36,3 +36,38 @@ run inside the disposable test VM via `tests/vm/Invoke-TestsInVM.ps1` — see
 `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`. For VM-run
 tests, VM deletion is the rollback. For any test that still runs on the
 physical host, the rollback-script rule above remains mandatory.
+
+### ACL / ACE cleanup after every test run
+
+The sandbox grants the per-session AppContainer SID access on the CWD and its
+ancestor directories (e.g. `$env:TEMP`, `AppData\Local`) via
+`SetNamedSecurityInfoW`. These ACEs **persist on the host** after the sandbox
+exits — they are never removed automatically. Over many test runs they
+accumulate until the ACL on the ancestor directory becomes so large that
+`SetNamedSecurityInfoW` / `GetNamedSecurityInfoW` hangs (observed at ~40+ ACEs
+on `AppData\Local`, causing `sandbox run --block-net` to deadlock in
+`grant_access`).
+
+**Rule:** every test run that exercises `sandbox run` (or anything that calls
+`grant_access` / `build_allowlist`) MUST clean up the ACEs it created
+afterwards. Two complementary mechanisms:
+
+1. **Per-session cleanup (Rust):** `sandbox run` should remove the ACEs it
+   added to the CWD ancestor directories on exit (after the child process
+   returns, before the supervisor exits). The per-session `.sandbox\<sid>`
+   directory is also removed. This is the primary defense — it runs
+   automatically. *(Not yet implemented; tracked as a follow-up.)*
+2. **Test harness cleanup (PowerShell):** `tests/run-tests.ps1` must, after the
+   suite completes (on success OR failure), remove any `S-1-15-2-*`
+   (AppContainer) ACEs that the run added to `$env:TEMP`, `AppData\Local`, and
+   the user profile root. The cleanup runs in a `finally` block so it executes
+   even if the harness is killed with Ctrl-C. A standalone cleanup script
+   (`tests/cleanup-acls.ps1`) is also provided so a user can manually recover
+   from a killed run.
+
+**Before running the test harness**, verify the ancestor ACLs are not already
+bloated:
+```powershell
+(icacls $env:TEMP | Select-String "S-1-15-2").Count
+```
+If the count is > 10, run `.\tests\cleanup-acls.ps1` first.
