@@ -46,7 +46,9 @@ pub enum Cmd {
         #[arg(long, value_name = "NAME")]
         network_profile: Option<String>,
 
-        /// Strict audit mode: abort the run if the audit log can't be written.
+        /// Strict audit mode: abort the run if the audit log can't be opened or
+        /// the session-start event can't be written. CONNECT audit events remain
+        /// best-effort (a mid-stream write failure does not kill active connections).
         #[arg(long)]
         audit_strict: bool,
 

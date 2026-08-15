@@ -3,11 +3,13 @@
 //! Grammar (AC-4.13):
 //!   filter  := clause ( "&" clause )*
 //!   clause  := key ( "=" | "~=" | ">=" | "<=" ) value
-//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq"
+//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted"
 //!   value   := bare-string (no & or = chars)
 //!
 //! Semantics:
-//!   `=`  — exact string match (case-sensitive for op/disposition; case-insensitive otherwise).
+//!   `=`  — exact string match (case-sensitive for op/disposition/source/scope,
+//!          which are enum-like taxonomy values; case-insensitive otherwise).
+//!          `persisted` is a boolean (`true`/`false`).
 //!   `~=` — substring match (case-insensitive).
 //!   `>=` / `<=` — for ts: ISO-8601 lexicographic; for seq/pid: integer.
 //! Multiple clauses AND together.
@@ -31,7 +33,9 @@ pub struct Filter {
     clauses: Vec<Clause>,
 }
 
-const KNOWN_KEYS: &[&str] = &["op", "disposition", "host", "path", "ts", "pid", "seq"];
+const KNOWN_KEYS: &[&str] = &[
+    "op", "disposition", "host", "path", "ts", "pid", "seq", "source", "scope", "persisted",
+];
 
 impl Filter {
     /// Parse a filter expression. Empty string returns a Filter that matches
@@ -101,7 +105,11 @@ fn clause_matches(c: &Clause, leaf: &Value) -> bool {
 }
 
 fn eq_match(key: &str, actual: &Value, expected: &str) -> bool {
-    if key == "op" || key == "disposition" {
+    if key == "persisted" {
+        // boolean field; expected is "true"/"false" string
+        let expected_bool = expected.eq_ignore_ascii_case("true");
+        actual.as_bool().map(|b| b == expected_bool).unwrap_or(false)
+    } else if key == "op" || key == "disposition" || key == "source" || key == "scope" {
         // case-sensitive for these enums
         actual.as_str().map(|s| s == expected).unwrap_or(false)
     } else {
@@ -214,5 +222,48 @@ mod tests {
         assert!(Filter::parse("op=").is_err());          // no value
         assert!(Filter::parse("boguskey=x").is_err());   // unknown key
         assert!(Filter::parse("op=CONNECT&").is_err());  // trailing empty clause
+    }
+
+    #[test]
+    fn source_eq_hard_deny_matches() {
+        let f = Filter::parse("source=hard-deny").unwrap();
+        assert!(f.matches(&leaf(&[("source", json!("hard-deny"))])));
+        assert!(!f.matches(&leaf(&[("source", json!("allowlist"))])));
+    }
+
+    #[test]
+    fn source_eq_allowlist_excludes_other_sources() {
+        let f = Filter::parse("source=allowlist").unwrap();
+        assert!(f.matches(&leaf(&[("source", json!("allowlist"))])));
+        assert!(!f.matches(&leaf(&[("source", json!("hard-deny"))])));
+        assert!(!f.matches(&leaf(&[("source", json!("default"))])));
+    }
+
+    #[test]
+    fn source_eq_is_case_sensitive() {
+        let f = Filter::parse("source=hard-deny").unwrap();
+        assert!(f.matches(&leaf(&[("source", json!("hard-deny"))])));
+        assert!(!f.matches(&leaf(&[("source", json!("HARD-DENY"))])));
+    }
+
+    #[test]
+    fn scope_eq_matches() {
+        let f = Filter::parse("scope=host").unwrap();
+        assert!(f.matches(&leaf(&[("scope", json!("host"))])));
+        assert!(!f.matches(&leaf(&[("scope", json!("suffix"))])));
+    }
+
+    #[test]
+    fn persisted_eq_true_matches_only_persisted() {
+        let f = Filter::parse("persisted=true").unwrap();
+        assert!(f.matches(&leaf(&[("persisted", json!(true))])));
+        assert!(!f.matches(&leaf(&[("persisted", json!(false))])));
+    }
+
+    #[test]
+    fn persisted_eq_false_matches_only_unpersisted() {
+        let f = Filter::parse("persisted=false").unwrap();
+        assert!(f.matches(&leaf(&[("persisted", json!(false))])));
+        assert!(!f.matches(&leaf(&[("persisted", json!(true))])));
     }
 }
