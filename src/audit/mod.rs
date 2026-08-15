@@ -1,6 +1,21 @@
 //! US-4a audit core: hash-chain NDJSON leaves, canonicalization, hashing.
 //! This module grows across tasks; for now it holds the pure canonicalization
 //! logic. The existing writer code from US-3 is folded in by Task 5.
+//!
+//! ## Reserved event: `secret.inject` (D-5.2, not yet emitted)
+//!
+//! Schema (a complete leaf; `seq`/`ts`/`hash`/`parent` are added by
+//! [`AuditWriter::append`], the caller supplies only `op` + `name`):
+//!
+//! ```json
+//! {"op": "secret.inject", "name": "<secret-name>", "seq": <u64>, "ts": "<iso8601>", "hash": "<hex>", "parent": "<hex|null>"}
+//! ```
+//!
+//! The `name` field identifies the secret being injected (e.g. an env var
+//! name or a file path identifier). This schema is reserved for F-2
+//! (credential injection), which is out of scope for ADR-0001. No emission
+//! code exists yet; see [`SECRET_INJECT_SCHEMA`] for the machine-checked
+//! contract.
 
 pub mod filter;
 pub mod show;
@@ -13,6 +28,15 @@ use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+/// Reserved schema template for the `secret.inject` audit event (D-5.2).
+/// Kept as a const so future F-2 emission code and tests share a single
+/// source of truth; no production call site consumes it yet (only tests
+/// reference it), so it is `#[allow(dead_code)]` until F-2 lands. See the
+/// module-level doc comment for the full schema description.
+#[allow(dead_code)]
+pub const SECRET_INJECT_SCHEMA: &str =
+    r#"{"op": "secret.inject", "name": "<secret-name>", "seq": <u64>, "ts": "<iso8601>", "hash": "<hex>", "parent": "<hex|null>"}"#;
 
 pub fn audit_log_path(session_id: &str) -> PathBuf {
     let local = std::env::var_os("LOCALAPPDATA")
@@ -352,5 +376,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(last_hash.is_some());
         assert_eq!(next_seq, 3);
+    }
+
+    #[test]
+    fn secret_inject_schema_is_reserved() {
+        // References SECRET_INJECT_SCHEMA so it isn't flagged dead_code; also
+        // pins the reserved `secret.inject` event contract (D-5.2) so an
+        // accidental rename or drop is caught. See the module doc comment for
+        // the full schema.
+        assert!(SECRET_INJECT_SCHEMA.contains("\"op\""), "schema must name the op field");
+        assert!(SECRET_INJECT_SCHEMA.contains("\"secret.inject\""), "schema must reserve the secret.inject op");
+        assert!(SECRET_INJECT_SCHEMA.contains("\"name\""), "schema must include the name field");
+        // Hash-chain fields are added by AuditWriter::append; the schema
+        // template should enumerate them so the contract is explicit.
+        for key in ["\"seq\"", "\"ts\"", "\"hash\"", "\"parent\""] {
+            assert!(
+                SECRET_INJECT_SCHEMA.contains(key),
+                "schema must enumerate the {key} hash-chain field"
+            );
+        }
     }
 }
