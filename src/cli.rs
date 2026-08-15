@@ -42,6 +42,17 @@ pub enum Cmd {
         #[arg(long, value_name = "DOMAIN")]
         allow_domain: Vec<String>,
 
+        /// Deny a domain (repeatable). Checked before the allow-list; deny
+        /// always wins. Complements the profile `network.denyDomain` field.
+        #[arg(long, value_name = "DOMAIN")]
+        deny_domain: Vec<String>,
+
+        /// Disable the interactive network prompt entirely. Unlisted hosts are
+        /// denied (or allowed, per `onUnavailable`). Distinct from
+        /// `onUnavailable=deny`, which only governs the prompt-unavailable case.
+        #[arg(long)]
+        no_prompt: bool,
+
         /// Network profile name: none | minimal | developer.
         #[arg(long, value_name = "NAME")]
         network_profile: Option<String>,
@@ -157,6 +168,8 @@ pub struct RunArgs {
     pub read_only: Vec<String>,
     pub block_net: bool,
     pub allow_domain: Vec<String>,
+    pub deny_domain: Vec<String>,
+    pub no_prompt: bool,
     pub network_profile: Option<String>,
     pub print_sid: bool,
     pub sid: Option<String>,
@@ -173,6 +186,8 @@ impl RunArgs {
         read_only: Vec<String>,
         block_net: bool,
         allow_domain: Vec<String>,
+        deny_domain: Vec<String>,
+        no_prompt: bool,
         network_profile: Option<String>,
         print_sid: bool,
         sid: Option<String>,
@@ -185,6 +200,8 @@ impl RunArgs {
             read_only,
             block_net,
             allow_domain,
+            deny_domain,
+            no_prompt,
             network_profile,
             print_sid,
             sid,

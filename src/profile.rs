@@ -121,7 +121,12 @@ pub fn to_expanded_json(
         "network": {
             "block": resolved.network.block_net,
             "allow_domain": resolved.network.allow_domain,
+            "deny_domain": resolved.network.deny_domain,
             "profile": resolved.network.profile_name,
+            "prompt_enabled": resolved.network.prompt_enabled,
+            "on_unavailable": resolved.network.on_unavailable,
+            "prompt_timeout_secs": resolved.network.prompt_timeout_secs,
+            "upstream_proxy": resolved.network.upstream_proxy,
         }
     });
     serde_json::to_string_pretty(&expanded).unwrap_or_else(|_| "{}".into())
@@ -155,6 +160,11 @@ pub struct NetworkSlice {
     pub block_net: bool,
     pub allow_domain: Vec<String>,
     pub profile_name: Option<String>,
+    pub deny_domain: Vec<String>,
+    pub prompt_enabled: Option<bool>,
+    pub on_unavailable: Option<String>,
+    pub prompt_timeout_secs: Option<u32>,
+    pub upstream_proxy: Option<String>,
 }
 
 /// The full resolved profile (filesystem slice only for this MVP slice).
@@ -253,10 +263,33 @@ pub struct RawFilesystem {
 pub struct RawNetwork {
     #[serde(default)]
     pub block_net: bool,
-    #[serde(default)]
+    /// Accept both `allow_domain` (canonical snake_case) and `allowDomain`
+    /// (legacy camelCase) for backward compatibility, matching the
+    /// `meta.schema_version` alias convention.
+    #[serde(default, alias = "allowDomain")]
     pub allow_domain: Vec<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Domains always denied, checked before the allow-list (deny wins).
+    /// Profile-only (no CLI equivalent); the CLI uses `--deny-domain`.
+    #[serde(default, rename = "denyDomain")]
+    pub deny_domain: Vec<String>,
+    /// Whether the interactive network prompt is shown for unlisted hosts.
+    /// Defaults to `true` when the network is active ([G-47]).
+    #[serde(default, rename = "promptEnabled")]
+    pub prompt_enabled: Option<bool>,
+    /// What to do when a host is unavailable / prompt times out:
+    /// `"deny"` (default) or `"allow"`. Profile-only ([G-48]).
+    #[serde(default, rename = "onUnavailable")]
+    pub on_unavailable: Option<String>,
+    /// Seconds before the prompt auto-denies. Default 60; `0` = instant deny
+    /// (handled by the prompt layer in D-3.5). Profile-only ([G-46]).
+    #[serde(default, rename = "promptTimeoutSecs")]
+    pub prompt_timeout_secs: Option<u32>,
+    /// Upstream proxy URL (e.g. `http://corp:8080`). Parsed now, consumed in
+    /// Phase 4.
+    #[serde(default, rename = "upstreamProxy")]
+    pub upstream_proxy: Option<String>,
 }
 
 /// `workdir` block. `access` is the only documented key in v1
@@ -456,6 +489,11 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
             block_net: c.block_net || p.block_net,
             allow_domain: dedupe_concat(p.allow_domain, c.allow_domain),
             profile: c.profile.or(p.profile),
+            deny_domain: dedupe_concat(p.deny_domain, c.deny_domain),
+            prompt_enabled: c.prompt_enabled.or(p.prompt_enabled),
+            on_unavailable: c.on_unavailable.or(p.on_unavailable),
+            prompt_timeout_secs: c.prompt_timeout_secs.or(p.prompt_timeout_secs),
+            upstream_proxy: c.upstream_proxy.or(p.upstream_proxy),
         }),
         (Some(p), None) => Some(p),
         (None, Some(c)) => Some(c),
@@ -514,6 +552,11 @@ fn resolve_network_slice(raw: &Option<RawNetwork>) -> NetworkSlice {
         block_net: raw.block_net,
         allow_domain: raw.allow_domain.clone(),
         profile_name: raw.profile.clone(),
+        deny_domain: raw.deny_domain.clone(),
+        prompt_enabled: raw.prompt_enabled,
+        on_unavailable: raw.on_unavailable.clone(),
+        prompt_timeout_secs: raw.prompt_timeout_secs,
+        upstream_proxy: raw.upstream_proxy.clone(),
     }
 }
 
@@ -848,6 +891,7 @@ mod tests {
                 block_net: false,
                 allow_domain: vec!["api.anthropic.com".into()],
                 profile_name: Some("minimal".into()),
+                ..Default::default()
             },
         };
         let groups_expanded: Vec<(String, Vec<PathBuf>)> = vec![
@@ -862,5 +906,91 @@ mod tests {
         assert_eq!(v["network"]["block"], false);
         assert_eq!(v["network"]["allow_domain"][0], "api.anthropic.com");
         assert_eq!(v["network"]["profile"], "minimal");
+    }
+
+    #[test]
+    fn raw_network_parses_camel_case_prompt_fields() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allowDomain":["a.com"],"denyDomain":["*.evil.com"],"promptEnabled":false,"onUnavailable":"allow","promptTimeoutSecs":30,"upstreamProxy":"http://corp:8080"}}"#;
+        let p: RawProfile = serde_json::from_str(raw).expect("parses");
+        let n = p.network.unwrap();
+        assert_eq!(n.deny_domain, vec!["*.evil.com"]);
+        assert_eq!(n.prompt_enabled, Some(false));
+        assert_eq!(n.on_unavailable.as_deref(), Some("allow"));
+        assert_eq!(n.prompt_timeout_secs, Some(30));
+        assert_eq!(n.upstream_proxy.as_deref(), Some("http://corp:8080"));
+    }
+
+    #[test]
+    fn raw_network_backward_compat_missing_prompt_fields() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allowDomain":["a.com"]}}"#;
+        let p: RawProfile = serde_json::from_str(raw).expect("parses");
+        let n = p.network.unwrap();
+        assert!(n.deny_domain.is_empty());
+        assert_eq!(n.prompt_enabled, None);
+        assert_eq!(n.on_unavailable, None);
+        assert_eq!(n.prompt_timeout_secs, None);
+        assert_eq!(n.upstream_proxy, None);
+    }
+
+    #[test]
+    fn merge_profiles_concatenates_deny_domain() {
+        let parent = RawProfile {
+            network: Some(RawNetwork {
+                deny_domain: vec!["*.a.com".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = RawProfile {
+            network: Some(RawNetwork {
+                deny_domain: vec!["*.b.com".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge_profiles(parent, child);
+        let n = merged.network.unwrap();
+        assert_eq!(n.deny_domain.len(), 2);
+    }
+
+    #[test]
+    fn resolve_network_slice_copies_prompt_fields() {
+        let raw = RawNetwork {
+            deny_domain: vec!["*.evil.com".into()],
+            prompt_enabled: Some(false),
+            on_unavailable: Some("allow".into()),
+            prompt_timeout_secs: Some(10),
+            upstream_proxy: Some("http://corp:8080".into()),
+            ..Default::default()
+        };
+        let slice = resolve_network_slice(&Some(raw));
+        assert_eq!(slice.deny_domain, vec!["*.evil.com"]);
+        assert_eq!(slice.prompt_enabled, Some(false));
+        assert_eq!(slice.on_unavailable.as_deref(), Some("allow"));
+        assert_eq!(slice.prompt_timeout_secs, Some(10));
+        assert_eq!(slice.upstream_proxy.as_deref(), Some("http://corp:8080"));
+    }
+
+    #[test]
+    fn expanded_json_emits_prompt_fields() {
+        let resolved = ResolvedProfile {
+            name: "x".into(),
+            filesystem: FilesystemSlice::default(),
+            network: NetworkSlice {
+                allow_domain: vec!["a.com".into()],
+                deny_domain: vec!["*.evil.com".into()],
+                prompt_enabled: Some(true),
+                on_unavailable: Some("deny".into()),
+                prompt_timeout_secs: Some(60),
+                upstream_proxy: None,
+                ..Default::default()
+            },
+        };
+        let json = to_expanded_json(&resolved, &[]);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["network"]["deny_domain"][0], "*.evil.com");
+        assert_eq!(v["network"]["prompt_enabled"], true);
+        assert_eq!(v["network"]["on_unavailable"], "deny");
+        assert_eq!(v["network"]["prompt_timeout_secs"], 60);
     }
 }

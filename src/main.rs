@@ -23,6 +23,8 @@ fn main() {
             read_only,
             block_net,
             allow_domain,
+            deny_domain,
+            no_prompt,
             network_profile,
             audit_strict,
             print_sid,
@@ -35,6 +37,8 @@ fn main() {
             read_only,
             block_net,
             allow_domain,
+            deny_domain,
+            no_prompt,
             network_profile,
             audit_strict,
             print_sid,
@@ -153,6 +157,8 @@ fn run_cmd(
     read_only: Vec<String>,
     block_net: bool,
     allow_domain: Vec<String>,
+    deny_domain: Vec<String>,
+    no_prompt: bool,
     network_profile: Option<String>,
     audit_strict: bool,
     print_sid: bool,
@@ -171,6 +177,8 @@ fn run_cmd(
         &read_only,
         block_net,
         &allow_domain,
+        &deny_domain,
+        no_prompt,
         network_profile.as_deref(),
         audit_strict,
         print_sid,
@@ -193,6 +201,8 @@ fn run_inner(
     read_only: &[String],
     block_net: bool,
     allow_domain: &[String],
+    deny_domain: &[String],
+    no_prompt: bool,
     network_profile: Option<&str>,
     audit_strict: bool,
     print_sid: bool,
@@ -208,8 +218,14 @@ fn run_inner(
     };
 
     // Resolve the network configuration from the profile slice + CLI flags.
-    let net_cfg_resolved =
-        net::resolve_network(&resolved.network, block_net, allow_domain, network_profile);
+    let net_cfg_resolved = net::resolve_network(
+        &resolved.network,
+        block_net,
+        allow_domain,
+        deny_domain,
+        no_prompt,
+        network_profile,
+    );
 
     // Merge CLI flags on top of the profile.
     let fs = profile::merge_filesystem(&resolved.filesystem, allow_cwd, allow, read_only, &cwd)?;

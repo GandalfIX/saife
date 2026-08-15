@@ -20,6 +20,22 @@ pub enum NetworkConfig {
     #[allow(dead_code)]
     Allow {
         allow_domain: Vec<String>,
+        /// Domains always denied, checked before `allow_domain` (deny wins).
+        /// Merged from the profile `network.denyDomain` and the CLI `--deny-domain`.
+        deny_domain: Vec<String>,
+        /// Whether the interactive prompt is shown for unlisted hosts ([G-47]).
+        /// Defaults to `true` unless the profile sets `promptEnabled: false` or
+        /// the CLI passes `--no-prompt`.
+        prompt_enabled: bool,
+        /// Action when a host is unavailable / the prompt times out: `"deny"`
+        /// (default) or `"allow"`. Profile-only ([G-48]).
+        on_unavailable: String,
+        /// Seconds before the prompt auto-denies. Default 60; `0` = instant
+        /// deny (handled by the prompt layer in D-3.5). Profile-only ([G-46]).
+        prompt_timeout_secs: u32,
+        /// Upstream proxy URL. Parsed now, consumed in Phase 4.
+        upstream_proxy: Option<String>,
+        profile_name: Option<String>,
         proxy_port: Option<u16>,
         token: Option<String>,
     },
@@ -48,6 +64,8 @@ pub fn resolve_network(
     profile_net: &NetworkSlice,
     cli_block_net: bool,
     cli_allow_domain: &[String],
+    cli_deny_domain: &[String],
+    cli_no_prompt: bool,
     cli_network_profile: Option<&str>,
 ) -> NetworkConfig {
     let block = cli_block_net
@@ -76,16 +94,49 @@ pub fn resolve_network(
     allow.extend(cli_allow_domain.iter().cloned());
     allow = dedupe(allow);
 
-    // Deny-by-default: an empty allow-list is semantically identical to
-    // Blocked (the proxy would deny every host), so skip the proxy entirely.
-    // This also avoids spurious "deferred" warnings when the user passes no
-    // network flags at all (the common case).
-    if allow.is_empty() {
+    // Merge deny-list from profile + CLI (deny wins over allow; checked first
+    // by the proxy/prompt layer).
+    let mut deny: Vec<String> = Vec::new();
+    deny.extend(profile_net.deny_domain.iter().cloned());
+    deny.extend(cli_deny_domain.iter().cloned());
+    deny = dedupe(deny);
+
+    // [G-47] prompt defaults to ON when the network is active, unless the
+    // profile explicitly sets `promptEnabled: false` or the CLI passes
+    // `--no-prompt`.
+    let prompt_enabled = !cli_no_prompt
+        && profile_net.prompt_enabled.unwrap_or(true);
+
+    // [G-48] `onUnavailable` defaults to "deny". Profile-only field.
+    let on_unavailable = profile_net.on_unavailable.clone()
+        .unwrap_or_else(|| "deny".to_string());
+
+    // [G-46] `promptTimeoutSecs` defaults to 60. Profile-only field.
+    // `0` means "instant deny" (handled by the prompt layer in D-3.5).
+    let prompt_timeout_secs = profile_net.prompt_timeout_secs.unwrap_or(60);
+
+    // Deny-by-default: when neither an allow-list nor a deny-list is present,
+    // there is nothing to enforce — skip the proxy entirely. This also avoids
+    // spurious "deferred" warnings when the user passes no network flags at
+    // all (the common case).
+    if allow.is_empty() && deny.is_empty() {
+        return NetworkConfig::Blocked;
+    }
+    // Allow-list mode: an empty allow-list is Blocked only when the prompt is
+    // off. When the prompt is on, an empty allow-list means "prompt for
+    // everything" (the deny-list still hard-denies its entries).
+    if allow.is_empty() && !prompt_enabled {
         return NetworkConfig::Blocked;
     }
 
     NetworkConfig::Allow {
         allow_domain: allow,
+        deny_domain: deny,
+        prompt_enabled,
+        on_unavailable,
+        prompt_timeout_secs,
+        upstream_proxy: profile_net.upstream_proxy.clone(),
+        profile_name,
         proxy_port: None,
         token: None,
     }
@@ -113,7 +164,7 @@ mod tests {
 
     #[test]
     fn block_net_flag_wins_even_with_profile() {
-        let cfg = resolve_network(&empty_slice(), true, &[], Some("minimal"));
+        let cfg = resolve_network(&empty_slice(), true, &[], &[], false, Some("minimal"));
         assert!(cfg.is_blocked());
     }
 
@@ -123,19 +174,19 @@ mod tests {
             profile_name: Some("none".into()),
             ..Default::default()
         };
-        let cfg = resolve_network(&slice, false, &[], None);
+        let cfg = resolve_network(&slice, false, &[], &[], false, None);
         assert!(cfg.is_blocked());
     }
 
     #[test]
     fn none_profile_via_cli_blocks() {
-        let cfg = resolve_network(&empty_slice(), false, &[], Some("none"));
+        let cfg = resolve_network(&empty_slice(), false, &[], &[], false, Some("none"));
         assert!(cfg.is_blocked());
     }
 
     #[test]
     fn minimal_profile_plus_cli_allow_domain_merges() {
-        let cfg = resolve_network(&empty_slice(), false, &["github.com".into()], Some("minimal"));
+        let cfg = resolve_network(&empty_slice(), false, &["github.com".into()], &[], false, Some("minimal"));
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 // minimal includes api.openai.com etc. but not github.com
@@ -149,7 +200,7 @@ mod tests {
     #[test]
     fn unknown_profile_does_not_crash() {
         // Returns Allow with just CLI/domain entries; warning printed to stderr.
-        let cfg = resolve_network(&empty_slice(), false, &["example.com".into()], Some("bogus"));
+        let cfg = resolve_network(&empty_slice(), false, &["example.com".into()], &[], false, Some("bogus"));
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 assert_eq!(allow_domain, vec!["example.com".to_string()]);
@@ -164,7 +215,7 @@ mod tests {
             allow_domain: vec!["api.anthropic.com".into(), "API.ANTHROPIC.COM".into()],
             ..Default::default()
         };
-        let cfg = resolve_network(&slice, false, &[], None);
+        let cfg = resolve_network(&slice, false, &[], &[], false, None);
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 assert_eq!(allow_domain.len(), 1);
@@ -178,7 +229,7 @@ mod tests {
         // Deny-by-default: no flags + no profile + no allow-list → Blocked
         // (not Allow-with-empty-list, which would spuriously trigger the
         // proxy + deferred-warning path).
-        let cfg = resolve_network(&empty_slice(), false, &[], None);
+        let cfg = resolve_network(&empty_slice(), false, &[], &[], false, None);
         assert!(matches!(cfg, NetworkConfig::Blocked));
     }
 
@@ -188,7 +239,7 @@ mod tests {
             block_net: true,
             ..Default::default()
         };
-        let cfg = resolve_network(&slice, false, &[], None);
+        let cfg = resolve_network(&slice, false, &[], &[], false, None);
         assert!(cfg.is_blocked());
     }
 
@@ -198,7 +249,7 @@ mod tests {
             allow_domain: vec!["api.anthropic.com".into()],
             ..Default::default()
         };
-        let cfg = resolve_network(&slice, false, &[], None);
+        let cfg = resolve_network(&slice, false, &[], &[], false, None);
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 assert_eq!(allow_domain, vec!["api.anthropic.com".to_string()]);
@@ -213,7 +264,7 @@ mod tests {
             profile_name: Some("minimal".into()),
             ..Default::default()
         };
-        let cfg = resolve_network(&slice, false, &[], Some("developer"));
+        let cfg = resolve_network(&slice, false, &[], &[], false, Some("developer"));
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 // developer includes github.com, minimal does not.
@@ -224,6 +275,89 @@ mod tests {
                 );
             }
             NetworkConfig::Blocked => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn no_prompt_flag_disables_prompt() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], true, None);
+        match cfg {
+            NetworkConfig::Allow { prompt_enabled, .. } => assert!(!prompt_enabled),
+            _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn prompt_defaults_on_when_network_active() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
+        match cfg {
+            NetworkConfig::Allow { prompt_enabled, .. } => assert!(prompt_enabled),
+            _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn deny_domain_merged_from_profile_and_cli() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            deny_domain: vec!["*.profile-evil.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &["*.cli-evil.com".into()], false, None);
+        match cfg {
+            NetworkConfig::Allow { deny_domain, .. } => {
+                assert!(deny_domain.iter().any(|d| d == "*.profile-evil.com"));
+                assert!(deny_domain.iter().any(|d| d == "*.cli-evil.com"));
+            }
+            _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn on_unavailable_defaults_to_deny() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
+        match cfg {
+            NetworkConfig::Allow { on_unavailable, .. } => assert_eq!(on_unavailable, "deny"),
+            _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn prompt_timeout_secs_defaults_to_60() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
+        match cfg {
+            NetworkConfig::Allow { prompt_timeout_secs, .. } => assert_eq!(prompt_timeout_secs, 60),
+            _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn profile_prompt_enabled_false_overrides_default() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            prompt_enabled: Some(false),
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
+        match cfg {
+            NetworkConfig::Allow { prompt_enabled, .. } => assert!(!prompt_enabled),
+            _ => panic!("expected Allow"),
         }
     }
 }
