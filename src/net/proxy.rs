@@ -32,7 +32,25 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::AuditWriter;
-use crate::net::matcher::{self, Verdict};
+use crate::net::matcher::{self, DenyReason, Verdict};
+
+/// The complete set of valid `source` values for a CONNECT audit event
+/// (D-5 taxonomy). Kept as a const so future validation logic and tests
+/// share a single source of truth; no production call site consumes it yet
+/// (only tests reference it), so it is `#[allow(dead_code)]` until the D-5
+/// validator lands.
+#[allow(dead_code)]
+pub const SOURCES: &[&str] = &[
+    "hard-deny",
+    "learned",
+    "blocklist",
+    "allowlist",
+    "prompt",
+    "unavailable",
+    "dns",
+    "default",
+    "prompt_overload",
+];
 
 pub struct ProxyConfig {
     pub session_id: String,
@@ -44,7 +62,21 @@ pub struct ProxyConfig {
 /// Emit a CONNECT audit leaf directly through the threaded `AuditWriter`
 /// (replaces the per-call `audit::emit_connect` wrapper, which opened the
 /// writer fresh on each event).
-fn emit_connect(writer: &AuditWriter, host: &str, port: u16, disposition: &str, reason: Option<&str>) {
+//
+// The 8-arg signature is mandated by D-5.1 Step 1 (host, port, disposition,
+// reason, source, scope, persisted + writer); folding into a struct would
+// diverge from the spec, so the clippy lint is suppressed here only.
+#[allow(clippy::too_many_arguments)]
+fn emit_connect(
+    writer: &AuditWriter,
+    host: &str,
+    port: u16,
+    disposition: &str,
+    reason: Option<&str>,
+    source: &str,
+    scope: Option<&str>,
+    persisted: bool,
+) {
     use serde_json::{json, Map};
     let mut e = Map::new();
     e.insert("op".into(), json!("CONNECT"));
@@ -52,6 +84,9 @@ fn emit_connect(writer: &AuditWriter, host: &str, port: u16, disposition: &str, 
     e.insert("port".into(), json!(port));
     e.insert("disposition".into(), json!(disposition));
     e.insert("reason".into(), json!(reason));
+    e.insert("source".into(), json!(source));
+    e.insert("scope".into(), json!(scope));
+    e.insert("persisted".into(), json!(persisted));
     writer.append(e);
 }
 
@@ -211,6 +246,18 @@ fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
     password.as_bytes().ct_eq(expected_token.as_bytes()).into()
 }
 
+/// Map a deny reason to the `source` field of the D-5 audit taxonomy.
+/// Metadata DNS names and CIDR/literal-IP denies are hard-denies
+/// (non-negotiable, built into the binary); a host merely absent from the
+/// allow-list is the `default` deny (will become `blocklist` once D-1
+/// introduces an explicit deny-list).
+fn deny_source(reason: DenyReason) -> &'static str {
+    match reason {
+        DenyReason::DeniedDns | DenyReason::DeniedCidr => "hard-deny",
+        DenyReason::DomainNotAllowed => "default",
+    }
+}
+
 async fn handle_conn(
     mut sock: tokio::net::TcpStream,
     token: Arc<String>,
@@ -244,7 +291,7 @@ async fn handle_conn(
               Proxy-Authenticate: Basic realm=\"sandbox\"\r\n\
               Content-Length: 0\r\n\r\n"
         ).await;
-        emit_connect(&writer, "<unknown>", 0, "deny", Some("no_token"));
+        emit_connect(&writer, "<unknown>", 0, "deny", Some("no_token"), "default", None, false);
         return Ok(());
     }
 
@@ -280,7 +327,7 @@ async fn handle_conn(
     let verdict = matcher::check(&host, &resolved, &allow);
     match verdict {
         Verdict::Allow => {
-            emit_connect(&writer, &host, port, "allow", None);
+            emit_connect(&writer, &host, port, "allow", None, "allowlist", None, false);
             if method == "CONNECT" {
                 let upstream = match tokio::net::TcpStream::connect(format!("{host}:{port}")).await {
                     Ok(s) => s,
@@ -316,7 +363,16 @@ async fn handle_conn(
         }
         Verdict::Deny(reason) => {
             let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
-            emit_connect(&writer, &host, port, "deny", Some(reason.as_str()));
+            emit_connect(
+                &writer,
+                &host,
+                port,
+                "deny",
+                Some(reason.as_str()),
+                deny_source(reason),
+                None,
+                false,
+            );
             Ok(())
         }
     }
@@ -364,5 +420,124 @@ mod tests {
         let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
         let head = format!("CONNECT x:443 HTTP/1.1\r\nproxy-AUTHORIZATION: Basic {creds}\r\n\r\n");
         assert!(check_proxy_auth(&head, token));
+    }
+
+    fn temp_sid(label: &str) -> String {
+        format!(
+            "test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn emit_connect_writes_source_scope_persisted() {
+        let sid = temp_sid("src-emit");
+        let writer = crate::audit::AuditWriter::open(&sid);
+        emit_connect(
+            &writer,
+            "api.anthropic.com",
+            443,
+            "allow",
+            None,
+            "allowlist",
+            None,
+            false,
+        );
+        let path = crate::audit::audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let line = content.trim_end().lines().next().expect("one event line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["op"], "CONNECT");
+        assert_eq!(v["disposition"], "allow");
+        assert_eq!(v["source"], "allowlist");
+        assert_eq!(v["scope"], serde_json::Value::Null);
+        assert_eq!(v["persisted"], false);
+    }
+
+    #[test]
+    fn emit_connect_scope_null_when_none() {
+        let sid = temp_sid("src-null");
+        let writer = crate::audit::AuditWriter::open(&sid);
+        emit_connect(
+            &writer,
+            "evil.example.com",
+            443,
+            "deny",
+            Some("domain_not_allowed"),
+            "default",
+            None,
+            false,
+        );
+        let path = crate::audit::audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let line = content.trim_end().lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        // Option<&str>::None serializes to JSON null, not the string "null".
+        assert!(v.get("scope").is_some(), "scope key present");
+        assert_eq!(v["scope"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn emit_connect_persisted_true_serializes_as_boolean() {
+        let sid = temp_sid("src-persisted");
+        let writer = crate::audit::AuditWriter::open(&sid);
+        emit_connect(
+            &writer,
+            "api.anthropic.com",
+            443,
+            "allow",
+            None,
+            "allowlist",
+            Some("session-42"),
+            true,
+        );
+        let path = crate::audit::audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let line = content.trim_end().lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        // persisted must be a JSON boolean true, not the string "true".
+        assert!(v["persisted"].is_boolean());
+        assert_eq!(v["persisted"], true);
+        assert_eq!(v["scope"], "session-42");
+    }
+
+    #[test]
+    fn sources_const_is_complete_and_contains_default() {
+        // References SOURCES so it isn't flagged dead_code; also pins the
+        // D-5 taxonomy so an accidental rename or drop is caught.
+        assert!(SOURCES.contains(&"default"));
+        assert!(SOURCES.contains(&"allowlist"));
+        assert!(SOURCES.contains(&"hard-deny"));
+        assert_eq!(
+            SOURCES,
+            &[
+                "hard-deny",
+                "learned",
+                "blocklist",
+                "allowlist",
+                "prompt",
+                "unavailable",
+                "dns",
+                "default",
+                "prompt_overload",
+            ]
+        );
+    }
+
+    #[test]
+    fn deny_source_maps_reasons_to_taxonomy() {
+        assert_eq!(deny_source(DenyReason::DeniedDns), "hard-deny");
+        assert_eq!(deny_source(DenyReason::DeniedCidr), "hard-deny");
+        assert_eq!(deny_source(DenyReason::DomainNotAllowed), "default");
     }
 }
