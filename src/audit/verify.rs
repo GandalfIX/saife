@@ -167,11 +167,11 @@ mod tests {
     fn verify_log_without_root_is_incomplete() {
         let sid = fresh_sid("no-root");
         {
-            let w = AuditWriter::open(&sid);
+            let w = AuditWriter::open(&sid, false).unwrap();
             let mut e = Map::new();
             e.insert("op".into(), json!("CONNECT"));
             e.insert("host".into(), json!("a.com"));
-            w.append(e);
+            w.append(e).unwrap();
         }
         let outcome = verify_inner(&sid).unwrap();
         cleanup(&sid);
@@ -183,12 +183,12 @@ mod tests {
         let sid = fresh_sid("clean");
         let root;
         {
-            let w = AuditWriter::open(&sid);
+            let w = AuditWriter::open(&sid, false).unwrap();
             for host in ["a.com", "b.com", "c.com"] {
                 let mut e = Map::new();
                 e.insert("op".into(), json!("CONNECT"));
                 e.insert("host".into(), json!(host));
-                w.append(e);
+                w.append(e).unwrap();
             }
             root = w.current_root().unwrap();
         }
@@ -210,15 +210,15 @@ mod tests {
         let sid = fresh_sid("tampered");
         let root;
         {
-            let w = AuditWriter::open(&sid);
+            let w = AuditWriter::open(&sid, false).unwrap();
             let mut e = Map::new();
             e.insert("op".into(), json!("CONNECT"));
             e.insert("host".into(), json!("a.com"));
-            w.append(e);
+            w.append(e).unwrap();
             let mut e2 = Map::new();
             e2.insert("op".into(), json!("CONNECT"));
             e2.insert("host".into(), json!("b.com"));
-            w.append(e2);
+            w.append(e2).unwrap();
             root = w.current_root().unwrap();
         }
         let key = signing::KeyMaterial::ensure().unwrap();
@@ -244,11 +244,11 @@ mod tests {
         let sid = fresh_sid("forged");
         let root;
         {
-            let w = AuditWriter::open(&sid);
+            let w = AuditWriter::open(&sid, false).unwrap();
             let mut e = Map::new();
             e.insert("op".into(), json!("CONNECT"));
             e.insert("host".into(), json!("a.com"));
-            w.append(e);
+            w.append(e).unwrap();
             root = w.current_root().unwrap();
         }
         // Write the real root + a corrupted signature (flip a byte).

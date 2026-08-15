@@ -46,6 +46,10 @@ pub enum Cmd {
         #[arg(long, value_name = "NAME")]
         network_profile: Option<String>,
 
+        /// Strict audit mode: abort the run if the audit log can't be written.
+        #[arg(long)]
+        audit_strict: bool,
+
         /// Print only the session id and exit 0 without spawning.
         #[arg(long, hide = true)]
         print_sid: bool,

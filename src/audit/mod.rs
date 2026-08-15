@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -64,43 +65,83 @@ pub fn emit_connect(
     disposition: Disposition,
     reason: Option<&str>,
 ) {
-    let writer = AuditWriter::open(session_id);
+    let writer = AuditWriter::open(session_id, false).unwrap();
     let mut event = Map::new();
     event.insert("op".into(), serde_json::json!("CONNECT"));
     event.insert("host".into(), serde_json::json!(host));
     event.insert("port".into(), serde_json::json!(port));
     event.insert("disposition".into(), serde_json::json!(disposition.as_str()));
     event.insert("reason".into(), serde_json::json!(reason));
-    writer.append(event);
+    writer.append(event).unwrap();
 }
 
 pub struct AuditWriter {
     path: PathBuf,
     last_hash: Mutex<Option<String>>,
     seq: AtomicU64,
+    strict: bool,
 }
 
 impl AuditWriter {
     /// Open the writer for a session. If the log file already exists (e.g.
     /// `--reuse <sid>` or crash recovery), scan existing lines to recover
     /// `last_hash` and `seq`. If it doesn't exist, start fresh.
-    pub fn open(session_id: &str) -> Self {
+    ///
+    /// When `strict` is true, returns `Err` if the audit directory can't be
+    /// created or the log file can't be opened for writing. When `strict`
+    /// is false, degrades gracefully (best-effort logging, never returns
+    /// `Err`).
+    pub fn open(session_id: &str, strict: bool) -> Result<Self> {
         let path = audit_log_path(session_id);
+        Self::open_at(path, strict)
+    }
+
+    /// Internal: open at an explicit path (for testing strict mode without
+    /// env var manipulation).
+    fn open_at(path: PathBuf, strict: bool) -> Result<Self> {
+        if strict {
+            // Verify the parent directory exists / can be created and the
+            // log file is writable before claiming the writer is usable.
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return Err(anyhow::anyhow!("create audit dir {:?}: {e}", parent.display()))
+                    .with_context(|| "strict audit: directory not writable");
+            }
+            // Touch the file to confirm it can be opened for appending. This
+            // also surfaces permission errors eagerly instead of at the first
+            // `append`.
+            if let Err(e) = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+            {
+                return Err(anyhow::anyhow!("open audit log {:?}: {e}", path.display()))
+                    .with_context(|| "strict audit: log file not writable");
+            }
+        }
+
         let (last_hash, next_seq) = if path.exists() {
             scan_existing(&path).unwrap_or((None, 0))
         } else {
             (None, 0)
         };
-        Self {
+        Ok(Self {
             path,
             last_hash: Mutex::new(last_hash),
             seq: AtomicU64::new(next_seq),
-        }
+            strict,
+        })
     }
 
     /// Append a leaf. `event` is the op-specific payload (op, host, path,
     /// etc.) WITHOUT seq/ts/hash/parent — those are computed here.
-    pub fn append(&self, mut event: Map<String, Value>) {
+    ///
+    /// When `strict` is true, returns `Err` if the file can't be opened for
+    /// appending or the write fails. When `strict` is false, silently
+    /// swallows errors (best-effort) and always returns `Ok(())`.
+    pub fn append(&self, mut event: Map<String, Value>) -> Result<()> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let ts = iso8601_utc();
         event.insert("seq".into(), serde_json::json!(seq));
@@ -116,10 +157,23 @@ impl AuditWriter {
         if std::env::var_os("SANDBOX_DIAG").is_some() {
             eprint!("[proxy] {line}");
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&self.path) {
-            let _ = f.write_all(line.as_bytes());
+
+        let file_result = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path);
+        if self.strict {
+            let mut f = file_result
+                .with_context(|| format!("strict audit: open {:?} for append", self.path.display()))?;
+            f.write_all(line.as_bytes())
+                .with_context(|| format!("strict audit: write {:?} failed", self.path.display()))?;
+        } else {
+            if let Ok(mut f) = file_result {
+                let _ = f.write_all(line.as_bytes());
+            }
         }
         *self.last_hash.lock().unwrap() = Some(hash);
+        Ok(())
     }
 
     /// The current chain root (last leaf's hash). None if no leaves yet.
@@ -321,15 +375,15 @@ mod tests {
     fn hash_chain_links_correctly() {
         let sid = format!("test-chain-{}-{}", std::process::id(), std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let writer = AuditWriter::open(&sid);
+        let writer = AuditWriter::open(&sid, false).unwrap();
         let mut e1 = Map::new();
         e1.insert("op".into(), serde_json::json!("CONNECT"));
         e1.insert("host".into(), serde_json::json!("a.com"));
-        writer.append(e1);
+        writer.append(e1).unwrap();
         let mut e2 = Map::new();
         e2.insert("op".into(), serde_json::json!("CONNECT"));
         e2.insert("host".into(), serde_json::json!("b.com"));
-        writer.append(e2);
+        writer.append(e2).unwrap();
 
         let path = audit_log_path(&sid);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -363,12 +417,12 @@ mod tests {
         let sid = format!("test-scan-{}-{}", std::process::id(), std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         {
-            let w = AuditWriter::open(&sid);
+            let w = AuditWriter::open(&sid, false).unwrap();
             for host in ["a", "b", "c"] {
                 let mut e = Map::new();
                 e.insert("op".into(), serde_json::json!("CONNECT"));
                 e.insert("host".into(), serde_json::json!(host));
-                w.append(e);
+                w.append(e).unwrap();
             }
         }
         let path = audit_log_path(&sid);
@@ -395,5 +449,81 @@ mod tests {
                 "schema must enumerate the {key} hash-chain field"
             );
         }
+    }
+
+    #[test]
+    fn strict_open_fails_on_unwritable_path() {
+        // Block `create_dir_all` by placing a regular file where a directory
+        // is required: a file at `blocker`, then a log path of
+        // `blocker/subdir/test.ndjson`. `create_dir_all` can't make a
+        // directory inside a file, so strict open must fail. Reliable on
+        // every platform (no env-var or drive-letter assumptions).
+        let mut blocker_parent = std::env::temp_dir();
+        blocker_parent.push(format!(
+            "sandbox-audit-blocker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let blocker_file = blocker_parent.join("blocker");
+        std::fs::create_dir_all(&blocker_parent).unwrap();
+        std::fs::write(&blocker_file, b"x").unwrap();
+
+        let log_path = blocker_file.join("subdir").join("test.ndjson");
+
+        // Strict mode MUST refuse: create_dir_all fails because `blocker`
+        // is a file, not a directory.
+        let strict_res = AuditWriter::open_at(log_path.clone(), true);
+        assert!(strict_res.is_err(), "strict open must fail on unwritable path");
+
+        // Non-strict mode degrades gracefully (never returns Err).
+        let lenient_res = AuditWriter::open_at(log_path, false);
+        assert!(lenient_res.is_ok(), "non-strict open must degrade gracefully");
+
+        // Clean up the blocker file + parent dir.
+        let _ = std::fs::remove_file(&blocker_file);
+        let _ = std::fs::remove_dir_all(&blocker_parent);
+    }
+
+    #[test]
+    fn strict_append_fails_on_write_error() {
+        // Open strict on a writable path inside a dedicated subdir we own,
+        // then delete the whole subdir so the next `append` can't reopen the
+        // file. Strict mode must surface that as `Err`; non-strict mode must
+        // swallow it and return `Ok(())`.
+        let mut own_dir = std::env::temp_dir();
+        own_dir.push(format!(
+            "sandbox-audit-strict-append-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&own_dir).unwrap();
+        let own_log = own_dir.join("test.ndjson");
+
+        let strict_writer = AuditWriter::open_at(own_log.clone(), true)
+            .expect("strict open in own dir succeeds");
+        let lenient_writer = AuditWriter::open_at(own_log.clone(), false)
+            .expect("non-strict open in own dir succeeds");
+
+        // Delete the dedicated dir + its file. Now append can't open the
+        // file (parent dir is gone).
+        let _ = std::fs::remove_dir_all(&own_dir);
+
+        let mut e = Map::new();
+        e.insert("op".into(), serde_json::json!("CONNECT"));
+        e.insert("host".into(), serde_json::json!("a.com"));
+
+        let strict_res = strict_writer.append(e.clone());
+        assert!(strict_res.is_err(), "strict append must fail when file can't be opened");
+
+        let lenient_res = lenient_writer.append(e);
+        assert!(lenient_res.is_ok(), "non-strict append must swallow the write error");
+
+        // No cleanup needed: own_dir was already removed.
     }
 }

@@ -76,7 +76,7 @@ fn emit_connect(
     source: &str,
     scope: Option<&str>,
     persisted: bool,
-) {
+) -> Result<()> {
     use serde_json::{json, Map};
     let mut e = Map::new();
     e.insert("op".into(), json!("CONNECT"));
@@ -87,7 +87,8 @@ fn emit_connect(
     e.insert("source".into(), json!(source));
     e.insert("scope".into(), json!(scope));
     e.insert("persisted".into(), json!(persisted));
-    writer.append(e);
+    writer.append(e)?;
+    Ok(())
 }
 
 pub struct ProxyHandle {
@@ -291,7 +292,7 @@ async fn handle_conn(
               Proxy-Authenticate: Basic realm=\"sandbox\"\r\n\
               Content-Length: 0\r\n\r\n"
         ).await;
-        emit_connect(&writer, "<unknown>", 0, "deny", Some("no_token"), "default", None, false);
+        let _ = emit_connect(&writer, "<unknown>", 0, "deny", Some("no_token"), "default", None, false);
         return Ok(());
     }
 
@@ -327,7 +328,7 @@ async fn handle_conn(
     let verdict = matcher::check(&host, &resolved, &allow);
     match verdict {
         Verdict::Allow => {
-            emit_connect(&writer, &host, port, "allow", None, "allowlist", None, false);
+            let _ = emit_connect(&writer, &host, port, "allow", None, "allowlist", None, false);
             if method == "CONNECT" {
                 let upstream = match tokio::net::TcpStream::connect(format!("{host}:{port}")).await {
                     Ok(s) => s,
@@ -363,7 +364,7 @@ async fn handle_conn(
         }
         Verdict::Deny(reason) => {
             let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
-            emit_connect(
+            let _ = emit_connect(
                 &writer,
                 &host,
                 port,
@@ -436,7 +437,7 @@ mod tests {
     #[test]
     fn emit_connect_writes_source_scope_persisted() {
         let sid = temp_sid("src-emit");
-        let writer = crate::audit::AuditWriter::open(&sid);
+        let writer = crate::audit::AuditWriter::open(&sid, false).unwrap();
         emit_connect(
             &writer,
             "api.anthropic.com",
@@ -446,7 +447,8 @@ mod tests {
             "allowlist",
             None,
             false,
-        );
+        )
+        .unwrap();
         let path = crate::audit::audit_log_path(&sid);
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -463,7 +465,7 @@ mod tests {
     #[test]
     fn emit_connect_scope_null_when_none() {
         let sid = temp_sid("src-null");
-        let writer = crate::audit::AuditWriter::open(&sid);
+        let writer = crate::audit::AuditWriter::open(&sid, false).unwrap();
         emit_connect(
             &writer,
             "evil.example.com",
@@ -473,7 +475,8 @@ mod tests {
             "default",
             None,
             false,
-        );
+        )
+        .unwrap();
         let path = crate::audit::audit_log_path(&sid);
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -488,7 +491,7 @@ mod tests {
     #[test]
     fn emit_connect_persisted_true_serializes_as_boolean() {
         let sid = temp_sid("src-persisted");
-        let writer = crate::audit::AuditWriter::open(&sid);
+        let writer = crate::audit::AuditWriter::open(&sid, false).unwrap();
         emit_connect(
             &writer,
             "api.anthropic.com",
@@ -498,7 +501,8 @@ mod tests {
             "allowlist",
             Some("session-42"),
             true,
-        );
+        )
+        .unwrap();
         let path = crate::audit::audit_log_path(&sid);
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);

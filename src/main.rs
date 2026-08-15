@@ -24,6 +24,7 @@ fn main() {
             block_net,
             allow_domain,
             network_profile,
+            audit_strict,
             print_sid,
             sid,
             cmd,
@@ -35,6 +36,7 @@ fn main() {
             block_net,
             allow_domain,
             network_profile,
+            audit_strict,
             print_sid,
             sid,
             cmd,
@@ -152,6 +154,7 @@ fn run_cmd(
     block_net: bool,
     allow_domain: Vec<String>,
     network_profile: Option<String>,
+    audit_strict: bool,
     print_sid: bool,
     sid: Option<String>,
     cmd: Vec<String>,
@@ -169,6 +172,7 @@ fn run_cmd(
         block_net,
         &allow_domain,
         network_profile.as_deref(),
+        audit_strict,
         print_sid,
         sid.as_deref(),
         &cmd,
@@ -190,6 +194,7 @@ fn run_inner(
     block_net: bool,
     allow_domain: &[String],
     network_profile: Option<&str>,
+    audit_strict: bool,
     print_sid: bool,
     sid: Option<&str>,
     cmd: &[String],
@@ -256,7 +261,7 @@ fn run_inner(
     // every session has at least one audit event (ensures `verify` can always
     // produce a root, even under --block-net where no proxy starts and
     // thus no CONNECT events fire).
-    let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid));
+    let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid, audit_strict)?);
     {
         use serde_json::{Map, json};
         let mut e = Map::new();
@@ -264,7 +269,7 @@ fn run_inner(
         e.insert("sid".into(), json!(sid));
         e.insert("command".into(), json!(cmd.join(" ")));
         e.insert("disposition".into(), json!("allow"));
-        audit_writer.append(e);
+        audit_writer.append(e)?;
     }
 
     let net_cfg = net_cfg_resolved.clone();
