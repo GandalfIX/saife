@@ -108,8 +108,20 @@ pub fn resolve_network(
         && profile_net.prompt_enabled.unwrap_or(true);
 
     // [G-48] `onUnavailable` defaults to "deny". Profile-only field.
-    let on_unavailable = profile_net.on_unavailable.clone()
-        .unwrap_or_else(|| "deny".to_string());
+    // Validated against {"deny", "allow"}: an invalid value (e.g. a typo like
+    // "denie") falls back to "deny" with a warning, so the resolved
+    // `NetworkConfig::Allow.on_unavailable` is always either "deny" or
+    // "allow" — the prompt layer (D-3.5) can then match it deterministically.
+    let on_unavailable = match profile_net.on_unavailable.as_deref() {
+        Some(v) if v == "deny" || v == "allow" => v.to_string(),
+        Some(invalid) => {
+            eprintln!(
+                "[sandbox] invalid onUnavailable value \"{invalid}\", defaulting to \"deny\""
+            );
+            "deny".to_string()
+        }
+        None => "deny".to_string(),
+    };
 
     // [G-46] `promptTimeoutSecs` defaults to 60. Profile-only field.
     // `0` means "instant deny" (handled by the prompt layer in D-3.5).
@@ -359,5 +371,66 @@ mod tests {
             NetworkConfig::Allow { prompt_enabled, .. } => assert!(!prompt_enabled),
             _ => panic!("expected Allow"),
         }
+    }
+
+    #[test]
+    fn on_unavailable_invalid_value_falls_back_to_deny() {
+        // A typo like "denie" must not silently pass through; the resolved
+        // on_unavailable is always either "deny" or "allow" so the prompt
+        // layer (D-3.5) can match it deterministically.
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            on_unavailable: Some("denie".into()),
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
+        match cfg {
+            NetworkConfig::Allow { on_unavailable, .. } => {
+                assert_eq!(on_unavailable, "deny", "invalid onUnavailable must fall back to \"deny\"");
+            }
+            _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    fn deny_only_mode_prompts_for_everything_not_denied() {
+        // allow empty + deny non-empty + prompt on → Allow (prompt for
+        // everything not in the deny-list). Exercises the branch where
+        // allow.is_empty() && !deny.is_empty() skips the first Blocked
+        // check and prompt_enabled keeps it off the second.
+        let slice = NetworkSlice {
+            deny_domain: vec!["*.evil.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &[], &["*.evil.com".into()], false, None);
+        match cfg {
+            NetworkConfig::Allow {
+                allow_domain,
+                deny_domain,
+                prompt_enabled,
+                ..
+            } => {
+                assert!(allow_domain.is_empty(), "allow-list should be empty in deny-only mode");
+                assert_eq!(deny_domain, vec!["*.evil.com".to_string()]);
+                assert!(prompt_enabled, "prompt must be on so empty allow means prompt-for-all");
+            }
+            _ => panic!("expected Allow in deny-only mode"),
+        }
+    }
+
+    #[test]
+    fn no_prompt_with_deny_only_yields_blocked() {
+        // allow empty + deny non-empty + prompt off → Blocked. The deny-list
+        // alone can't form a usable Allow config when there is nothing to
+        // allow and no prompt to ask the user. Exercises the
+        // `allow.is_empty() && !prompt_enabled → Blocked` branch (deny
+        // non-empty is required to reach it; otherwise the earlier
+        // `allow.is_empty() && deny.is_empty()` check intercepts).
+        let slice = NetworkSlice {
+            deny_domain: vec!["*.evil.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &[], &["*.evil.com".into()], true, None);
+        assert!(matches!(cfg, NetworkConfig::Blocked), "no-prompt + deny-only must be Blocked");
     }
 }
