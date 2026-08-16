@@ -8,13 +8,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Always-denied IPv4 CIDRs (AC-3.6, AC-3.7). Link-local + AWS/GCP/Azure
 /// metadata.
 pub const ALWAYS_DENIED_V4_CIDRS: &[(Ipv4Addr, u8)] = &[(Ipv4Addr::new(169, 254, 0, 0), 16)];
-/// Always-denied IPv4 literals (checked both as host-string and parsed IP).
-//
-// Post-split ([G-45]) the matcher's IP path uses `ALWAYS_DENIED_IP_LITERALS`
-// (parsed comparison against resolved IPs), so this host-string set is not
-// consulted by `is_hard_denied_host`/`is_hard_denied_ip`. It is retained as
-// the documented canonical V4 host-string list and will be consulted when
-// the pre-resolution host-string deny check lands in D-3.6.
+/// Canonical always-denied IPv4 host-strings (retained for reference; IP-path
+/// uses `ALWAYS_DENIED_V4_LITERALS`/CIDRs post-split per [G-45]). Not consulted
+/// by `is_hard_denied_host`/`is_hard_denied_ip`; the pre-resolution host-string
+/// deny check that will consume this lands in D-3.6.
 #[allow(dead_code)]
 pub const ALWAYS_DENIED_V4_HOSTS: &[&str] = &["169.254.169.254", "169.254.169.253"];
 /// Always-denied IPv6 CIDRs (link-local).
@@ -25,13 +22,15 @@ pub const ALWAYS_DENIED_DNS: &[&str] = &[
     "metadata.azure.internal",
     "metadata.tencentyun.com",
 ];
-/// Always-denied IP literals (the IP set from [G-45]). Parsed and compared
-/// against resolved IPs, distinct from the hostname-string set so audit
-/// attribution is precise (`source: "hard-deny"` with the right sub-reason).
-pub const ALWAYS_DENIED_IP_LITERALS: &[&str] = &[
-    "169.254.169.254",
-    "169.254.169.253",
-    "100.100.100.200",
+/// Always-denied IPv4 literals (the IP set from [G-45]). Precomputed as
+/// `Ipv4Addr` (const-constructible) so `is_hard_denied_ip` compares directly
+/// without reparsing the `&str` form per request. Distinct from the
+/// hostname-string set so audit attribution is precise (`source: "hard-deny"`
+/// with the right sub-reason).
+const ALWAYS_DENIED_V4_LITERALS: &[Ipv4Addr] = &[
+    Ipv4Addr::new(169, 254, 169, 254),
+    Ipv4Addr::new(169, 254, 169, 253),
+    Ipv4Addr::new(100, 100, 100, 200),
 ];
 
 /// Reason codes used in the audit log.
@@ -69,8 +68,10 @@ pub fn matches(host: &str, entry: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     let e = entry.trim_end_matches('.').to_ascii_lowercase();
     if let Some(suffix) = e.strip_prefix("*.") {
-        // [G-55] apex + subdomain, not cross-dot.
-        h == suffix || h.ends_with(&format!(".{suffix}"))
+        // [G-55] apex + subdomain, not cross-dot. Allocation-free:
+        // `h == suffix` is the apex; otherwise `h` must end with `.suffix`
+        // (strip `suffix`, the remainder must end with '.').
+        h == suffix || h.strip_suffix(suffix).is_some_and(|p| p.ends_with('.'))
     } else {
         h == e
     }
@@ -86,13 +87,13 @@ pub fn is_hard_denied_host(host: &str) -> bool {
 }
 
 /// Is `ip` on the hard-deny IP list (literal match or link-local CIDR)?
-/// Covers `ALWAYS_DENIED_IP_LITERALS` + `ALWAYS_DENIED_V4_CIDRS` +
+/// Covers `ALWAYS_DENIED_V4_LITERALS` + `ALWAYS_DENIED_V4_CIDRS` +
 /// `ALWAYS_DENIED_V6_CIDRS`. IPv4-mapped IPv6 forms are unmapped first.
 pub fn is_hard_denied_ip(ip: IpAddr) -> bool {
     let ip = unmap_ipv4_mapped(ip);
     match ip {
         IpAddr::V4(v) => {
-            if ALWAYS_DENIED_IP_LITERALS.iter().any(|s| s.parse::<Ipv4Addr>().ok() == Some(v)) {
+            if ALWAYS_DENIED_V4_LITERALS.contains(&v) {
                 return true;
             }
             for (net, prefix) in ALWAYS_DENIED_V4_CIDRS {
