@@ -1,3 +1,4 @@
+pub mod learned;
 pub mod loopback;
 pub mod matcher;
 pub mod profile;
