@@ -8,12 +8,31 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Always-denied IPv4 CIDRs (AC-3.6, AC-3.7). Link-local + AWS/GCP/Azure
 /// metadata.
 pub const ALWAYS_DENIED_V4_CIDRS: &[(Ipv4Addr, u8)] = &[(Ipv4Addr::new(169, 254, 0, 0), 16)];
-/// Always-denied IPv4 literals.
-pub const ALWAYS_DENIED_V4_HOSTS: &[&str] = &["169.254.169.254"];
+/// Always-denied IPv4 literals (checked both as host-string and parsed IP).
+//
+// Post-split ([G-45]) the matcher's IP path uses `ALWAYS_DENIED_IP_LITERALS`
+// (parsed comparison against resolved IPs), so this host-string set is not
+// consulted by `is_hard_denied_host`/`is_hard_denied_ip`. It is retained as
+// the documented canonical V4 host-string list and will be consulted when
+// the pre-resolution host-string deny check lands in D-3.6.
+#[allow(dead_code)]
+pub const ALWAYS_DENIED_V4_HOSTS: &[&str] = &["169.254.169.254", "169.254.169.253"];
 /// Always-denied IPv6 CIDRs (link-local).
 pub const ALWAYS_DENIED_V6_CIDRS: &[(Ipv6Addr, u8)] = &[(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xfe80, 0), 10)];
 /// Always-denied DNS names (checked pre-resolution, AC-3.7).
-pub const ALWAYS_DENIED_DNS: &[&str] = &["metadata.google.internal"];
+pub const ALWAYS_DENIED_DNS: &[&str] = &[
+    "metadata.google.internal",
+    "metadata.azure.internal",
+    "metadata.tencentyun.com",
+];
+/// Always-denied IP literals (the IP set from [G-45]). Parsed and compared
+/// against resolved IPs, distinct from the hostname-string set so audit
+/// attribution is precise (`source: "hard-deny"` with the right sub-reason).
+pub const ALWAYS_DENIED_IP_LITERALS: &[&str] = &[
+    "169.254.169.254",
+    "169.254.169.253",
+    "100.100.100.200",
+];
 
 /// Reason codes used in the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +40,7 @@ pub enum DenyReason {
     DomainNotAllowed,
     DeniedCidr,
     DeniedDns,
+    DeniedDomain,
 }
 
 impl DenyReason {
@@ -29,6 +49,7 @@ impl DenyReason {
             DenyReason::DomainNotAllowed => "domain_not_allowed",
             DenyReason::DeniedCidr => "denied_cidr",
             DenyReason::DeniedDns => "denied_dns",
+            DenyReason::DeniedDomain => "denied_domain",
         }
     }
 }
@@ -41,50 +62,92 @@ pub enum Verdict {
 }
 
 /// Does `host` (a hostname or literal IP, no port) match an allow-list
-/// `entry`? Implements the suffix-wildcard rule from AC-3.5: `*.anthropic.com`
-/// matches `api.anthropic.com` but NOT `anthropic.com.evil.io` and NOT the
-/// bare apex `anthropic.com`.
+/// `entry`? Implements the wildcard rule from [G-55]: `*.suffix` matches
+/// `suffix` (the apex) and any subdomain (`foo.suffix`), but NOT
+/// `suffix.evil.io` (suffix doesn't cross dots).
 pub fn matches(host: &str, entry: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     let e = entry.trim_end_matches('.').to_ascii_lowercase();
     if let Some(suffix) = e.strip_prefix("*.") {
-        let dot = format!(".{suffix}");
-        h.ends_with(&dot)
+        // [G-55] apex + subdomain, not cross-dot.
+        h == suffix || h.ends_with(&format!(".{suffix}"))
     } else {
         h == e
     }
 }
 
-/// Is `host` (or any of its `resolved_ips`) on the always-denied list?
-/// `resolved_ips` is the empty slice when `host` is not a literal IP and DNS
-/// resolution has not yet been attempted (or failed).
-pub fn is_always_denied(host: &str, resolved_ips: &[IpAddr]) -> bool {
+/// Is `host` (a hostname, no port) on the hard-deny DNS-name list?
+/// Case-insensitive, trailing dot stripped. Does NOT check IPs — see
+/// [`is_hard_denied_ip`]. The two are separate so audit `source: "hard-deny"`
+/// attribution distinguishes a hostname deny from an IP deny.
+pub fn is_hard_denied_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    if ALWAYS_DENIED_DNS.iter().any(|d| **d == h) {
-        return true;
-    }
-    for ip in resolved_ips {
-        match ip {
-            IpAddr::V4(v) => {
-                if ALWAYS_DENIED_V4_HOSTS.iter().any(|s| s.parse::<Ipv4Addr>().ok() == Some(*v)) {
+    ALWAYS_DENIED_DNS.iter().any(|d| **d == h)
+}
+
+/// Is `ip` on the hard-deny IP list (literal match or link-local CIDR)?
+/// Covers `ALWAYS_DENIED_IP_LITERALS` + `ALWAYS_DENIED_V4_CIDRS` +
+/// `ALWAYS_DENIED_V6_CIDRS`. IPv4-mapped IPv6 forms are unmapped first.
+pub fn is_hard_denied_ip(ip: IpAddr) -> bool {
+    let ip = unmap_ipv4_mapped(ip);
+    match ip {
+        IpAddr::V4(v) => {
+            if ALWAYS_DENIED_IP_LITERALS.iter().any(|s| s.parse::<Ipv4Addr>().ok() == Some(v)) {
+                return true;
+            }
+            for (net, prefix) in ALWAYS_DENIED_V4_CIDRS {
+                if in_v4_cidr(v, *net, *prefix) {
                     return true;
                 }
-                for (net, prefix) in ALWAYS_DENIED_V4_CIDRS {
-                    if in_v4_cidr(*v, *net, *prefix) {
-                        return true;
-                    }
+            }
+            false
+        }
+        IpAddr::V6(v) => {
+            for (net, prefix) in ALWAYS_DENIED_V6_CIDRS {
+                if in_v6_cidr(v, *net, *prefix) {
+                    return true;
                 }
             }
-            IpAddr::V6(v) => {
-                for (net, prefix) in ALWAYS_DENIED_V6_CIDRS {
-                    if in_v6_cidr(*v, *net, *prefix) {
-                        return true;
-                    }
-                }
-            }
+            false
         }
     }
-    false
+}
+
+/// Unmap IPv4-mapped IPv6 (::ffff:a.b.c.d) to the IPv4 form, so the
+/// hard-deny IP check works on mapped addresses returned by dual-stack
+/// resolvers.
+fn unmap_ipv4_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v) if is_ipv4_mapped(&v) => {
+            let octets = v.octets();
+            IpAddr::V4(Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+        }
+        other => other,
+    }
+}
+
+/// Is `v` an IPv4-mapped IPv6 address (::ffff:a.b.c.d)? Manual check —
+/// `Ipv6Addr::is_ipv4_mapped` is unstable on stable Rust.
+fn is_ipv4_mapped(v: &Ipv6Addr) -> bool {
+    let o = v.octets();
+    o[0] == 0 && o[1] == 0 && o[2] == 0 && o[3] == 0
+        && o[4] == 0 && o[5] == 0 && o[6] == 0 && o[7] == 0
+        && o[8] == 0 && o[9] == 0 && o[10] == 0xff && o[11] == 0xff
+}
+
+/// Legacy combined check. Prefer [`is_hard_denied_host`] + [`is_hard_denied_ip`]
+/// for precise audit attribution.
+//
+// Kept as the transitional API the spec (D-3.2 Step 2) mandates for call sites
+// that have not yet migrated to the split functions. No production call site
+// consumes it after D-3.2 (the sole caller, `check`, was rewritten to use the
+// split functions); `dead_code` is allowed here so the wrapper remains
+// available for D-3.6 wiring and any external consumers. The `deprecated`
+// attribute surfaces a warning at any future use site.
+#[allow(dead_code)]
+#[deprecated(note = "use is_hard_denied_host + is_hard_denied_ip")]
+pub fn is_always_denied(host: &str, resolved_ips: &[IpAddr]) -> bool {
+    is_hard_denied_host(host) || resolved_ips.iter().any(|ip| is_hard_denied_ip(*ip))
 }
 
 fn in_v4_cidr(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
@@ -105,17 +168,25 @@ fn in_v6_cidr(ip: Ipv6Addr, net: Ipv6Addr, prefix: u8) -> bool {
     (ipb[full] & mask) == (netb[full] & mask)
 }
 
-/// Full verdict: always-denied first (overrides allow-list per AC-3.6),
-/// then allow-list match.
-pub fn check(host: &str, resolved_ips: &[IpAddr], allow_list: &[String]) -> Verdict {
-    if is_always_denied(host, resolved_ips) {
-        // Distinguish DNS-name deny (AC-3.7) from CIDR deny (AC-3.6).
-        let h = host.trim_end_matches('.').to_ascii_lowercase();
-        if ALWAYS_DENIED_DNS.iter().any(|d| **d == h) {
-            return Verdict::Deny(DenyReason::DeniedDns);
-        }
-        return Verdict::Deny(DenyReason::DeniedCidr);
+/// Full verdict pipeline: hard-deny → deny_domain → allow-list.
+/// `deny_list` is the `deny_domain` blocklist ([G-32]); `allow_list` is the
+/// allow-list. Pipeline ordering is load-bearing for audit `source`
+/// attribution ([G-33]).
+pub fn check(host: &str, resolved_ips: &[IpAddr], deny_list: &[String], allow_list: &[String]) -> Verdict {
+    // 1. Hard-deny (hostname set + IP set + CIDR).
+    if is_hard_denied_host(host) {
+        return Verdict::Deny(DenyReason::DeniedDns);
     }
+    for ip in resolved_ips {
+        if is_hard_denied_ip(*ip) {
+            return Verdict::Deny(DenyReason::DeniedCidr);
+        }
+    }
+    // 2. deny_domain blocklist ([G-32, G-33]).
+    if deny_list.iter().any(|e| matches(host, e)) {
+        return Verdict::Deny(DenyReason::DeniedDomain);
+    }
+    // 3. Allow-list.
     if allow_list.iter().any(|e| matches(host, e)) {
         Verdict::Allow
     } else {
@@ -143,9 +214,17 @@ mod tests {
     fn wildcard_suffix() {
         assert!(matches("api.anthropic.com", "*.anthropic.com"));
         assert!(matches("console.anthropic.com", "*.anthropic.com"));
-        // Bare apex is NOT matched by *.anthropic.com.
-        assert!(!matches("anthropic.com", "*.anthropic.com"));
+        // [G-55] Bare apex IS matched by *.anthropic.com now.
+        assert!(matches("anthropic.com", "*.anthropic.com"));
         // Suffix does not cross dots.
+        assert!(!matches("anthropic.com.evil.io", "*.anthropic.com"));
+    }
+
+    #[test]
+    fn wildcard_apex_matches_now() {
+        // [G-55] regression: *.anthropic.com now matches the apex.
+        assert!(matches("anthropic.com", "*.anthropic.com"));
+        assert!(matches("api.anthropic.com", "*.anthropic.com"));
         assert!(!matches("anthropic.com.evil.io", "*.anthropic.com"));
     }
 
@@ -163,36 +242,90 @@ mod tests {
     }
 
     #[test]
-    fn always_denied_dns() {
-        assert!(is_always_denied("metadata.google.internal", &[]));
-        assert!(is_always_denied("METADATA.google.INTERNAL.", &[]));
+    fn hard_denied_dns() {
+        assert!(is_hard_denied_host("metadata.google.internal"));
+        assert!(is_hard_denied_host("METADATA.google.INTERNAL."));
+        assert!(is_hard_denied_host("metadata.azure.internal"));
+        assert!(is_hard_denied_host("metadata.tencentyun.com"));
+        assert!(!is_hard_denied_host("api.anthropic.com"));
     }
 
     #[test]
-    fn always_denied_ip_literal() {
-        let ips = [IpAddr::V4("169.254.169.254".parse().unwrap())];
-        assert!(is_always_denied("169.254.169.254", &ips));
+    fn hard_denied_ip_literal() {
+        let ip: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(is_hard_denied_ip(ip));
+        let ip: IpAddr = "169.254.169.253".parse().unwrap();
+        assert!(is_hard_denied_ip(ip));
+        let ip: IpAddr = "100.100.100.200".parse().unwrap();
+        assert!(is_hard_denied_ip(ip));
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!is_hard_denied_ip(ip));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_unmapped_for_hard_deny() {
+        // ::ffff:169.254.169.254 unmapped → 169.254.169.254 → hard-denied.
+        let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(is_hard_denied_ip(mapped));
     }
 
     #[test]
     fn check_overrides_allow_with_cidr() {
         let ips = [IpAddr::V4("169.254.169.254".parse().unwrap())];
         let allow = vec!["169.254.169.254".to_string(), "api.anthropic.com".to_string()];
-        // AC-3.6: explicit allow is overridden by always-denied.
-        assert_eq!(check("169.254.169.254", &ips, &allow), Verdict::Deny(DenyReason::DeniedCidr));
-        // But the unrelated allow entry still works.
-        assert_eq!(check("api.anthropic.com", &[], &allow), Verdict::Allow);
+        assert_eq!(check("169.254.169.254", &ips, &[], &allow), Verdict::Deny(DenyReason::DeniedCidr));
+        assert_eq!(check("api.anthropic.com", &[], &[], &allow), Verdict::Allow);
     }
 
     #[test]
     fn check_dns_deny_reason() {
         // AC-3.7: metadata.google.internal denied with reason=denied_dns.
-        assert_eq!(check("metadata.google.internal", &[], &[]), Verdict::Deny(DenyReason::DeniedDns));
+        assert_eq!(check("metadata.google.internal", &[], &[], &[]), Verdict::Deny(DenyReason::DeniedDns));
     }
 
     #[test]
     fn check_unlisted_host_denied() {
-        assert_eq!(check("evil.example.com", &[], &["api.anthropic.com".into()]),
+        assert_eq!(check("evil.example.com", &[], &[], &["api.anthropic.com".into()]),
                    Verdict::Deny(DenyReason::DomainNotAllowed));
+    }
+
+    #[test]
+    fn deny_domain_wins_over_allow() {
+        // [G-32, G-33] deny_domain checked before allow-list.
+        //
+        // Note: the deny entry must actually match the host under the Step 3
+        // wildcard rule (`*.suffix` matches `suffix` + its subdomains, not
+        // cross-dot). `*.example.com` matches `evil.example.com`, which is
+        // also in the allow-list — so a Deny(DeniedDomain) outcome proves the
+        // deny_domain stage runs before the allow-list stage.
+        let deny = vec!["*.example.com".to_string()];
+        let allow = vec!["evil.example.com".to_string()];
+        assert_eq!(check("evil.example.com", &[], &deny, &allow), Verdict::Deny(DenyReason::DeniedDomain));
+    }
+
+    #[test]
+    fn deny_domain_exact_match() {
+        let deny = vec!["api.evil.com".to_string()];
+        assert_eq!(check("api.evil.com", &[], &deny, &[]), Verdict::Deny(DenyReason::DeniedDomain));
+    }
+
+    #[test]
+    fn deny_domain_wildcard_matches_apex() {
+        // [G-55] apex match applies to deny_domain too.
+        let deny = vec!["*.evil.com".to_string()];
+        assert_eq!(check("evil.com", &[], &deny, &[]), Verdict::Deny(DenyReason::DeniedDomain));
+        assert_eq!(check("api.evil.com", &[], &deny, &[]), Verdict::Deny(DenyReason::DeniedDomain));
+        assert_eq!(check("not-evil.com", &[], &deny, &[]), Verdict::Deny(DenyReason::DomainNotAllowed));
+    }
+
+    #[test]
+    fn hard_deny_precedes_deny_domain() {
+        // [G-33] hard-deny (hostname set) is step 1, before deny_domain (step 2).
+        // metadata.google.internal is in the hard-deny DNS list; even if it's also
+        // in deny_domain, the hard-deny reason wins.
+        assert_eq!(
+            check("metadata.google.internal", &[], &["metadata.google.internal".into()], &[]),
+            Verdict::Deny(DenyReason::DeniedDns),
+        );
     }
 }

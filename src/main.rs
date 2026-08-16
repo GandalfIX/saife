@@ -318,12 +318,13 @@ fn run_inner(
             proxy_env = None;
             None
         }
-        net::NetworkConfig::Allow { allow_domain, .. } => {
+        net::NetworkConfig::Allow { allow_domain, deny_domain, .. } => {
             let token = net::token::gen_token().context("generate session token")?;
             let handle = net::proxy::spawn(net::proxy::ProxyConfig {
                 session_id: sid.clone(),
                 token: token.clone(),
                 allow_domain: allow_domain.clone(),
+                deny_domain: deny_domain.clone(),
                 writer: audit_writer.clone(),
             })
             .context("start localhost proxy")?;

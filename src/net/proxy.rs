@@ -56,6 +56,10 @@ pub struct ProxyConfig {
     pub session_id: String,
     pub token: String,
     pub allow_domain: Vec<String>,
+    /// Domains always denied, checked after hard-deny and before the
+    /// allow-list ([G-32, G-33]). Wired in D-3.2; the full prompt/learned-deny
+    /// pipeline lands in D-3.6.
+    pub deny_domain: Vec<String>,
     pub writer: Arc<AuditWriter>,
 }
 
@@ -143,8 +147,9 @@ impl Drop for ProxyHandle {
 pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
     // `session_id` is retained in ProxyConfig for diagnostics/future use but
     // is not threaded into handle_conn: the AuditWriter holds the log path.
-    let ProxyConfig { session_id: _session_id, token, allow_domain, writer } = cfg;
+    let ProxyConfig { session_id: _session_id, token, allow_domain, deny_domain, writer } = cfg;
     let allow = Arc::new(allow_domain);
+    let deny = Arc::new(deny_domain);
     let token = Arc::new(token);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -182,10 +187,11 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
                         Err(_) => continue,
                     };
                     let allow = allow.clone();
+                    let deny = deny.clone();
                     let token = token.clone();
                     let writer = writer.clone();
                     tokio::spawn(async move {
-                        let _ = handle_conn(sock, token, allow, writer).await;
+                        let _ = handle_conn(sock, token, deny, allow, writer).await;
                     });
                 }
             }
@@ -249,12 +255,14 @@ fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
 
 /// Map a deny reason to the `source` field of the D-5 audit taxonomy.
 /// Metadata DNS names and CIDR/literal-IP denies are hard-denies
-/// (non-negotiable, built into the binary); a host merely absent from the
-/// allow-list is the `default` deny (will become `blocklist` once D-1
-/// introduces an explicit deny-list).
+/// (non-negotiable, built into the binary); a `deny_domain` blocklist match
+/// is the `blocklist` source ([G-32]); a host merely absent from the
+/// allow-list is the `default` deny (will become `prompt` once the prompt
+/// layer in D-3.5 intercepts unlisted hosts).
 fn deny_source(reason: DenyReason) -> &'static str {
     match reason {
         DenyReason::DeniedDns | DenyReason::DeniedCidr => "hard-deny",
+        DenyReason::DeniedDomain => "blocklist",
         DenyReason::DomainNotAllowed => "default",
     }
 }
@@ -262,6 +270,7 @@ fn deny_source(reason: DenyReason) -> &'static str {
 async fn handle_conn(
     mut sock: tokio::net::TcpStream,
     token: Arc<String>,
+    deny: Arc<Vec<String>>,
     allow: Arc<Vec<String>>,
     writer: Arc<AuditWriter>,
 ) -> Result<()> {
@@ -325,7 +334,7 @@ async fn handle_conn(
         .map(|it| it.map(|sa| sa.ip()).collect())
         .unwrap_or_default();
 
-    let verdict = matcher::check(&host, &resolved, &allow);
+    let verdict = matcher::check(&host, &resolved, &deny, &allow);
     match verdict {
         Verdict::Allow => {
             let _ = emit_connect(&writer, &host, port, "allow", None, "allowlist", None, false);
@@ -542,6 +551,7 @@ mod tests {
     fn deny_source_maps_reasons_to_taxonomy() {
         assert_eq!(deny_source(DenyReason::DeniedDns), "hard-deny");
         assert_eq!(deny_source(DenyReason::DeniedCidr), "hard-deny");
+        assert_eq!(deny_source(DenyReason::DeniedDomain), "blocklist");
         assert_eq!(deny_source(DenyReason::DomainNotAllowed), "default");
     }
 }
