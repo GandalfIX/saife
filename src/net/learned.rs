@@ -61,6 +61,9 @@ pub struct LearnedDecision {
 
 /// In-memory learned store. Loaded once at startup; `record` writes
 /// through to disk atomically.
+///
+/// Not `Sync` by design — single-threaded use, or wrap in
+/// `Arc<Mutex<LearnedStore>>` for cross-thread access (see D-3.6).
 #[derive(Debug, Clone)]
 pub struct LearnedStore {
     file_path: PathBuf,
@@ -84,7 +87,14 @@ impl LearnedStore {
     /// `%USERPROFILE%\.sandbox\learned\` parent). Test-friendly + used by
     /// `load`. Same semantics as `load` otherwise: missing file → empty
     /// store, corrupt file → error, schema mismatch → error.
+    ///
+    /// Validates `profile_name` via [`validate_profile_name`] before
+    /// constructing the path, so a malicious/typo'd name cannot escape the
+    /// `.sandbox/learned/` directory (path-traversal defense).
     pub fn load_in(base: &Path, profile_name: Option<&str>) -> Result<Self> {
+        if let Some(name) = profile_name {
+            validate_profile_name(name)?;
+        }
         let path = learned_file_path_in(base, profile_name);
         if !path.exists() {
             return Ok(Self {
@@ -231,8 +241,51 @@ impl LearnedStore {
     }
 }
 
+/// Validate a learned-file profile name. Rejects anything that could
+/// escape the `.sandbox/learned/` directory or corrupt the path:
+/// - path separators (`/` or `\`)
+/// - `..` as a path component (parent-directory traversal)
+/// - NUL bytes (Win32 path terminator)
+/// - control characters (`\0`–`\x1F`)
+/// - empty after trimming whitespace
+///
+/// Allowed: letters, digits, hyphens, underscores, dots (within a
+/// component, e.g. `my.profile`). The `default` name (used when
+/// `profile_name` is `None`) also passes. Call this before
+/// `learned_file_path`/`learned_file_path_in` when the name comes from
+/// untrusted input (D-3.7 CLI). `load_in` calls it internally.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("learned profile name is empty");
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("learned profile name contains NUL byte");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        anyhow::bail!("learned profile name contains a path separator: {trimmed:?}");
+    }
+    // Reject `..` as a standalone component (e.g. "..", "foo/..", "..bar").
+    // Splitting on `.` lets us catch `..` even when the user writes it
+    // without separators (the earlier separator check already blocks the
+    // path-traversal form; this blocks the literal `..` token as well).
+    for component in trimmed.split('.') {
+        if component.is_empty() || component == ".." {
+            anyhow::bail!("learned profile name has empty or `..` component: {trimmed:?}");
+        }
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        anyhow::bail!("learned profile name contains a control character: {trimmed:?}");
+    }
+    Ok(())
+}
+
 /// Compute the learned file path: `%USERPROFILE%\.sandbox\learned\<name>.json`.
 /// Unnamed → `default.json` ([G-5]).
+///
+/// Does **not** validate `profile_name` — callers passing untrusted input
+/// (e.g. D-3.7 CLI) must call [`validate_profile_name`] first. `load_in`
+/// validates internally.
 pub fn learned_file_path(profile_name: Option<&str>) -> PathBuf {
     let base = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
@@ -243,6 +296,10 @@ pub fn learned_file_path(profile_name: Option<&str>) -> PathBuf {
 /// Compute the learned file path rooted at `base`:
 /// `<base>\.sandbox\learned\<name>.json`. Unnamed → `default.json` ([G-5]).
 /// Pure (no env read) so tests can drive it deterministically.
+///
+/// Does **not** validate `profile_name` — callers passing untrusted input
+/// must call [`validate_profile_name`] first. `load_in` validates
+/// internally.
 pub fn learned_file_path_in(base: &Path, profile_name: Option<&str>) -> PathBuf {
     let name = profile_name
         .filter(|s| !s.is_empty())
@@ -292,9 +349,13 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         }
     }
 
-    // Fallback: direct write (non-atomic, but the data lands).
-    std::fs::write(path, data).with_context(|| format!("fallback direct write {}", path.display()))?;
+    // Fallback: direct write (non-atomic, but the data lands). If this
+    // also fails, clean up the temp file before propagating the error so
+    // we don't leave a stale `.json.tmp` on disk.
+    let fallback = std::fs::write(path, data)
+        .with_context(|| format!("fallback direct write {}", path.display()));
     let _ = std::fs::remove_file(&tmp);
+    fallback?;
     Ok(())
 }
 
@@ -441,6 +502,71 @@ mod tests {
         let result = LearnedStore::load_in(&tmp, Some("corrupt"));
         assert!(result.is_err());
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The `bail!` branch for `parsed.schema != LEARNED_SCHEMA_VERSION`
+    /// must error (not panic, not succeed). Writes a structurally-valid
+    /// file with a future schema number and expects load to reject it.
+    #[test]
+    fn schema_mismatch_errors() {
+        let tmp = temp_dir("schema-mismatch");
+        let path = learned_file_path_in(&tmp, Some("schema-mismatch"));
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        // Valid shape, wrong schema version.
+        let raw = "{\
+            \"schema\": 999,\
+            \"allow\": [{\"host\": \"a.com\", \"scope\": \"host\"}],\
+            \"deny\": []\
+        }";
+        std::fs::write(&path, raw).ok();
+        let result = LearnedStore::load_in(&tmp, Some("schema-mismatch"));
+        assert!(result.is_err(), "schema mismatch must error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("schema version"),
+            "error should mention schema version: {msg}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Path-traversal defense: `validate_profile_name` rejects names that
+    /// could escape `.sandbox/learned/` or corrupt the path.
+    #[test]
+    fn validate_profile_name_accepts_valid_names() {
+        assert!(validate_profile_name("developer").is_ok());
+        assert!(validate_profile_name("valid-name_1").is_ok());
+        assert!(validate_profile_name("my.profile").is_ok());
+        assert!(validate_profile_name("default").is_ok());
+        assert!(validate_profile_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_profile_name_rejects_path_traversal() {
+        assert!(validate_profile_name("../escape").is_err(), "parent traversal");
+        assert!(validate_profile_name("a/b").is_err(), "forward slash");
+        assert!(validate_profile_name("a\\b").is_err(), "backslash");
+        assert!(validate_profile_name("..").is_err(), "bare ..");
+    }
+
+    #[test]
+    fn validate_profile_name_rejects_empty_and_control_chars() {
+        assert!(validate_profile_name("").is_err(), "empty");
+        assert!(validate_profile_name("   ").is_err(), "whitespace only");
+        assert!(validate_profile_name("name\0").is_err(), "NUL byte");
+        assert!(validate_profile_name("na\x01me").is_err(), "control char");
+    }
+
+    /// `load_in` must reject a path-traversing profile name (defense at
+    /// the load boundary, not just at the pure validator).
+    #[test]
+    fn load_in_rejects_path_traversal_profile_name() {
+        let tmp = temp_dir("load-traversal");
+        let result = LearnedStore::load_in(&tmp, Some("../escape"));
+        assert!(result.is_err(), "load_in must reject ../escape");
+        let result2 = LearnedStore::load_in(&tmp, Some("a/b"));
+        assert!(result2.is_err(), "load_in must reject a/b");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
