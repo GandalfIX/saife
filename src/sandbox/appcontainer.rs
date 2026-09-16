@@ -3,6 +3,7 @@ use windows::Win32::Security::Authorization::*;
 use windows::Win32::Security::Isolation::*;
 use windows::Win32::Security::*;
 use windows::Win32::System::Threading::*;
+use windows::Win32::Storage::FileSystem::*;
 use windows::core::*;
 
 use crate::net::ProxyEnv;
@@ -110,6 +111,9 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
         let ea = EXPLICIT_ACCESS_W {
             grfAccessPermissions: e.access,
             grfAccessMode: if e.deny { DENY_ACCESS } else { SET_ACCESS },
+            // An inheritable ACE here would make SetNamedSecurityInfoW
+            // recursively propagate it through the existing subtree (Marta);
+            // on paths like C:\Users\<user> that walk never completes.
             grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
             Trustee: TRUSTEE_W {
                 TrusteeForm: TRUSTEE_IS_SID,
@@ -146,13 +150,37 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
             return Err(HRESULT::from_win32(set_r.0).into());
         }
 
+        // SetSecurityInfo bypasses aclapi Marta propagation entirely.
+        // Marta (ntmarta.dll) hangs when recursively propagating ANY inherited
+        // ACEs down a large subtree (e.g. C:\Users\<user>) - not just the new ACE.
+        // Using a kernel-handle-based DACL write skips Marta completely: the
+        // kernel writes the DACL directly, no userspace tree propagation.
+        let mut path_buf: Vec<u16> = path_str.encode_utf16().collect();
+        path_buf.push(0); // ensure trailing null
+        let open_r = CreateFileW(
+            PCWSTR(path_buf.as_ptr()),
+            WRITE_DAC.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        );
+        let handle = match open_r {
+            Ok(h) => h,
+            Err(e) => {
+                LocalFree(Some(HLOCAL(new_acl as *mut _)));
+                return Err(e);
+            }
+        };
+        // call SetSecurityInfo (which uses the kernel) with the handle.
         let flags = if e.protected {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
         } else {
             DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION
         };
-        let write_r = SetNamedSecurityInfoW(
-            &path_w,
+        let write_r = SetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             flags,
             None,
@@ -161,6 +189,7 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
             None,
         );
         let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
+        let _ = CloseHandle(handle);
         if write_r.is_err() {
             return Err(HRESULT::from_win32(write_r.0).into());
         }
