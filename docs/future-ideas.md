@@ -72,6 +72,102 @@ guarantee (the AppContainer can walk *through* `C:\Users\<user>` but cannot
 **Resolves:** KI-1.2 (the `Set-Location` part; `InitializeDefaultDrives`
 enumerating other drives may still warn).
 
+### F-23. UI / Win32k restriction Job Object flags (AI-agent hardening)
+
+Mirror the UI-restriction layer from Microsoft's MXC `processcontainer`
+backend (`docs/process-container/os-version-support.md`, "UI restrictions"
+matrix) into our own Job Object setup. MXC applies these in **both** its T1
+(BaseContainer) and T3 (AppContainer+DACL) tiers via
+`src/backends/appcontainer/common/src/job_object.rs`, so they are orthogonal
+to the grant mechanism and can land on top of our existing code with no
+architectural change.
+
+**Why:** an escaping prompt-driven agent should not be able to (a) read the
+clipboard the user may have just copied a secret into, (b) enumerate or inject
+into other windows, or (c) call win32k syscalls it doesn't need. These are
+cheap, kernel-enforced, and independent of the filesystem/network policy.
+
+**Design:**
+
+- Extend the Job Object setup (currently `KILL_ON_JOB_CLOSE`, no
+  `BREAKAWAY_OK`) with `JOB_OBJECT_UILIMIT_*` flags:
+  - `HANDLES` / `GLOBALATOMS` — UI isolation (`ui.isolation`)
+  - `READCLIPBOARD` / `WRITECLIPBOARD` — clipboard control (`ui.clipboard`)
+  - `SYSTEMPARAMETERS` / `DISPLAYSETTINGS` (`ui.systemSettings`)
+  - `DESKTOP` / `EXITWINDOWS` (`ui.desktopSystemControl`)
+  - `IME` (`0x100`, requires build 22621+ → always available on supported
+    hosts; MXC gate: `MIN_BUILD_FOR_IME_LIMIT`)
+  - `INJECTION` (`0x200`, requires build 26100+ → Win11 24H2; MXC gate:
+    `MIN_BUILD_FOR_INJECTION_LIMIT`). Build-gate this one: 23H2 kernel
+    rejects it, so use MXC's `requested & supported` mask pattern — never
+    hand the kernel a flag it would reject.
+- Add the `disallowWin32kSystemCalls` process mitigation as `ui.disable`
+  (available 23H2+).
+- Expose as profile `ui.*` slice plus CLI (e.g. `--ui-lockdown`,
+  `--no-clipboard`). Effective mask = `requested & supported_for_build`.
+- `sandbox setup --check-only` reports which UI limits the host can enforce
+  (equivalent to MXC's `wxc-exec --probe` output).
+
+**Scope:** contained — touches Job Object creation + process-attribute
+(mitigation) setup in `src/sandbox/`, plus CLI/profile plumbing. No change to
+the AppContainer/DACL path. Works on our existing Windows 10 1709+ floor
+(except `INJECTION`, which simply no-ops below 26100).
+
+**Resolves:** clipboard/window/IME/injection escape surface for unattended
+agent runs; parity with the MXC UI-restriction surface without adopting MXC.
+
+### F-24. Denial-capture / learning-mode audit for policy authoring
+
+Mirror MXC's `--audit` (Permissive Learning Mode) developer-inner-loop
+feature: run the sandbox in a permissive mode where denied operations are
+**logged but allowed**, capture what the workload *actually* touches, and emit
+an adjusted profile. From MXC: it starts a PLM (Permissive Learning Mode) ETW
+trace alongside the workload and always prints an artifact dir containing
+`trace.etl`, `denials.json`, and any adjusted config.
+
+**Why:** authoring a tight filesystem/network allow-list by hand is painful
+guess-work ("which paths does `npm install` really need?"). A capture-driven
+flow turns policy authoring from trial-and-error into: run once in learning
+mode → review `denials.json` → promote the entries you agree with into the
+profile. This directly feeds US-4 (audit trail) and makes F-22 (ancestor
+grants) and per-app profiles (claude-code, opencode, codex) much easier to
+write correctly.
+
+**Design:**
+
+- New `sandbox audit <profile> -- <cmd>` subcommand (separate from
+  `sandbox run` so the permissive mode is opt-in and explicit, never a
+  default).
+- Backend A (no OS changes, ship first): run the child *without* the DACL
+  deny-by-default (grants-only), attach an ETW file-access + `connect()`
+  listener (US-4 plumbing already planned), emit
+  `.\.sandbox\<sid>\audit\denials.json` listing every path/host the child
+  touched that was *not* in the profile. Fail-closed alternatives stay in
+  `sandbox run` only.
+- Backend B (later, if a capable Windows build is present): key off the OS
+  BaseContainer Learning-Mode export set MXC probes for
+  (`StartLearningModeTrace` / `StopLearningModeTrace` / `CloseLearningModeTrace`,
+  requires the full V2 contract) so kernel AppContainer denials are captured
+  natively instead of running permissive. Build-gate behind a runtime probe;
+  fall back to Backend A otherwise.
+- Output: `denials.json` + a suggested profile delta (paths to add to
+  `filesystem.allow`, hosts to add to `network.allow_domain`), plus a
+  human-readable summary. Include the "never silently granted" note in the
+  report header so it's obvious the audit run did **not** enforce policy.
+- Hard rules (from DX/security): cannot be combined with a production
+  profile's enforcement; the permissive mode is *rejected* for any backend
+  that doesn't honor learning mode; reserved capability names
+  (`learningModeLogging`, `permissiveLearningMode`) are rejected in normal
+  profiles (matching MXC's restriction).
+
+**Scope:** new subcommand + ETW/session wiring (reuses US-4 audit backend) +
+report writer. Backend A is most of the value and is unprivileged; Backend B
+is an optional refinement gated on Windows capability.
+
+**Resolves:** policy-authoring pain (FR for US-1/US-3 profile correctness),
+US-4 (audit trail) gains real data, reduces the "just give it `--allow-cwd`
+and everything under `$HOME`" profile-bloat antipattern.
+
 ### F-1. Undo & Rollback
 SHA-256 content-addressed snapshots of every file in the sandbox scope taken
 **before** the agent starts and **after** it exits. Stored in a deduplicating
