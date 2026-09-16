@@ -1,0 +1,20 @@
+{
+  "meta": { "name": "opencode", "version": "1.0.0", "schema_version": 1 },
+  "filesystem": {
+    "allow": [
+      "$CWD",
+      "$HOME/.local/share/opencode",
+      "$HOME/.local/state/opencode",
+      "$HOME/.cache/opencode",
+      "$HOME/.config/opencode",
+      "$USERPROFILE/AppData/Roaming/opencode",
+      "$USERPROFILE/AppData/Local/opencode"
+    ],
+    "read_only": ["$HOME/.gitconfig"],
+    "deny": ["$HOME/.ssh", "$HOME/.aws"]
+  },
+  "network": {
+    "block_net": false,
+    "profile": "developer"
+  }
+}
