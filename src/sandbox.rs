@@ -1,5 +1,6 @@
 pub mod allowlist;
 pub mod appcontainer;
+pub mod dacl_journal;
 pub mod job;
 pub mod spawn;
 

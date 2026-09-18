@@ -3,8 +3,8 @@
 //! Mirrors `grant_one()` in `src/sandbox/appcontainer.rs` (non-protected path):
 //!   1. GetNamedSecurityInfoW        -> current DACL of the target path
 //!   2. SetEntriesInAclW             -> old DACL + one new SET_ACCESS ACE
-//!   3. SetNamedSecurityInfoW        -> write the merged DACL back (SKIPPED
-//!                                      in default dry-run mode)
+//!   3. SetNamedSecurityInfoW       -> write the merged DACL back (SKIPPED
+//!      in default dry-run mode)
 //!
 //! Usage:
 //!   hang_repro.exe                 dry-run: steps 1+2 only, DACL NOT modified
