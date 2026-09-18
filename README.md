@@ -200,6 +200,10 @@ When the fix lands, the integration scenarios S-27..S-34, S-36, S-38
    the proxy enforces the domain allow-list + always-denied list (cloud
    metadata endpoints, link-local CIDRs) and emits `CONNECT` audit
    events.
+6. Every ACE grant is journaled before it is applied; on exit the
+   journal is replayed to restore the host. If `sandbox.exe` is killed,
+   the next run reaps and restores orphaned journals (quarantining
+   unparseable ones as `.corrupt`).
 
 ## Testing
 

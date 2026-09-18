@@ -42,7 +42,10 @@ fn main() {
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { action } => profile_cmd(action),
-        Cmd::Setup { check_only, grant_drive_root } => {
+        Cmd::Setup {
+            check_only,
+            grant_drive_root,
+        } => {
             if let Err(e) = setup::check(check_only, grant_drive_root) {
                 eprintln!("[sandbox] setup check failed: {e:#}");
                 std::process::exit(1);
@@ -57,16 +60,20 @@ fn ps_cmd(json: bool) -> i32 {
     // Minimal: list the most recent audit log's sid.
     let dir = match std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
         Some(p) => p.join("sandbox").join("audit"),
-        None => { eprintln!("[sandbox] LOCALAPPDATA not set"); return 1; }
+        None => {
+            eprintln!("[sandbox] LOCALAPPDATA not set");
+            return 1;
+        }
     };
     let mut entries: Vec<(std::time::SystemTime, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             if let Some(name) = e.file_name().to_str()
                 && let Some(sid) = name.strip_suffix(".ndjson")
-                    && let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
-                        entries.push((mtime, sid.to_string()));
-                    }
+                && let Ok(mtime) = e.metadata().and_then(|m| m.modified())
+            {
+                entries.push((mtime, sid.to_string()));
+            }
         }
     }
     entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
@@ -89,12 +96,12 @@ fn ps_cmd(json: bool) -> i32 {
 fn audit_cmd(action: cli::AuditAction) -> i32 {
     use cli::AuditAction;
     match action {
-        AuditAction::Show { session_id, json, filter } => {
-            audit::show::run_show(&session_id, json, filter.as_deref())
-        }
-        AuditAction::Verify { session_id } => {
-            audit::verify::run_verify(&session_id)
-        }
+        AuditAction::Show {
+            session_id,
+            json,
+            filter,
+        } => audit::show::run_show(&session_id, json, filter.as_deref()),
+        AuditAction::Verify { session_id } => audit::verify::run_verify(&session_id),
     }
 }
 
@@ -113,16 +120,14 @@ fn profile_cmd(action: cli::ProfileAction) -> i32 {
             }
             0
         }
-        ProfileAction::Show { name, expanded } => {
-            profile::show_profile(&name, expanded)
-        }
+        ProfileAction::Show { name, expanded } => profile::show_profile(&name, expanded),
     }
 }
 
 fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
     let key = signing::KeyMaterial::ensure()?;
-    let root_bytes = decode_hex_vec(root)
-        .ok_or_else(|| anyhow::anyhow!("root is not valid hex: {root}"))?;
+    let root_bytes =
+        decode_hex_vec(root).ok_or_else(|| anyhow::anyhow!("root is not valid hex: {root}"))?;
     let sig = key.sign_root(&root_bytes);
     let sig_hex: String = sig.iter().map(|b| format!("{:02x}", b)).collect();
     let log_path = audit::audit_log_path(sid);
@@ -132,8 +137,13 @@ fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
 }
 
 fn decode_hex_vec(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) { return None; }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect()
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,12 +206,8 @@ fn run_inner(
     };
 
     // Resolve the network configuration from the profile slice + CLI flags.
-    let net_cfg_resolved = net::resolve_network(
-        &resolved.network,
-        block_net,
-        allow_domain,
-        network_profile,
-    );
+    let net_cfg_resolved =
+        net::resolve_network(&resolved.network, block_net, allow_domain, network_profile);
 
     // Merge CLI flags on top of the profile.
     let fs = profile::merge_filesystem(&resolved.filesystem, allow_cwd, allow, read_only, &cwd)?;
@@ -209,6 +215,31 @@ fn run_inner(
     let sid = match sid {
         Some(s) => s.to_string(),
         None => new_session_id(),
+    };
+
+    // MXC F-C/F-D: before any host-DACL mutation, reap journals of dead
+    // owners (restore their entries, quarantine corrupt ones). Then open
+    // this run's journal. Failure to open is a warning only — the run
+    // proceeds unjournaled.
+    let journal_dir = sandbox::dacl_journal::default_dir();
+    sandbox::dacl_journal::recover_orphans(
+        &journal_dir,
+        &|h| !sandbox::dacl_journal::is_process_alive(h.owner_pid, h.owner_created),
+        &|j| sandbox::appcontainer::restore_or_warn(j),
+    );
+    let run_journal = match sandbox::dacl_journal::DaclJournal::open(
+        &journal_dir,
+        sandbox::dacl_journal::JournalHeader {
+            run_id: sid.clone(),
+            owner_pid: std::process::id(),
+            owner_created: sandbox::dacl_journal::current_process_creation_time(),
+        },
+    ) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            eprintln!("[sandbox] warning: DACL journal unavailable: {e}");
+            None
+        }
     };
 
     // Ensure the per-session install dirs exist.
@@ -230,7 +261,7 @@ fn run_inner(
     // starts and thus no CONNECT events fire).
     let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid));
     {
-        use serde_json::{json, Map};
+        use serde_json::{Map, json};
         let mut e = Map::new();
         e.insert("op".into(), json!("SESSION_START"));
         e.insert("sid".into(), json!(sid));
@@ -258,9 +289,7 @@ fn run_inner(
             eprintln!(
                 "[sandbox]          privateNetworkClientServer-capability path is a follow-up)."
             );
-            eprintln!(
-                "[sandbox]          Downgrading this session to --block-net semantics."
-            );
+            eprintln!("[sandbox]          Downgrading this session to --block-net semantics.");
             net::NetworkConfig::Blocked
         }
         other => other.clone(),
@@ -298,7 +327,10 @@ fn run_inner(
                 writer: audit_writer.clone(),
             })
             .context("start localhost proxy")?;
-            proxy_env = Some(net::ProxyEnv { port: handle.port, token });
+            proxy_env = Some(net::ProxyEnv {
+                port: handle.port,
+                token,
+            });
             Some(handle)
         }
     };
@@ -306,7 +338,7 @@ fn run_inner(
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
 
-    if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries) {
+    if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries, run_journal.as_ref()) {
         eprintln!("[sandbox] warning: some ACL grants failed: {e}");
     }
 
@@ -351,10 +383,22 @@ fn run_inner(
     drop(audit_writer);
 
     if let Some(root) = captured_root
-        && let Err(e) = commit_audit_root(&sid, &root) {
-            eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
-            // The log is still readable; verify will report INCOMPLETE.
+        && let Err(e) = commit_audit_root(&sid, &root)
+    {
+        eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
+        // The log is still readable; verify will report INCOMPLETE.
+    }
+
+    // MXC F-C/F-D teardown order matters: restore host DACLs BEFORE deleting
+    // the profile (a crash between the two leaves restorable journal state,
+    // not re-derivable grants). Journal file is removed ONLY on success.
+    if let Some(j) = &run_journal {
+        let ok = sandbox::appcontainer::restore_or_warn(j);
+        if ok {
+            j.remove_file();
         }
+    }
+    sandbox::appcontainer::delete_profile(&session.ac_name);
 
     Ok(exit_code as i32)
 }
@@ -412,7 +456,11 @@ fn join_cmdline(tokens: &[String]) -> String {
             a.to_string()
         }
     }
-    tokens.iter().map(|t| quote_arg(t)).collect::<Vec<_>>().join(" ")
+    tokens
+        .iter()
+        .map(|t| quote_arg(t))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -440,7 +488,10 @@ mod tests {
 
     #[test]
     fn join_cmdline_quotes_spaces() {
-        assert_eq!(join_cmdline(&["echo".into(), "hello world".into()]), "echo \"hello world\"");
+        assert_eq!(
+            join_cmdline(&["echo".into(), "hello world".into()]),
+            "echo \"hello world\""
+        );
         assert_eq!(join_cmdline(&["echo".into(), "".into()]), "echo \"\"");
         assert_eq!(join_cmdline(&["a".into()]), "a");
     }

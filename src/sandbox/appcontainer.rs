@@ -2,12 +2,13 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Security::Authorization::*;
 use windows::Win32::Security::Isolation::*;
 use windows::Win32::Security::*;
-use windows::Win32::System::Threading::*;
 use windows::Win32::Storage::FileSystem::*;
+use windows::Win32::System::Threading::*;
 use windows::core::*;
 
 use crate::net::ProxyEnv;
 use crate::sandbox::allowlist::AllowEntry;
+use crate::sandbox::dacl_journal::{DaclJournal, JournalEntry, PriorAce};
 
 /// Fields `sid` and `ac_name` are retained for diagnostics and future
 /// tear-down/audit wiring; only `ac_sid` is consumed by `spawn` today.
@@ -42,8 +43,9 @@ pub fn create_session(sid: &str) -> Result<AppContainerSession> {
             // Both error codes appear across windows-rs versions:
             // ERROR_ALREADY_EXISTS (0x800700B7) and the AppContainer-specific
             // 0x80071392.
-            Err(e) if e.code() == HRESULT::from_win32(0x800700B7)
-                || e.code() == HRESULT::from_win32(0x80071392) =>
+            Err(e)
+                if e.code() == HRESULT::from_win32(0x800700B7)
+                    || e.code() == HRESULT::from_win32(0x80071392) =>
             {
                 DeriveAppContainerSidFromAppContainerName(&ac_name_w)?
             }
@@ -63,21 +65,37 @@ pub fn create_session(sid: &str) -> Result<AppContainerSession> {
 /// logged to stderr but do not abort (the spike showed that some SystemRoot
 /// grants fail on locked-down machines — harmless because those dirs are
 /// world-readable).
-pub fn grant_access(ac_sid: &PSID, entries: &[AllowEntry]) -> Result<()> {
+///
+/// `journal`, when present, receives every grant BEFORE it is applied
+/// (MXC filesystem_dacl.rs pattern): teardown replays the journal to
+/// restore the host, and a crash leaves a restorable record behind.
+pub fn grant_access(
+    ac_sid: &PSID,
+    entries: &[AllowEntry],
+    journal: Option<&DaclJournal>,
+) -> Result<()> {
     let diag = std::env::var_os("SANDBOX_DIAG").is_some();
     for e in entries {
-        if let Err(err) = grant_one(ac_sid, e) {
+        if let Err(err) = grant_one(ac_sid, e, journal) {
             if diag {
                 eprintln!(
                     "[grant] WARN: {:>16} {:?} failed: {err}",
-                    if e.deny { format!("{} [deny]", e.label) } else { e.label.to_string() },
+                    if e.deny {
+                        format!("{} [deny]", e.label)
+                    } else {
+                        e.label.to_string()
+                    },
                     e.win32_path
                 );
             }
         } else if diag {
             eprintln!(
                 "[grant] {:>16}  {:?}  mask=0x{:x}{}{}",
-                if e.deny { format!("{} [deny]", e.label) } else { e.label.to_string() },
+                if e.deny {
+                    format!("{} [deny]", e.label)
+                } else {
+                    e.label.to_string()
+                },
                 e.win32_path,
                 e.access,
                 if e.deny { " DENY" } else { "" },
@@ -88,7 +106,7 @@ pub fn grant_access(ac_sid: &PSID, entries: &[AllowEntry]) -> Result<()> {
     Ok(())
 }
 
-fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
+fn grant_one(ac_sid: &PSID, e: &AllowEntry, journal: Option<&DaclJournal>) -> Result<()> {
     let path_str = e.win32_path.to_string_lossy().to_string();
     let path_w = HSTRING::from(&path_str);
     unsafe {
@@ -108,13 +126,44 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
             return Err(HRESULT::from_win32(r.0).into());
         }
 
+        // Snapshot our trustee's explicit ACEs BEFORE mutating (restored on
+        // teardown; MXC filesystem_dacl.rs:22-28 — SetEntriesInAclW coalesces
+        // same-trustee rights, so per-ACE selective removal is impossible).
+        let prior_aces = snapshot_prior_aces(dacl_ptr, ac_sid);
+        if let Some(j) = journal {
+            if let Ok(sid_str) = sid_to_string(*ac_sid) {
+                let entry = JournalEntry {
+                    path: path_str.clone(),
+                    sid: sid_str,
+                    granted_mask: e.access,
+                    deny: e.deny,
+                    protected: e.protected,
+                    inherit: e.inherit,
+                    prior_aces,
+                };
+                if let Err(err) = j.record(&entry) {
+                    // Journal failure is a warning: the run proceeds, and
+                    // teardown/next startup simply won't restore this path.
+                    // Matches grant_access's per-entry error tolerance.
+                    eprintln!("[journal] WARN: record failed for {path_str}: {err}");
+                }
+            } else {
+                eprintln!("[journal] WARN: record failed for {path_str}: SID conversion failed");
+            }
+        }
+
         let ea = EXPLICIT_ACCESS_W {
             grfAccessPermissions: e.access,
             grfAccessMode: if e.deny { DENY_ACCESS } else { SET_ACCESS },
-            // An inheritable ACE here would make SetNamedSecurityInfoW
-            // recursively propagate it through the existing subtree (Marta);
-            // on paths like C:\Users\<user> that walk never completes.
-            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            // Inheritable ACE only when requested; ancestor traverse grants
+            // are non-inheritable (a kernel-handle DACL write with an
+            // inheritable ACE on a large tree walks every descendant —
+            // e.g. C:\Users\marku\AppData\Local — appearing as a hang).
+            grfInheritance: if e.inherit {
+                SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            } else {
+                NO_INHERITANCE
+            },
             Trustee: TRUSTEE_W {
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_GROUP,
@@ -155,11 +204,21 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
         // ACEs down a large subtree (e.g. C:\Users\<user>) - not just the new ACE.
         // Using a kernel-handle-based DACL write skips Marta completely: the
         // kernel writes the DACL directly, no userspace tree propagation.
+        // (Extracted as `apply_dacl_kernel` so the DACL-restore path uses the
+        // identical write mechanism.)
+        apply_dacl_kernel(&path_str, new_acl, e.protected)
+    }
+}
+
+/// Open `path` for a DACL write and apply `new_acl` via kernel-handle
+/// `SetSecurityInfo` (the de0b9bf Marta-hang bypass). Frees `new_acl`.
+fn apply_dacl_kernel(path_str: &str, new_acl: *mut ACL, protected: bool) -> Result<()> {
+    unsafe {
         let mut path_buf: Vec<u16> = path_str.encode_utf16().collect();
         path_buf.push(0); // ensure trailing null
         let open_r = CreateFileW(
             PCWSTR(path_buf.as_ptr()),
-            WRITE_DAC.0,
+            WRITE_DAC.0 | READ_CONTROL.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
@@ -174,7 +233,7 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
             }
         };
         // call SetSecurityInfo (which uses the kernel) with the handle.
-        let flags = if e.protected {
+        let flags = if protected {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
         } else {
             DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION
@@ -195,6 +254,207 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Revoke our trustee's ACEs and re-grant the journaled prior state for
+/// every entry in the journal (MXC teardown semantics). Applies through
+/// `apply_dacl_kernel` — never through the Marta write path.
+pub fn restore_all(journal: &DaclJournal) -> Result<()> {
+    for entry in journal.entries() {
+        restore_one(&entry)?;
+    }
+    Ok(())
+}
+
+/// Restore + log-on-failure wrapper for `run()` teardown and orphan reaping.
+/// Returns true only when every entry was restored (journal then removable);
+/// on failure the journal file is KEPT so the next startup retries.
+pub fn restore_or_warn(journal: &DaclJournal) -> bool {
+    match restore_all(journal) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "[sandbox] warning: DACL restore failed; journal retained for retry at next start: {}",
+                journal.path().display()
+            );
+            eprintln!("[sandbox]          {e:#}");
+            false
+        }
+    }
+}
+
+fn restore_one(e: &JournalEntry) -> Result<()> {
+    let path_str = e.path.clone();
+    let path_w = HSTRING::from(e.path.as_str());
+    let sid_w = HSTRING::from(e.sid.as_str());
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+        let r = GetNamedSecurityInfoW(
+            &path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl_ptr),
+            None,
+            &mut sd,
+        );
+        if r.is_err() {
+            return Err(HRESULT::from_win32(r.0).into());
+        }
+
+        let mut psid = PSID(std::ptr::null_mut());
+        if ConvertStringSidToSidW(&sid_w, &mut psid).is_err() {
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            return Err(Error::from_hresult(HRESULT::from_win32(0x80070057)));
+        }
+
+        // The journal records entries BEFORE the grant applies, so a grant
+        // that never applied (e.g. system-owned System32/SystemRoot, or a
+        // failed write) has nothing to restore. Skip the DACL write when the
+        // object carries none of our ACEs and there is no prior state —
+        // otherwise the write fails on unwritable system paths and the
+        // journal can never be retired.
+        let ours_on_object = snapshot_prior_aces(dacl_ptr, &psid);
+        if !e.protected && e.prior_aces.is_empty() && ours_on_object.is_empty() {
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            let _ = LocalFree(Some(HLOCAL(psid.0 as *mut _)));
+            return Ok(());
+        }
+
+        let revoke = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_GROUP,
+                ptstrName: PWSTR(psid.0 as *mut _),
+                ..Default::default()
+            },
+        };
+
+        let mut new_acl: *mut ACL = std::ptr::null_mut();
+        let set_r = if e.protected {
+            // PROTECTED dropped inheritance, so grant_one rebuilt the DACL
+            // from scratch: rebuild it the same way (owner trustees + prior
+            // state for our trustee), applied with the PROTECTED flag.
+            let mut all_entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
+            for trustee in owner_trustees() {
+                all_entries.push(EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: 0x1f01ff, // FILE_ALL_ACCESS
+                    grfAccessMode: SET_ACCESS,
+                    grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+                    Trustee: trustee,
+                });
+            }
+            for ea in prior_eas(&e.prior_aces, psid) {
+                all_entries.push(ea);
+            }
+            SetEntriesInAclW(Some(&all_entries), None, &mut new_acl)
+        } else {
+            let old_acl_opt = if dacl_ptr.is_null() {
+                None
+            } else {
+                Some(dacl_ptr as *const ACL)
+            };
+            let mut tmp: *mut ACL = std::ptr::null_mut();
+            let first = SetEntriesInAclW(Some(&[revoke]), old_acl_opt, &mut tmp);
+            if first.is_err() {
+                let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+                let _ = LocalFree(Some(HLOCAL(psid.0 as *mut _)));
+                return Err(HRESULT::from_win32(first.0).into());
+            }
+            let prior: Vec<EXPLICIT_ACCESS_W> = prior_eas(&e.prior_aces, psid);
+            if prior.is_empty() {
+                new_acl = tmp;
+                WIN32_ERROR(0)
+            } else {
+                let second = SetEntriesInAclW(Some(&prior), Some(tmp), &mut new_acl);
+                let _ = LocalFree(Some(HLOCAL(tmp as *mut _)));
+                second
+            }
+        };
+
+        let _ = LocalFree(Some(HLOCAL(psid.0 as *mut _)));
+        let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+        if set_r.is_err() {
+            return Err(HRESULT::from_win32(set_r.0).into());
+        }
+
+        apply_dacl_kernel(&path_str, new_acl, e.protected)
+    }
+}
+
+/// EXPLICIT_ACCESS_W entries that reproduce a journal's prior ACEs verbatim
+/// for the session trustee `psid`.
+fn prior_eas(prior: &[PriorAce], psid: PSID) -> Vec<EXPLICIT_ACCESS_W> {
+    prior
+        .iter()
+        .map(|a| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: a.mask,
+            grfAccessMode: if a.deny { DENY_ACCESS } else { SET_ACCESS },
+            grfInheritance: windows::Win32::Security::ACE_FLAGS(a.inherit_flags),
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_GROUP,
+                ptstrName: PWSTR(psid.0 as *mut _),
+                ..Default::default()
+            },
+        })
+        .collect()
+}
+
+/// Explicit (non-inherited) ACEs for `ac_sid` currently on `dacl_ptr` —
+/// the prior state we must restore after revoking our grants.
+fn snapshot_prior_aces(dacl_ptr: *mut ACL, ac_sid: &PSID) -> Vec<PriorAce> {
+    let mut out = Vec::new();
+    if dacl_ptr.is_null() {
+        return out;
+    }
+    unsafe {
+        let mut count: u32 = 0;
+        let mut ea_array: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
+        if GetExplicitEntriesFromAclW(dacl_ptr, &mut count, &mut ea_array).is_ok()
+            && !ea_array.is_null()
+        {
+            for i in 0..count as usize {
+                let ea = ea_array.add(i);
+                if (*ea).Trustee.TrusteeForm == TRUSTEE_IS_SID {
+                    let sid = PSID((*ea).Trustee.ptstrName.0 as *mut _);
+                    if EqualSid(*ac_sid, sid).is_ok() {
+                        out.push(PriorAce {
+                            deny: (*ea).grfAccessMode == DENY_ACCESS,
+                            mask: (*ea).grfAccessPermissions,
+                            inherit_flags: (*ea).grfInheritance.0,
+                        });
+                    }
+                }
+            }
+            let _ = LocalFree(Some(HLOCAL(ea_array as *mut _)));
+        }
+    }
+    out
+}
+
+/// SDDL-style string form of `sid` (ConvertSidToStringSidW + LocalFree).
+fn sid_to_string(sid: PSID) -> Result<String> {
+    unsafe {
+        let mut buf = PWSTR::null();
+        ConvertSidToStringSidW(sid, &mut buf)?;
+        let s = if buf.0.is_null() {
+            String::new()
+        } else {
+            // buf.0 is a NUL-terminated UTF-16 string; decode it as such
+            // (reading it as an 8-bit C string would truncate at "S" —
+            // the second UTF-16 byte is the NUL).
+            let len = (0..).take_while(|i| *buf.0.add(*i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(buf.0, len))
+        };
+        let _ = LocalFree(Some(HLOCAL(buf.0 as *mut _)));
+        Ok(s)
+    }
 }
 
 /// Owner trustees for PROTECTED_DACLs: current user, SYSTEM, Administrators.
@@ -265,7 +525,9 @@ fn well_known_sid(rid: u32) -> Option<PSID> {
     let size = SECURITY_MAX_SID_SIZE;
     let mut buf = vec![0u8; size as usize];
     let mut sid = PSID(buf.as_mut_ptr() as *mut _);
-    let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 5] };
+    let authority = SID_IDENTIFIER_AUTHORITY {
+        Value: [0, 0, 0, 0, 0, 5],
+    };
     unsafe {
         if AllocateAndInitializeSid(&authority, 1, rid, 0, 0, 0, 0, 0, 0, 0, &mut sid).is_ok() {
             let len = GetLengthSid(sid) as usize;
@@ -283,7 +545,9 @@ fn builtin_admins_sid() -> Option<PSID> {
     let size = SECURITY_MAX_SID_SIZE;
     let mut buf = vec![0u8; size as usize];
     let mut sid = PSID(buf.as_mut_ptr() as *mut _);
-    let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 5] };
+    let authority = SID_IDENTIFIER_AUTHORITY {
+        Value: [0, 0, 0, 0, 0, 5],
+    };
     unsafe {
         if AllocateAndInitializeSid(&authority, 2, 32, 544, 0, 0, 0, 0, 0, 0, &mut sid).is_ok() {
             let len = GetLengthSid(sid) as usize;
@@ -321,17 +585,11 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
                 p.token.clone(),
                 String::new(),
             ),
-            None => (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
         };
     // Names of the four proxy vars, in the order we post-process them.
     // Comparison is case-insensitive (Windows env vars are case-insensitive).
-    const PROXY_VARS: [&str; 4] =
-        ["HTTP_PROXY", "HTTPS_PROXY", "X-Sandbox-Token", "NO_PROXY"];
+    const PROXY_VARS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "X-Sandbox-Token", "NO_PROXY"];
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
@@ -345,9 +603,18 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
             continue;
         }
         // Check if this is one of the proxy vars we manage.
-        if let Some(idx) = PROXY_VARS.iter().position(|name| k.eq_ignore_ascii_case(name)) {
+        if let Some(idx) = PROXY_VARS
+            .iter()
+            .position(|name| k.eq_ignore_ascii_case(name))
+        {
             proxy_seen[idx] = true;
-            let replacement = [http_proxy.clone(), https_proxy.clone(), token_val.clone(), no_proxy.clone()][idx].clone();
+            let replacement = [
+                http_proxy.clone(),
+                https_proxy.clone(),
+                token_val.clone(),
+                no_proxy.clone(),
+            ][idx]
+                .clone();
             vars.push((k, replacement));
         } else {
             vars.push((k, v));

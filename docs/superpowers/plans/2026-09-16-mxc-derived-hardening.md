@@ -53,7 +53,7 @@ leaks; MXC `allowedProxyPeer` is the interim once PSEC reaches stable Windows).
 **Files:**
 - Add (commit): `docs/mxc-source-analysis.md`, `docs/superpowers/plans/2026-09-16-mxc-derived-hardening.md`
 
-- [ ] **Step 1: Commit both docs on `feature/windows-sandbox`** (main checkout)
+- [x] **Step 1: Commit both docs on `feature/windows-sandbox`** (main checkout)
 
 ```bash
 git add docs/mxc-source-analysis.md docs/superpowers/plans/2026-09-16-mxc-derived-hardening.md
@@ -375,7 +375,7 @@ Work in a **new worktree** off `feature/windows-sandbox`, branch `feature/dacl-j
 - Modify: `src/sandbox/mod.rs` (register module)
 - Create: `tests/cleanup-session-aces.ps1` (rollback script — AGENTS.md rule; **the trunk branch has no `cleanup-acls.ps1`; that file exists only on the ADR branch**, so this is new infrastructure here)
 
-- [ ] **Step 1: Create the module with failing-first tests**
+- [x] **Step 1: Create the module with failing-first tests**
 
 Create `src/sandbox/dacl_journal.rs` containing the test module plus `todo!()`
 stubs for `DaclJournal::open`, `record`, `entries`, `remove_file`,
@@ -480,14 +480,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail (todo! panics)**
+- [x] **Step 2: Run the tests to verify they fail (todo! panics)**
 
 Add `pub mod dacl_journal;` to `src/sandbox/mod.rs` FIRST (without registration the
 test binary runs 0 tests and silently "passes"). Then:
 Run: `cargo test dacl_journal --release`
 Expected: FAIL/panic — `not yet implemented` from the `todo!()` stubs.
 
-- [ ] **Step 3: Implement the module**
+- [x] **Step 3: Implement the module**
 
 ```rust
 impl DaclJournal {
@@ -569,7 +569,7 @@ Run: `cargo test dacl_journal --release` → PASS (3 tests);
 `cargo clippy --release -- -D warnings` → zero warnings.
 (`serde`/`serde_json` are already dependencies — no Cargo.toml change.)
 
-- [ ] **Step 4: Create the rollback script (AGENTS.md rule — BEFORE any scenario mutates ACLs)**
+- [x] **Step 4: Create the rollback script (AGENTS.md rule — BEFORE any scenario mutates ACLs)**
 
 Create `tests/cleanup-session-aces.ps1` on this branch (new infrastructure here;
 the trunk harness has no ACL cleanup yet):
@@ -601,7 +601,7 @@ foreach ($p in $Paths | Where-Object { Test-Path $_ }) {
 Write-Host "$removed session ACE(s) removed."
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sandbox/dacl_journal.rs src/sandbox/mod.rs tests/cleanup-session-aces.ps1
@@ -623,7 +623,7 @@ changes). Rebase `feature/dacl-journal` onto the merged trunk first.
 - Modify: `tests/run-tests.ps1` (S-73, S-74)
 - Modify: `README.md` + worktree `AGENTS.md`
 
-- [ ] **Step 1: Write the failing integration scenarios**
+- [x] **Step 1: Write the failing integration scenarios**
 
 **S-73 (teardown restore):** in a scenario dir, snapshot `(icacls $d | Select-String 'S-1-15-2-(?!2)').Count` before; run `sandbox run --allow-cwd -- cmd /c echo x`; after exit the count must equal the before-count (session ACEs removed — nothing left to re-derive, F-D). The regex excludes `S-1-15-2-2` (persistent drive-root grant) and inherited ACEs must be filtered (`-not IsInherited` in a Get-Acl variant if `icacls` output proves ambiguous).
 
@@ -632,7 +632,7 @@ changes). Rebase `feature/dacl-journal` onto the merged trunk first.
 Register both in the runner table (non-gate). Verify: `pwsh -ExecutionPolicy Bypass -File tests\run-tests.ps1 -Only 73` / `-Only 74`
 Expected: FAIL (no journaling wired yet).
 
-- [ ] **Step 2: Snapshot prior explicit ACEs in the grant path**
+- [x] **Step 2: Snapshot prior explicit ACEs in the grant path**
 
 In `src/sandbox/appcontainer.rs`, add `use crate::sandbox::dacl_journal::{DaclJournal, JournalEntry, PriorAce};`.
 Add a snapshot helper using `GetExplicitEntriesFromAclW` (returns **explicit, non-inherited** entries only — exactly the prior state we must restore; avoids manual ACE parsing):
@@ -683,7 +683,7 @@ glob-imported via the file's existing `use` — verify; if not, extend that impo
 Compile-check against windows 0.62.2 metadata and adjust signature details
 accordingly (this snippet must be treated as a starting point, not gospel).
 
-- [ ] **Step 3: Journal in `grant_access`, before each `grant_one` write**
+- [x] **Step 3: Journal in `grant_access`, before each `grant_one` write**
 
 Change `grant_access(ac_sid, entries)` → `grant_access(ac_sid, entries, journal: Option<&DaclJournal>)`
 and pass `journal` into `grant_one` (add the parameter). In `grant_one`, before the
@@ -716,7 +716,7 @@ merged struct keeps it, also record `inherit: e.inherit` and add the field to
 `JournalEntry`). `diag` is a local of `grant_access`; either pass it down or use
 plain `eprintln!` as above.
 
-- [ ] **Step 4: Teardown restore in main.rs**
+- [x] **Step 4: Teardown restore in main.rs**
 
 In `src/main.rs`'s run path (`run_inner`), after the child exits:
 
@@ -757,25 +757,32 @@ any grants, with the real `is_alive`.
 Trunk `main.rs` does **not** call `delete_profile` today — adding it here also
 stops the per-session profile accumulation (F-D facet 2).
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run: `cargo build --release` (zero warnings), `cargo test --release`,
 `cargo clippy --release -- -D warnings`, then
 `pwsh -ExecutionPolicy Bypass -File tests\run-tests.ps1` (full suite).
 Expected: S-73, S-74 PASS; no regressions in S-1..S-72.
 
-- [ ] **Step 6: Update docs**
+- [x] **Step 6: Update docs**
 
 - `README.md` "How it works": append — *"6. Every ACE grant is journaled before it is applied; on exit the journal is replayed to restore the host. If sandbox.exe is killed, the next run reaps and restores orphaned journals (quarantining unparseable ones as `.corrupt`)."*
 - Worktree `AGENTS.md` ACE-cleanup section: mark the "per-session cleanup (Rust)" follow-up as **implemented** (keep the harness-cleanup rule; `tests/cleanup-session-aces.ps1` is the manual recovery path).
 - `docs/mxc-source-analysis.md` F-C/F-D rows: mark landed (this file is on the trunk after Task 0 — edit it in this trunk-based worktree).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/sandbox/appcontainer.rs src/main.rs tests/run-tests.ps1 README.md AGENTS.md docs/mxc-source-analysis.md
 git commit -m "feat(us-1): journal-backed DACL restore on teardown + orphan recovery (MXC F-C/F-D)"
 ```
+
+**Deviations from this spec as implemented on trunk (2026-09-18):**
+- Journal dir is `%LOCALAPPDATA%\sandbox\dacl-restore` (codebase convention), not `%USERPROFILE%\.sandbox\dacl-restore`.
+- `apply_dacl_kernel` opens the write handle with `WRITE_DAC | READ_CONTROL` — a handle opened with `WRITE_DAC` alone made kernel-handle `SetSecurityInfo` return ACCESS_DENIED on this machine (pre-existing trunk grant bug, found while wiring; root cause of the all-grants-fail warnings in `err-main*.txt`).
+- Ancestor traverse grants are non-inheritable and `collect_ancestors` stops at `USERPROFILE`/`AppData`/`AppData\Local` (ported from ADR commit `5192dfc`): with inheritable ancestor ACEs, even the kernel-handle write performs the recursive subtree DACL walk and hangs on large trees. This must merge cleanly with `5192dfc` during the ADR rebase.
+- `recover_orphans` deletes a journal only when `reap` reports success (MXC hard rule: failed restores keep their entries for retry); `restore_one` skips entries whose object carries none of our ACEs and has no prior state (never-applied grants, e.g. system-owned SystemRoot, would otherwise keep the journal alive forever).
+- S-73/S-74 register via an explicit function table so S-72 stays reserved for Task 2 (LPAC).
 
 ---
 

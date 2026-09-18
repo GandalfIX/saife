@@ -1282,6 +1282,100 @@ function Invoke-Scenario-S71 {
 }
 
 # ---------------------------------------------------------------------------
+# Dispatched-vector scenarios end at S-71; S-72 is reserved (Task 2, LPAC,
+# another branch). S-73/S-74 register via $script:ScenarioFunctions above.
+# ---------------------------------------------------------------------------
+
+# Count non-inherited session AppContainer ACEs on a path. Excludes
+# S-1-15-2-2 (the intentional persistent drive-root grant).
+function Get-SessionAceCount { param([string]$Path)
+    $acl = Get-Acl -LiteralPath $Path
+    return @($acl.Access | Where-Object {
+        $_.IdentityReference -match '^S-1-15-2-' -and
+        $_.IdentityReference -ne 'S-1-15-2-2' -and
+        -not $_.IsInherited }).Count
+}
+
+function Get-DaclJournalDir { return Join-Path $env:LOCALAPPDATA 'sandbox\dacl-restore' }
+
+# S-73 (MXC F-C/F-D): teardown restores the host DACL — no session ACE remains.
+function Invoke-Scenario-S73 {
+    $d = New-ScenarioDir 73
+    $wasDiag = $env:SANDBOX_DIAG
+    $env:SANDBOX_DIAG = '1'
+    try {
+        $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','echo','restore-me') -WorkingDirectory $d
+    } finally { $env:SANDBOX_DIAG = $wasDiag }
+    $stderr = ($r.Stderr -join "`n")
+    $out = ($r.Stdout -join "`n")
+    if ($stderr -match '\[grant\] WARN: allow:') {
+        # This shell cannot write DACLs (e.g. non-elevated + write-denied);
+        # the scenario is meaningless here, not a teardown failure. WARNs on
+        # system-owned paths (System32/SystemRoot) are normal unprivileged.
+        return @{ Num=73; Name='S-73 (journal teardown restore)'; Passed=$false; Skipped=$true
+            Detail = 'DACL writes unavailable in this shell — run elevated to validate teardown' }
+    }
+    $before = Get-SessionAceCount -Path $d
+    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','echo','restore-me-2') -WorkingDirectory $d
+    $after = Get-SessionAceCount -Path $d
+    $passed = ($r2.ExitCode -eq 0) -and ($out -match 'restore-me') -and ($after -eq $before)
+    return @{ Num=73; Name='S-73 (journal teardown restore)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'session ACEs restored on exit' } else { "before=$before after=$after exit=$($r2.ExitCode)" } }
+}
+
+# S-74 (MXC F-C/F-D): crash leaves journal + ACE; next startup reaps the
+# orphan (restore + journal deletion). Rollback path: the pre-written
+# tests/cleanup-session-aces.ps1 recovers the host if this scenario fails.
+function Invoke-Scenario-S74 {
+    $d = New-ScenarioDir 74
+    $journalDir = Get-DaclJournalDir
+    $beforeJournals = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue)
+    $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--','cmd','/c','ping -n 30 127.0.0.1') -PassThru -WorkingDirectory $d
+    $journal = $null
+    try {
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 300
+            $now = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue |
+                Where-Object { $beforeJournals.Name -notcontains $_.Name })
+            if ($now.Count -gt 0) { $journal = $now[0]; break }
+        }
+        if (-not $journal) {
+            return @{ Num=74; Name='S-74 (journal crash recovery)'; Passed=$false; Skipped=$false
+                Detail = 'no new journal appeared within 20s (journaling not wired?)' }
+        }
+        $aceCount = Get-SessionAceCount -Path $d
+        if ($aceCount -lt 1) {
+            # In a shell that cannot write DACLs the ACE never lands; skip
+            # rather than misreport. Elevated runs exercise the full cycle.
+            return @{ Num=74; Name='S-74 (journal crash recovery)'; Passed=$false; Skipped=$true
+                Detail = 'session ACE missing after grant phase — DACL writes unavailable here' }
+        }
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    finally {
+        # Never leak the pinging child, whatever the asserts did.
+        Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process sandbox -ErrorAction SilentlyContinue | Where-Object { $_.Id -eq $proc.Id } | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+
+    $journalStale = (Join-Path $journalDir $journal.Name)
+    if (-not (Test-Path -LiteralPath $journalStale)) {
+        return @{ Num=74; Name='S-74 (journal crash recovery)'; Passed=$false; Skipped=$false
+            Detail = "journal $($journal.Name) gone after supervisor crash — should persist" }
+    }
+
+    # Second short run in the same dir triggers startup recover_orphans.
+    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','echo','recover-ok') -WorkingDirectory $d
+    $afterAce = Get-SessionAceCount -Path $d
+    $journalGone = -not (Test-Path -LiteralPath $journalStale)
+    $passed = ($r2.ExitCode -eq 0) -and ($r2.Stdout -match 'recover-ok') -and ($afterAce -eq 0) -and $journalGone
+    return @{ Num=74; Name='S-74 (journal crash recovery)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'orphan journal reaped + stale ACE restored' }
+                 else { "afterAce=$afterAce journalGone=$journalGone exit=$($r2.ExitCode)" } }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -1311,13 +1405,26 @@ $script:Scenarios = @(
     { Invoke-Scenario-S69 }, { Invoke-Scenario-S70 }, { Invoke-Scenario-S71 }
 )
 
+# Scenarios beyond the positional array register explicitly (number -> block);
+# this keeps reserved numbers (e.g. S-72, owned by another branch) free.
+$script:MaxScenario = 74
+$script:ScenarioFunctions = @{
+    73 = { Invoke-Scenario-S73 }
+    74 = { Invoke-Scenario-S74 }
+}
+
 function Invoke-Scenario { param([int]$Number)
-    if ($Number -lt 1 -or $Number -gt $script:Scenarios.Count) { return $null }
+    if ($Number -lt 1 -or $Number -gt $script:MaxScenario) { return $null }
+    if ($script:ScenarioFunctions.ContainsKey($Number)) { return & $script:ScenarioFunctions[$Number] }
+    if ($Number -gt $script:Scenarios.Count) {
+        return @{ Num=$Number; Name="S-$Number (reserved)"; Passed=$false; Skipped=$true
+            Detail = 'scenario number reserved (owned by another branch)' }
+    }
     return & $script:Scenarios[$Number - 1]
 }
 
 function Select-ScenarioNumbers {
-    $nums = 1..$script:Scenarios.Count
+    $nums = 1..$script:MaxScenario
     if ($Only -and $Only.Count -gt 0) { $nums = $nums | Where-Object { $Only -contains $_ } }
     if ($Skip -and $Skip.Count -gt 0) { $nums = $nums | Where-Object { $Skip -notcontains $_ } }
     return $nums
@@ -1347,9 +1454,16 @@ function Main {
     }
 
     $total = $results.Count
-    $pass  = ($results | Where-Object { $_.State -eq 'pass' }).Count
-    $fail  = ($results | Where-Object { $_.State -eq 'fail' }).Count
-    $skip  = ($results | Where-Object { $_.State -eq 'skip' }).Count
+    $pass = 0; $fail = 0; $skip = 0; $anyFail = $false
+    foreach ($r in $results) {
+        # NOTE: never pipe this list into Where-Object — hashtables unroll
+        # into DictionaryEntry items in a pipeline and corrupt the counts.
+        switch ($r.State) {
+            'pass' { $pass++ }
+            'fail' { $fail++; $anyFail = $true }
+            'skip' { $skip++ }
+        }
+    }
     Write-Host ""
     Write-Host ("Summary: total={0} pass={1} fail={2} skip={3}" -f $total,$pass,$fail,$skip) -ForegroundColor White
 
@@ -1361,10 +1475,10 @@ function Main {
         $required = 1,2,3,4,5,6,7,10,11,12,13,16,17,18,21,24,35,42
         $hardFail = $false
         foreach ($n in $required) {
-            $r = $results | Where-Object { $_.Num -eq $n } | Select-Object -First 1
-            if ($r -and $r.State -eq 'fail') { $hardFail = $true }
+            foreach ($r in $results) { if ($r.Num -eq $n -and $r.State -eq 'fail') { $hardFail = $true } }
         }
-        $pythonSkipped = ($results | Where-Object { $_.PythonSkipped }).Count -gt 0
+        $pythonSkipped = $false
+        foreach ($r in $results) { if ($r.PythonSkipped) { $pythonSkipped = $true } }
         if ($hardFail) { Write-Host "SANDBOX: FAIL" -ForegroundColor Red }
         elseif ($pythonSkipped) { Write-Host "SANDBOX: PASS (python scenarios skipped)" -ForegroundColor Yellow }
         else { Write-Host "SANDBOX: PASS" -ForegroundColor Green }
@@ -1372,7 +1486,7 @@ function Main {
 
     if ($script:OwnsCwd -and -not $Keep) { Remove-Item -LiteralPath $script:TempCwd -Recurse -Force -ErrorAction SilentlyContinue }
     if ($Strict -and $skip -gt 0) { return 1 }
-    if ($gateFailed -or ($results | Where-Object { $_.State -eq 'fail' }).Count -gt 0) { return 1 }
+    if ($gateFailed -or $anyFail) { return 1 }
     return 0
 }
 

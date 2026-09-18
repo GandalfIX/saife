@@ -10,6 +10,12 @@ pub struct AllowEntry {
     pub label: String,
     pub deny: bool,
     pub protected: bool,
+    /// Whether the ACE should propagate to children (inheritable) or apply
+    /// to this directory only (non-inheritable). Ancestor traverse grants
+    /// use `false` to avoid recursively rewriting the DACL of every
+    /// descendant — a Windows operation that hangs on large trees like
+    /// the user profile root (`C:\Users\<user>`).
+    pub inherit: bool,
 }
 
 pub const RWX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
@@ -47,17 +53,38 @@ pub fn build_allowlist(
 
     // Profile allow entries (readwrite = RWX).
     for p in &fs.allow {
-        push_entry(&mut entries, p.clone(), RWX, format!("allow:{}", p.display()), false, false);
+        push_entry(
+            &mut entries,
+            p.clone(),
+            RWX,
+            format!("allow:{}", p.display()),
+            false,
+            false,
+        );
         collect_ancestors(p, &mut ancestor_set);
     }
     // Profile read-only entries (RX).
     for p in &fs.read_only {
-        push_entry(&mut entries, p.clone(), RX, format!("ro:{}", p.display()), false, false);
+        push_entry(
+            &mut entries,
+            p.clone(),
+            RX,
+            format!("ro:{}", p.display()),
+            false,
+            false,
+        );
         collect_ancestors(p, &mut ancestor_set);
     }
     // Profile deny entries (deny ACE).
     for p in &fs.deny {
-        push_entry(&mut entries, p.clone(), 0, format!("deny:{}", p.display()), true, false);
+        push_entry(
+            &mut entries,
+            p.clone(),
+            0,
+            format!("deny:{}", p.display()),
+            true,
+            false,
+        );
     }
     // Ancestor traverse grants (KI-1.2 fix): for every allowed/RO path, grant
     // the AppContainer SID `FILE_READ_ATTRIBUTES | FILE_TRAVERSE` on each
@@ -69,32 +96,72 @@ pub fn build_allowlist(
     // system-owned ancestors are attempted and silently skipped if they fail
     // (see `grant_access`).
     for ancestor in &ancestor_set {
-        push_entry(
+        push_entry_noninherit(
             &mut entries,
             ancestor.clone(),
             ANCESTOR_MASK,
             format!("ancestor:{}", ancestor.display()),
-            false,
-            false,
         );
     }
 
     // .sandbox: minimal RX so the owning session can traverse to reach its own
     // subtree, without being able to read sibling subtrees (the per-session
     // subtrees are PROTECTED so inheritance stops at their boundary).
-    push_entry(&mut entries, cwd.join(".sandbox"), RX, ".sandbox".into(), false, false);
+    push_entry(
+        &mut entries,
+        cwd.join(".sandbox"),
+        RX,
+        ".sandbox".into(),
+        false,
+        false,
+    );
 
     // Per-session subtree: PROTECTED so it inherits nothing from $CWD/.sandbox.
     // Only this session's AppContainer SID is granted (RWX).
-    push_entry(&mut entries, cwd.join(".sandbox").join(sid), RWX, ".sandbox/<sid>".into(), false, true);
-    push_entry(&mut entries, cwd.join(".sandbox").join(sid).join("bin"), RWX, ".sandbox/bin".into(), false, true);
-    push_entry(&mut entries, cwd.join(".sandbox").join(sid).join("venv"), RWX, ".sandbox/venv".into(), false, true);
+    push_entry(
+        &mut entries,
+        cwd.join(".sandbox").join(sid),
+        RWX,
+        ".sandbox/<sid>".into(),
+        false,
+        true,
+    );
+    push_entry(
+        &mut entries,
+        cwd.join(".sandbox").join(sid).join("bin"),
+        RWX,
+        ".sandbox/bin".into(),
+        false,
+        true,
+    );
+    push_entry(
+        &mut entries,
+        cwd.join(".sandbox").join(sid).join("venv"),
+        RWX,
+        ".sandbox/venv".into(),
+        false,
+        true,
+    );
 
     // Implicit grants for any Win32 process to start (windows_common group,
     // per the US-1 spec nono comparison): SystemRoot/System32 (RX).
     if let Ok(sysroot) = std::env::var("SystemRoot") {
-        push_entry(&mut entries, std::path::PathBuf::from(&sysroot).join("System32"), RX, "System32".into(), false, false);
-        push_entry(&mut entries, std::path::PathBuf::from(&sysroot), RX, "SystemRoot".into(), false, false);
+        push_entry(
+            &mut entries,
+            std::path::PathBuf::from(&sysroot).join("System32"),
+            RX,
+            "System32".into(),
+            false,
+            false,
+        );
+        push_entry(
+            &mut entries,
+            std::path::PathBuf::from(&sysroot),
+            RX,
+            "SystemRoot".into(),
+            false,
+            false,
+        );
     }
 
     Ok(entries)
@@ -114,6 +181,28 @@ fn push_entry(
         label,
         deny,
         protected,
+        inherit: true,
+    });
+}
+
+/// Like `push_entry` but with `inherit=false` — the ACE applies to this
+/// directory only and does NOT propagate to children. Used for ancestor
+/// traverse grants to avoid the recursive DACL rewrite that Windows
+/// performs when an inheritable ACE is added to a large tree (e.g. the
+/// user profile root `C:\Users\<user>`).
+fn push_entry_noninherit(
+    entries: &mut Vec<AllowEntry>,
+    p: std::path::PathBuf,
+    access: u32,
+    label: String,
+) {
+    entries.push(AllowEntry {
+        win32_path: p,
+        access,
+        label,
+        deny: false,
+        protected: false,
+        inherit: false,
     });
 }
 
@@ -123,7 +212,24 @@ fn push_entry(
 /// so we stop there. Dedupes against `out` to avoid redundant ACE writes when
 /// multiple granted paths share ancestors (e.g. `$HOME/.local/share/opencode`
 /// and `$HOME/.config/opencode` both live under `C:\Users\<user>`).
+///
+/// **Stops at the user profile root (`C:\Users\<user>`) and the `AppData` /
+/// `AppData\Local` directories.** Writing an ACE to any of these makes the
+/// kernel's recursive DACL propagation walk the whole subtree — an operation
+/// that effectively hangs on these large trees (mirrors the ADR-0001 finding;
+/// see docs/superpowers/plans/2026-09-16-mxc-derived-hardening.md Task 3B).
+/// The AppContainer can already traverse these directories via inherited
+/// `Everyone: ReadAndExecute` ACEs, so explicit grants are unnecessary.
 fn collect_ancestors(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    // Build the set of directories at which to stop (without canonicalization
+    // — Rust's `canonicalize()` adds a `\\?\` prefix on Windows which would
+    // defeat the `eq` comparison below).
+    let mut stop_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
+        stop_dirs.push(profile.clone());
+        stop_dirs.push(profile.join("AppData"));
+        stop_dirs.push(profile.join("AppData").join("Local"));
+    }
     let mut cur = path.parent();
     while let Some(parent) = cur {
         // Stop at the drive root (e.g. `C:\`): it's handled by the
@@ -132,11 +238,23 @@ fn collect_ancestors(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) 
         if s.len() <= 3 && s.chars().nth(1) == Some(':') {
             break;
         }
+        // Stop at (and do NOT include) any of the large profile directories
+        // where DACL writes hang (see the doc comment above).
+        if stop_dirs.iter().any(|d| paths_eq_ci(parent, d)) {
+            break;
+        }
         if !out.iter().any(|e| e.eq(parent)) {
             out.push(parent.to_path_buf());
         }
         cur = parent.parent();
     }
+}
+
+/// Case-insensitive path comparison (Windows paths are case-insensitive).
+/// Avoids `canonicalize()` which adds a `\\?\` prefix.
+fn paths_eq_ci(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 /// Resolve a Win32 path (e.g. `C:\foo`) to its NT device path
@@ -188,5 +306,72 @@ mod tests {
             "System32 must always be in the allowlist; got: {:?}",
             entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn ancestor_entries_are_non_inheritable() {
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from("C:\\Users\\test\\proj\\subdir")],
+            ..Default::default()
+        };
+        let entries = build_allowlist(
+            "test-sid",
+            std::path::Path::new("C:\\Users\\test\\proj"),
+            &fs,
+        )
+        .unwrap();
+        let ancestors: Vec<&AllowEntry> = entries
+            .iter()
+            .filter(|e| e.label.starts_with("ancestor:"))
+            .collect();
+        assert!(!ancestors.is_empty(), "should have ancestor entries");
+        for a in &ancestors {
+            assert!(
+                !a.inherit,
+                "ancestor {:?} should be non-inheritable to avoid recursive DACL propagation",
+                a.win32_path
+            );
+        }
+    }
+
+    #[test]
+    fn collect_ancestors_stops_at_user_profile_root() {
+        let mut out: Vec<std::path::PathBuf> = Vec::new();
+        // Use a path under the real user profile so the stop-dir checks
+        // trigger. If USERPROFILE is unset, this test still passes because
+        // the stop-dir guard is a no-op.
+        let profile = std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("C:\\Users\\nonexistent"));
+        let deep = profile
+            .join("AppData")
+            .join("Local")
+            .join("Temp")
+            .join("proj");
+        collect_ancestors(&deep, &mut out);
+        for stop in &[
+            profile.clone(),
+            profile.join("AppData"),
+            profile.join("AppData").join("Local"),
+        ] {
+            assert!(
+                !out.iter().any(|p| paths_eq_ci(p, stop)),
+                "stop-dir {:?} must not appear in ancestors {:?}",
+                stop,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn paths_eq_ci_matches_case_insensitively() {
+        assert!(paths_eq_ci(
+            std::path::Path::new("C:\\Users\\Marku"),
+            std::path::Path::new("c:\\users\\marku"),
+        ));
+        assert!(!paths_eq_ci(
+            std::path::Path::new("C:\\Users\\marku"),
+            std::path::Path::new("C:\\Users\\other"),
+        ));
     }
 }
