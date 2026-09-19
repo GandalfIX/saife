@@ -89,17 +89,7 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
         if build >= MIN_BUILD { "available" } else { "MISSING" }
     );
     println!("Job Object                 : available (always, Win9x+)");
-    println!(
-        "Network (loopback+intranet) : {}",
-        if build >= MIN_BUILD {
-            "available via privateNetworkClientServer capability"
-        } else {
-            "MISSING (requires Windows 10 1709+)"
-        }
-    );
-    println!("  NOTE                     : loopback firewall exemption required (admin). Run elevated for --allow-domain.");
-    println!("  WARNING (intranet leak)  : raw-socket apps can reach LAN hosts without proxy filtering.");
-    println!("    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)");
+    for line in network_report_lines(build) { println!("{line}"); }
     println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());
     println!(
         "Audit (hash-chain + Ed25519): {}",
@@ -114,6 +104,30 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
         bail!("host build {build} is below minimum {MIN_BUILD} (AppContainer RuleSet unavailable)");
     }
     Ok(())
+}
+
+/// Network-posture report lines (setup --check-only). Extracted so the
+/// documented limitations are unit-testable. The `privateNetworkClientServer`
+/// capability (S-1-15-3-7) is BIDIRECTIONAL: it grants egress to loopback +
+/// intranet AND lets a listening sandboxed process accept connections from
+/// LAN peers. MXC rejects ingress-allow policies on its AppContainer tier for
+/// exactly this reason (appcontainer_runner.rs:1747). See ADR-0001 D-0,
+/// docs/mxc-source-analysis.md F-A.
+fn network_report_lines(build: u32) -> Vec<String> {
+    vec![
+        format!(
+            "Network (loopback+intranet) : {}",
+            if build >= MIN_BUILD {
+                "available via privateNetworkClientServer capability"
+            } else {
+                "MISSING (requires Windows 10 1709+)"
+            }
+        ),
+        "  NOTE                     : loopback firewall exemption required (admin). Run elevated for --allow-domain.".to_string(),
+        "  WARNING (intranet leak)  : raw-socket apps can reach LAN hosts without proxy filtering.".to_string(),
+        "  WARNING (inbound surface) : capability is bidirectional - a listening sandboxed process can accept connections from LAN peers.".to_string(),
+        "    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)".to_string(),
+    ]
 }
 
 /// One-time admin step: grant S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES)
@@ -433,5 +447,25 @@ fn os_build_number() -> Result<u32> {
             .parse()
             .map_err(|_| anyhow::anyhow!("could not parse CurrentBuild `{s}` as u32"))?;
         Ok(build)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_report_documents_bidirectional_leak() {
+        let lines = network_report_lines(26100);
+        let joined = lines.join("\n");
+        assert!(joined.contains("intranet leak"), "egress leak documented: {joined}");
+        assert!(joined.contains("inbound"), "inbound surface documented: {joined}");
+        assert!(joined.contains("bidirectional"), "capability semantics documented: {joined}");
+    }
+
+    #[test]
+    fn network_report_handles_unsupported_build() {
+        let lines = network_report_lines(16298);
+        assert!(lines.iter().any(|l| l.contains("MISSING")));
     }
 }

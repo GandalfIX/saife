@@ -82,7 +82,7 @@ about egress.
 
 Work in the **ADR worktree** (`C:\Users\marku\tools\.worktrees\adr-0001-network\sandbox\sandbox`), branch `feature/adr-0001-network-hardening`.
 
-- [ ] **Step 1: Write the failing unit test**
+- [x] **Step 1: Write the failing unit test**
 
 Append to `src/setup.rs`:
 
@@ -108,12 +108,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test network_report --release`
 Expected: FAIL — `cannot find function network_report_lines`.
 
-- [ ] **Step 3: Extract the report block verbatim + add the inbound line**
+- [x] **Step 3: Extract the report block verbatim + add the inbound line**
 
 In `src/setup.rs`, replace the six `println!` calls for lines 92–102 (from
 `Network (loopback+intranet)` through `Strong isolation`) with:
@@ -152,14 +152,14 @@ fn network_report_lines(build: u32) -> Vec<String> {
 }
 ```
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run: `cargo test network_report --release` → PASS. Then `cargo test --release`
 (all pass), `cargo clippy --release -- -D warnings` (zero warnings), and
 `cargo run --release -- setup --check-only` — expected output shows the new
 `WARNING (inbound surface)` line.
 
-- [ ] **Step 5: Amend ADR-0001's documented limitation**
+- [x] **Step 5: Amend ADR-0001's documented limitation**
 
 In `docs/adr/0001-omac-derived-network-hardening.md`, in D-0's "Intranet leak
 (documented limitation)" bullet (line 29), append:
@@ -178,11 +178,11 @@ loopback grant is the interim once the OS APIs reach stable Windows. See
 
 Mirror the same note into "Negative consequences / Intranet leak (D-0)" (line 181).
 
-- [ ] **Step 6: Record in PROGRESS.md**
+- [x] **Step 6: Record in PROGRESS.md**
 
 Add row `| 1.7 Ingress-surface warning (MXC F-A) | [x] | impl | pass | pass | <sha> | setup.rs report extracted + bidirectional warning; ADR amended. |` to the Phase 1 table and an Event Log line dated today.
 
-- [ ] **Step 7: Commit (in the ADR worktree)**
+- [x] **Step 7: Commit (in the ADR worktree)**
 
 ```bash
 git add src/setup.rs docs/adr/0001-omac-derived-network-hardening.md docs/superpowers/tasks/adr-0001/PROGRESS.md
