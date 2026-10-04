@@ -220,6 +220,15 @@ filesystem-isolation, Job-Object, breakaway, per-session, profile-loading,
 and network scenarios. Python/curl-dependent scenarios skip cleanly when
 those binaries aren't on `PATH`.
 
+**Tier 2/3 tests are moving into a disposable VM.** The integration suite
+mutates ACLs and AppContainer state on the machine it runs on; the approved
+default is to run it hermetically inside a disposable Hyper-V VM with
+`pwsh tests\vm\Invoke-TestsInVM.ps1 -Phase all` (one-time host/image prep:
+`tests\vm\Initialize-VMHost.ps1`, `tests\vm\BUILD-BASE-IMAGE.md`). Direct
+host runs of `tests\run-tests.ps1` are for smoke only. See
+`docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` and the binding
+rule in `docs/testing-principles.md`.
+
 ## Documentation
 
 - `docs/prd/prd-sandbox.md` — full product requirements.
@@ -231,3 +240,8 @@ those binaries aren't on `PATH`.
 - `docs/future-ideas.md` — deferred roadmap (F-1..F-19).
 - `agent.md` — high-level project overview.
 - `docs/testing-principles.md` — testing philosophy for the project.
+- `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` — VM-01:
+  disposable-VM test harness (binding default for Tier 2/3 tests).
+- `docs/impact-analysis-windows-cli-sandbox-wbd.md` — impact analysis of the
+  external work breakdown in `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md`
+  (MXC BaseContainer/PSEC track, two-track recommendation, VM amendment).

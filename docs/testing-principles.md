@@ -13,6 +13,27 @@ TDD on Tier 1 just because Tier 3 is hard.
 
 ---
 
+## Binding rule (2026-10-04): Tier 2/3 tests run in a disposable VM
+
+**All host-dependent tests (Tier 2 and Tier 3) must run inside a disposable
+Hyper-V VM, not on the developer host.** The integration suite mutates host
+ACLs, AppContainer profiles, and per-session trees; a disposable VM makes
+rollback structural (delete the VM) instead of best-effort (rollback scripts,
+journal replay). The MXC/BaseContainer research track additionally requires
+evidence capture on an experimental Windows build that the dev host does not
+run — only a VM can provide it.
+
+- Harness + one-time setup: `tests/vm/` — see
+  `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` (plan VM-01).
+- Direct runs of `tests/run-tests.ps1` on the dev host are **smoke tests
+  only**; the full suite must pass in the VM.
+- The `AGENTS.md` rollback-script rule remains mandatory for any test that
+  still runs on the physical host; VM-run tests get rollback by construction.
+
+Tier 1 below is unaffected: pure-logic unit tests stay in-process and fast.
+
+---
+
 ## Tier 1 — Pure logic: strict TDD, ~100% coverage achievable
 
 Pure functions, no I/O, no kernel, no async. **Write the test first, watch it
@@ -151,7 +172,9 @@ Don't pretend TDD covers these. Document the gap, mitigate where possible.
    valuable than "it correctly allows" tests.**
 6. **CI constraint to flag now:** the entire Tier 2/3 suite requires Windows.
    No Linux/mac coverage is meaningful there. Plan Windows-only CI plus a
-   `--self-test` for developer machines.
+   `--self-test` for developer machines. Tier 2/3 additionally runs in the
+   disposable test VM (see the binding rule above); the VM harness is the
+   local substitute for the dedicated runners CI cannot reach.
 
 ---
 
@@ -182,3 +205,16 @@ benches/
 Tier 3 ETW / hook tests live in `tests/integration/` too, marked
 `#[ignore]` by default and run explicitly (or via `--self-test`) to keep the
 default CI suite green.
+
+```text
+tests/vm/                  # VM-01 disposable-VM harness (Tier 2/3 default)
+  Invoke-TestsInVM.ps1     # spin up → copy → run in-VM → collect → destroy
+  run-in-vm.ps1            # guest entry point (build + suites + summary.json)
+  Remove-TestVM.ps1        # rollback for the harness itself
+  BUILD-BASE-IMAGE.md      # one-time template image runbook
+  vms/, results/           # working dirs (gitignored)
+```
+
+Tier 2/3 suites must pass inside the VM (`pwsh tests/vm/Invoke-TestsInVM.ps1`);
+host runs are smoke-only. See the binding rule at the top of this document and
+`docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`.

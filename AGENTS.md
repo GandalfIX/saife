@@ -29,3 +29,10 @@ See `docs/prd/prd-sandbox.md` for the full product requirements and
 Must follow: If a test needs to change anything on the host system, like setting permissions, ACLs or similar, 
 before the change is performed a "rollback script" needs to be written. 
 So in case the test is killed and the cleanup cannot be performed the user is able to clean up manually.
+
+**VM-first rule (2026-10-04):** Tests that change anything on the host (ACLs,
+permissions, AppContainer profiles, network configuration) must be written to
+run inside the disposable test VM via `tests/vm/Invoke-TestsInVM.ps1` — see
+`docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`. For VM-run
+tests, VM deletion is the rollback. For any test that still runs on the
+physical host, the rollback-script rule above remains mandatory.
