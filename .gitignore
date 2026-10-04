@@ -6,3 +6,10 @@
 
 # Local diagnostics env (set by SANDBOX_DIAG)
 # (no file — environment variable only)
+
+# VM-01 test infrastructure: per-run VM working dirs, fetched results,
+# template VHDXs, and local guest credentials (never commit these)
+/tests/vm/vms/
+/tests/vm/results/
+/tests/vm/templates/
+/tests/vm/vm-settings.json
