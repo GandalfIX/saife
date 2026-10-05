@@ -1,0 +1,256 @@
+# BUILD-BASE-IMAGE — disposable test-VM base image (`sbx-base-a`) runbook
+
+> **VM-01, Task 2.** One-time, **manual** runbook. Fully automated
+> ISO→image builds are a documented non-goal for v1 (see
+> `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`); likewise
+> unattended Windows Setup and CredSSP. The template is only ever **cloned**
+> (differencing VHDX per run), never booted directly and never reused as a
+> daily driver — so **no sysprep** is performed.
+
+**Image role.** The downloaded ISO is the insider/experimental build that
+also serves the later MXC discovery track: **one image serves both tracks
+initially** — base image A (current AppContainer suite) is built from it,
+and the same template (or a derived one) later becomes image B by adding
+the pinned `mxc/` checkout (plan Task 6). If the experimental build proves
+too unstable for the AppContainer suite, add a stable-Windows template
+later; the harness is image-agnostic.
+
+> **Hyper-V command caveat:** the Hyper-V module cannot be imported in a
+> non-elevated shell on the dev host, so the commands below could not be
+> syntax-checked with `Get-Command`. Commands marked **verify at image-build
+> time** should be double-checked against `Get-Help <cmdlet>` if one of
+> them errors.
+
+---
+
+## Step 0 — Prereqs
+
+Run everything below from an **elevated pwsh on the host**.
+
+1. **Hyper-V management tools** —
+   `pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Initialize-VMHost.ps1`
+   must print `Hyper-V management tools present.` (The template and
+   `vm-settings.json` checks report `NOT READY` until this runbook is
+   finished — that is expected.)
+2. **Disk space** — ~150 GB free on the drive that will hold the builder
+   VM (up to 127 GB VHDX) plus the template copy.
+3. **ISO** — the downloaded insider ISO. Record the exact path now; the
+   operator records the exact ISO and resulting OS build in the
+   [Current image](#current-image) section at the end.
+
+Set these once and copy-paste the blocks in order:
+
+```powershell
+# Adjust to your machine, then keep this shell for all steps below.
+$repoRoot = 'C:\Users\marku\tools\sandbox'   # the sandbox tool's repo root
+$vmName   = 'sbx-base-a-builder'
+$isoPath  = '<path-to-iso>'                  # exact path of the downloaded ISO
+$vmDir    = 'D:\hyper-v'                     # drive with ~150 GB free
+$diskPath = Join-Path $vmDir "$vmName.vhdx"
+```
+
+## Step 1 — Create the builder VM
+
+```powershell
+New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 8GB -NewVHDPath $diskPath -NewVHDSizeBytes 127GB
+Set-VM -Name $vmName -ProcessorCount 4
+# Optional: fix memory instead of dynamic (verify at image-build time):
+# Set-VM -Name $vmName -StaticMemory
+Add-VMDvdDrive -VMName $vmName -Path $isoPath
+Connect-VMNetworkAdapter -VMName $vmName -SwitchName 'Default Switch'
+# Boot the ISO before the (empty) VHDX (verify at image-build time):
+Set-VMFirmware -VMName $vmName -FirstBootDevice (Get-VMDvdDrive -VMName $vmName)
+Start-VM -Name $vmName
+```
+
+**Secure boot:** try booting **with** secure boot on (the default; Gen 2).
+ONLY if the experimental build fails to boot with it on (boot loop /
+`Secure Boot violation` on the VM console):
+
+```powershell
+Set-VMFirmware -VMName $vmName -EnableSecureBoot Off
+```
+
+Record the choice (on/off) in [Current image](#current-image). The builder
+VM name `sbx-base-*` is outside `Remove-TestVM.ps1`'s `sbx-test-` allow-list,
+so the rollback script never touches it.
+
+## Step 2 — Install Windows (manual)
+
+Open the VM console and walk through Windows Setup **manually**:
+
+```powershell
+vmconnect.exe $env:COMPUTERNAME $vmName
+```
+
+- Recommended local account name: **`sbxadmin`** (make it an administrator).
+- The account **must have a non-empty password** — PowerShell Direct refuses
+  blank-password logons. Do not reuse a real password of yours.
+- Complete first logon at least once (PowerShell Direct needs no interactive
+  logon afterwards).
+
+## Step 3 — Copy the repo and run provisioning (PowerShell Direct, from the host)
+
+The VM must be **RUNNING**. Get the guest credential once:
+
+```powershell
+$cred = Get-Credential -UserName 'sbxadmin' -Message 'Guest password for sbx-base-a-builder'
+```
+
+Stage the repo on the host excluding `target\` (adding `.git` to `/XD`
+shrinks the copy further; git is not needed for tests):
+
+```powershell
+$stage = Join-Path $env:TEMP 'sbx-repo-stage'
+if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+robocopy $repoRoot $stage /E /XD target
+# NOTE: robocopy exit codes 0-7 are success (1 = files copied); only >= 8 is an error.
+```
+
+`Copy-VMFile` copies one file at a time, so walk the staging tree, create
+each guest directory via PowerShell Direct, then copy the file:
+
+```powershell
+$files = @(Get-ChildItem -LiteralPath $stage -Recurse -File)
+$i = 0
+foreach ($f in $files) {
+    $i++
+    $rel = $f.FullName.Substring($stage.Length + 1)
+    $dest = Join-Path 'C:\sbx-repo' $rel
+    $destDir = Split-Path -Parent $dest
+    Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+        param($d)
+        if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    } -ArgumentList $destDir
+    Copy-VMFile -Name $vmName -SourcePath $f.FullName -DestinationPath $dest -FileSource Host -Force
+    Write-Host ("[copy] {0}/{1}: {2}" -f $i, $files.Count, $rel)
+}
+```
+
+Run provisioning. **Chicken-and-egg:** on the first pass pwsh is not
+installed inside the guest yet, so run `prepare-guest.ps1` once under
+**Windows PowerShell 5.1** (it is 5.1-compatible and installs pwsh):
+
+```powershell
+Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+    powershell -NoProfile -ExecutionPolicy Bypass -File C:\sbx-repo\tests\vm\prepare-guest.ps1 -RepoDir C:\sbx-repo
+    if ($LASTEXITCODE -ne 0) { throw "prepare-guest.ps1 failed (exit $LASTEXITCODE)" }
+}
+```
+
+Then **verify `pwsh` exists** (later passes and `run-in-vm.ps1` need it):
+
+```powershell
+Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+    pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+}
+```
+
+Notes:
+
+- This step takes a long time (VS Build Tools alone: 10–30+ minutes; plus
+  the cargo warm-up). Expect the whole step to run 30–60 minutes.
+- `prepare-guest.ps1` is idempotent; re-running with
+  `-SkipCargoWarmup` is a quick way to verify idempotence.
+- Success is the line `GUEST PREPARED` (exit 0). Any other verdict means the
+  bake failed — fix it here, at bake time, not at test time.
+
+## Step 4 — Create `tests/vm/vm-settings.json` (host side)
+
+Create `<repoRoot>\tests\vm\vm-settings.json` with EXACTLY this shape:
+
+```json
+{
+  "schema": 1,
+  "guestUser": "sbxadmin",
+  "guestPassword": "<the password you typed during setup>"
+}
+```
+
+> **Security note.** This file is machine-local and gitignored
+> (`sandbox/.gitignore`) — never commit it, never echo its contents. A
+> plaintext credential here is acceptable ONLY because the image is a
+> disposable throwaway that is never exposed to any network beyond the
+> Default Switch, and the password is used solely for PowerShell Direct
+> over the VM bus. Do NOT reuse a real password.
+
+## Step 5 — Snapshot: stop, copy the VHDX, register as the template
+
+The template is a **file copy**; the builder VM stays untouched so it can
+be kept for re-bakes:
+
+```powershell
+Stop-VM -Name $vmName
+$templateDir  = Join-Path $repoRoot 'tests\vm\templates'
+$templatePath = Join-Path $templateDir 'sbx-base-a.vhdx'
+New-Item -ItemType Directory -Path $templateDir -Force | Out-Null
+Copy-Item -LiteralPath $diskPath -Destination $templatePath
+Get-FileHash -LiteralPath $templatePath -Algorithm SHA256
+```
+
+(The copy of a multi-GB VHDX takes a few minutes.)
+
+**Keep the builder VM** and refresh the template copy after every re-bake
+(Stop-VM + `Copy-Item` again). `Initialize-VMHost.ps1` must then list the
+template and print `READY`:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot 'tests\vm\Initialize-VMHost.ps1')
+```
+
+Expected final line: `READY: sbx-base-a.vhdx` (exit 0).
+
+## Current image
+
+Fill in after the build (the operator records the exact ISO and resulting
+OS build here):
+
+| Field            | Value |
+|------------------|-------|
+| Template name    | sbx-base-a.vhdx |
+| Edition (Caption)| _fill in_ |
+| OS build (BuildNumber) | _fill in_ |
+| ISO path         | _fill in_ |
+| Secure boot      | on / off |
+| Template SHA256  | _fill in (Get-FileHash output above)_ |
+| Build date       | _fill in_ |
+
+Collect guest values (VM must be running):
+
+```powershell
+Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+    Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber
+}
+```
+
+## Troubleshooting
+
+- **Secure-boot boot loop / `Secure Boot violation`** — disable secure boot
+  for this experimental image: `Set-VMFirmware -VMName $vmName -EnableSecureBoot Off`,
+  record it in Current image.
+- **`winget` missing on the experimental build** (`prepare-guest.ps1`
+  exits 4 and prints remediation) — either install App Installer (winget)
+  from its GitHub release (`https://github.com/microsoft/winget-cli/releases`,
+  msixbundle + dependency .appx via `Add-AppxPackage`), or install the
+  tools manually with their official installers (VS Build Tools
+  bootstrapper `https://aka.ms/vs/17/release/vs_BuildTools.exe` with
+  `--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`,
+  rustup `https://rustup.rs`, PowerShell 7 and Git from their official
+  releases), then re-run `prepare-guest.ps1` to verify everything is
+  present. The script never hand-rolls MSI downloads.
+- **PowerShell Direct `failed to connect to the guest`** — the VM must be
+  **RUNNING** (`Start-VM -Name $vmName`); the guest must have completed
+  first logon once; the credential is the guest-local account with a
+  non-empty password.
+- **`prepare-guest.ps1` exits 2 via PowerShell Direct** — the session was
+  not elevated; open an elevated shell inside the guest console
+  (`vmconnect.exe $env:COMPUTERNAME $vmName`) and run the script there.
+- **Cargo warm-up failure** (`GUEST PREP FAILED: cargo warm-up ...`) —
+  common causes: insufficient disk (check free space in the guest), missing
+  Windows SDK / MSVC because the VS Build Tools install did not complete
+  (re-run `prepare-guest.ps1`; verify with vswhere:
+  `& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath`),
+  or the rustup toolchain missing (`rustup default stable-msvc`). A
+  reboot-pending VS install (exit 3010) needs one VM reboot, then a re-run.
+- **robocopy "failed"** — robocopy exit codes 0–7 are success (1 = files
+  copied); only ≥ 8 is an error.
