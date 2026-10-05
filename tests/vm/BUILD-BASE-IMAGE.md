@@ -103,7 +103,7 @@ needed inside the image):
 ```powershell
 $stage = Join-Path $env:TEMP 'sbx-repo-stage'
 if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-robocopy $repoRoot $stage /E /XD target .git
+robocopy $repoRoot $stage /E /XD target .git vms results templates /XF vm-settings.json
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }   # robocopy 0-7 = success (1 = files copied)
 ```
 

@@ -111,7 +111,7 @@ try {
     } else {
         $missing.Add('template VHDX')
         Write-Host "[vm-host] NOT READY: no template VHDX found under $templatesDir." -ForegroundColor Red
-        Write-Host '[vm-host] build one first — see tests\vm\BUILD-BASE-IMAGE.md (pending; the runbook lands with a later task).' -ForegroundColor Yellow
+        Write-Host '[vm-host] build one first — see tests\vm\BUILD-BASE-IMAGE.md.' -ForegroundColor Yellow
     }
 
     # -----------------------------------------------------------------------
