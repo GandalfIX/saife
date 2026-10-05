@@ -122,10 +122,41 @@ vmconnect.exe $env:COMPUTERNAME $vmName
 
 ## Step 3 — Copy the repo and run provisioning (PowerShell Direct, from the host)
 
-The VM must be **RUNNING**. Get the guest credential once:
+The VM must be **RUNNING**. Two prerequisites this step depends on:
+
+- the Hyper-V **Guest Service** integration service must be enabled
+  (`Copy-VMFile` refuses to work without it), and
+- the guest credential (account created during Windows Setup).
+
+**Recommended: let the wrapper do the host half** —
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Copy-RepoToVM.ps1
+```
+
+The interactive wrapper (`tests\vm\Copy-RepoToVM.ps1`) loads the values
+saved by `New-BuilderVM.ps1` (`tests\vm\build-config.json`), verifies the
+VM is running, **enables the Guest Service** (idempotent), asks for the
+guest credential via `Get-Credential`, stages and zips the repo with the
+exclusions below, performs the single `Copy-VMFile`, expands and verifies
+the copy by file count — then prints the exact `prepare-guest.ps1`
+command to run next. Continue with the provisioning command under
+[Run provisioning](#run-provisioning) below.
+
+**Manual alternative** — the same operations spelled out. Get the guest
+credential once:
 
 ```powershell
 $cred = Get-Credential -UserName 'sbxadmin' -Message 'Guest password for sbx-base-a-builder'
+```
+
+Enable the Guest Service (idempotent; required by `Copy-VMFile`):
+
+```powershell
+$vm = Get-VM $vmName
+Get-VMIntegrationService -VM $vm |
+  Where-Object Id -like '*6C09BB55-D683-4DA0-8931-C9BF705F6480*' |
+  Enable-VMIntegrationService
 ```
 
 Stage the repo on the host, excluding `target\` and `.git` (git is not
@@ -170,8 +201,10 @@ Copy-VMFile -Name $vmName -SourcePath $zipPath -DestinationPath 'C:\sbx-repo.zip
 > ```
 
 ```powershell
-# Guest: expand (single PS Direct session).
+# Guest: expand (single PS Direct session; remove a stale C:\sbx-repo
+# first so re-runs stay idempotent and the count check stays meaningful).
 Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+    if (Test-Path -LiteralPath 'C:\sbx-repo') { Remove-Item -LiteralPath 'C:\sbx-repo' -Recurse -Force }
     Expand-Archive -Path 'C:\sbx-repo.zip' -DestinationPath 'C:\sbx-repo' -Force
     Remove-Item -LiteralPath 'C:\sbx-repo.zip' -Force
 }
@@ -188,7 +221,9 @@ Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
 } -ArgumentList $stageCount
 ```
 
-Run provisioning. **Chicken-and-egg:** on the first pass pwsh is not
+### Run provisioning
+
+**Chicken-and-egg:** on the first pass pwsh is not
 installed inside the guest yet, so run `prepare-guest.ps1` once under
 **Windows PowerShell 5.1** (it is 5.1-compatible and installs pwsh):
 
@@ -275,12 +310,12 @@ OS build here):
 | Field            | Value |
 |------------------|-------|
 | Template name    | sbx-base-a.vhdx |
-| Edition (Caption)| _fill in_ |
-| OS build (BuildNumber) | _fill in_ |
-| ISO path         | _fill in_ |
+| Edition (Caption)| Microsoft Windows 11 Enterprise Insider Preview |
+| OS build (BuildNumber) | 26340 |
+| ISO path         | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_26340_9577.iso |
 | Secure boot      | on / off |
-| Template SHA256  | _fill in (Get-FileHash output above)_ |
-| Build date       | _fill in_ |
+| Template SHA256  | 35FC6BAC8B463E7688BCED51DDF081E62CCD332F5F60EA3C2B37AFD8614DFBB1 |
+| Build date       | 2026-10-05 |
 
 Collect guest values (PowerShell Direct needs the VM RUNNING again, so
 start it first; if it just booted, retry after a few seconds):
