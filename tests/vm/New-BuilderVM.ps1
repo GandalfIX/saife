@@ -23,8 +23,8 @@
        changes; edit or delete the config file to change values.
     4. On confirmation executes Step 1 of the runbook: creates vmDir,
        then the VM (generation 2, 8 GB startup memory, 4 vCPU,
-       127 GB VHDX, ISO attached, DVD first boot, Default Switch) and
-       starts it.
+       127 GB VHDX, local key protector + vTPM enabled, ISO attached,
+       DVD first boot, Default Switch) and starts it.
 
   Idempotent: an already-existing builder VM is detected and reported;
   nothing is recreated or modified.
@@ -247,6 +247,10 @@ try {
 
     New-VM -Name $config.vmName -Generation 2 -MemoryStartupBytes 8GB -NewVHDPath $diskPath -NewVHDSizeBytes 127GB | Out-Null
     Set-VM -Name $config.vmName -ProcessorCount 4
+    # vTPM (fresh VM, not yet started): local key protector first,
+    # then the virtual TPM.
+    Set-VMKeyProtector -VMName $config.vmName -NewLocalKeyProtector
+    Enable-VMTPM -VMName $config.vmName
     Add-VMDvdDrive -VMName $config.vmName -Path $config.isoPath
     Connect-VMNetworkAdapter -VMName $config.vmName -SwitchName $switchName
     Set-VMFirmware -VMName $config.vmName -FirstBootDevice (Get-VMDvdDrive -VMName $config.vmName)

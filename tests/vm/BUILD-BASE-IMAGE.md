@@ -82,6 +82,9 @@ $diskPath = Join-Path $vmDir "$vmName.vhdx"
 ```powershell
 New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 8GB -NewVHDPath $diskPath -NewVHDSizeBytes 127GB
 Set-VM -Name $vmName -ProcessorCount 4
+# vTPM (fresh VM, not yet started): local key protector first, then the virtual TPM.
+Set-VMKeyProtector -VMName $vmName -NewLocalKeyProtector
+Enable-VMTPM -VMName $vmName
 # Optional: fix memory instead of dynamic (verify at image-build time):
 # Set-VM -Name $vmName -StaticMemory
 Add-VMDvdDrive -VMName $vmName -Path $isoPath
