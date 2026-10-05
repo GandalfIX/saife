@@ -85,7 +85,7 @@ Merge order: independent; merge any time.
 - Create: `tests/vm/Initialize-VMHost.ps1`
 - Modify: `.gitignore` (add `sandbox/tests/vm/vms/` and `sandbox/tests/vm/results/`)
 
-- [ ] **Step 1: Write `Initialize-VMHost.ps1`** — parameterless, idempotent,
+- [x] **Step 1: Write `Initialize-VMHost.ps1`** — parameterless, idempotent,
   safe to re-run. It must:
   1. Check the Hyper-V management tools are available
      (`Get-Command New-VM`, `Get-WindowsOptionalFeature -FeatureName
@@ -101,8 +101,8 @@ Merge order: independent; merge any time.
      `NOT READY: <missing things>`) and exit non-zero when not ready. No output
      may suggest disabling the checks (fail-closed, in the spirit of the
      project).
-- [ ] **Step 2: Update `.gitignore`** for the two working directories.
-- [ ] **Step 3: Verify:** run it twice; second run prints only the same
+- [x] **Step 2: Update `.gitignore`** for the two working directories.
+- [x] **Step 3: Verify:** run it twice; second run prints only the same
   readiness verdict (idempotent). Run on a machine without Hyper-V tools (or
   simulate) and confirm the non-zero exit + remediation text.
 
@@ -138,31 +138,31 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
 - Checkpointed (`sbx-base-a-clean`) and **stopped**; the VHDX is registered as
   the template in `Initialize-VMHost.ps1`'s template directory.
 
-- [ ] **Step 1: Write `prepare-guest.ps1`** (idempotent: installs pwsh/rustup if
+- [x] **Step 1: Write `prepare-guest.ps1`** (idempotent: installs pwsh/rustup if
   missing via winget, runs the cargo warm-up, disables Windows Update
   auto-reboot, sets execution policy for the admin user) and reference it from
   the runbook.
-- [ ] **Step 2: Write the runbook:** exact VM creation parameters (generation 2,
+- [x] **Step 2: Write the runbook:** exact VM creation parameters (generation 2,
   dynamic memory off or fixed 8 GB, 4 vCPU, 127 GB VHDX), install steps,
   `prepare-guest.ps1` invocation, `sysprep` — **not** (the template is only
   ever cloned, never reused as a domain-joined/activated daily driver),
   checkpoint + stop + register instructions.
-- [ ] **Step 3: Build the image** following the runbook; record edition, build
+- [ ] **Step 3: Build the image** following the runbook; record edition, build - [BLOCKED on ISO: image not built yet; steps 1-2 done, scripts landed]
   number, and template SHA256 in the runbook's "current image" section.
-- [ ] **Step 4: Verify:** `Initialize-VMHost.ps1` prints `READY: sbx-base-a`.
+- [ ] **Step 4: Verify:** `Initialize-VMHost.ps1` prints `READY: sbx-base-a`. - [BLOCKED on ISO]
 
 ## Task 3: Rollback script (before any VM exists — AGENTS.md rule)
 
 **Files:**
 - Create: `tests/vm/Remove-TestVM.ps1`
 
-- [ ] **Step 1: Write it.** Semantics: removes every VM whose name matches the
+- [x] **Step 1: Write it.** Semantics: removes every VM whose name matches the
   harness prefix `sbx-test-` (and only that prefix — a name whitelist, like
   the product's own allow-lists), force-stops it, deletes the VM and its
   differencing VHDX; `-Name <specific>` for targeted removal; `-List` dry-run
   mode that prints what would be removed without removing. Templates and
   `sbx-base-*` VMs are never touched. Prints everything it removes.
-- [ ] **Step 2: Verify:** `-List` against a fake-named registered VM object (or
+- [x] **Step 2: Verify:** `-List` against a fake-named registered VM object (or
   simulate) shows the planned removal; targeted mode refuses names outside the
   prefix.
 
@@ -171,7 +171,7 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
 **Files:**
 - Create: `tests/vm/run-in-vm.ps1`
 
-- [ ] **Step 1: Write it.** Parameters: `-Phase` (`unit | integration | all`),
+- [x] **Step 1: Write it.** Parameters: `-Phase` (`unit | integration | all`),
   `-Only <scenario-numbers>` (passed through to `run-tests.ps1`). Behavior:
   1. `cargo build --release` (fail → summary with build failure).
   2. `cargo test --release` (unit/Tier-1).
@@ -183,7 +183,7 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
   5. Emits `C:\sbx-results\summary.json` (versioned shape:
      `{ schema: 1, started, finished, build_ok, unit: {…}, integration: {…},
      artifacts: [...] }`).
-- [ ] **Step 2: Verify in-VM manually** (boot a clone by hand once, run it,
+- [ ] **Step 2: Verify in-VM manually** (boot a clone by hand once, run it, - [BLOCKED on ISO: guest entry point landed + mock-verified; in-VM smoke pending image]
   inspect summary.json) before wiring the host harness.
 
 ## Task 5: Host-side harness + doc wiring
@@ -195,7 +195,7 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
 - Modify: `tests/vm/vm-settings.json` convention documented in
   `BUILD-BASE-IMAGE.md` (gitignored)
 
-- [ ] **Step 1: Write `Invoke-TestsInVM.ps1`.** Parameters: `-Image sbx-base-a`
+- [x] **Step 1: Write `Invoke-TestsInVM.ps1`.** Parameters: `-Image sbx-base-a`
   (template name), `-Phase`, `-Only`, `-KeepOnFailure` (switch: keep VM +
   checkpoint instead of destroying, for debugging), `-VMSuffix` (default:
   short run id). Sequence:
@@ -216,7 +216,7 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
   8. Teardown: unless `-KeepOnFailure` and the run failed — `Stop-VM -Force`,
      `Remove-VM`, delete differencing VHDX. Print the summary table and exit
      with the suite's aggregated result code.
-- [ ] **Step 2: Verify end-to-end:** run
+- [ ] **Step 2: Verify end-to-end:** run - [BLOCKED on ISO: harness landed; fail-closed paths verified non-elevated]
   `pwsh tests/vm/Invoke-TestsInVM.ps1 -Image sbx-base-a -Phase all` on a clean
   template and assert: (a) S-1…S-74 results match a known-good host run
   (modulo scenarios that legitimately depend on host specifics), (b) afterwards
@@ -224,11 +224,11 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
   diff on `$env:TEMP`, `$env:LOCALAPPDATA`, and the scenario roots before/after
   shows zero changes on the dev host, (d) `Remove-TestVM.ps1 -List` prints
   nothing.
-- [ ] **Step 3: Repeat-run check:** run it twice back-to-back; second run must
+- [ ] **Step 3: Repeat-run check:** run it twice back-to-back; second run must - [BLOCKED on ISO]
   succeed identically (proves differencing-disk hermeticity, no stale state).
-- [ ] **Step 4: Parallel check:** two concurrent runs with distinct suffixes
+- [ ] **Step 4: Parallel check:** two concurrent runs with distinct suffixes - [BLOCKED on ISO]
   both succeed.
-- [ ] **Step 5c: Doc wording (commit exactly these edits):**
+- [x] **Step 5c: Doc wording (commit exactly these edits):**
   - `README.md` Testing section gains, after the two existing commands:
     > **Tier 2/3 tests run in a disposable VM.** The integration suite mutates
     > ACLs and AppContainer state; run it hermetically with
@@ -246,7 +246,7 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
     > test that still runs on the physical host, the rollback-script rule below
     > remains mandatory. For VM-run tests, VM deletion is the rollback; write
     > rollback scripts only for host-run tests.
-- [ ] **Step 6: Commit** — single branch; message:
+- [x] **Step 6: Commit** — single branch; message:
   `test(infra): disposable-VM test harness (VM-01): spin up, run suites in-VM, collect, destroy`
 
 ## Task 6 (BLOCKED — do not start): Base image B + WBD discovery lane
