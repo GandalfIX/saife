@@ -40,6 +40,13 @@ Run everything below from an **elevated pwsh on the host**.
 
 Set these once and copy-paste the blocks in order:
 
+> **Shortcut:** `pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\New-BuilderVM.ps1`
+> is an interactive wrapper for Steps 0-1: it runs the readiness probe, asks
+> for the values above (defaults where sensible), stores them in
+> `tests\vm\build-config.json` (gitignored; an existing file is used
+> directly), asks for confirmation, and then creates `vmDir` and the builder
+> VM. If you used it, skip Step 1 below.
+
 ```powershell
 # Adjust to your machine, then keep this shell for all steps below.
 $repoRoot = 'C:\Users\marku\tools\sandbox'   # the sandbox tool's repo root

@@ -13,3 +13,4 @@
 /tests/vm/results/
 /tests/vm/templates/
 /tests/vm/vm-settings.json
+/tests/vm/build-config.json
