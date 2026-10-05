@@ -82,7 +82,10 @@ $script:Summary = [ordered]@{
     unit        = @{ requested = $false; exit = $null; log = 'unit.log' }
     integration = @{ requested = $false; exit = $null; total = $null; pass = $null
                      fail = $null; skip = $null; verdict = $null; log = 'integration.log' }
-    artifacts   = @('build.log', 'unit.log', 'integration.log', 'summary.json')
+    # Advertise only artifacts that can exist: build.log + summary.json always,
+    # plus unit.log/integration.log when their phase was requested (filled in
+    # below once the phase flags are known).
+    artifacts   = @('build.log', 'summary.json')
 }
 # 99 (unexpected) until the run proves otherwise; the try block sets 0/1.
 $script:RunExit = 99
@@ -130,6 +133,11 @@ try {
     $wantIntegration = ($Phase -eq 'integration') -or ($Phase -eq 'all')
     $script:Summary.unit.requested = $wantUnit
     $script:Summary.integration.requested = $wantIntegration
+    # Dynamic artifacts: only logs for phases that were actually requested.
+    $script:Summary.artifacts = @('build.log')
+    if ($wantUnit) { $script:Summary.artifacts += 'unit.log' }
+    if ($wantIntegration) { $script:Summary.artifacts += 'integration.log' }
+    $script:Summary.artifacts += 'summary.json'
     if ($Only -and -not $wantIntegration) {
         Write-Host "[vm-guest] NOTE: -Only applies to the integration phase only; ignoring it for phase '$Phase'." -ForegroundColor Yellow
     }

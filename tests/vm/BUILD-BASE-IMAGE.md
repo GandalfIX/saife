@@ -97,34 +97,64 @@ The VM must be **RUNNING**. Get the guest credential once:
 $cred = Get-Credential -UserName 'sbxadmin' -Message 'Guest password for sbx-base-a-builder'
 ```
 
-Stage the repo on the host excluding `target\` (adding `.git` to `/XD`
-shrinks the copy further; git is not needed for tests):
+Stage the repo on the host, excluding `target\` and `.git` (git is not
+needed inside the image):
 
 ```powershell
 $stage = Join-Path $env:TEMP 'sbx-repo-stage'
 if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-robocopy $repoRoot $stage /E /XD target
-# NOTE: robocopy exit codes 0-7 are success (1 = files copied); only >= 8 is an error.
+robocopy $repoRoot $stage /E /XD target .git
+if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }   # robocopy 0-7 = success (1 = files copied)
 ```
 
-`Copy-VMFile` copies one file at a time, so walk the staging tree, create
-each guest directory via PowerShell Direct, then copy the file:
+> **Why one archive, not per-file copies:** `Copy-VMFile` moves a single
+> file per call. Copying a repo tree file-by-file would open thousands of
+> PowerShell Direct sessions, cannot resume after a transient failure, and
+> a failed `Copy-VMFile` does not raise an error under the default
+> `EAP Continue` — missing files would only surface later as a confusing
+> cargo failure at bake time. One archive = one PS Direct session,
+> restartable, and verifiable by file count.
+
+Compress the staging tree (contents only — no top-level folder), copy ONE
+file, expand it in the guest (one session), then verify the copy by file
+count (one session):
 
 ```powershell
-$files = @(Get-ChildItem -LiteralPath $stage -Recurse -File)
-$i = 0
-foreach ($f in $files) {
-    $i++
-    $rel = $f.FullName.Substring($stage.Length + 1)
-    $dest = Join-Path 'C:\sbx-repo' $rel
-    $destDir = Split-Path -Parent $dest
-    Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
-        param($d)
-        if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-    } -ArgumentList $destDir
-    Copy-VMFile -Name $vmName -SourcePath $f.FullName -DestinationPath $dest -FileSource Host -Force
-    Write-Host ("[copy] {0}/{1}: {2}" -f $i, $files.Count, $rel)
+# Host: count + compress + single-file copy.
+$stageCount = @(Get-ChildItem -LiteralPath $stage -Recurse -File).Count
+$zipPath = Join-Path $env:TEMP 'sbx-repo.zip'
+if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+Copy-VMFile -Name $vmName -SourcePath $zipPath -DestinationPath 'C:\sbx-repo.zip' -FileSource Host -Force
+```
+
+> **Archive caveat:** `Compress-Archive` can be slow on large trees, and
+> older Windows PowerShell 5.1 versions fail past 2 GB. If it struggles,
+> use the built-in bsdtar instead (ships with Windows 10+); the guest can
+> keep using `Expand-Archive` (it reads bsdtar zips) or `tar -xf`:
+>
+> ```powershell
+> # Host: tar -a -c -f $zipPath -C $stage .
+> # Guest: replace Expand-Archive in the session below with: tar -xf C:\sbx-repo.zip -C C:\sbx-repo
+> ```
+
+```powershell
+# Guest: expand (single PS Direct session).
+Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+    Expand-Archive -Path 'C:\sbx-repo.zip' -DestinationPath 'C:\sbx-repo' -Force
+    Remove-Item -LiteralPath 'C:\sbx-repo.zip' -Force
 }
+
+# Guest: end-of-copy verification against the host-side staging count
+# (single PS Direct session; loud failure instead of a silent gap).
+Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
+    param($expected)
+    $actual = @(Get-ChildItem -LiteralPath 'C:\sbx-repo' -Recurse -File).Count
+    if ($actual -ne $expected) {
+        throw "repo copy verification FAILED: expected $expected files under C:\sbx-repo, found $actual - re-run the copy step"
+    }
+    Write-Host "repo copy verified: $actual of $expected files present"
+} -ArgumentList $stageCount
 ```
 
 Run provisioning. **Chicken-and-egg:** on the first pass pwsh is not
@@ -174,12 +204,17 @@ Create `<repoRoot>\tests\vm\vm-settings.json` with EXACTLY this shape:
 > Default Switch, and the password is used solely for PowerShell Direct
 > over the VM bus. Do NOT reuse a real password.
 
-## Step 5 — Snapshot: stop, copy the VHDX, register as the template
+## Step 5 — Template copy (plus re-bake checkpoint)
 
-The template is a **file copy**; the builder VM stays untouched so it can
-be kept for re-bakes:
+The VHDX **file copy** below becomes the immutable template; an optional
+checkpoint taken first is the builder VM's re-bake restore point. The
+builder VM itself stays untouched by the copy, so it can be kept for
+re-bakes (revert to the checkpoint, re-run provisioning, refresh the
+template copy):
 
 ```powershell
+# Optional but recommended BEFORE stopping: the re-bake restore point.
+Checkpoint-VM -Name $vmName -SnapshotName 'sbx-base-a-clean'
 Stop-VM -Name $vmName
 $templateDir  = Join-Path $repoRoot 'tests\vm\templates'
 $templatePath = Join-Path $templateDir 'sbx-base-a.vhdx'
@@ -191,7 +226,8 @@ Get-FileHash -LiteralPath $templatePath -Algorithm SHA256
 (The copy of a multi-GB VHDX takes a few minutes.)
 
 **Keep the builder VM** and refresh the template copy after every re-bake
-(Stop-VM + `Copy-Item` again). `Initialize-VMHost.ps1` must then list the
+(checkpoint `sbx-base-a-clean` → revert → re-run `prepare-guest.ps1` →
+Stop-VM → `Copy-Item` again). `Initialize-VMHost.ps1` must then list the
 template and print `READY`:
 
 ```powershell
@@ -215,9 +251,11 @@ OS build here):
 | Template SHA256  | _fill in (Get-FileHash output above)_ |
 | Build date       | _fill in_ |
 
-Collect guest values (VM must be running):
+Collect guest values (PowerShell Direct needs the VM RUNNING again, so
+start it first; if it just booted, retry after a few seconds):
 
 ```powershell
+Start-VM -Name $vmName
 Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
     Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber
 }
