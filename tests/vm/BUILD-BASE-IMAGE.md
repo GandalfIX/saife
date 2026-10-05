@@ -23,7 +23,7 @@ later; the harness is image-agnostic.
 
 ---
 
-## Step 0 — Prereqs
+## Step 0 — Prereqs and configuration
 
 Run everything below from an **elevated pwsh on the host**.
 
@@ -36,16 +36,34 @@ Run everything below from an **elevated pwsh on the host**.
    VM (up to 127 GB VHDX) plus the template copy.
 3. **ISO** — the downloaded insider ISO. Record the exact path now; the
    operator records the exact ISO and resulting OS build in the
-   [Current image](#current-image) section at the end.
+   [Current image](#current-image) section at the end (with the wrapper
+   it is also preserved in `tests\vm\build-config.json`).
 
-Set these once and copy-paste the blocks in order:
+**Recommended: let the wrapper do Steps 0-1** —
 
-> **Shortcut:** `pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\New-BuilderVM.ps1`
-> is an interactive wrapper for Steps 0-1: it runs the readiness probe, asks
-> for the values above (defaults where sensible), stores them in
-> `tests\vm\build-config.json` (gitignored; an existing file is used
-> directly), asks for confirmation, and then creates `vmDir` and the builder
-> VM. If you used it, skip Step 1 below.
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\New-BuilderVM.ps1
+```
+
+The interactive wrapper (`tests\vm\New-BuilderVM.ps1`):
+
+- runs the readiness probe first (fail-closed: a non-elevated shell or
+  missing Hyper-V tools aborts immediately; a `NOT READY` for the missing
+  template/`vm-settings.json` is **expected** before the first build and
+  only blocks when no virtual switch exists),
+- asks for the values below (defaults where sensible) and stores them in
+  `tests\vm\build-config.json` — machine-local and gitignored; an existing
+  file is used directly, edit or delete it to change values,
+- shows all values including the derived VHDX path for confirmation
+  (decline aborts cleanly with no changes), then creates `vmDir` and the
+  builder VM (Step 1) and starts it,
+- is idempotent: an already-existing builder VM is reported, not
+  recreated.
+
+Then continue with [Step 2 — Install Windows](#step-2--install-windows-manual).
+
+**Manual alternative:** set these once and copy-paste the blocks in order
+(the wrapper stores exactly these values, so both paths stay equivalent):
 
 ```powershell
 # Adjust to your machine, then keep this shell for all steps below.
@@ -56,7 +74,10 @@ $vmDir    = 'D:\hyper-v'                     # drive with ~150 GB free
 $diskPath = Join-Path $vmDir "$vmName.vhdx"
 ```
 
-## Step 1 — Create the builder VM
+## Step 1 — Create the builder VM (manual path only)
+
+> Skipped if you used `New-BuilderVM.ps1` in Step 0 — the wrapper performs
+> this step (plus creating `$vmDir`).
 
 ```powershell
 New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 8GB -NewVHDPath $diskPath -NewVHDSizeBytes 127GB
@@ -297,5 +318,13 @@ Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
   `& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath`),
   or the rustup toolchain missing (`rustup default stable-msvc`). A
   reboot-pending VS install (exit 3010) needs one VM reboot, then a re-run.
+- **`New-BuilderVM.ps1` refuses an unusable configuration** ("configuration
+  in ... is unusable") — a value saved in `tests\vm\build-config.json` no
+  longer holds (typically the ISO was moved or deleted, or `repoRoot`
+  points elsewhere). Edit or delete the file and re-run; the wrapper
+  re-asks for values.
+- **`New-BuilderVM.ps1`: "VHDX path already occupied"** — a previous
+  partial run left `<vmDir>\<name>.vhdx` on disk. Delete it (or pick a
+  different VM name) and re-run.
 - **robocopy "failed"** — robocopy exit codes 0–7 are success (1 = files
   copied); only ≥ 8 is an error.
