@@ -40,13 +40,13 @@ $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 try {
     # -----------------------------------------------------------------------
-    # 1. Elevation — must be the first check; Hyper-V cmdlets fail with a
+    # 1. Elevation - must be the first check; Hyper-V cmdlets fail with a
     #    confusing permission error otherwise.
     # -----------------------------------------------------------------------
     $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
     if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host '[vm-host] not elevated — run from an elevated (administrator) pwsh, then re-run tests\vm\Initialize-VMHost.ps1' -ForegroundColor Red
+        Write-Host '[vm-host] not elevated - run from an elevated (administrator) pwsh, then re-run tests\vm\Initialize-VMHost.ps1' -ForegroundColor Red
         exit 2
     }
 
@@ -72,7 +72,7 @@ try {
     Write-Host '[vm-host] Hyper-V management tools present.' -ForegroundColor Green
 
     # -----------------------------------------------------------------------
-    # 3. Working directories (create if missing — idempotent).
+    # 3. Working directories (create if missing - idempotent).
     # -----------------------------------------------------------------------
     $vmDir = Join-Path $script:ThisDir 'vms'
     $resultsDir = Join-Path $script:ThisDir 'results'
@@ -111,12 +111,12 @@ try {
     } else {
         $missing.Add('template VHDX')
         Write-Host "[vm-host] NOT READY: no template VHDX found under $templatesDir." -ForegroundColor Red
-        Write-Host '[vm-host] build one first — see tests\vm\BUILD-BASE-IMAGE.md.' -ForegroundColor Yellow
+        Write-Host '[vm-host] build one first - see tests\vm\BUILD-BASE-IMAGE.md.' -ForegroundColor Yellow
     }
 
     # -----------------------------------------------------------------------
     # 5. Guest-credentials file (local only; gitignored; contents never
-    #    read or echoed — existence and non-emptiness only).
+    #    read or echoed - existence and non-emptiness only).
     # -----------------------------------------------------------------------
     $settingsItem = Get-Item -LiteralPath $settingsFile -ErrorAction SilentlyContinue
     if ($settingsItem -and ($settingsItem.Length -gt 0)) {
@@ -128,7 +128,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 6. Virtual switch (safe to call now — elevation already verified).
+    # 6. Virtual switch (safe to call now - elevation already verified).
     # -----------------------------------------------------------------------
     $switches = @()
     $switchQueryFailed = $false
@@ -158,12 +158,12 @@ try {
         $repoDrive = $repoRoot.Substring(0, 1)
         $freeGb = [math]::Round((Get-PSDrive -Name $repoDrive).Free / 1GB, 1)
         if ($freeGb -lt 40) {
-            Write-Host "[vm-host] WARNING: only $freeGb GB free on drive ${repoDrive}: — 40 GB or more is recommended for template + per-run differencing disks." -ForegroundColor Yellow
+            Write-Host "[vm-host] WARNING: only $freeGb GB free on drive ${repoDrive}: - 40 GB or more is recommended for template + per-run differencing disks." -ForegroundColor Yellow
         } else {
             Write-Host "[vm-host] free disk space on drive ${repoDrive}: $freeGb GB." -ForegroundColor Green
         }
     } else {
-        Write-Host "[vm-host] WARNING: repo path '$repoRoot' is not on a lettered drive (UNC?) — free-disk-space check skipped." -ForegroundColor Yellow
+        Write-Host "[vm-host] WARNING: repo path '$repoRoot' is not on a lettered drive (UNC?) - free-disk-space check skipped." -ForegroundColor Yellow
     }
 
     # -----------------------------------------------------------------------

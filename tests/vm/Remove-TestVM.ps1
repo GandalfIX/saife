@@ -11,13 +11,24 @@
     - On disk, only .vhdx files under tests\vm\vms belonging to the removed
       VM are deleted; the templates directory is never touched.
 
+  Orphaned-disk cleanup: the harness can leave a differencing disk behind
+  with no registered VM (run killed between New-VHD and New-VM, or a
+  failed cleanup).
+    - -Name also removes tests\vm\vms\<Name>.vhdx when no registered VM
+      matches (reported as an orphaned disk removed).
+    - -All additionally sweeps tests\vm\vms\sbx-test-*.vhdx files that do
+      not belong to any registered VM and removes them.
+    - Only sbx-test-* prefixed .vhdx files are ever deleted.
+    - -List lists orphaned disks too (marked as such); it removes nothing.
+
   Parameter validation (including the prefix allow-list) runs BEFORE the
   elevation check, so misuse is reported identically regardless of whether
   the shell is elevated.
 
   Exit codes:
     0  = nothing (left) to remove, or removal succeeded
-    1  = at least one matched VM (or its disk) failed to remove
+    1  = at least one matched VM, its disk, or an orphaned disk failed
+         to remove
     2  = not elevated (run from an elevated pwsh)
     4  = usage error, name outside the sbx-test- allow-list,
          or Hyper-V management tools/service unavailable
@@ -25,7 +36,8 @@
 .PARAMETER Name
   Exact name of a single VM to remove; must start with the sbx-test- prefix.
 .PARAMETER List
-  Dry run: print what would be removed, remove nothing.
+  Dry run: print what would be removed (matched VMs and orphaned disks),
+  remove nothing.
 .PARAMETER All
   Remove every VM whose name starts with the sbx-test- prefix.
 .EXAMPLE
@@ -47,7 +59,7 @@ $script:Prefix = 'sbx-test-'
 
 try {
     # -----------------------------------------------------------------------
-    # Parameter validation — first, so usage and allow-list errors surface
+    # Parameter validation - first, so usage and allow-list errors surface
     # identically whether or not the shell is elevated.
     # -----------------------------------------------------------------------
     $selectedModes = 0
@@ -60,7 +72,7 @@ try {
         exit 4
     }
     if ($Name -and -not $Name.StartsWith($script:Prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-Host "[vm] refusing: '$Name' is outside the test-VM allow-list — this script only ever touches VMs named 'sbx-test-*'." -ForegroundColor Red
+        Write-Host "[vm] refusing: '$Name' is outside the test-VM allow-list - this script only ever touches VMs named 'sbx-test-*'." -ForegroundColor Red
         exit 4
     }
 
@@ -71,7 +83,7 @@ try {
     $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
     if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host '[vm] not elevated — run from an elevated pwsh; one-time prep: tests\vm\Initialize-VMHost.ps1' -ForegroundColor Red
+        Write-Host '[vm] not elevated - run from an elevated pwsh; one-time prep: tests\vm\Initialize-VMHost.ps1' -ForegroundColor Red
         exit 2
     }
 
@@ -89,7 +101,7 @@ try {
         }
     }
     if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
-        Write-Host '[vm] Hyper-V management tools are missing — enable them from an elevated pwsh: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell.' -ForegroundColor Red
+        Write-Host '[vm] Hyper-V management tools are missing - enable them from an elevated pwsh: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell.' -ForegroundColor Red
         exit 4
     }
 
@@ -130,32 +142,72 @@ try {
         return $true
     }
 
+    # Orphaned disks: sbx-test-*.vhdx files under tests\vm\vms that do not
+    # belong to ANY registered VM (differencing disk whose VM was never
+    # registered or whose cleanup failed). Never matches non-sbx-test-
+    # files; the deletable-disk guard still applies on deletion.
+    function Get-OrphanedDisks {
+        param([object[]]$RegisteredVms)
+        if (-not (Test-Path -LiteralPath $script:VmsDir)) { return @() }
+        $vmNames = @($RegisteredVms | ForEach-Object { $_.Name })
+        $orphans = New-Object System.Collections.Generic.List[string]
+        Get-ChildItem -LiteralPath $script:VmsDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.Extension -eq '.vhdx') -and
+                ($_.BaseName.StartsWith($script:Prefix, [System.StringComparison]::OrdinalIgnoreCase))
+            } |
+            ForEach-Object {
+                $segments = @($_.FullName -split '[\\/]')
+                $belongsToVm = $false
+                foreach ($vmName in $vmNames) {
+                    if (($_.BaseName -eq $vmName) -or ($segments -contains $vmName)) {
+                        $belongsToVm = $true
+                        break
+                    }
+                }
+                if (-not $belongsToVm) { $orphans.Add($_.FullName) }
+            }
+        return @($orphans)
+    }
+
     # -----------------------------------------------------------------------
     # Target selection (prefix allow-list applied to every mode).
     # -----------------------------------------------------------------------
+    $allVms = @()
     $matchingVms = @()
     try {
-        $matchingVms = @(Get-VM | Where-Object { $_.Name -like "$($script:Prefix)*" })
+        $allVms = @(Get-VM)
+        $matchingVms = @($allVms | Where-Object { $_.Name -like "$($script:Prefix)*" })
     } catch {
-        Write-Host "[vm] Hyper-V service unavailable — could not enumerate VMs: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "[vm] Hyper-V service unavailable - could not enumerate VMs: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host '[vm] the Hyper-V Virtual Machine Management service (VMMS) may not be running; start it, then re-run.' -ForegroundColor Yellow
         exit 4
     }
 
     if ($List) {
-        if ($matchingVms.Count -eq 0) {
-            Write-Host "[vm] no VMs matching '$($script:Prefix)*' exist — nothing to remove." -ForegroundColor Gray
+        $orphanedDisks = Get-OrphanedDisks -RegisteredVms $allVms
+        if ($matchingVms.Count -eq 0 -and $orphanedDisks.Count -eq 0) {
+            Write-Host "[vm] no VMs matching '$($script:Prefix)*' exist - nothing to remove." -ForegroundColor Gray
             exit 0
         }
-        Write-Host "[vm] DRY RUN: the following $($matchingVms.Count) VM(s) would be removed (nothing is modified):" -ForegroundColor Cyan
-        foreach ($vm in $matchingVms) {
-            Write-Host ("[vm]   VM: {0} (state: {1})" -f $vm.Name, $vm.State) -ForegroundColor Yellow
-            foreach ($disk in Get-VmDiskCandidates -VmName $vm.Name -Vm $vm) {
-                if (Test-IsDeletableDisk -Path $disk) {
-                    Write-Host "[vm]     would delete disk: $disk" -ForegroundColor Gray
-                } else {
-                    Write-Host "[vm]     would keep disk (not deletable by guard): $disk" -ForegroundColor DarkGray
+        if ($matchingVms.Count -gt 0) {
+            Write-Host "[vm] DRY RUN: the following $($matchingVms.Count) VM(s) would be removed (nothing is modified):" -ForegroundColor Cyan
+            foreach ($vm in $matchingVms) {
+                Write-Host ("[vm]   VM: {0} (state: {1})" -f $vm.Name, $vm.State) -ForegroundColor Yellow
+                foreach ($disk in Get-VmDiskCandidates -VmName $vm.Name -Vm $vm) {
+                    if (Test-IsDeletableDisk -Path $disk) {
+                        Write-Host "[vm]     would delete disk: $disk" -ForegroundColor Gray
+                    } else {
+                        Write-Host "[vm]     would keep disk (not deletable by guard): $disk" -ForegroundColor DarkGray
+                    }
                 }
+            }
+        }
+        foreach ($orphan in $orphanedDisks) {
+            if (Test-IsDeletableDisk -Path $orphan) {
+                Write-Host "[vm]   would remove orphaned disk (no matching registered VM): $orphan" -ForegroundColor Yellow
+            } else {
+                Write-Host "[vm]     would keep orphaned disk (not deletable by guard): $orphan" -ForegroundColor DarkGray
             }
         }
         exit 0
@@ -169,11 +221,26 @@ try {
 
     if ($targets.Count -eq 0) {
         if ($All) {
-            Write-Host "[vm] no VMs matching '$($script:Prefix)*' exist — nothing to remove." -ForegroundColor Gray
+            # Fall through to the orphan-disk sweep below (empty target list).
+            Write-Host "[vm] no VMs matching '$($script:Prefix)*' exist - nothing to remove." -ForegroundColor Gray
         } else {
-            Write-Host "[vm] no VM named '$Name' exists — nothing to remove." -ForegroundColor Gray
+            # -Name with no matching registered VM: the harness can still
+            # have left the differencing disk behind (killed between
+            # New-VHD and New-VM, or a failed cleanup) - remove the orphan.
+            $orphanPath = Join-Path $script:VmsDir "$Name.vhdx"
+            if ((Test-Path -LiteralPath $orphanPath) -and (Test-IsDeletableDisk -Path $orphanPath)) {
+                try {
+                    Remove-Item -LiteralPath $orphanPath -Force
+                    Write-Host "[vm] orphaned disk removed: $orphanPath" -ForegroundColor Gray
+                } catch {
+                    Write-Host "[vm] FAILED to delete orphaned disk '$orphanPath': $($_.Exception.Message)" -ForegroundColor Red
+                    exit 1
+                }
+                exit 0
+            }
+            Write-Host "[vm] no VM named '$Name' exists - nothing to remove." -ForegroundColor Gray
+            exit 0
         }
-        exit 0
     }
 
     # -----------------------------------------------------------------------
@@ -224,6 +291,34 @@ try {
         } catch {
             Write-Host "[vm]   FAILED on VM '$vmName': $($_.Exception.Message)" -ForegroundColor Red
             $failedCount++
+        }
+    }
+
+    if ($All) {
+        # Orphan-disk sweep: remove sbx-test-*.vhdx files under tests\vm\vms
+        # that belong to no registered VM. Runs AFTER VM removal (a failed
+        # Remove-VM keeps the VM registered, so its disk is not swept).
+        $remainingVms = $null
+        try {
+            $remainingVms = @(Get-VM)
+        } catch {
+            Write-Host "[vm] could not re-enumerate VMs for the orphan-disk sweep - nothing swept: $($_.Exception.Message)" -ForegroundColor Red
+            $failedCount++
+        }
+        if ($null -ne $remainingVms) {
+            foreach ($orphan in (Get-OrphanedDisks -RegisteredVms $remainingVms)) {
+                if (-not (Test-IsDeletableDisk -Path $orphan)) {
+                    Write-Host "[vm]   keeping orphaned disk (guard: outside tests\vm\vms, not a .vhdx, or a sbx-base-* template): $orphan" -ForegroundColor DarkGray
+                    continue
+                }
+                try {
+                    Remove-Item -LiteralPath $orphan -Force
+                    Write-Host "[vm]   orphaned disk removed: $orphan" -ForegroundColor Gray
+                } catch {
+                    Write-Host "[vm]   FAILED to delete orphaned disk '$orphan': $($_.Exception.Message)" -ForegroundColor Red
+                    $failedCount++
+                }
+            }
         }
     }
 

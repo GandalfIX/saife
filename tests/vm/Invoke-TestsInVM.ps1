@@ -28,9 +28,9 @@
 
   Teardown policy (one function; rules that compose):
     - keep   when ((failed AND -KeepOnFailure) or the fetch failed) AND
-      the VM exists: checkpoint 'failed-run' BEFORE stopping, keep VM +
-      differencing disk (a VM that was never created cannot be kept - its
-      orphaned disk is destroyed instead);
+      the VM exists: checkpoint 'failed-run', keep VM + differencing
+      disk, the VM is left RUNNING for debugging (a VM that was never
+      created cannot be kept - its orphaned disk is destroyed instead);
     - destroy otherwise: Stop-VM + Remove-VM, then delete the differencing
       disk ONLY when the VM was never registered or its removal succeeded
       (a registered VM must never point at a deleted file), with an
@@ -72,9 +72,9 @@
   in-process or via 'pwsh -Command'. Via 'pwsh -File' only a single id is
   reliable ("1,2,6" would bind as the single int 126).
 .PARAMETER KeepOnFailure
-  On a failed run: checkpoint the VM as 'failed-run' (BEFORE stopping it)
-  and keep it plus the differencing disk for debugging, instead of
-  destroying them. Artifacts are always fetched first; when fetching
+  On a failed run: checkpoint the VM as 'failed-run' and keep it plus
+  the differencing disk for debugging (the VM is left running), instead
+  of destroying them. Artifacts are always fetched first; when fetching
   itself fails the VM is kept regardless of this switch.
 .PARAMETER VMSuffix
   Suffix for the VM name and differencing disk: sbx-test-<suffix>. Default:
@@ -132,8 +132,8 @@ $script:RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $script:ThisDir '..\
 #             failure: the completed run's results still live in the
 #             guest), but only when the VM EXISTS - a VM that was never
 #             created cannot be kept, and keeping its orphaned disk would
-#             leak it: checkpoint 'failed-run' BEFORE stopping, keep VM +
-#             differencing disk, skip destruction entirely.
+#             leak it: checkpoint 'failed-run', keep VM (left running for
+#             debugging) + differencing disk, skip destruction entirely.
 #   destroy - otherwise. When Hyper-V cannot be queried: delete NOTHING
 #             (a registered VM must never point at a deleted file) and
 #             report teardown failure. When the VM is registered: Stop-VM
@@ -209,7 +209,7 @@ function Invoke-TestVmTeardown {
         }
     }
     if ($teardownFailed) {
-        Write-Host "[vm-run] WARNING: teardown incomplete - finish cleanup with: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Remove-TestVM.ps1 -Name $VmName" -ForegroundColor Yellow
+        Write-Host "[vm-run] WARNING: teardown incomplete - finish cleanup with: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Remove-TestVM.ps1 -Name $VmName (removes the VM and/or its orphaned disk)" -ForegroundColor Yellow
     } else {
         Write-Host "[vm-run] VM destroyed: $VmName"
     }
@@ -314,8 +314,9 @@ try {
 
     # -----------------------------------------------------------------------
     # 5. Stage the repo host-side (working tree minus build output, VM
-    #    artifacts, and the credentials file), then archive the CONTENTS
-    #    and record the file count for the post-copy verification.
+    #    artifacts, the runtime-state dir, and the credentials file), then
+    #    archive the CONTENTS and record the file count for the
+    #    post-copy verification.
     #    /XD gets root-anchored ABSOLUTE paths: bare names would exclude
     #    same-named directories tree-wide.
     # -----------------------------------------------------------------------
@@ -323,6 +324,7 @@ try {
     $excludeDirs = @(
         (Join-Path $script:RepoRoot 'target'),
         (Join-Path $script:RepoRoot '.git'),
+        (Join-Path $script:RepoRoot '.sandbox'),
         $script:VmsDir,
         $script:ResultsBaseDir,
         (Join-Path $script:ThisDir 'templates')
@@ -584,9 +586,9 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 12. Teardown decision (checkpoint BEFORE stopping when kept; step 11's
-    #     failure path already exited above, so a fetch failure never
-    #     reaches this destruction).
+    # 12. Teardown decision (checkpoint 'failed-run' when kept, the VM is
+    #     left running; step 11's failure path already exited above, so a
+    #     fetch failure never reaches this destruction).
     # -----------------------------------------------------------------------
     $suitePassed = ($guestExit -eq 0)
     $teardownFailed = Invoke-TestVmTeardown -Failed (-not $suitePassed) -VmName $vmName -VhdxPath $vhdxPath -KeepOnFailure:$KeepOnFailure
