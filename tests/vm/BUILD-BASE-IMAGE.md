@@ -23,6 +23,37 @@ later; the harness is image-agnostic.
 
 ---
 
+## One-command build (recommended)
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Build-BaseImage.ps1
+```
+
+`tests\vm\Build-BaseImage.ps1` drives the ENTIRE runbook interactively,
+asking only for what it needs at each point:
+
+1. **Phase 1** runs `New-BuilderVM.ps1` (probe, configuration questions,
+   confirmation; creates and starts the builder VM with vTPM).
+2. **Phase 2** opens the VM console and prompts you to install Windows
+   manually (this is the only manual work — unattended installs are a
+   documented non-goal). You come back and press Enter when done; it then
+   collects the guest credential and verifies PowerShell Direct.
+3. **Phase 3** runs `Copy-RepoToVM.ps1` (Guest Service, staging, zip,
+   single copy, expand, count verification).
+4. **Phase 4** runs `prepare-guest.ps1` in the guest (30–60 min), with a
+   reboot-and-retry loop for reboot-pending VS installs, and verifies
+   pwsh.
+5. **Phase 5** runs `Export-BaseImage.ps1` (Steps 4–5 below plus the
+   current-image record) and finishes with the readiness probe.
+
+The guest credential is asked once and passed in-process; it is never
+printed. Re-runs are safe — every phase is idempotent or state-checking.
+
+The step-by-step sections below remain the manual alternative and the
+reference for what the scripts do.
+
+---
+
 ## Step 0 — Prereqs and configuration
 
 Run everything below from an **elevated pwsh on the host**.
@@ -253,6 +284,14 @@ Notes:
 
 ## Step 4 — Create `tests/vm/vm-settings.json` (host side)
 
+> **Recommended:** `tests\vm\Export-BaseImage.ps1` (or the overall
+> `Build-BaseImage.ps1`, phase 5) performs Steps 4–5 below plus the
+> current-image collection — it asks for the template name, writes
+> `vm-settings.json` from the credential you already entered (after
+> confirmation, password never printed), takes the checkpoint, stops the
+> VM, copies + hashes the template and runs the readiness probe. The
+> blocks below are the manual alternative.
+
 Create `<repoRoot>\tests\vm\vm-settings.json` with EXACTLY this shape:
 
 ```json
@@ -305,7 +344,8 @@ Expected final line: `READY: sbx-base-a.vhdx` (exit 0).
 ## Current image
 
 Fill in after the build (the operator records the exact ISO and resulting
-OS build here):
+OS build here) — `Export-BaseImage.ps1` prints this table ready-to-paste
+with all values collected automatically:
 
 | Field            | Value |
 |------------------|-------|

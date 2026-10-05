@@ -42,11 +42,18 @@
     4  Hyper-V management tools missing
     99 unexpected error
 
+.PARAMETER Credential
+  Optional guest credential; when omitted the script asks via
+  Get-Credential. Used by Build-BaseImage.ps1 to pass an
+  already-collected credential in-process (never stored, never printed).
+
 .EXAMPLE
   pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Copy-RepoToVM.ps1
 #>
 [CmdletBinding()]
-param()
+param(
+    [pscredential]$Credential
+)
 
 $ErrorActionPreference = 'Stop'
 $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -131,11 +138,16 @@ try {
     # -----------------------------------------------------------------------
     # 5. Guest credential (asked AFTER all hard gates - never waste a
     #    password prompt on a doomed run; never printed or logged).
+    #    Passed in-process by Build-BaseImage.ps1 when -Credential is given.
     # -----------------------------------------------------------------------
-    $cred = Get-Credential -UserName 'sbxadmin' -Message "Guest credential for $vmName (account created during Windows Setup)"
-    if (-not $cred) {
-        Write-Host '[vm-copy] ABORTED - credential prompt cancelled; nothing was copied.' -ForegroundColor Yellow
-        exit 0
+    if ($Credential) {
+        $cred = $Credential
+    } else {
+        $cred = Get-Credential -UserName 'sbxadmin' -Message "Guest credential for $vmName (account created during Windows Setup)"
+        if (-not $cred) {
+            Write-Host '[vm-copy] ABORTED - credential prompt cancelled; nothing was copied.' -ForegroundColor Yellow
+            exit 0
+        }
     }
 
     # -----------------------------------------------------------------------
