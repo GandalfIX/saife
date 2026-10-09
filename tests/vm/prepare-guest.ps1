@@ -16,9 +16,13 @@
        winget itself is missing, exact remediation is printed and the
        script exits non-zero.
     3. Tool installs, each checked first (idempotence), via winget:
-       - PowerShell 7            (Microsoft.PowerShell)
-       - Git                     (Git.Git)
-       - VS Build Tools 2022 with the C++ workload + Windows SDK
+        - PowerShell 7            (Microsoft.PowerShell)
+        - Git                     (Git.Git)
+        - Python 3, machine-wide, on PATH (Python.Python.3.12; the python
+          scenarios need a REAL python.exe - the Microsoft Store execution
+          alias degrades to the "Python was not found" stub (exit 9009)
+          for AppContainer callers, so it must not count as installed)
+        - VS Build Tools 2022 with the C++ workload + Windows SDK
          (Microsoft.VisualStudio.2022.BuildTools, --override
           "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools
           --includeRecommended") - takes many minutes (10-30+)
@@ -77,6 +81,26 @@ function Test-CommandAvailable {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Test-RealPythonAvailable {
+    # True when `python` on PATH is a real interpreter. The Microsoft Store
+    # execution alias (.../Microsoft/WindowsApps/python.exe) resolves fine
+    # in a normal session but degrades to the "Python was not found" stub
+    # (exit 9009) for AppContainer callers - it must NOT count as installed
+    # (docs/bugs/2026-08-15-python-store-alias-unusable-in-appcontainer.md).
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $false }
+    if ($cmd.Source -match '\\Microsoft\\WindowsApps\\') { return $false }
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $cmd.Source -c "pass" | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = 'Stop'
+    }
+}
+
 function Test-VcToolsInstalled {
     param([string]$VswherePath)
     # True when any installed VS product carries the native C++ workload
@@ -117,10 +141,18 @@ function Invoke-ToolCommand {
 }
 
 function Invoke-WingetInstall {
-    param([string]$Id, [string[]]$ExtraArgs)
+    # -Override REPLACES winget's default silent switches entirely (and must
+    # therefore carry its own /quiet etc.) - used when an installer needs
+    # exact control, e.g. Python's machine-wide + PrependPath variables.
+    param([string]$Id, [string[]]$ExtraArgs, [string]$Override)
     $wingetArgs = @('install', '--id', $Id, '--exact', '--source', 'winget',
-        '--accept-package-agreements', '--accept-source-agreements', '--silent')
-    if ($ExtraArgs) { $wingetArgs += $ExtraArgs }
+        '--accept-package-agreements', '--accept-source-agreements')
+    if ($Override) {
+        $wingetArgs += @('--override', $Override)
+    } else {
+        $wingetArgs += '--silent'
+        if ($ExtraArgs) { $wingetArgs += $ExtraArgs }
+    }
     Write-Host "[vm-guest]   winget $($wingetArgs -join ' ')" -ForegroundColor DarkGray
     return (Invoke-ToolCommand -FilePath 'winget' -ArgumentList $wingetArgs)
 }
@@ -145,7 +177,7 @@ try {
         Write-Host '[vm-guest] winget is missing - tools cannot be installed automatically, and this script does not hand-roll MSI downloads.' -ForegroundColor Red
         Write-Host '[vm-guest] remediation (pick one):' -ForegroundColor Yellow
         Write-Host '[vm-guest]   1. install App Installer (winget) from its GitHub release: https://github.com/microsoft/winget-cli/releases (latest Microsoft.DesktopAppInstaller msixbundle plus its VCLibs/Microsoft.UI.Xaml dependency .appx files, install via Add-AppxPackage), or' -ForegroundColor Yellow
-        Write-Host '[vm-guest]   2. install the tools manually with their official installers - VS Build Tools: https://aka.ms/vs/17/release/vs_BuildTools.exe (run with --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet), Rustup: https://rustup.rs, PowerShell 7: https://github.com/PowerShell/PowerShell/releases, Git: https://git-scm.com/download/win -' -ForegroundColor Yellow
+        Write-Host '[vm-guest]   2. install the tools manually with their official installers - VS Build Tools: https://aka.ms/vs/17/release/vs_BuildTools.exe (run with --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet), Rustup: https://rustup.rs, PowerShell 7: https://github.com/PowerShell/PowerShell/releases, Git: https://git-scm.com/download/win, Python: https://www.python.org/downloads/ (machine-wide: /quiet InstallAllUsers=1 PrependPath=1) -' -ForegroundColor Yellow
         Write-Host '[vm-guest]   In either case, re-run this script afterwards to verify everything is present.' -ForegroundColor Yellow
         exit 4
     }
@@ -186,7 +218,31 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 3c. VS Build Tools with the C++ workload + Windows SDK (idempotence
+    # 3c. Python 3 - machine-wide (InstallAllUsers=1) and on the machine
+    #     PATH (PrependPath=1). The test harness's python scenarios run
+    #     `python` inside the AppContainer, where the Microsoft Store
+    #     execution alias is unusable (stub, exit 9009), so a real
+    #     C:\Program Files\Python3xx\python.exe must shadow it. Machine PATH
+    #     precedes the user-PATH WindowsApps alias dir, so `python` resolves
+    #     deterministically. Program Files carries ALL APPLICATION PACKAGES
+    #     read+execute ACEs, so the AppContainer can run it.
+    # -----------------------------------------------------------------------
+    if (Test-RealPythonAvailable) {
+        Write-Host '[vm-guest] real Python (not the Store alias) already present.' -ForegroundColor Green
+    } else {
+        Write-Host '[vm-guest] installing Python (Python.Python.3.12, machine-wide, on PATH)...' -ForegroundColor Yellow
+        $installExit = Invoke-WingetInstall -Id 'Python.Python.3.12' -Override '/quiet InstallAllUsers=1 PrependPath=1'
+        Update-SessionPath
+        if (($installExit -eq 0) -and (Test-RealPythonAvailable)) {
+            Write-Host '[vm-guest] Python installed.' -ForegroundColor Green
+        } else {
+            Write-Host "[vm-guest] FAILED: Python install (winget exit $installExit)." -ForegroundColor Red
+            $script:Failed.Add('Python (Python.Python.3.12)')
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # 3d. VS Build Tools with the C++ workload + Windows SDK (idempotence
     #     via vswhere; winget would otherwise re-run the VS installer).
     # -----------------------------------------------------------------------
     $vswhere = $null
@@ -209,7 +265,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 3d. Rustup + default MSVC toolchain.
+    # 3e. Rustup + default MSVC toolchain.
     # -----------------------------------------------------------------------
     $rustupPath = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
     $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'

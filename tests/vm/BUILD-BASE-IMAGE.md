@@ -380,8 +380,19 @@ Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
   bootstrapper `https://aka.ms/vs/17/release/vs_BuildTools.exe` with
   `--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`,
   rustup `https://rustup.rs`, PowerShell 7 and Git from their official
-  releases), then re-run `prepare-guest.ps1` to verify everything is
-  present. The script never hand-rolls MSI downloads.
+  releases, Python from `https://www.python.org/downloads/` — machine-wide:
+  `/quiet InstallAllUsers=1 PrependPath=1`), then re-run
+  `prepare-guest.ps1` to verify everything is present. The script never
+  hand-rolls MSI downloads.
+- **Python scenarios fail with `exit=9009` / "Python wurde nicht gefunden"**
+  — the image has no real Python, only the Microsoft Store execution
+  alias, which degrades to the "Python was not found" stub for
+  AppContainer callers (see
+  `docs/bugs/2026-08-15-python-store-alias-unusable-in-appcontainer.md`).
+  `prepare-guest.ps1` installs a real machine-wide Python on the machine
+  PATH (shadowing the alias); a missing/failed install is caught at bake
+  time by the `Test-RealPythonAvailable` gate, which deliberately does
+  NOT accept the WindowsApps alias as "installed".
 - **PowerShell Direct `failed to connect to the guest`** — the VM must be
   **RUNNING** (`Start-VM -Name $vmName`); the guest must have completed
   first logon once; the credential is the guest-local account with a
