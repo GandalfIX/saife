@@ -247,7 +247,10 @@ try {
         Write-Host "[vm-export] flattening the checkpoint chain into the template (multi-GB - takes a few minutes):" -ForegroundColor Gray
         Write-Host "  $liveDisk  ->  $templatePath"
         if (Test-Path -LiteralPath $templatePath) { Remove-Item -LiteralPath $templatePath -Force }
-        Convert-VHD -Path $liveDisk -DestinationPath $templatePath
+        # -VHDType Dynamic is REQUIRED: without it Convert-VHD preserves the
+        # source's differencing type and fails demanding a -ParentPath. With
+        # it, the whole chain is flattened into one standalone dynamic VHDX.
+        Convert-VHD -Path $liveDisk -DestinationPath $templatePath -VHDType Dynamic
     } else {
         Write-Host "[vm-export] copying the VHDX to the template (multi-GB - takes a few minutes):" -ForegroundColor Gray
         Write-Host "  $liveDisk  ->  $templatePath"
