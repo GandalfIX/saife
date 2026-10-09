@@ -178,7 +178,19 @@ try {
         $prepCode = 999
         try {
             $prepCode = Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
-                powershell -NoProfile -ExecutionPolicy Bypass -File C:\sbx-repo\tests\vm\prepare-guest.ps1 -RepoDir C:\sbx-repo
+                # PS Direct turns the child process's stdout into pipeline
+                # output: unredirected, every [vm-guest] line rides along in
+                # the return value next to $LASTEXITCODE, and
+                # 'if ($prepCode -eq 0)' then misreads the resulting array -
+                # the -eq filter yields @(0), which unwraps to [int]0 = $false
+                # in boolean context, looping successful runs through the
+                # reboot-retry path forever. Route the child's output through
+                # the Information stream instead: Write-Host keeps the lines
+                # streaming to the host console live, while the pipeline
+                # carries ONLY the exit code (same reasoning as the
+                # structured runner in Invoke-TestsInVM.ps1, step 10).
+                powershell -NoProfile -ExecutionPolicy Bypass -File C:\sbx-repo\tests\vm\prepare-guest.ps1 -RepoDir C:\sbx-repo 2>&1 |
+                    ForEach-Object { Write-Host $_ }
                 $LASTEXITCODE
             }
         } catch {
