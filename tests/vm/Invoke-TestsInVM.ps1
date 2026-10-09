@@ -449,10 +449,23 @@ try {
     # -----------------------------------------------------------------------
     $guestService = Get-VMIntegrationService -VMName $vmName |
         Where-Object { $_.Name -eq 'Guest Service Interface' }
-    if ($guestService -and ($guestService.Enabled -eq $false)) {
+    if (-not $guestService) {
+        Write-Host "[vm-run] WARNING: 'Guest Service Interface' not found among the VM's integration services (localized name?):" -ForegroundColor Yellow
+        Get-VMIntegrationService -VMName $vmName | ForEach-Object { Write-Host ("[vm-run]   {0} (enabled: {1})" -f $_.Name, $_.Enabled) -ForegroundColor Yellow }
+    } elseif (-not $guestService.Enabled) {
         $guestService | Enable-VMIntegrationService
         Write-Host '[vm-run] Guest Service integration enabled.' -ForegroundColor Gray
     }
+    # The in-guest copy service (vmicguestinterface) is trigger-started; on a
+    # first-booting clone it has been observed stopped while PowerShell
+    # Direct already answers. Nudge it explicitly - harmless when already
+    # running, and the bounded Copy-VMFile retry below remains the safety
+    # net.
+    try {
+        $null = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
+            Start-Service vmicguestinterface -ErrorAction SilentlyContinue
+        } -ErrorAction Stop
+    } catch { }
     $copyDeadline = (Get-Date).AddMinutes(5)
     $copied = $false
     while (-not $copied) {
@@ -461,6 +474,17 @@ try {
             $copied = $true
         } catch {
             if ((Get-Date) -ge $copyDeadline) {
+                # Self-serve diagnostics before teardown: PS Direct works even
+                # when the copy device does not.
+                try {
+                    $svc = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
+                        Get-Service vmic* | Select-Object Name, Status, StartType | Format-Table | Out-String
+                    }
+                    Write-Host '[vm-run] in-guest integration services at failure time:' -ForegroundColor Yellow
+                    Write-Host $svc -ForegroundColor Yellow
+                } catch {
+                    Write-Host "[vm-run] could not collect in-guest diagnostics: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
                 throw "Copy-VMFile not ready within 5 minutes: $($_.Exception.Message)"
             }
             Write-Host '[vm-run] guest file-copy service not ready yet; retrying in 30 s...' -ForegroundColor Gray
