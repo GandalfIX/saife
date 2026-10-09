@@ -216,12 +216,51 @@ try {
         Stop-VM -Name $vmName -Force
         Write-Host "[vm-export] VM stopped (graceful-first)." -ForegroundColor Green
     }
+
+    # Resolve the VM's ACTUAL boot disk - never trust the build-config path.
+    # The re-bake checkpoint above (and any earlier checkpoint, e.g. a
+    # Hyper-V automatic checkpoint silently taken at Start-VM) makes the
+    # live disk an .avhdx differencing leaf; copying the config-path base
+    # VHDX instead exports an EMPTY or STALE disk (2026-10-10 incident: a
+    # 0.04 GB template). Flatten the live leaf with Convert-VHD instead:
+    # the result is a standalone VHDX with the full current state, and the
+    # checkpoint chain (the re-bake restore point) stays intact on the
+    # builder VM.
+    $diskDrives = @(Get-VMHardDiskDrive -VMName $vmName)
+    if ($diskDrives.Count -eq 0) {
+        Write-Host "[vm-export] no hard disk attached to VM '$vmName' - re-run tests\vm\New-BuilderVM.ps1." -ForegroundColor Red
+        exit 1
+    }
+    if ($diskDrives.Count -gt 1) {
+        Write-Host "[vm-export] WARNING: VM has $($diskDrives.Count) hard disks; exporting only the first. Paths:" -ForegroundColor Yellow
+        foreach ($d in $diskDrives) { Write-Host "[vm-export]   $($d.Path)" -ForegroundColor Yellow }
+    }
+    $liveDisk = [string]$diskDrives[0].Path
+    if ($liveDisk -ne $vhdxPath) {
+        Write-Host '[vm-export] live boot disk differs from the build-config path - using the live disk:' -ForegroundColor Yellow
+        Write-Host "[vm-export]   live  : $liveDisk" -ForegroundColor Yellow
+        Write-Host "[vm-export]   config: $vhdxPath" -ForegroundColor Yellow
+    }
     New-Item -ItemType Directory -Path $templatesDir -Force | Out-Null
-    Write-Host "[vm-export] copying the VHDX to the template (multi-GB - takes a few minutes):" -ForegroundColor Gray
-    Write-Host "  $vhdxPath  ->  $templatePath"
-    Copy-Item -LiteralPath $vhdxPath -Destination $templatePath -Force
+    if ([System.IO.Path]::GetExtension($liveDisk) -eq '.avhdx') {
+        Write-Host "[vm-export] live disk is a checkpoint differencing disk: $liveDisk" -ForegroundColor Gray
+        Write-Host "[vm-export] flattening the checkpoint chain into the template (multi-GB - takes a few minutes):" -ForegroundColor Gray
+        Write-Host "  $liveDisk  ->  $templatePath"
+        if (Test-Path -LiteralPath $templatePath) { Remove-Item -LiteralPath $templatePath -Force }
+        Convert-VHD -Path $liveDisk -DestinationPath $templatePath
+    } else {
+        Write-Host "[vm-export] copying the VHDX to the template (multi-GB - takes a few minutes):" -ForegroundColor Gray
+        Write-Host "  $liveDisk  ->  $templatePath"
+        Copy-Item -LiteralPath $liveDisk -Destination $templatePath -Force
+    }
     $sha256 = (Get-FileHash -LiteralPath $templatePath -Algorithm SHA256).Hash
-    Write-Host "[vm-export] template SHA256: $sha256" -ForegroundColor Green
+    $templateGb = [math]::Round((Get-Item -LiteralPath $templatePath).Length / 1GB, 2)
+    if ($templateGb -lt 10) {
+        Write-Host "[vm-export] REFUSING to publish a suspiciously small template: $templatePath is only $templateGb GB." -ForegroundColor Red
+        Write-Host '[vm-export] a provisioned image (Windows + VS Build Tools + Rust) is far larger; the source disk is wrong or stale - inspect the builder VM before re-exporting.' -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[vm-export] template: $templateGb GB. SHA256: $sha256" -ForegroundColor Green
 
     # -----------------------------------------------------------------------
     # 7. Host readiness probe (expected: READY, exit 0).
@@ -244,6 +283,7 @@ try {
     Write-Host '| Field                 | Value |'
     Write-Host '|-----------------------|-------|'
     Write-Host ("| Template name         | {0} |" -f (Split-Path -Leaf $templatePath))
+    Write-Host ("| Template size (GB)    | {0} |" -f $templateGb)
     Write-Host ("| Edition (Caption)     | {0} |" -f $osEdition)
     Write-Host ("| OS build (BuildNumber)| {0} |" -f $osBuild)
     Write-Host ("| ISO path             | {0} |" -f $(if ($isoPath) { $isoPath } else { '-' }))

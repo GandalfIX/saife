@@ -359,6 +359,10 @@ try {
     Write-Host "[vm-run] virtual switch selected: $switchName"
     New-VM -Generation 2 -Name $vmName -MemoryStartupBytes 6GB -SwitchName $switchName | Out-Null
     Set-VM -Name $vmName -ProcessorCount 4   # verify at image-build time
+    # No auto-checkpoints on disposable run VMs (client-Hyper-V default):
+    # one would layer an .avhdx over the differencing disk and leak it on
+    # teardown (Remove-TestVM only sweeps VHDX files it knows about).
+    Set-VM -Name $vmName -AutomaticCheckpointsEnabled $false
     Add-VMHardDiskDrive -VMName $vmName -Path $vhdxPath
     # Boot order: the differencing drive first (verify at image-build time).
     Set-VMFirmware -VMName $vmName -FirstBootDevice (Get-VMHardDiskDrive -VMName $vmName)

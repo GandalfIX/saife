@@ -247,6 +247,13 @@ try {
 
     New-VM -Name $config.vmName -Generation 2 -MemoryStartupBytes 8GB -NewVHDPath $diskPath -NewVHDSizeBytes 127GB | Out-Null
     Set-VM -Name $config.vmName -ProcessorCount 4
+    # Auto-checkpoints (client-Hyper-V default) would silently redirect ALL
+    # guest writes into an .avhdx chain from the very first boot - the base
+    # VHDX stays empty and an export that copies the base path ships an
+    # empty template (2026-10-10 incident). The only checkpoint this
+    # workflow wants is the deliberate re-bake point taken by
+    # Export-BaseImage.ps1.
+    Set-VM -Name $config.vmName -AutomaticCheckpointsEnabled $false
     # vTPM (fresh VM, not yet started): local key protector first,
     # then the virtual TPM.
     Set-VMKeyProtector -VMName $config.vmName -NewLocalKeyProtector

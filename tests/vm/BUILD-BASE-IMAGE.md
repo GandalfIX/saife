@@ -350,6 +350,7 @@ with all values collected automatically:
 | Field            | Value |
 |------------------|-------|
 | Template name    | sbx-base-a.vhdx |
+| Template size (GB) | ~40 |
 | Edition (Caption)| Microsoft Windows 11 Enterprise Insider Preview |
 | OS build (BuildNumber) | 26340 |
 | ISO path         | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_26340_9577.iso |
