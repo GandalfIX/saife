@@ -1195,7 +1195,7 @@ function Invoke-Scenario-S66 {
     $out = ($r.Stdout -join "`n")
     $passed = ($r.ExitCode -eq 0) -and ($out -match 'extends-ok')
     return @{ Num=66; Name='S-66 (AC-5.3)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'extends merged' } else { "exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { 'extends merged' } else { "exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # S-67 (AC-5.5): multi-level extends (a -> b -> c).
@@ -1215,7 +1215,7 @@ function Invoke-Scenario-S67 {
     $out = ($r.Stdout -join "`n")
     $passed = ($r.ExitCode -eq 0) -and ($out -match 'multi-ok')
     return @{ Num=67; Name='S-67 (AC-5.5)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { '3-deep extends resolved' } else { "exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { '3-deep extends resolved' } else { "exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # S-68 (AC-5.8): $HOME expands per-user.
@@ -1233,7 +1233,7 @@ function Invoke-Scenario-S68 {
     Remove-Item -LiteralPath $markerDir -Recurse -Force -ErrorAction SilentlyContinue
     $passed = ($r.ExitCode -eq 0) -and ($out -match 'home-expanded')
     return @{ Num=68; Name='S-68 (AC-5.8)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { '$HOME expanded' } else { "exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { '$HOME expanded' } else { "exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # S-69 (AC-5.9): windows_common (System32) is reachable even with an empty profile.
@@ -1246,7 +1246,7 @@ function Invoke-Scenario-S69 {
     $out = ($r.Stdout -join "`n")
     $passed = ($r.ExitCode -eq 0) -and ($out -match 'sys32-ok')
     return @{ Num=69; Name='S-69 (AC-5.9)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'System32 reachable from empty profile' } else { "exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { 'System32 reachable from empty profile' } else { "exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # S-70 (AC-5.10): CLI --allow merges on top of profile.
@@ -1263,7 +1263,7 @@ function Invoke-Scenario-S70 {
     $out = ($r.Stdout -join "`n")
     $passed = ($r.ExitCode -eq 0) -and ($out -match 'cli-merge-ok')
     return @{ Num=70; Name='S-70 (AC-5.10)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'CLI --allow merged' } else { "exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { 'CLI --allow merged' } else { "exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # S-71 (AC-5.17): a profile using only $HOME/$CWD/groups is portable (no edits).
@@ -1278,7 +1278,7 @@ function Invoke-Scenario-S71 {
     $out = ($r.Stdout -join "`n")
     $passed = (-not $hasAbs) -and ($r.ExitCode -eq 0) -and ($out -match 'portable-ok')
     return @{ Num=71; Name='S-71 (AC-5.17)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'portable profile ran' } else { "hasAbs=$hasAbs exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { 'portable profile ran' } else { "hasAbs=$hasAbs exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # ---------------------------------------------------------------------------
@@ -1320,7 +1320,7 @@ function Invoke-Scenario-S73 {
     $after = Get-SessionAceCount -Path $d
     $passed = ($r2.ExitCode -eq 0) -and ($out -match 'restore-me') -and ($after -eq $before)
     return @{ Num=73; Name='S-73 (journal teardown restore)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'session ACEs restored on exit' } else { "before=$before after=$after exit=$($r2.ExitCode)" } }
+        Detail = if ($passed) { 'session ACEs restored on exit' } else { "before=$before after=$after out1=$out exit=$($r2.ExitCode) stderr1=$(($r.Stderr -join "`n")) stderr2=$(($r2.Stderr -join "`n"))" } }
 }
 
 # S-74 (MXC F-C/F-D): crash leaves journal + ACE; next startup reaps the
@@ -1372,7 +1372,7 @@ function Invoke-Scenario-S74 {
     $passed = ($r2.ExitCode -eq 0) -and ($r2.Stdout -match 'recover-ok') -and ($afterAce -eq 0) -and $journalGone
     return @{ Num=74; Name='S-74 (journal crash recovery)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'orphan journal reaped + stale ACE restored' }
-                 else { "afterAce=$afterAce journalGone=$journalGone exit=$($r2.ExitCode)" } }
+                 else { "afterAce=$afterAce journalGone=$journalGone exit=$($r2.ExitCode) stdout=$(($r2.Stdout -join "`n")) stderr=$(($r2.Stderr -join "`n"))" } }
 }
 
 # ---------------------------------------------------------------------------
@@ -1446,7 +1446,14 @@ function Main {
 
     $results = New-Object System.Collections.Generic.List[hashtable]
     foreach ($n in $nums) {
-        $r = Invoke-Scenario -Number $n
+        try {
+            $r = Invoke-Scenario -Number $n
+        } catch {
+            # A thrown scenario (e.g. Start-Process failing inside a PS
+            # Direct session) must fail that scenario, not kill the suite.
+            $r = @{ Num=$n; Name="S-$n"; Passed=$false; Skipped=$false
+                Detail = "scenario threw: $($_.Exception.Message)" }
+        }
         $r = ConvertTo-Result $r
         $results.Add($r)
         Write-Result $r
