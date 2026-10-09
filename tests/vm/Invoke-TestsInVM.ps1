@@ -447,14 +447,19 @@ try {
     #    first-booting clone, hence the bounded retry (observed:
     #    0x80070015 'Das Gerät ist nicht bereit').
     # -----------------------------------------------------------------------
+    # Match by the language-independent integration-service Id (GUID), never
+    # by name - names are LOCALIZED on non-English hosts (observed 2026-10-10:
+    # German 'Gastdienstschnittstelle'; the English filter matched nothing
+    # and Copy-VMFile failed 0x80070015 through the whole 5-min retry).
+    # Same GUID filter as Copy-RepoToVM.ps1 step 4.
     $guestService = Get-VMIntegrationService -VMName $vmName |
-        Where-Object { $_.Name -eq 'Guest Service Interface' }
+        Where-Object { $_.Id -like '*6C09BB55-D683-4DA0-8931-C9BF705F6480*' }
     if (-not $guestService) {
-        Write-Host "[vm-run] WARNING: 'Guest Service Interface' not found among the VM's integration services (localized name?):" -ForegroundColor Yellow
-        Get-VMIntegrationService -VMName $vmName | ForEach-Object { Write-Host ("[vm-run]   {0} (enabled: {1})" -f $_.Name, $_.Enabled) -ForegroundColor Yellow }
+        Write-Host '[vm-run] WARNING: guest file-copy integration service not found on the VM (Id 6C09BB55-...):' -ForegroundColor Yellow
+        Get-VMIntegrationService -VMName $vmName | ForEach-Object { Write-Host ("[vm-run]   {0}  (enabled: {1})" -f $_.Name, $_.Enabled) -ForegroundColor Yellow }
     } elseif (-not $guestService.Enabled) {
         $guestService | Enable-VMIntegrationService
-        Write-Host '[vm-run] Guest Service integration enabled.' -ForegroundColor Gray
+        Write-Host '[vm-run] guest file-copy integration service enabled.' -ForegroundColor Gray
     }
     # The in-guest copy service (vmicguestinterface) is trigger-started; on a
     # first-booting clone it has been observed stopped while PowerShell
