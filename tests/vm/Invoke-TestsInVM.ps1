@@ -357,7 +357,7 @@ try {
     if (-not $chosenSwitch) { $chosenSwitch = $switch[0] }
     $switchName = $chosenSwitch.Name
     Write-Host "[vm-run] virtual switch selected: $switchName"
-    New-VM -Generation 2 -Name $vmName -MemoryStartupBytes 6GB -SwitchName $switchName | Out-Null
+    New-VM -Generation 2 -Name $vmName -MemoryStartupBytes 8GB -SwitchName $switchName | Out-Null
     Set-VM -Name $vmName -ProcessorCount 4   # verify at image-build time
     # No auto-checkpoints on disposable run VMs (client-Hyper-V default):
     # one would layer an .avhdx over the differencing disk and leak it on
@@ -434,6 +434,17 @@ try {
         exit 1
     }
     Write-Host ("[vm-run] PowerShell Direct ready (guest: {0})." -f $guestName)
+
+    # A disposable test VM must never reboot itself mid-run: the Insider
+    # guest has internet via Default Switch, and a Windows Update reboot
+    # kills the in-guest suite with 'Der Hyper-V-Socket-Zielprozess wurde
+    # beendet' (2026-10-10, run 011648). Disable the update service for
+    # this run's lifetime; the VM is destroyed afterwards anyway.
+    $null = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
+        Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+        Set-Service wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
+    } -ErrorAction SilentlyContinue
+    Write-Host '[vm-run] Windows Update disabled in the guest for the run.'
 
     # -----------------------------------------------------------------------
     # 9. Transfer: one Copy-VMFile, one expand session, one count check.
