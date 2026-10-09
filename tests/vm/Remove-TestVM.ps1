@@ -8,17 +8,19 @@
     - Only VMs whose name starts with 'sbx-test-' are ever touched,
       in every mode (-Name, -List, -All).
     - VMs named sbx-base-* (base images) are never touched.
-    - On disk, only .vhdx files under tests\vm\vms belonging to the removed
-      VM are deleted; the templates directory is never touched.
+    - On disk, only .vhdx/.avhdx files under tests\vm\vms belonging to the
+      removed VM are deleted; the templates directory is never touched.
+      (.avhdx = checkpoint differencing disks; deleting a checkpoint disk
+      without its parent, or the parent without it, would orphan the chain.)
 
   Orphaned-disk cleanup: the harness can leave a differencing disk behind
   with no registered VM (run killed between New-VHD and New-VM, or a
   failed cleanup).
     - -Name also removes tests\vm\vms\<Name>.vhdx when no registered VM
       matches (reported as an orphaned disk removed).
-    - -All additionally sweeps tests\vm\vms\sbx-test-*.vhdx files that do
-      not belong to any registered VM and removes them.
-    - Only sbx-test-* prefixed .vhdx files are ever deleted.
+    - -All additionally sweeps tests\vm\vms\sbx-test-*.vhdx/.avhdx files
+      that do not belong to any registered VM and removes them.
+    - Only sbx-test-* prefixed .vhdx/.avhdx files are ever deleted.
     - -List lists orphaned disks too (marked as such); it removes nothing.
 
   Parameter validation (including the prefix allow-list) runs BEFORE the
@@ -110,8 +112,9 @@ try {
     # -----------------------------------------------------------------------
 
     # Candidate disk paths belonging to a VM: the paths recorded in the VM's
-    # config (Get-VMHardDiskDrive) plus any .vhdx under tests\vm\vms whose file
-    # name (or a parent folder) equals the VM name (per-run differencing disks).
+    # config (Get-VMHardDiskDrive) plus any .vhdx/.avhdx under tests\vm\vms
+    # whose file name, checkpoint name (<vm>_<guid>.avhdx), or a parent
+    # folder matches the VM name (per-run differencing disks).
     function Get-VmDiskCandidates {
         param([string]$VmName, [object]$Vm)
         $candidates = New-Object System.Collections.Generic.List[string]
@@ -121,28 +124,29 @@ try {
         if (Test-Path -LiteralPath $script:VmsDir) {
             Get-ChildItem -LiteralPath $script:VmsDir -Recurse -File -ErrorAction SilentlyContinue |
                 Where-Object {
-                    ($_.Extension -eq '.vhdx') -and
-                    (($_.BaseName -eq $VmName) -or (($_.FullName -split '[\\/]') -contains $VmName))
+                    ($_.Extension -in '.vhdx', '.avhdx') -and
+                    (($_.BaseName -eq $VmName) -or ($_.BaseName.StartsWith("$VmName_", [System.StringComparison]::OrdinalIgnoreCase)) -or (($_.FullName -split '[\\/]') -contains $VmName))
                 } |
                 ForEach-Object { $candidates.Add($_.FullName) }
         }
         return @($candidates | Sort-Object -Unique)
     }
 
-    # Deletion guard: only .vhdx files physically under tests\vm\vms are deleted,
-    # and never anything named sbx-base-* (base templates).
+    # Deletion guard: only .vhdx/.avhdx files physically under tests\vm\vms
+    # are deleted, and never anything named sbx-base-* (base templates).
     function Test-IsDeletableDisk {
         param([string]$Path)
         if (-not $Path) { return $false }
         $full = [System.IO.Path]::GetFullPath($Path)
         $vmsRoot = [System.IO.Path]::GetFullPath($script:VmsDir).TrimEnd('\') + '\'
         if (-not $full.StartsWith($vmsRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
-        if ([System.IO.Path]::GetExtension($full) -ne '.vhdx') { return $false }
+        $ext = [System.IO.Path]::GetExtension($full)
+        if ($ext -ne '.vhdx' -and $ext -ne '.avhdx') { return $false }
         if ([System.IO.Path]::GetFileNameWithoutExtension($full) -like 'sbx-base-*') { return $false }
         return $true
     }
 
-    # Orphaned disks: sbx-test-*.vhdx files under tests\vm\vms that do not
+    # Orphaned disks: sbx-test-*.vhdx/.avhdx files under tests\vm\vms that do not
     # belong to ANY registered VM (differencing disk whose VM was never
     # registered or whose cleanup failed). Never matches non-sbx-test-
     # files; the deletable-disk guard still applies on deletion.
@@ -153,7 +157,7 @@ try {
         $orphans = New-Object System.Collections.Generic.List[string]
         Get-ChildItem -LiteralPath $script:VmsDir -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object {
-                ($_.Extension -eq '.vhdx') -and
+                ($_.Extension -in '.vhdx', '.avhdx') -and
                 ($_.BaseName.StartsWith($script:Prefix, [System.StringComparison]::OrdinalIgnoreCase))
             } |
             ForEach-Object {
@@ -226,19 +230,34 @@ try {
         } else {
             # -Name with no matching registered VM: the harness can still
             # have left the differencing disk behind (killed between
-            # New-VHD and New-VM, or a failed cleanup) - remove the orphan.
+            # New-VHD and New-VM, or a failed cleanup) - remove the orphan
+            # and any orphaned checkpoint disks (<name>_<guid>.avhdx).
+            $removedAny = $false
             $orphanPath = Join-Path $script:VmsDir "$Name.vhdx"
             if ((Test-Path -LiteralPath $orphanPath) -and (Test-IsDeletableDisk -Path $orphanPath)) {
                 try {
                     Remove-Item -LiteralPath $orphanPath -Force
                     Write-Host "[vm] orphaned disk removed: $orphanPath" -ForegroundColor Gray
+                    $removedAny = $true
                 } catch {
                     Write-Host "[vm] FAILED to delete orphaned disk '$orphanPath': $($_.Exception.Message)" -ForegroundColor Red
                     exit 1
                 }
-                exit 0
             }
-            Write-Host "[vm] no VM named '$Name' exists - nothing to remove." -ForegroundColor Gray
+            foreach ($ckpt in @(Get-ChildItem -LiteralPath $script:VmsDir -Filter "$($Name)_*.avhdx" -File -ErrorAction SilentlyContinue)) {
+                if (-not (Test-IsDeletableDisk -Path $ckpt.FullName)) { continue }
+                try {
+                    Remove-Item -LiteralPath $ckpt.FullName -Force
+                    Write-Host "[vm] orphaned checkpoint disk removed: $($ckpt.FullName)" -ForegroundColor Gray
+                    $removedAny = $true
+                } catch {
+                    Write-Host "[vm] FAILED to delete orphaned checkpoint disk '$($ckpt.FullName)': $($_.Exception.Message)" -ForegroundColor Red
+                    exit 1
+                }
+            }
+            if (-not $removedAny) {
+                Write-Host "[vm] no VM named '$Name' exists - nothing to remove." -ForegroundColor Gray
+            }
             exit 0
         }
     }
@@ -273,7 +292,7 @@ try {
 
             foreach ($disk in $diskPaths) {
                 if (-not (Test-IsDeletableDisk -Path $disk)) {
-                    Write-Host "[vm]   keeping disk (guard: outside tests\vm\vms, not a .vhdx, or a sbx-base-* template): $disk" -ForegroundColor DarkGray
+                    Write-Host "[vm]   keeping disk (guard: outside tests\vm\vms, not a .vhdx/.avhdx, or a sbx-base-* template): $disk" -ForegroundColor DarkGray
                     continue
                 }
                 if (-not (Test-Path -LiteralPath $disk)) {
@@ -308,7 +327,7 @@ try {
         if ($null -ne $remainingVms) {
             foreach ($orphan in (Get-OrphanedDisks -RegisteredVms $remainingVms)) {
                 if (-not (Test-IsDeletableDisk -Path $orphan)) {
-                    Write-Host "[vm]   keeping orphaned disk (guard: outside tests\vm\vms, not a .vhdx, or a sbx-base-* template): $orphan" -ForegroundColor DarkGray
+                    Write-Host "[vm]   keeping orphaned disk (guard: outside tests\vm\vms, not a .vhdx/.avhdx, or a sbx-base-* template): $orphan" -ForegroundColor DarkGray
                     continue
                 }
                 try {
