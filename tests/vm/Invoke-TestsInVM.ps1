@@ -391,8 +391,18 @@ try {
         } -ArgumentList $vmName, $guestCred
         $null = Wait-Job -Job $probeJob -Timeout 60
         if ($probeJob.State -eq 'Completed') {
-            $probeOut = @(Receive-Job -Job $probeJob)
-            if ($probeOut.Count -gt 0) {
+            # Receive-Job re-emits the job's error records into THIS session;
+            # with $ErrorActionPreference='Stop' a non-terminating remoting
+            # error (observed: 'Eine Remotesitzung wurde beendet' on a
+            # not-yet-booted guest) would throw and abort the whole harness
+            # as an 'unexpected error' on the very first attempt. Surface job
+            # errors as a normal attempt failure instead so the loop retries
+            # until the deadline.
+            $probeErr = $null
+            $probeOut = @(Receive-Job -Job $probeJob -ErrorVariable probeErr -ErrorAction SilentlyContinue)
+            if ($probeErr) {
+                $attemptError = [string]$probeErr[0]
+            } elseif ($probeOut.Count -gt 0) {
                 $guestName = [string]$probeOut[0]
                 $guestReady = $true
             } else {
