@@ -542,9 +542,10 @@ try {
     #     (a) lets PowerShell itself parse "-Only 1,2,6" as an int array
     #     (pwsh -File cannot - it would bind the single int 126), and
     #     (b) isolates run-in-vm.ps1's exit from the remote session. The
-    #     child's exit code is read as $LASTEXITCODE INSIDE the session and
-    #     returned alongside the captured output lines in one structured
-    #     object; the host prints the lines tagged. Any nonzero guest exit
+    #     child's exit code is read as $LASTEXITCODE INSIDE the session
+    #     and returned as the session's only pipeline value while its
+    #     output STREAMS to the host console line by line (see the comment
+    #     below for why it must not be captured). Any nonzero guest exit
     #     (0 only is success; run-in-vm.ps1 exits 1 or 99 on failure)
     #     surfaces as harness exit 1 (see the help exit-code table).
     # -----------------------------------------------------------------------
@@ -552,19 +553,29 @@ try {
     $guestCommand = "& '$escapedRunner' -Phase '$Phase' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results'"
     if ($Only) { $guestCommand += ' -Only ' + ($Only -join ',') }
     Write-Host "[vm-run] guest command: pwsh -NoProfile -Command $guestCommand"
-    $runResult = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
-        param([string]$Command)
-        $lines = @(& pwsh -NoProfile -Command $Command 2>&1 | ForEach-Object { "$_" })
-        [pscustomobject]@{ lines = $lines; exitCode = $LASTEXITCODE }
-    } -ArgumentList $guestCommand
-    foreach ($line in @($runResult.lines)) {
-        # Tag guest lines; run-in-vm.ps1 already tags many of its own lines,
-        # so do not double-tag those.
-        if (-not ($line -like '[vm-guest]*')) { $line = "[vm-guest] $line" }
-        Write-Host $line
+    # STREAM each suite line via Write-Host (Information stream) instead of
+    # accumulating an in-memory array: the full suite output (cargo + unit
+    # tests + the integration suite) plus the cargo build's own memory
+    # peaks converge on the guest's PS Direct session host, and Windows
+    # terminated it mid-suite ('Der Hyper-V-Socket-Zielprozess wurde
+    # beendet', 2026-10-10) even though the guest and the suite survived.
+    # The full output still lives in C:\sbx-results\*.log (fetched in step
+    # 11); the exit code stays the only pipeline value. A session death no
+    # longer aborts the run: the step-11 fetch must always run so results
+    # are never stranded in a VM this harness is about to destroy.
+    $guestExit = $null
+    try {
+        $guestExit = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
+            param([string]$Command)
+            & pwsh -NoProfile -Command $Command 2>&1 | ForEach-Object {
+                if ($_ -like '[vm-guest]*') { Write-Host $_ } else { Write-Host "[vm-guest] $_" }
+            }
+            $LASTEXITCODE
+        } -ArgumentList $guestCommand
+    } catch {
+        Write-Host "[vm-run] ERROR: suite session died: $($_.Exception.Message)" -ForegroundColor Red
     }
-    $guestExit = $runResult.exitCode
-    Write-Host ("[vm-run] guest suite finished (exit {0})." -f $guestExit)
+    Write-Host ("[vm-run] guest suite finished (exit {0})." -f $(if ($null -ne $guestExit) { $guestExit } else { 'unknown' }))
 
     # -----------------------------------------------------------------------
     # 11. Fetch artifacts PER FILE, CHUNKED (one PS Direct session per
