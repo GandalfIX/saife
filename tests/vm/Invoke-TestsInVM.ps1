@@ -440,8 +440,33 @@ try {
     #    The archive REPLACES the repo copy baked into the image (C:\sbx-repo
     #    still holds bake-time files, incl. a target\ tree from the cargo
     #    warm-up) so that the guest file count equals the staging count.
+    #    Copy-VMFile additionally needs the "Guest Service" integration
+    #    service - Copy-RepoToVM.ps1 enables it on the BUILDER VM, but every
+    #    disposable run VM is fresh (default: disabled) - and even enabled,
+    #    the in-guest service starts LATER than PowerShell Direct on a
+    #    first-booting clone, hence the bounded retry (observed:
+    #    0x80070015 'Das Gerät ist nicht bereit').
     # -----------------------------------------------------------------------
-    Copy-VMFile -Name $vmName -SourcePath $zipPath -DestinationPath 'C:\sbx-repo.zip' -FileSource Host
+    $guestService = Get-VMIntegrationService -VMName $vmName |
+        Where-Object { $_.Name -eq 'Guest Service Interface' }
+    if ($guestService -and ($guestService.Enabled -eq $false)) {
+        $guestService | Enable-VMIntegrationService
+        Write-Host '[vm-run] Guest Service integration enabled.' -ForegroundColor Gray
+    }
+    $copyDeadline = (Get-Date).AddMinutes(5)
+    $copied = $false
+    while (-not $copied) {
+        try {
+            Copy-VMFile -Name $vmName -SourcePath $zipPath -DestinationPath 'C:\sbx-repo.zip' -FileSource Host -Force -ErrorAction Stop
+            $copied = $true
+        } catch {
+            if ((Get-Date) -ge $copyDeadline) {
+                throw "Copy-VMFile not ready within 5 minutes: $($_.Exception.Message)"
+            }
+            Write-Host '[vm-run] guest file-copy service not ready yet; retrying in 30 s...' -ForegroundColor Gray
+            Start-Sleep -Seconds 30
+        }
+    }
     Write-Host '[vm-run] repo archive copied into the guest.'
     Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
         if (Test-Path -LiteralPath 'C:\sbx-repo') {
