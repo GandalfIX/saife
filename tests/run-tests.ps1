@@ -134,6 +134,29 @@ function Invoke-Sandbox {
 
 function Get-Python { $py = Get-Command python -ErrorAction SilentlyContinue; if (-not $py) { return $null }; return $py.Source }
 
+# Detached supervisor launch for the long-running-session scenarios
+# (S-11, S-55, S-74). Start-Process is avoided on purpose: its
+# ShellExecute/new-console path is unreliable in headless PowerShell Direct
+# sessions (E_NOINTERFACE at Start, or the supervisor dying with
+# STATUS_DLL_INIT_FAILED 0xC0000142); this uses CreateProcess via .NET
+# Process with redirected pipes so the supervisor's diagnostics always
+# have valid handles. Returns the Process object (Id, HasExited, ExitCode).
+function Start-SandboxProcess {
+    param([Parameter(Mandatory)][string]$Arguments, [string]$WorkingDirectory = $script:Cwd)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $SandboxExe
+    $psi.Arguments = $Arguments
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+    return $proc
+}
+
 function Write-Result { param([hashtable]$R)
     $tag = switch ($R.State) { 'pass' {'[PASS]'} 'fail' {'[FAIL]'} 'skip' {'[SKIP]'} 'info' {'[INFO]'} default {'[????]'} }
     $color = switch ($R.State) { 'pass' {'Green'} 'fail' {'Red'} 'skip' {'Cyan'} 'info' {'DarkGray'} default {'Gray'} }
@@ -171,8 +194,25 @@ function Invoke-Scenario-S1 {
 function Invoke-Scenario-S2 {
     $d = New-ScenarioDir 2
     $target = Join-Path $env:USERPROFILE '.ssh\id_rsa'
+    # Portability: a fresh VM guest has no ~\.ssh\id_rsa, and `type` then
+    # reports "path not found" instead of "access denied". Create a
+    # ssh-keygen-style fixture (protected DACL, user-only, inheritance
+    # off — crucially without an ALL APPLICATION PACKAGES ACE) so the
+    # denial path is exercised everywhere. Removed again if we made it.
+    $createdFixture = -not (Test-Path -LiteralPath $target)
+    if ($createdFixture) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        Set-Content -LiteralPath $target -Value 'sandbox-test-fixture' -Encoding ASCII
+        $acl = Get-Acl -LiteralPath $target
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow')
+        $acl.AddAccessRule($rule)
+        (Get-Item -LiteralPath $target).SetAccessControl($acl)
+    }
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','type',$target) -WorkingDirectory $d
     $err = ($r.Stderr -join "`n")
+    if ($createdFixture) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
     $passed = ($r.ExitCode -ne 0) -and (Test-Denied $err)
     return @{ Num=2; Name='S-2'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'denied read of .ssh\id_rsa' } else { "exit=$($r.ExitCode) stderr=$err" } }
@@ -274,7 +314,7 @@ function Invoke-Scenario-S9 {
     $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','python','-m','venv',".sandbox\$sid\venv") -WorkingDirectory $d
     $pyExe = Join-Path $d ".sandbox\$sid\venv\Scripts\python.exe"
     if ($r1.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pyExe)) {
-        return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe)" }
+        return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe) stderr=$(($r1.Stderr -join "`n"))" }
     }
     $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',$pyExe,'-c',"print('venv works')") -WorkingDirectory $d
     $out = ($r2.Stdout -join "`n")
@@ -298,7 +338,7 @@ function Invoke-Scenario-S10 {
 function Invoke-Scenario-S11 {
     $d = New-ScenarioDir 11
     Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--','cmd','/c','ping -t 127.0.0.1') -PassThru -WorkingDirectory $d
+    $proc = Start-SandboxProcess -Arguments 'run --allow-cwd -- cmd /c ping -t 127.0.0.1' -WorkingDirectory $d
     Start-Sleep -Seconds 1
     try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
     Start-Sleep -Seconds 1
@@ -965,7 +1005,7 @@ function Invoke-Scenario-S55 {
     $sid = ($psid.Stdout -join '').Trim()
     # Start a long-running session. The child sleeps 30s; we kill the sandbox
     # supervisor after 2s, before the child exits naturally.
-    $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--block-net','--sid',$sid,'--','powershell','-NoProfile','-Command','Start-Sleep -Seconds 30') -WorkingDirectory $d -PassThru -NoNewWindow
+    $proc = Start-SandboxProcess -Arguments "run --allow-cwd --block-net --sid $sid -- powershell -NoProfile -Command Start-Sleep -Seconds 30" -WorkingDirectory $d
     Start-Sleep -Seconds 2
     if ($proc.HasExited) {
         Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsPowerShell*' } | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -1330,7 +1370,7 @@ function Invoke-Scenario-S74 {
     $d = New-ScenarioDir 74
     $journalDir = Get-DaclJournalDir
     $beforeJournals = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--','cmd','/c','ping -n 30 127.0.0.1') -PassThru -WorkingDirectory $d
+    $proc = Start-SandboxProcess -Arguments 'run --allow-cwd -- cmd /c ping -n 30 127.0.0.1' -WorkingDirectory $d
     $journal = $null
     try {
         $deadline = (Get-Date).AddSeconds(20)
