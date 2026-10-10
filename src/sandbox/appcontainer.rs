@@ -3,6 +3,10 @@ use windows::Win32::Security::Authorization::*;
 use windows::Win32::Security::Isolation::*;
 use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+    REG_OPTION_NON_VOLATILE,
+};
 use windows::Win32::System::Threading::*;
 use windows::core::*;
 
@@ -36,21 +40,23 @@ pub fn create_session(sid: &str) -> Result<AppContainerSession> {
     let ac_name = format!("sandbox.{sid}.ac");
     let ac_name_w = HSTRING::from(&ac_name);
 
-    let ac_sid = unsafe {
-        match CreateAppContainerProfile(&ac_name_w, w!("sandbox"), w!("sandbox session"), None) {
-            Ok(s) => s,
-            // Profile already exists for this name — re-derive the SID.
-            // Both error codes appear across windows-rs versions:
-            // ERROR_ALREADY_EXISTS (0x800700B7) and the AppContainer-specific
-            // 0x80071392.
-            Err(e)
-                if e.code() == HRESULT::from_win32(0x800700B7)
-                    || e.code() == HRESULT::from_win32(0x80071392) =>
-            {
-                DeriveAppContainerSidFromAppContainerName(&ac_name_w)?
-            }
-            Err(e) => return Err(e),
+    // DeleteAppContainerProfile removes the profile base resources (the
+    // %LOCALAPPDATA%\...\AppContainer\Profiles directory — verified missing
+    // on a heavily used host) together with the LAST profile. A pristine
+    // test VM carries no other AppContainer profiles, so every sandbox
+    // teardown deletes "the last one"; on Windows builds that do not
+    // recreate the bases (observed: Insider 26340 guest, ERROR_FILE_NOT_FOUND
+    // 0x80070002) every subsequent session creation then fails. Recreate
+    // the bases up front and retry once on ERROR_FILE_NOT_FOUND.
+    ensure_profile_resources();
+
+    let ac_sid = match try_create_or_derive(&ac_name_w) {
+        Ok(s) => s,
+        Err(e) if e.code() == HRESULT::from_win32(0x80070002) => {
+            ensure_profile_resources();
+            try_create_or_derive(&ac_name_w)?
         }
+        Err(e) => return Err(e),
     };
 
     Ok(AppContainerSession {
@@ -58,6 +64,59 @@ pub fn create_session(sid: &str) -> Result<AppContainerSession> {
         ac_sid,
         ac_name,
     })
+}
+
+/// Create the AppContainer profile for `ac_name_w`, or re-derive its SID
+/// when a profile of that name already exists.
+fn try_create_or_derive(ac_name_w: &HSTRING) -> Result<PSID> {
+    unsafe {
+        match CreateAppContainerProfile(ac_name_w, w!("sandbox"), w!("sandbox session"), None) {
+            Ok(s) => Ok(s),
+            // Profile already exists for this name (e.g. a crashed supervisor
+            // left it behind) — re-derive the SID. Both error codes appear
+            // across windows-rs versions: ERROR_ALREADY_EXISTS (0x800700B7)
+            // and the AppContainer-specific 0x80071392.
+            Err(e)
+                if e.code() == HRESULT::from_win32(0x800700B7)
+                    || e.code() == HRESULT::from_win32(0x80071392) =>
+            {
+                DeriveAppContainerSidFromAppContainerName(ac_name_w)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Recreate the AppContainer profile base resources that profile teardown
+/// can remove together with the last profile: the file-system Profiles
+/// directory and the per-user Storage registry key. Both are plain
+/// containers with no data of their own; creating them when missing is
+/// harmless and lets CreateAppContainerProfile succeed on Windows builds
+/// that do not recreate them themselves.
+fn ensure_profile_resources() {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let profiles = std::path::Path::new(&local).join("Microsoft\\Windows\\AppContainer\\Profiles");
+        if !profiles.is_dir() {
+            let _ = std::fs::create_dir_all(&profiles);
+        }
+    }
+    unsafe {
+        let mut hkey = HKEY::default();
+        let r = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage"),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE,
+            None,
+            &mut hkey,
+            None,
+        );
+        if r.is_ok() {
+            let _ = RegCloseKey(hkey);
+        }
+    }
 }
 
 /// Grant the AppContainer SID the requested access on `entries` by writing
