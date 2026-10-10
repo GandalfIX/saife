@@ -568,7 +568,10 @@ try {
         $guestExit = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
             param([string]$Command)
             & pwsh -NoProfile -Command $Command 2>&1 | ForEach-Object {
-                if ($_ -like '[vm-guest]*') { Write-Host $_ } else { Write-Host "[vm-guest] $_" }
+                # NOTE: StartsWith, not -like: '[vm-guest]*' is an INVALID
+                # wildcard pattern ([...] is a char class) — with EAP=Stop
+                # this error record once killed the whole streaming session.
+                if ($_.StartsWith('[vm-guest]')) { Write-Host $_ } else { Write-Host "[vm-guest] $_" }
             }
             $LASTEXITCODE
         } -ArgumentList $guestCommand
