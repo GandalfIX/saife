@@ -608,7 +608,7 @@ try {
             $ordered = @($names | Where-Object { $_ -and ($_ -ne 'summary.json') } | Select-Object -Unique)
             $ordered += 'summary.json'
             return @($ordered | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-        } -ArgumentList @('build.log', 'unit.log', 'integration.log', 'summary.json')
+        } -ArgumentList @('build.log', 'unit.log', 'integration.log', 'guest-metrics.log', 'summary.json')
 
         New-Item -ItemType Directory -Path $hostResultsDir -Force | Out-Null
         $chunkSize = 4MB

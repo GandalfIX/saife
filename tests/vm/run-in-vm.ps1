@@ -109,10 +109,11 @@ try {
     $buildLog = Join-Path $script:ResultsRoot 'build.log'
     $unitLog = Join-Path $script:ResultsRoot 'unit.log'
     $integrationLog = Join-Path $script:ResultsRoot 'integration.log'
+    $metricsLog = Join-Path $script:ResultsRoot 'guest-metrics.log'
 
     # Stale logs from an earlier manual run would corrupt parsing - remove
     # best-effort; each step re-creates its log.
-    foreach ($stale in @($buildLog, $unitLog, $integrationLog)) {
+    foreach ($stale in @($buildLog, $unitLog, $integrationLog, $metricsLog)) {
         Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
     }
 
@@ -137,6 +138,7 @@ try {
     $script:Summary.artifacts = @('build.log')
     if ($wantUnit) { $script:Summary.artifacts += 'unit.log' }
     if ($wantIntegration) { $script:Summary.artifacts += 'integration.log' }
+    if ($wantIntegration) { $script:Summary.artifacts += 'guest-metrics.log' }
     $script:Summary.artifacts += 'summary.json'
     if ($Only -and -not $wantIntegration) {
         Write-Host "[vm-guest] NOTE: -Only applies to the integration phase only; ignoring it for phase '$Phase'." -ForegroundColor Yellow
@@ -199,6 +201,12 @@ try {
         $childCommand = "& '$escapedPath'"
         if ($Only) { $childCommand += (' -Only ' + ($Only -join ',')) }
         $rtArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $childCommand)
+        # Per-scenario metrics go to a guest file (not just the streamed
+        # output) so they survive a PS-Direct session-host death - the
+        # 20261011-004018 run's mid-suite collapse was invisible to the
+        # stream because the host died at S-54. run-tests.ps1 appends one
+        # line per scenario; fetched with the other artifacts.
+        $env:SBX_GUEST_METRICS = $metricsLog
         Write-Host ("[vm-guest] step: pwsh {0} {1}" -f ($rtArgs[0..3] -join ' '), $childCommand)
         & pwsh @rtArgs 2>&1 | Tee-Object -FilePath $integrationLog
         $integrationExit = $LASTEXITCODE

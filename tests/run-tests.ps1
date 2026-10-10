@@ -170,6 +170,34 @@ function Write-Result { param([hashtable]$R)
     Write-Host $msg -ForegroundColor $color
 }
 
+# Per-scenario guest metrics (VM runs only): run-in-vm.ps1 sets
+# SBX_GUEST_METRICS to a file path before invoking this script. The file
+# survives a PS-Direct session-host death (streamed output does not), which
+# is how we correlate the mid-suite vmicvmsession/AppContainer collapse
+# (run 20261011-004018: every container-creating scenario failed with
+# 0x80070002 after the session host died at S-54) with resource exhaustion.
+# Silently skipped on host runs. Never fatal.
+function Write-GuestMetric {
+    param([string]$Kind, [int]$Number)
+    $p = $env:SBX_GUEST_METRICS
+    if (-not $p) { return }
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem
+        $availMb = [int][math]::Round($os.FreePhysicalMemory / 1KB)
+        $commitPct = -1
+        if ($os.TotalVirtualMemorySize -gt 0) {
+            $commitPct = [int][math]::Round(100 * (1 - ($os.FreeVirtualMemory / $os.TotalVirtualMemorySize)))
+        }
+        $procs = @(Get-Process).Count
+        $sbx = @(Get-Process -Name 'sandbox*' -ErrorAction SilentlyContinue).Count
+        $vmic = 0
+        if (Get-Process -Name vmicvmsession -ErrorAction SilentlyContinue) { $vmic = 1 }
+        $line = "{0} {1} S-{2} availMB={3} commitPct={4} procs={5} sbxProcs={6} vmicAlive={7}" -f `
+            (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fff'), $Kind, $Number, $availMb, $commitPct, $procs, $sbx, $vmic
+        Add-Content -LiteralPath $p -Value $line -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function ConvertTo-Result { param([hashtable]$h)
     if ($h.Skipped) { $h.State = 'skip' } elseif ($h.Passed) { $h.State = 'pass' } else { $h.State = 'fail' }
     if (-not $h.ContainsKey('Name')) { $h.Name = $h.Num }
@@ -1476,6 +1504,7 @@ function Main {
     Write-Host "  Cwd        : $script:Cwd"
     Write-Host "  Keep       : $Keep"
     Write-Host ""
+    Write-GuestMetric 'suite-begin' 0
 
     $nums = Select-ScenarioNumbers
     if (-not $nums -or $nums.Count -eq 0) {
@@ -1486,6 +1515,7 @@ function Main {
 
     $results = New-Object System.Collections.Generic.List[hashtable]
     foreach ($n in $nums) {
+        Write-GuestMetric 'start' $n
         try {
             $r = Invoke-Scenario -Number $n
         } catch {
@@ -1496,6 +1526,7 @@ function Main {
         }
         $r = ConvertTo-Result $r
         $results.Add($r)
+        Write-GuestMetric 'end' $r.Num
         Write-Result $r
         if ($StopOnFail -and $r.State -eq 'fail') { Write-Host "[stop] -StopOnFail set; halting after S-$($r.Num)." -ForegroundColor Red; break }
     }
@@ -1511,6 +1542,7 @@ function Main {
             'skip' { $skip++ }
         }
     }
+    Write-GuestMetric 'suite-end' 0
     Write-Host ""
     Write-Host ("Summary: total={0} pass={1} fail={2} skip={3}" -f $total,$pass,$fail,$skip) -ForegroundColor White
 

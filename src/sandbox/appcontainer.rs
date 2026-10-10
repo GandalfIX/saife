@@ -621,7 +621,18 @@ fn builtin_admins_sid() -> Option<PSID> {
 }
 
 /// Build the child environment block: parent env + `PATH` prepended with
-/// `.sandbox\<sid>\bin`, plus the proxy env vars.
+/// `.sandbox\<sid>\bin`, `TEMP`/`TMP` redirected to `.sandbox\<sid>\tmp`,
+/// plus the proxy env vars.
+///
+/// `TEMP`/`TMP` are redirected because the parent's `%TEMP%` is not in the
+/// allow-list, and the AppContainer-private `%TEMP%`
+/// (`%LOCALAPPDATA%\Packages\<ac>\AC\Temp`) has broken ACL inheritance on
+/// some Windows builds — directories created inside it deny their own
+/// creator (observed on build 26340), breaking every tool that stages
+/// files via the temp dir (pip/ensurepip, installers, compilers). Python's
+/// `tempfile` checks env `TEMP`/`TMP` before falling back to `GetTempPathW`
+/// (which ignores them for AppContainer tokens), so the redirect takes
+/// precedence.
 ///
 /// `proxy: Some(ProxyEnv)` injects `HTTP_PROXY`/`HTTPS_PROXY`/`X-Sandbox-Token`
 /// pointing at the localhost proxy and clears `NO_PROXY` (forces the proxy to
@@ -630,8 +641,10 @@ fn builtin_admins_sid() -> Option<PSID> {
 /// `proxy: None` (block-net case) explicitly clears all four vars so a
 /// parent shell's proxy settings don't leak into the sandboxed process.
 pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv>) -> Vec<u16> {
-    let bin_abs = cwd.join(format!(".\\.sandbox\\{sid}\\bin"));
+    let bin_abs = cwd.join(format!(".sandbox\\{sid}\\bin"));
     let bin_path = bin_abs.to_string_lossy().to_string();
+    let tmp_abs = cwd.join(format!(".sandbox\\{sid}\\tmp"));
+    let tmp_path = tmp_abs.to_string_lossy().to_string();
 
     // Decide the value (or absence) of the four proxy-related env vars.
     // `Some` → inject proxy URL + token, empty NO_PROXY.
@@ -649,12 +662,16 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     // Names of the four proxy vars, in the order we post-process them.
     // Comparison is case-insensitive (Windows env vars are case-insensitive).
     const PROXY_VARS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "X-Sandbox-Token", "NO_PROXY"];
+    // Temp vars to redirect into the per-session dir (case-insensitive).
+    const TEMP_VARS: [&str; 2] = ["TEMP", "TMP"];
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
     // Track which of the 4 proxy vars we've already emitted (by index) so we
     // can fill in any that were missing from the parent env afterwards.
     let mut proxy_seen = [false; 4];
+    // Same for TEMP/TMP.
+    let mut temp_seen = [false; 2];
     for (k, v) in std::env::vars() {
         if k.eq_ignore_ascii_case("PATH") {
             vars.push((k, format!("{};{}", bin_path, v)));
@@ -675,6 +692,12 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
             ][idx]
                 .clone();
             vars.push((k, replacement));
+        } else if let Some(idx) = TEMP_VARS
+            .iter()
+            .position(|name| k.eq_ignore_ascii_case(name))
+        {
+            temp_seen[idx] = true;
+            vars.push((k, tmp_path.clone()));
         } else {
             vars.push((k, v));
         }
@@ -687,6 +710,12 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     for (idx, name) in PROXY_VARS.iter().enumerate() {
         if !proxy_seen[idx] {
             vars.push((name.to_string(), proxy_values[idx].clone()));
+        }
+    }
+    // Append any temp vars that were not present in the parent env.
+    for (idx, name) in TEMP_VARS.iter().enumerate() {
+        if !temp_seen[idx] {
+            vars.push((name.to_string(), tmp_path.clone()));
         }
     }
 
@@ -710,4 +739,51 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
 pub fn delete_profile(ac_name: &str) {
     let w = HSTRING::from(ac_name);
     let _ = unsafe { DeleteAppContainerProfile(&w) };
+}
+
+#[cfg(test)]
+mod env_block_tests {
+    use super::*;
+
+    /// Decode a NUL-separated UTF-16 environment block into (key, value) pairs.
+    fn decode(block: &[u16]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for entry in block.split(|&c| c == 0) {
+            if entry.is_empty() {
+                continue;
+            }
+            let s = String::from_utf16_lossy(entry);
+            if let Some(eq) = s.find('=') {
+                out.push((s[..eq].to_string(), s[eq + 1..].to_string()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn env_block_redirects_temp_and_prepends_path() {
+        let sid = "testsid";
+        let cwd = std::path::Path::new(r"C:\some\cwd");
+        let vars = decode(&build_env_block(sid, cwd, None));
+        let get = |name: &str| {
+            vars.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .expect("env var present")
+        };
+        assert_eq!(
+            get("TEMP"),
+            r"C:\some\cwd\.sandbox\testsid\tmp",
+            "TEMP redirected to per-session dir"
+        );
+        assert_eq!(get("TMP"), r"C:\some\cwd\.sandbox\testsid\tmp");
+        assert!(
+            get("PATH").starts_with(r"C:\some\cwd\.sandbox\testsid\bin;"),
+            "PATH prepended with session bin dir: {}",
+            get("PATH")
+        );
+        // Block-net mode (proxy: None) clears the proxy vars.
+        assert_eq!(get("HTTP_PROXY"), "");
+        assert_eq!(get("NO_PROXY"), "");
+    }
 }

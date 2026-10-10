@@ -33,6 +33,7 @@ pub fn ensure_session_dirs(cwd: &std::path::Path, sid: &str) -> std::io::Result<
     let base = cwd.join(".sandbox").join(sid);
     std::fs::create_dir_all(base.join("bin"))?;
     std::fs::create_dir_all(base.join("venv"))?;
+    std::fs::create_dir_all(base.join("tmp"))?;
     Ok(())
 }
 
@@ -139,6 +140,15 @@ pub fn build_allowlist(
         cwd.join(".sandbox").join(sid).join("venv"),
         RWX,
         ".sandbox/venv".into(),
+        false,
+        true,
+    );
+    // Per-session temp dir (child TEMP/TMP point here — see build_env_block).
+    push_entry(
+        &mut entries,
+        cwd.join(".sandbox").join(sid).join("tmp"),
+        RWX,
+        ".sandbox/tmp".into(),
         false,
         true,
     );
