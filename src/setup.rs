@@ -376,8 +376,9 @@ fn os_build_number() -> Result<u32> {
         }
 
         let utf16: Vec<u16> = buf[..len as usize]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>().0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let s = String::from_utf16_lossy(&utf16)
             .trim_end_matches('\0')
