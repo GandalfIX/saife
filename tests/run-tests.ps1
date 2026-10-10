@@ -208,7 +208,7 @@ function Invoke-Scenario-S2 {
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             [Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow')
         $acl.AddAccessRule($rule)
-        (Get-Item -LiteralPath $target).SetAccessControl($acl)
+        (Get-Item -LiteralPath $target) | Set-Acl -AclObject $acl
     }
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','type',$target) -WorkingDirectory $d
     $err = ($r.Stderr -join "`n")
@@ -1102,7 +1102,7 @@ function Invoke-Scenario-S60 {
     $out = ($r.Stdout -join "`n")
     $passed = ($r.ExitCode -eq 0) -and ($out -match 'git version')
     return @{ Num=60; Name='S-60 (AC-5.7)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'git ran under git_runtime group' } else { "exit=$($r.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { 'git ran under git_runtime group' } else { "exit=$($r.ExitCode) stdout=$out stderr=$(($r.Stderr -join "`n"))" } }
 }
 
 # S-61 (AC-5.7): dotnet_runtime group makes dotnet usable. Skips if dotnet absent.
