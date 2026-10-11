@@ -641,7 +641,9 @@ fn builtin_admins_sid() -> Option<PSID> {
 }
 
 /// Build the child environment block: parent env + `PATH` prepended with
-/// `.sandbox\<sid>\bin`, plus the proxy env vars.
+/// `.sandbox\<sid>\bin`, `PYTHONPATH` prepended with `.sandbox\<sid>\pyshim`
+/// (the CPython 0o700-mkdir interposition — see sitecustomize.py), plus the
+/// proxy env vars.
 ///
 /// `TEMP`/`TMP` are NOT redirectable here: Windows rewrites them to the
 /// AppContainer-private `%LOCALAPPDATA%\Packages\<ac>\AC\Temp` even when
@@ -659,6 +661,10 @@ fn builtin_admins_sid() -> Option<PSID> {
 pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv>) -> Vec<u16> {
     let bin_abs = cwd.join(format!(".sandbox\\{sid}\\bin"));
     let bin_path = bin_abs.to_string_lossy().to_string();
+    let pyshim_path = cwd
+        .join(format!(".sandbox\\{sid}\\pyshim"))
+        .to_string_lossy()
+        .to_string();
 
     // Decide the value (or absence) of the four proxy-related env vars.
     // `Some` → inject proxy URL + token, empty NO_PROXY.
@@ -679,6 +685,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
+    let mut pythonpath_overridden = false;
     // Track which of the 4 proxy vars we've already emitted (by index) so we
     // can fill in any that were missing from the parent env afterwards.
     let mut proxy_seen = [false; 4];
@@ -686,6 +693,11 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         if k.eq_ignore_ascii_case("PATH") {
             vars.push((k, format!("{};{}", bin_path, v)));
             path_overridden = true;
+            continue;
+        }
+        if k.eq_ignore_ascii_case("PYTHONPATH") {
+            vars.push((k, format!("{};{}", pyshim_path, v)));
+            pythonpath_overridden = true;
             continue;
         }
         // Check if this is one of the proxy vars we manage.
@@ -708,6 +720,9 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     }
     if !path_overridden {
         vars.push(("PATH".to_string(), bin_path));
+    }
+    if !pythonpath_overridden {
+        vars.push(("PYTHONPATH".to_string(), pyshim_path));
     }
     // Append any proxy vars that were not present in the parent env.
     let proxy_values = [http_proxy, https_proxy, token_val, no_proxy];
@@ -773,6 +788,12 @@ mod env_block_tests {
             get("PATH").starts_with(r"C:\some\cwd\.sandbox\testsid\bin;"),
             "PATH prepended with session bin dir: {}",
             get("PATH")
+        );
+        assert!(
+            get("PYTHONPATH")
+                .starts_with(r"C:\some\cwd\.sandbox\testsid\pyshim"),
+            "PYTHONPATH prepended with session pyshim dir: {}",
+            get("PYTHONPATH")
         );
         // Block-net mode (proxy: None) clears the proxy vars.
         assert_eq!(get("HTTP_PROXY"), "");

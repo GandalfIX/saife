@@ -41,11 +41,19 @@ pub const RX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 /// home) without weakening sibling isolation.
 const ANCESTOR_MASK: u32 = FILE_READ_ATTRIBUTES.0 | FILE_TRAVERSE.0;
 
+/// The python shim the sandbox injects via PYTHONPATH (see the module
+/// docstring in sitecustomize.py for why it must rewrite mode 0o700).
+const PYSHIM_SITECUSTOMIZE: &str = include_str!("sitecustomize.py");
+
 /// Ensure the per-session install dirs exist on disk (Option E roots).
+/// `pyshim` additionally receives the sitecustomize.py shim itself.
 pub fn ensure_session_dirs(cwd: &std::path::Path, sid: &str) -> std::io::Result<()> {
     let base = cwd.join(".sandbox").join(sid);
     std::fs::create_dir_all(base.join("bin"))?;
     std::fs::create_dir_all(base.join("venv"))?;
+    let pyshim = base.join("pyshim");
+    std::fs::create_dir_all(&pyshim)?;
+    std::fs::write(pyshim.join("sitecustomize.py"), PYSHIM_SITECUSTOMIZE)?;
     Ok(())
 }
 
@@ -152,6 +160,16 @@ pub fn build_allowlist(
         cwd.join(".sandbox").join(sid).join("venv"),
         RWX,
         ".sandbox/venv".into(),
+        false,
+        true,
+    );
+    // PYTHONPATH shim dir (read by every python the session spawns; see
+    // sitecustomize.py). Same PROTECTED treatment as bin/venv.
+    push_entry(
+        &mut entries,
+        cwd.join(".sandbox").join(sid).join("pyshim"),
+        RWX,
+        ".sandbox/pyshim".into(),
         false,
         true,
     );
@@ -408,5 +426,46 @@ mod tests {
             std::path::Path::new("C:\\Users\\marku"),
             std::path::Path::new("C:\\Users\\other"),
         ));
+    }
+
+    #[test]
+    fn ensure_session_dirs_writes_python_shim() {
+        let base = std::env::temp_dir().join(format!(
+            "sbx-allowlist-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = "sid-test";
+        ensure_session_dirs(&cwd, sid).unwrap();
+        let shim = cwd.join(".sandbox").join(sid).join("pyshim\\sitecustomize.py");
+        let content = std::fs::read_to_string(&shim).unwrap();
+        assert!(
+            content.contains("_sandbox_mkdir"),
+            "sitecustomize.py must contain the mkdir interposition"
+        );
+        assert!(
+            content.contains("mode == 0o700"),
+            "sitecustomize.py must rewrite the 0o700 mode"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn allowlist_contains_python_shim_grant() {
+        let fs = FilesystemSlice::default();
+        let entries =
+            build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs).unwrap();
+        let pyshim = std::path::Path::new(r"C:\proj\.sandbox\test-sid\pyshim");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.win32_path == pyshim && e.access == RWX),
+            "pyshim dir must carry an RWX grant; got: {:?}",
+            entries.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
     }
 }
