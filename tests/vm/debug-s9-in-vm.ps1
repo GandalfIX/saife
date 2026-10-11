@@ -1,57 +1,61 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Debug the S-9 venv/ensurepip failure inside a kept test VM (probe battery).
+    Round-4 S-9 probe battery: pin the AppContainer 0xC0000142 cluster.
 
 .DESCRIPTION
-    S-9 fails with a silent exit 1 from `venv python -m ensurepip`, and the
-    2026-10-11 debug runs surfaced two unexplained behaviors:
+    State of the hunt after rounds 1-3 (all findings VM-verified):
 
-      a) sandboxed: tempfile's tempdir CHECK fails on every candidate,
-         including the granted cwd (run 2), though it passed inside the
-         OS-created AC\Temp in run 1;
-      b) unsandboxed: the VENV python.exe (created inside the sandbox)
-         fails the same check where the SYSTEM python succeeds.
+      - CPython's 0o700 mkdir DACL blocker is fixed (token-owner fixup +
+        PYTHONPATH sitecustomize shim); all mkdir modes + mkdtemp now
+        work inside the sandbox.
+      - pip's vendored platformdirs then dies during config discovery:
+        import ctypes fails inside the AC (WinError 1114,
+        STATUS_DLL_INIT_FAILED), so platformdirs falls back to its
+        registry variant, which queries HKCU\...\Shell Folders for
+        'Common AppData' - a value modern Windows no longer writes
+        (the host's own hive lacks it too). The registry-grant route
+        is exhausted: the key OPENS fine in the AC (31 values, no
+        grant needed); the value is simply absent everywhere.
+      - So S-9 reduces to one question: why does _ctypes fail DLL init
+        inside the AppContainer? Cluster victims observed so far:
+        whoami.exe, powershell.exe (PS5) and import ctypes all die
+        with 0xC0000142, while python.exe, cmd.exe and the whole
+        stdlib probe set run fine.
 
-    Instead of a one-shot fix, this script pins the divergence down with
-    explicit probes that report the exact winerror for every operation:
+    This round adds:
 
-      - probe_env      executable / TEMP / TMP / cwd
-      - probe_tempdir  replica of tempfile's candidate loop with per-
-                       candidate winerrors (no guessing which candidate
-                       failed or why)
-      - probe_ops      per-op probes in cwd + %TEMP% (or AC temp), each
-                       op reported individually: listdir, plain open,
-                       open+unlink, O_TEMPORARY open, mkdir, write-
-                       inside, listdir-subdir, chmod-created-file,
-                       rmtree, mkdir+rmdir, subprocess spawn
-      - venv repro    exact S-9 flow (venv WITH pip) + a direct
-                       `ensurepip -v` on the resulting venv python —
-                       venv swallows the ensurepip subprocess's stderr,
-                       so the direct run is the only way to see the
-                       real error
-      - probe_mkmode  the S-9 root cause hunt: tempfile.mkdtemp calls
-                       os.mkdir(path, 0o600) — an EXPLICIT mode — and
-                       that dir denies its own creator (even scandir),
-                       while default-mode mkdir dirs work fine. This
-                       probe creates dirs at 0o777/0o755/0o700/0o600 in
-                       cwd AND the granted AC temp, tries write+listdir
-                       inside each, plus the exact mkdtemp+write op, so
-                       the icacls dump afterwards shows precisely which
-                       ACEs/mask/protection explicit modes produce.
+      - dllprobe: a zero-dependency Rust crate written and built
+        in-guest. For each candidate DLL it reports two
+        LoadLibraryExW results:
+          probe = DONT_RESOLVE_DLL_REFERENCES (does the image even
+                  map? is the file readable by the AC?)
+          full  = normal load (deps resolve, every DllMain runs)
+        full=FAIL gle=1114 with probe=OK pins a DLL *initialization*
+        failure; gle=5 would pin a file-ACL problem instead. The
+        candidate matrix covers the import graphs of the victims:
+        _ctypes (libffi-8, ole32, oleaut32, combase) and whoami
+        (user32, authz, wkscli, netutils, sspicli), plus known-good
+        controls (kernel32, ws2_32, python3xx.dll, vcruntime140).
+      - The still-missing control: an UNSANDBOXED `python -m venv`
+        WITH pip on the same guest. Outside the AC, ctypes works, so
+        platformdirs takes the SHGetFolderPathW path and never
+        reaches the broken registry fallback.
+      - probe_ctypes: the exact import error, plus probe_registry
+        baselines both sandboxed and not (expected: OpenKey OK
+        everywhere, 'Common AppData' missing everywhere - the
+        fallback is broken generally, it is only ever *reached*
+        where ctypes is broken).
 
-    Each probe runs in four contexts:
-      1. sandboxed system python   2. unsandboxed system python
-      3. sandboxed venv python      4. unsandboxed venv python
-    Plus an exe-provenance experiment (a pwsh-copied python.exe run
-    unsandboxed) and icacls/owner dumps of everything involved.
+    VM-only by design: everything it mutates lives in the disposable
+    test VM (VM deletion is the rollback).
 
 .PARAMETER VmName
-    Name of the kept VM (e.g. sbx-test-20261011-123919-551). The VM must
+    Name of the kept VM (e.g. sbx-test-20261011-234136-151). The VM must
     have the repo staged at C:\sbx-repo and the release binary built.
 
 .EXAMPLE
-    pwsh -NoProfile -File tests\vm\debug-s9-in-vm.ps1 -VmName sbx-test-20261011-123919-551
+    pwsh -NoProfile -File tests\vm\debug-s9-in-vm.ps1 -VmName sbx-test-20261011-234136-151
 #>
 param(
     [Parameter(Mandatory)][string]$VmName
@@ -149,6 +153,18 @@ except OSError as e:
     print('platformdirs call: FAIL', e)
 '@
 
+    Set-Content -LiteralPath (Join-Path $work 'probe_ctypes.py') -Encoding ASCII -Value @'
+# The exact import that decides which platformdirs variant pip uses.
+# import ctypes first (pure-python wrapper + C module), then the bare
+# C module to strip the wrapper from the picture.
+for mod in ('ctypes', '_ctypes'):
+    try:
+        __import__(mod)
+        print('import %-8s: OK' % mod)
+    except BaseException as e:
+        print('import %-8s: %s: %s' % (mod, type(e).__name__, e))
+'@
+
     Set-Content -LiteralPath (Join-Path $work 'probe_tempdir.py') -Encoding ASCII -Value @'
 import os, tempfile
 # Exact replica of tempfile._get_default_tempdir's loop (3.12), but every
@@ -192,416 +208,210 @@ for label, d in candidates:
                   % (label, d, e.winerror, e.strerror))
 '@
 
-    Set-Content -LiteralPath (Join-Path $work 'probe_ops.py') -Encoding ASCII -Value @'
-import os, sys, shutil, subprocess
-def t(label, fn):
-    try:
-        r = fn()
-        print('  %-28s OK %s' % (label, r if r is not None else ''))
-    except OSError as e:
-        print('  %-28s FAIL winerror=%s errno=%s %s' % (label, e.winerror, e.errno, e.strerror))
-for d in [os.getcwd(), os.environ.get('TEMP', '')]:
-    if not d:
-        continue
-    print('dir:', d)
-    p = lambda n: os.path.join(d, n)
-    t('listdir', lambda: len(os.listdir(d)))
-    t('plain open wb', lambda: open(p('p1'), 'wb').write(b'x'))
-    def _ou():
-        open(p('p2'), 'wb').write(b'x'); os.unlink(p('p2'))
-    t('open + unlink', _ou)
-    def _ot():
-        fd = os.open(p('p3'), os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_TEMPORARY', 0))
-        os.close(fd)
-    t('O_TEMPORARY open', _ot)
-    def _mk():
-        os.mkdir(p('pd1')); return 'isdir=%s' % os.path.isdir(p('pd1'))
-    t('mkdir', _mk)
-    def _wi():
-        open(p('pd1/f'), 'wb').write(b'x'); return 'size=%s' % os.path.getsize(p('pd1/f'))
-    t('write-inside', _wi)
-    def _ls():
-        return os.listdir(p('pd1'))
-    t('listdir subdir', _ls)
-    def _ch():
-        os.chmod(p('pd1/f'), 0o700)
-    t('chmod created file', _ch)
-    def _rm():
-        shutil.rmtree(p('pd1'))
-    t('rmtree subdir', _rm)
-    def _rmdir():
-        os.mkdir(p('pd2')); os.rmdir(p('pd2'))
-    t('mkdir + rmdir', _rmdir)
-    def _sp():
-        r = subprocess.run([sys.executable, '-c', 'print("subproc-ok")'],
-                           capture_output=True, text=True)
-        return 'rc=%s out=%r err=%r' % (r.returncode, r.stdout.strip(), r.stderr.strip())
-    t('subprocess spawn', _sp)
-'@
-
-    Set-Content -LiteralPath (Join-Path $work 'probe_mkmode.py') -Encoding ASCII -Value @'
-import os, tempfile
-def t(label, fn):
-    try:
-        r = fn()
-        print('  %-34s OK %s' % (label, r if r is not None else ''))
-    except OSError as e:
-        print('  %-34s FAIL winerror=%s errno=%s %s' % (label, e.winerror, e.errno, e.strerror))
-print('TEMP:', os.environ.get('TEMP'))
-print('cwd :', os.getcwd())
-# Exact mkdtemp+write op that ensurepip's _bootstrap does.
-def _mk():
-    td = tempfile.mkdtemp()
-    open(os.path.join(td, 'whltest'), 'wb').write(b'x')
-    return td
-t('mkdtemp + write inside', _mk)
-for base, blabel in ((os.getcwd(), 'cwd'), (os.environ.get('TEMP', ''), 'temp')):
-    if not base:
-        continue
-    dn = os.path.join(base, 'm_%s_default' % blabel)
-    os.mkdir(dn)
-    def _w(d=dn):
-        open(os.path.join(d, 'f'), 'wb').write(b'x')
-    t('%s default mkdir: write' % blabel, _w)
-    for m in (0o777, 0o755, 0o700, 0o600):
-        d = os.path.join(base, 'm_%s_%o' % (blabel, m))
-        def _c(m=m, d=d):
-            os.mkdir(d, m)
-        t('%s mkdir 0o%o' % (blabel, m), _c)
-        def _wm(d=d):
-            open(os.path.join(d, 'f'), 'wb').write(b'x')
-        t('%s mkdir 0o%o: write' % (blabel, m), _wm)
-        def _lm(d=d):
-            return os.listdir(d)
-        t('%s mkdir 0o%o: listdir' % (blabel, m), _lm)
-'@
-
-    Set-Content -LiteralPath (Join-Path $work 'ac_bootstrap.py') -Encoding ASCII -Value @'
-import ctypes, os, sys, subprocess, tempfile
-from ctypes import wintypes
-
-advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
-kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-
-TOKEN_QUERY = 0x0008
-TOKEN_ADJUST_DEFAULT = 0x0100
-TokenOwner = 4
-TokenAppContainerSid = 25
-
-advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-advapi32.OpenProcessToken.restype = wintypes.BOOL
-advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
-advapi32.GetTokenInformation.restype = wintypes.BOOL
-advapi32.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-advapi32.SetTokenInformation.restype = wintypes.BOOL
-advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-kernel32.LocalFree.restype = ctypes.c_void_p
-
-def t(label, fn):
-    try:
-        r = fn()
-        print('[bootstrap] %-36s OK %s' % (label, r if r is not None else ''))
-    except OSError as e:
-        print('[bootstrap] %-36s FAIL winerror=%s %s' % (label, e.winerror, e.strerror))
-
-hTok = wintypes.HANDLE()
-if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, ctypes.byref(hTok)):
-    print('[bootstrap] OpenProcessToken failed err=', ctypes.get_last_error())
-    sys.exit(1)
-
-def tok_info(cls):
-    need = wintypes.DWORD(0)
-    advapi32.GetTokenInformation(hTok, cls, None, 0, ctypes.byref(need))
-    buf = ctypes.create_string_buffer(max(8, need.value))
-    if not advapi32.GetTokenInformation(hTok, cls, buf, need, ctypes.byref(need)):
-        return None
-    return buf
-
-def sid_str(buf):
-    if buf is None:
-        return '<unavailable>'
-    psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-    s = wintypes.LPWSTR()
-    if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(psid), ctypes.byref(s)):
-        return '?'
-    v = s.value
-    kernel32.LocalFree(ctypes.cast(s, ctypes.c_void_p))
-    return v
-
-# --- control: 0o700 mkdir is expected to FAIL for this process now ---
-t('PRE  mkdir 0o700', lambda: os.mkdir('bt700pre', 0o700))
-t('PRE  write inside bt700pre', lambda: open('bt700pre/f', 'wb').write(b'x'))
-
-ac_buf = tok_info(TokenAppContainerSid)
-ac_sid = sid_str(ac_buf)
-print('[bootstrap] AC SID                :', ac_sid)
-print('[bootstrap] token owner (before) :', sid_str(tok_info(TokenOwner)))
-
-if ac_buf is None:
-    print('[bootstrap] no AppContainer SID - not running inside an AppContainer?')
-    sys.exit(1)
-
-ac_psid = ctypes.cast(ac_buf, ctypes.POINTER(ctypes.c_void_p))[0]
-TOKEN_OWNER = ctypes.c_void_p * 1
-owner_struct = TOKEN_OWNER(ctypes.c_void_p(ac_psid))
-rc = advapi32.SetTokenInformation(hTok, TokenOwner, ctypes.byref(owner_struct), ctypes.sizeof(TOKEN_OWNER))
-err = ctypes.get_last_error() if not rc else 0
-print('[bootstrap] SetTokenInformation(TokenOwner=AC SID): rc=%s err=%s' % (rc, err))
-print('[bootstrap] token owner (after)  :', sid_str(tok_info(TokenOwner)))
-
-# --- retest: same process, token owner now the AC SID ---
-t('POST mkdir 0o700', lambda: os.mkdir('bt700', 0o700))
-t('POST write inside bt700', lambda: open('bt700/f', 'wb').write(b'x'))
-t('POST listdir bt700', lambda: os.listdir('bt700'))
-
-def _mk():
-    td = tempfile.mkdtemp()
-    open(os.path.join(td, 'w'), 'wb').write(b'x')
-    return td
-t('POST mkdtemp + write (ensurepip op)', _mk)
-
-# --- child test: does the owner survive CreateProcess? (the product fix
-#     depends on the spawned target inheriting the owner) ---
-r = subprocess.run([sys.executable, '-m', 'venv', '.btvenv'], capture_output=True, text=True)
-print('[bootstrap] child `python -m venv .btvenv` rc=', r.returncode)
-if r.stdout.strip():
-    print('[bootstrap]   stdout:', r.stdout.strip()[-400:])
-if r.stderr.strip():
-    print('[bootstrap]   stderr:', r.stderr.strip()[-800:])
-if r.returncode == 0:
-    vp = os.path.join('.btvenv', 'Scripts', 'python.exe')
-    rp = subprocess.run([vp, '-m', 'pip', '--version'], capture_output=True, text=True)
-    print('[bootstrap] child pip --version rc=', rp.returncode, rp.stdout.strip())
-'@
-
     Write-Host "[s9dbg] workdir: $work"
     & python --version 2>&1 | ForEach-Object { Write-Host "[s9dbg] python: $_" }
 
     # ------------------------------------------------------------------
-    # 0b. Token dump from inside the AC: whoami lists the process token's
-    #     SIDs with their attributes (deny-only / use-for-allow-only /
-    #     enabled) — settles which SIDs can satisfy allow ACEs, and shows
-    #     the integrity level of AppContainer processes.
+    # 1. Victim #1: whoami inside the AC. Run-Step prints the sandbox
+    #    exit code - expect -1073741502 (0xC0000142) and thus the whole
+    #    point of this round: something in its import graph fails DLL
+    #    init inside the AppContainer.
     # ------------------------------------------------------------------
-    Run-Step 'sandboxed whoami /user /groups (AC token dump)' @(
+    Run-Step 'sandboxed whoami /user /groups (expect 0xC0000142)' @(
         'run','--allow-cwd','--','whoami','/user','/groups')
 
     # ------------------------------------------------------------------
-    # 1. Sandboxed system python: env, tempdir-check replica, per-op probes
+    # 2. Sandboxed system python: environment, shim state, tempdir
+    #    replica, registry view baseline, ctypes import error.
     # ------------------------------------------------------------------
     Run-Step 'sandboxed system python: env' @('run','--allow-cwd','--','python','probe_env.py')
     Run-Step 'sandboxed system python: shim state + mkdtemp' @('run','--allow-cwd','--','python','probe_shim.py')
     Run-Step 'sandboxed system python: tempdir check replica' @('run','--allow-cwd','--','python','probe_tempdir.py')
-    Run-Step 'sandboxed system python: ops in cwd + AC temp' @('run','--allow-cwd','--','python','probe_ops.py')
+    Run-Step 'sandboxed system python: registry view baseline' @(
+        'run','--allow-cwd','--','python','probe_registry.py')
+    Run-Step 'sandboxed system python: ctypes import error (THE blocker)' @(
+        'run','--allow-cwd','--','python','probe_ctypes.py')
 
     # ------------------------------------------------------------------
-    # 1b. mkdir-mode matrix: the mkdtemp mechanism. tempfile.mkdtemp
-    #     calls os.mkdir(path, 0o600); that dir denied its own creator
-    #     in the ensurepip run while default-mode mkdir dirs work.
-    #     Dump every created dir with icacls afterwards (step 5) to see
-    #     which ACEs/mask/protection an explicit mode produces.
+    # 3. Unsandboxed system python: control side of 2.
     # ------------------------------------------------------------------
-    Run-Step 'sandboxed system python: mkdir-mode matrix + mkdtemp' @(
-        'run','--allow-cwd','--','python','probe_mkmode.py')
+    Run-Py 'unsandboxed system python: registry view (control)' python 'probe_registry.py'
+    Run-Py 'unsandboxed system python: ctypes import (control)' python 'probe_ctypes.py'
 
     # ------------------------------------------------------------------
-    # 1c. THE bootstrap experiment — candidate fix, end to end, inside
-    #     the AC: python (ctypes) sets its own TokenOwner to its
-    #     AppContainer SID, retests the 0o700/mkdtemp ops, then spawns
-    #     `python -m venv` as a child (S-9 chain). CPython's 0o700 DACL
-    #     is D:P(SY)(BA)(OW) — the OW (owner-rights) ACE is the only
-    #     entry that could authorize the sandboxed process, and it only
-    #     matches when the object owner == the process token owner ==
-    #     the AC SID (AC tokens have user/group SIDs use-for-allow-only,
-    #     but the AC SID itself can satisfy allow ACEs).
-    # ------------------------------------------------------------------
-    Run-Step 'bootstrap: AC python sets TokenOwner=AC SID, retests, child venv' @(
-        'run','--allow-cwd','--','python','ac_bootstrap.py')
-
-    # ------------------------------------------------------------------
-    # 2. Unsandboxed system python (baseline that works)
-    # ------------------------------------------------------------------
-    Run-Py 'unsandboxed system python: env' python 'probe_env.py'
-    Run-Py 'unsandboxed system python: tempdir check replica' python 'probe_tempdir.py'
-    Run-Py 'unsandboxed system python: ops in cwd + TEMP' python 'probe_ops.py'
-
-    # ------------------------------------------------------------------
-    # 3. Venv (created inside the sandbox, like S-9) + sandboxed venv python
-    # ------------------------------------------------------------------
-    Run-Step 'venv --without-pip (created inside sandbox)' @(
-        'run','--allow-cwd','--','python','-m','venv','--without-pip','.dbgvenv')
-    $venvPy = Join-Path $work '.dbgvenv\Scripts\python.exe'
-    if (Test-Path -LiteralPath $venvPy) {
-        Run-Step 'sandboxed venv python: shim state + mkdtemp' @(
-            'run','--allow-cwd','--',$venvPy,'probe_shim.py')
-        Run-Step 'sandboxed venv python: tempdir check replica' @(
-            'run','--allow-cwd','--',$venvPy,'probe_tempdir.py')
-        Run-Py 'unsandboxed venv python: env' $venvPy 'probe_env.py'
-        Run-Py 'unsandboxed venv python: tempdir check replica' $venvPy 'probe_tempdir.py'
-        Run-Py 'unsandboxed venv python: ops in cwd + TEMP' $venvPy 'probe_ops.py'
-    } else {
-        Write-Host '[s9dbg] venv python missing, skipping venv probes'
-    }
-
-    # ------------------------------------------------------------------
-    # 3b. Exact S-9 reproduction: venv WITH pip inside the sandbox.
-    #     The harness sees only venv's "Error: Command ... exit status 1"
-    #     because venv suppresses the ensurepip subprocess's stderr —
-    #     so immediately afterwards we run ensurepip DIRECTLY (-v) on
-    #     the same venv python to capture the real error.
+    # 4. Exact S-9 reproduction: venv WITH pip inside the sandbox, then
+    #    a direct ensurepip -v on the resulting venv python (venv
+    #    swallows the ensurepip subprocess's stderr) and pip --version.
+    #    Current expectation: venv fails; the direct ensurepip traceback
+    #    shows the platformdirs 'Common AppData' FileNotFoundError; the
+    #    hunt is upstream of that at the _ctypes 0xC0000142 failure.
     # ------------------------------------------------------------------
     Run-Step 'venv WITH pip (exact S-9 reproduction)' @(
-        'run','--allow-cwd','--','python','-m','venv','.dbgvenv2')
-    $venv2Py = Join-Path $work '.dbgvenv2\Scripts\python.exe'
-    if (Test-Path -LiteralPath $venv2Py) {
+        'run','--allow-cwd','--','python','-m','venv','.dbgvenv')
+    $venvPy = Join-Path $work '.dbgvenv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venvPy) {
         Run-Step 'direct ensurepip -v on that venv (output venv swallows)' @(
-            'run','--allow-cwd','--',$venv2Py,'-m','ensurepip','--upgrade','--default-pip','-v')
+            'run','--allow-cwd','--',$venvPy,'-m','ensurepip','--upgrade','--default-pip','-v')
         Run-Step 'pip --version in venv (installed at all?)' @(
-            'run','--allow-cwd','--',$venv2Py,'-m','pip','--version')
+            'run','--allow-cwd','--',$venvPy,'-m','pip','--version')
     } else {
         Write-Host '[s9dbg] pip-venv python missing, skipping ensurepip probes'
     }
 
     # ------------------------------------------------------------------
-    # 3c. Registry-view probe (S-9 blocker #2: pip/platformdirs reads
-    #     HKCU\...\Shell Folders via winreg; inside the AppContainer the
-    #     merged registry view makes the key invisible -> FileNotFoundError
-    #     -> pip dies during config discovery).
-    #     Baseline probe, then grant ALL APPLICATION PACKAGES (S-1-15-2-1)
-    #     ReadKey on the two Shell Folders keys, re-probe, run the full
-    #     S-9 flow, then revoke. AAP sidesteps the chicken-and-egg of
-    #     per-session AC SIDs for this probe; the product fix would grant
-    #     the session's own AC SID. VM-only: VM deletion is the rollback.
-    # ------------------------------------------------------------------
-    Run-Step 'registry view probe: baseline (expect Shell Folders FAIL)' @(
-        'run','--allow-cwd','--','python','probe_registry.py')
-
-    $regKeys = @(
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders',
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders')
-    $regRuleType = [System.Security.AccessControl.RegistryRights]
-    $aap = New-Object System.Security.Principal.SecurityIdentifier('S-1-15-2-1')
-    function Open-RegKeyForAcl([string]$subkey) {
-        return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
-            $subkey,
-            [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-            [System.Security.AccessControl.RegistryRights]::ChangePermissions)
-    }
-    Write-Host '=== registry: grant AAP ReadKey on Shell Folders keys ==='
-    foreach ($rk in $regKeys) {
-        try {
-            $k = Open-RegKeyForAcl $rk
-            $acl = $k.GetAccessControl()
-            $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-                $aap, $regRuleType::ReadKey,
-                [System.Security.AccessControl.AccessControlType]::Allow)
-            $acl.AddAccessRule($rule)
-            $k.SetAccessControl($acl)
-            $k.Close()
-            Write-Host "  granted AAP ReadKey on HKCU\$rk"
-        } catch {
-            Write-Host "  GRANT FAILED on HKCU\${rk}: $($_.Exception.Message)"
-        }
-    }
-    Run-Step 'registry view probe: after AAP grant (THE ANSWER)' @(
-        'run','--allow-cwd','--','python','probe_registry.py')
-    Run-Step 'venv WITH pip with registry grant in place (full S-9 flow)' @(
-        'run','--allow-cwd','--','python','-m','venv','.dbgvenv3')
-    $venv3Py = Join-Path $work '.dbgvenv3\Scripts\python.exe'
-    if (Test-Path -LiteralPath $venv3Py) {
-        Run-Step 'pip --version in venv3 (installed at all?)' @(
-            'run','--allow-cwd','--',$venv3Py,'-m','pip','--version')
-    }
-    Write-Host '=== registry: revoke AAP ReadKey (restore original ACLs) ==='
-    foreach ($rk in $regKeys) {
-        try {
-            $k = Open-RegKeyForAcl $rk
-            $acl = $k.GetAccessControl()
-            foreach ($r in @($acl.Access |
-                Where-Object { $_.IdentityReference.Value -eq 'S-1-15-2-1' })) {
-                $acl.RemoveAccessRule($r) | Out-Null
-            }
-            $k.SetAccessControl($acl)
-            $k.Close()
-            Write-Host "  revoked AAP on HKCU\$rk"
-        } catch {
-            Write-Host "  REVOKE FAILED on HKCU\${rk}: $($_.Exception.Message)"
-        }
-    }
-
-    # ------------------------------------------------------------------
-    # 4. Exe provenance: same python.exe, but copied by pwsh (not by the
-    #    AC process) — isolates "exe created inside AppContainer".
+    # 5. The still-missing control: UNSANDBOXED venv WITH pip. Outside
+    #    the AC, ctypes works, so platformdirs takes the
+    #    SHGetFolderPathW path and never reaches the broken registry
+    #    fallback. If this passes while step 4 fails, the AppContainer
+    #    is the only differing variable for S-9.
     # ------------------------------------------------------------------
     Write-Host ""
-    Write-Host "=== exe provenance: pwsh-copied python.exe, unsandboxed ==="
-    $sysPy = (Get-Command python).Source
-    $copyPy = Join-Path $work 'python-copy.exe'
-    Copy-Item -LiteralPath $sysPy -Destination $copyPy -Force
-    & $copyPy probe_tempdir.py 2>&1 | ForEach-Object { Write-Host "  $_" }
+    Write-Host "=== unsandboxed baseline: python -m venv WITH pip ==="
+    & python -m venv (Join-Path $work 'basevenv') 2>&1 | ForEach-Object { Write-Host "  $_" }
     Write-Host "--- exit: $LASTEXITCODE"
-
-    # ------------------------------------------------------------------
-    # 5. ACL / owner dumps of everything involved
-    # ------------------------------------------------------------------
-    Write-Host ""
-    Write-Host "=== icacls: mode-created probe dirs (mkdir-mode matrix) ==="
-    foreach ($md in @(Get-ChildItem -LiteralPath $work -Directory -Filter 'm_*' -ErrorAction SilentlyContinue)) {
-        Write-Host "--- $($md.FullName)"
-        & icacls.exe $md.FullName 2>&1 | ForEach-Object { Write-Host "  $_" }
-        $acl = Get-Acl -LiteralPath $md.FullName
-        Write-Host ("  owner: {0}" -f $acl.Owner)
-    }
-    foreach ($bt in @((Join-Path $work 'bt700pre'), (Join-Path $work 'bt700'), (Join-Path $work '.btvenv'))) {
-        if (Test-Path -LiteralPath $bt) {
-            Write-Host "--- $bt"
-            & icacls.exe $bt 2>&1 | ForEach-Object { Write-Host "  $_" }
-            $acl = Get-Acl -LiteralPath $bt
-            Write-Host ("  owner: {0}" -f $acl.Owner)
-        }
-    }
-    $pkgsRoot2 = Join-Path $env:LOCALAPPDATA 'Packages'
-    foreach ($acDir2 in @(Get-ChildItem -LiteralPath $pkgsRoot2 -Directory -Filter 'sandbox.*.ac' -ErrorAction SilentlyContinue)) {
-        $acTemp2 = Join-Path $acDir2.FullName 'AC\Temp'
-        if (-not (Test-Path -LiteralPath $acTemp2)) { continue }
-        foreach ($sub in @(Get-ChildItem -LiteralPath $acTemp2 -Directory -ErrorAction SilentlyContinue)) {
-            Write-Host "--- $($sub.FullName)"
-            & icacls.exe $sub.FullName 2>&1 | ForEach-Object { Write-Host "  $_" }
-            $acl = Get-Acl -LiteralPath $sub.FullName
-            Write-Host ("  owner: {0}" -f $acl.Owner)
-        }
+    $basePy = Join-Path $work 'basevenv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $basePy) {
+        & $basePy -m pip --version 2>&1 | ForEach-Object { Write-Host "  $_" }
+        Write-Host "--- exit: $LASTEXITCODE"
     }
 
+    # ------------------------------------------------------------------
+    # 6. dllprobe: LoadLibraryExW matrix, written + built in-guest.
+    #    probe = DONT_RESOLVE_DLL_REFERENCES (image maps? file readable
+    #    by the AC?), full = normal load (dependency graph resolves,
+    #    every DllMain runs). full=FAIL gle=1114 with probe=OK pins a
+    #    DLL *initialization* failure inside the AppContainer; gle=5
+    #    would pin a file-ACL problem instead. Candidates = the import
+    #    graphs of the observed victims (_ctypes: libffi-8, ole32,
+    #    oleaut32, combase; whoami: user32, authz, wkscli, netutils,
+    #    sspicli) plus known-good controls.
+    # ------------------------------------------------------------------
+    $probeDir = Join-Path $work 'dllprobe'
+    New-Item -ItemType Directory -Path (Join-Path $probeDir 'src') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $probeDir 'Cargo.toml') -Encoding ASCII -Value @'
+[package]
+name = "dllprobe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+'@
+    Set-Content -LiteralPath (Join-Path $probeDir 'src\main.rs') -Encoding ASCII -Value @'
+use std::ffi::c_void;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStrExt;
+
+type HModule = *mut c_void;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryExW(file: *const u16, reserved: *const c_void, flags: u32) -> HModule;
+    fn FreeLibrary(module: HModule) -> i32;
+    fn GetLastError() -> u32;
+}
+
+const DONT_RESOLVE_DLL_REFERENCES: u32 = 0x1;
+const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+
+fn wide(text: &str) -> Vec<u16> {
+    OsString::from(text)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn gle_name(gle: u32) -> &'static str {
+    match gle {
+        5 => "ERROR_ACCESS_DENIED",
+        126 => "ERROR_MOD_NOT_FOUND",
+        127 => "ERROR_PROC_NOT_FOUND",
+        1114 => "ERROR_DLL_INIT_FAILED",
+        193 => "ERROR_BAD_EXE_FORMAT",
+        998 => "ERROR_NOACCESS",
+        14001 => "SXS_CANT_GEN_ACTCTX",
+        _ => "",
+    }
+}
+
+fn load_result(module: HModule) -> String {
+    if module.is_null() {
+        let gle = unsafe { GetLastError() };
+        let name = gle_name(gle);
+        if name.is_empty() {
+            format!("FAIL gle={gle}")
+        } else {
+            format!("FAIL gle={gle} {name}")
+        }
+    } else {
+        unsafe { FreeLibrary(module) };
+        "OK".to_string()
+    }
+}
+
+fn main() {
+    for arg in std::env::args().skip(1) {
+        let path = wide(&arg);
+        let probe = unsafe {
+            LoadLibraryExW(path.as_ptr(), std::ptr::null(), DONT_RESOLVE_DLL_REFERENCES)
+        };
+        let probe_res = load_result(probe);
+        let full = unsafe {
+            LoadLibraryExW(path.as_ptr(), std::ptr::null(), LOAD_WITH_ALTERED_SEARCH_PATH)
+        };
+        let full_res = load_result(full);
+        println!("{arg:<44} probe={probe_res:<28} full={full_res}");
+    }
+}
+'@
     Write-Host ""
-    Write-Host "=== icacls: TEMP, cwd, venv python, AC temp dirs ==="
-    foreach ($target in @(
-        $env:TEMP, $work,
-        (Join-Path $work '.dbgvenv'), (Join-Path $work '.dbgvenv\Scripts'),
-        $venvPy)) {
-        if ($target -and (Test-Path -LiteralPath $target)) {
-            Write-Host "--- $target"
-            & icacls.exe $target 2>&1 | ForEach-Object { Write-Host "  $_" }
-        }
+    Write-Host "=== dllprobe: cargo build (in-guest, unsandboxed) ==="
+    & cargo build --release --manifest-path (Join-Path $probeDir 'Cargo.toml') 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
+    $dllprobeExe = Join-Path $probeDir 'target\release\dllprobe.exe'
+    if (Test-Path -LiteralPath $dllprobeExe) {
+        $pyExe = (Get-Command python).Source
+        $pyDir = Split-Path -Parent $pyExe
+        $pyDlls = Join-Path $pyDir 'DLLs'
+        $pyMainDll = (Get-ChildItem -LiteralPath $pyDir -Filter 'python3*.dll' |
+            Select-Object -First 1).FullName
+        $sys = Join-Path $env:SystemRoot 'System32'
+        $candidates = @(
+            (Join-Path $pyDlls 'libffi-8.dll'),
+            $pyMainDll,
+            (Join-Path $pyDir 'vcruntime140.dll'),
+            (Join-Path $sys 'ole32.dll'),
+            (Join-Path $sys 'oleaut32.dll'),
+            (Join-Path $sys 'combase.dll'),
+            (Join-Path $sys 'user32.dll'),
+            (Join-Path $sys 'gdi32.dll'),
+            (Join-Path $sys 'rpcrt4.dll'),
+            (Join-Path $sys 'sechost.dll'),
+            (Join-Path $sys 'shell32.dll'),
+            (Join-Path $sys 'shlwapi.dll'),
+            (Join-Path $sys 'imm32.dll'),
+            (Join-Path $sys 'authz.dll'),
+            (Join-Path $sys 'wkscli.dll'),
+            (Join-Path $sys 'netutils.dll'),
+            (Join-Path $sys 'sspicli.dll'),
+            (Join-Path $sys 'version.dll'),
+            (Join-Path $sys 'msvcrt.dll'),
+            (Join-Path $sys 'kernel32.dll'),
+            (Join-Path $sys 'ws2_32.dll'),
+            (Join-Path $sys 'advapi32.dll')
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+        Write-Host ""
+        Write-Host "=== dllprobe: unsandboxed control matrix ==="
+        & $dllprobeExe @candidates 2>&1 | ForEach-Object { Write-Host "  $_" }
+        Write-Host "--- exit: $LASTEXITCODE"
+        Run-Step 'dllprobe matrix (sandboxed, inside the AC) - THE ANSWER' (@(
+            'run','--allow-cwd','--',$dllprobeExe) + $candidates)
+    } else {
+        Write-Host '[s9dbg] dllprobe build FAILED - skipping matrix'
     }
-    $pkgsRoot = Join-Path $env:LOCALAPPDATA 'Packages'
-    foreach ($acDir in @(Get-ChildItem -LiteralPath $pkgsRoot -Directory -Filter 'sandbox.*.ac' -ErrorAction SilentlyContinue)) {
-        $acTemp = Join-Path $acDir.FullName 'AC\Temp'
-        if (Test-Path -LiteralPath $acTemp) {
-            Write-Host "--- $acTemp"
-            & icacls.exe $acTemp 2>&1 | ForEach-Object { Write-Host "  $_" }
-            foreach ($sub in @(Get-ChildItem -LiteralPath $acTemp -Directory -ErrorAction SilentlyContinue | Select-Object -First 3)) {
-                Write-Host "--- $($sub.FullName)"
-                & icacls.exe $sub.FullName 2>&1 | ForEach-Object { Write-Host "  $_" }
-            }
-        }
-    }
-    if (Test-Path -LiteralPath $venvPy) {
-        $acl = Get-Acl -LiteralPath $venvPy
-        Write-Host ("venv python.exe owner: {0}" -f $acl.Owner)
-    }
+
+    # ------------------------------------------------------------------
+    # 7. pyshim presence dump (one line per session dir)
+    # ------------------------------------------------------------------
     Write-Host ""
     Write-Host "=== pyshim dirs in battery sessions ==="
     $sandRoot = Join-Path $work '.sandbox'
@@ -610,9 +420,6 @@ if r.returncode == 0:
             $shim = Join-Path $sess.FullName 'pyshim\sitecustomize.py'
             $present = Test-Path -LiteralPath $shim
             Write-Host ("  {0}: sitecustomize.py present={1}" -f $sess.Name, $present)
-            if ($present) {
-                Get-Content -LiteralPath $shim -TotalCount 3 | ForEach-Object { Write-Host "    | $_" }
-            }
         }
     }
 
