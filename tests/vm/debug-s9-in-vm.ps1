@@ -86,7 +86,45 @@ $out = Invoke-Command -VMName $VmName -Credential $guestCred -ScriptBlock {
         (Join-Path $work '.dbgvenv\Scripts\python.exe'),
         '-m','ensurepip','-v','--upgrade','--default-pip')
 
-    # 5. Same, but unsandboxed inside the VM — the control that must pass.
+    # 5. Discriminating probes for the unsandboxed-temp anomaly (the
+    #    2026-10-11 control failed EVERY tempdir candidate, incl. cwd,
+    #    where pwsh writes had just worked):
+    #    a) system python (NOT the AC-created venv copy) tempdir check
+    #    b) raw open() for write in %TEMP% and cwd, system python
+    #    c) pwsh file write for comparison
+    #    d) tempdircheck* leftovers in %TEMP%
+    Write-Host ""
+    Write-Host "=== unsandboxed system python: gettempdir ==="
+    & python -c "import tempfile;print('gettempdir=',tempfile.gettempdir())" 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
+    Write-Host "--- exit: $LASTEXITCODE"
+    Write-Host ""
+    Write-Host "=== unsandboxed system python: raw open() in TEMP and cwd ==="
+    & python -c "import os;open(os.path.join(os.environ['TEMP'],'rawwrite.chk'),'wb').write(b'x');print('TEMP write ok');open('rawwrite-cwd.chk','wb').write(b'x');print('cwd write ok')" 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
+    Write-Host "--- exit: $LASTEXITCODE"
+    Write-Host ""
+    Write-Host "=== unsandboxed pwsh: file write in TEMP and cwd ==="
+    try {
+        Set-Content -LiteralPath (Join-Path $env:TEMP 'pshwrite.chk') -Value 'x' -ErrorAction Stop
+        Write-Host "  pwsh TEMP write ok"
+        Set-Content -LiteralPath (Join-Path $work 'pshwrite-cwd.chk') -Value 'x' -ErrorAction Stop
+        Write-Host "  pwsh cwd write ok"
+    } catch { Write-Host "  pwsh write FAILED: $($_.Exception.Message)" }
+    Write-Host ""
+    Write-Host "=== tempdircheck* leftovers in TEMP ==="
+    $left = @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'tempdircheck*' -Force -ErrorAction SilentlyContinue)
+    Write-Host ("  count: {0}" -f $left.Count)
+    foreach ($f in ($left | Select-Object -First 5)) { Write-Host "    $($f.Name)" }
+
+    # 6. Same as 5a but with the venv python (the one whose control failed).
+    Write-Host ""
+    Write-Host "=== unsandboxed venv python: gettempdir ==="
+    & (Join-Path $work '.dbgvenv\Scripts\python.exe') -c "import tempfile;print('gettempdir=',tempfile.gettempdir())" 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
+    Write-Host "--- exit: $LASTEXITCODE"
+
+    # 7. The original control: venv python -m ensurepip -v, unsandboxed.
     Write-Host ""
     Write-Host "=== venv python -m ensurepip -v (unsandboxed control) ==="
     & (Join-Path $work '.dbgvenv\Scripts\python.exe') -m ensurepip -v --upgrade --default-pip 2>&1 |
