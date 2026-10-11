@@ -334,6 +334,15 @@ if r.returncode == 0:
     & python --version 2>&1 | ForEach-Object { Write-Host "[s9dbg] python: $_" }
 
     # ------------------------------------------------------------------
+    # 0b. Token dump from inside the AC: whoami lists the process token's
+    #     SIDs with their attributes (deny-only / use-for-allow-only /
+    #     enabled) — settles which SIDs can satisfy allow ACEs, and shows
+    #     the integrity level of AppContainer processes.
+    # ------------------------------------------------------------------
+    Run-Step 'sandboxed whoami /user /groups (AC token dump)' @(
+        'run','--allow-cwd','--','whoami','/user','/groups')
+
+    # ------------------------------------------------------------------
     # 1. Sandboxed system python: env, tempdir-check replica, per-op probes
     # ------------------------------------------------------------------
     Run-Step 'sandboxed system python: env' @('run','--allow-cwd','--','python','probe_env.py')
