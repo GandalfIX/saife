@@ -30,6 +30,15 @@
                        venv swallows the ensurepip subprocess's stderr,
                        so the direct run is the only way to see the
                        real error
+      - probe_mkmode  the S-9 root cause hunt: tempfile.mkdtemp calls
+                       os.mkdir(path, 0o600) — an EXPLICIT mode — and
+                       that dir denies its own creator (even scandir),
+                       while default-mode mkdir dirs work fine. This
+                       probe creates dirs at 0o777/0o755/0o700/0o600 in
+                       cwd AND the granted AC temp, tries write+listdir
+                       inside each, plus the exact mkdtemp+write op, so
+                       the icacls dump afterwards shows precisely which
+                       ACEs/mask/protection explicit modes produce.
 
     Each probe runs in four contexts:
       1. sandboxed system python   2. unsandboxed system python
@@ -183,6 +192,144 @@ for d in [os.getcwd(), os.environ.get('TEMP', '')]:
     t('subprocess spawn', _sp)
 '@
 
+    Set-Content -LiteralPath (Join-Path $work 'probe_mkmode.py') -Encoding ASCII -Value @'
+import os, tempfile
+def t(label, fn):
+    try:
+        r = fn()
+        print('  %-34s OK %s' % (label, r if r is not None else ''))
+    except OSError as e:
+        print('  %-34s FAIL winerror=%s errno=%s %s' % (label, e.winerror, e.errno, e.strerror))
+print('TEMP:', os.environ.get('TEMP'))
+print('cwd :', os.getcwd())
+# Exact mkdtemp+write op that ensurepip's _bootstrap does.
+def _mk():
+    td = tempfile.mkdtemp()
+    open(os.path.join(td, 'whltest'), 'wb').write(b'x')
+    return td
+t('mkdtemp + write inside', _mk)
+for base, blabel in ((os.getcwd(), 'cwd'), (os.environ.get('TEMP', ''), 'temp')):
+    if not base:
+        continue
+    dn = os.path.join(base, 'm_%s_default' % blabel)
+    os.mkdir(dn)
+    def _w(d=dn):
+        open(os.path.join(d, 'f'), 'wb').write(b'x')
+    t('%s default mkdir: write' % blabel, _w)
+    for m in (0o777, 0o755, 0o700, 0o600):
+        d = os.path.join(base, 'm_%s_%o' % (blabel, m))
+        def _c(m=m, d=d):
+            os.mkdir(d, m)
+        t('%s mkdir 0o%o' % (blabel, m), _c)
+        def _wm(d=d):
+            open(os.path.join(d, 'f'), 'wb').write(b'x')
+        t('%s mkdir 0o%o: write' % (blabel, m), _wm)
+        def _lm(d=d):
+            return os.listdir(d)
+        t('%s mkdir 0o%o: listdir' % (blabel, m), _lm)
+'@
+
+    Set-Content -LiteralPath (Join-Path $work 'ac_bootstrap.py') -Encoding ASCII -Value @'
+import ctypes, os, sys, subprocess, tempfile
+from ctypes import wintypes
+
+advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+TOKEN_QUERY = 0x0008
+TOKEN_ADJUST_DEFAULT = 0x0100
+TokenOwner = 4
+TokenAppContainerSid = 25
+
+advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+advapi32.GetTokenInformation.restype = wintypes.BOOL
+advapi32.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+advapi32.SetTokenInformation.restype = wintypes.BOOL
+advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+kernel32.LocalFree.restype = ctypes.c_void_p
+
+def t(label, fn):
+    try:
+        r = fn()
+        print('[bootstrap] %-36s OK %s' % (label, r if r is not None else ''))
+    except OSError as e:
+        print('[bootstrap] %-36s FAIL winerror=%s %s' % (label, e.winerror, e.strerror))
+
+hTok = wintypes.HANDLE()
+if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, ctypes.byref(hTok)):
+    print('[bootstrap] OpenProcessToken failed err=', ctypes.get_last_error())
+    sys.exit(1)
+
+def tok_info(cls):
+    need = wintypes.DWORD(0)
+    advapi32.GetTokenInformation(hTok, cls, None, 0, ctypes.byref(need))
+    buf = ctypes.create_string_buffer(max(8, need.value))
+    if not advapi32.GetTokenInformation(hTok, cls, buf, need, ctypes.byref(need)):
+        return None
+    return buf
+
+def sid_str(buf):
+    if buf is None:
+        return '<unavailable>'
+    psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+    s = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(psid), ctypes.byref(s)):
+        return '?'
+    v = s.value
+    kernel32.LocalFree(ctypes.cast(s, ctypes.c_void_p))
+    return v
+
+# --- control: 0o700 mkdir is expected to FAIL for this process now ---
+t('PRE  mkdir 0o700', lambda: os.mkdir('bt700pre', 0o700))
+t('PRE  write inside bt700pre', lambda: open('bt700pre/f', 'wb').write(b'x'))
+
+ac_buf = tok_info(TokenAppContainerSid)
+ac_sid = sid_str(ac_buf)
+print('[bootstrap] AC SID                :', ac_sid)
+print('[bootstrap] token owner (before) :', sid_str(tok_info(TokenOwner)))
+
+if ac_buf is None:
+    print('[bootstrap] no AppContainer SID - not running inside an AppContainer?')
+    sys.exit(1)
+
+ac_psid = ctypes.cast(ac_buf, ctypes.POINTER(ctypes.c_void_p))[0]
+TOKEN_OWNER = ctypes.c_void_p * 1
+owner_struct = TOKEN_OWNER(ctypes.c_void_p(ac_psid))
+rc = advapi32.SetTokenInformation(hTok, TokenOwner, ctypes.byref(owner_struct), ctypes.sizeof(TOKEN_OWNER))
+err = ctypes.get_last_error() if not rc else 0
+print('[bootstrap] SetTokenInformation(TokenOwner=AC SID): rc=%s err=%s' % (rc, err))
+print('[bootstrap] token owner (after)  :', sid_str(tok_info(TokenOwner)))
+
+# --- retest: same process, token owner now the AC SID ---
+t('POST mkdir 0o700', lambda: os.mkdir('bt700', 0o700))
+t('POST write inside bt700', lambda: open('bt700/f', 'wb').write(b'x'))
+t('POST listdir bt700', lambda: os.listdir('bt700'))
+
+def _mk():
+    td = tempfile.mkdtemp()
+    open(os.path.join(td, 'w'), 'wb').write(b'x')
+    return td
+t('POST mkdtemp + write (ensurepip op)', _mk)
+
+# --- child test: does the owner survive CreateProcess? (the product fix
+#     depends on the spawned target inheriting the owner) ---
+r = subprocess.run([sys.executable, '-m', 'venv', '.btvenv'], capture_output=True, text=True)
+print('[bootstrap] child `python -m venv .btvenv` rc=', r.returncode)
+if r.stdout.strip():
+    print('[bootstrap]   stdout:', r.stdout.strip()[-400:])
+if r.stderr.strip():
+    print('[bootstrap]   stderr:', r.stderr.strip()[-800:])
+if r.returncode == 0:
+    vp = os.path.join('.btvenv', 'Scripts', 'python.exe')
+    rp = subprocess.run([vp, '-m', 'pip', '--version'], capture_output=True, text=True)
+    print('[bootstrap] child pip --version rc=', rp.returncode, rp.stdout.strip())
+'@
+
     Write-Host "[s9dbg] workdir: $work"
     & python --version 2>&1 | ForEach-Object { Write-Host "[s9dbg] python: $_" }
 
@@ -192,6 +339,30 @@ for d in [os.getcwd(), os.environ.get('TEMP', '')]:
     Run-Step 'sandboxed system python: env' @('run','--allow-cwd','--','python','probe_env.py')
     Run-Step 'sandboxed system python: tempdir check replica' @('run','--allow-cwd','--','python','probe_tempdir.py')
     Run-Step 'sandboxed system python: ops in cwd + AC temp' @('run','--allow-cwd','--','python','probe_ops.py')
+
+    # ------------------------------------------------------------------
+    # 1b. mkdir-mode matrix: the mkdtemp mechanism. tempfile.mkdtemp
+    #     calls os.mkdir(path, 0o600); that dir denied its own creator
+    #     in the ensurepip run while default-mode mkdir dirs work.
+    #     Dump every created dir with icacls afterwards (step 5) to see
+    #     which ACEs/mask/protection an explicit mode produces.
+    # ------------------------------------------------------------------
+    Run-Step 'sandboxed system python: mkdir-mode matrix + mkdtemp' @(
+        'run','--allow-cwd','--','python','probe_mkmode.py')
+
+    # ------------------------------------------------------------------
+    # 1c. THE bootstrap experiment — candidate fix, end to end, inside
+    #     the AC: python (ctypes) sets its own TokenOwner to its
+    #     AppContainer SID, retests the 0o700/mkdtemp ops, then spawns
+    #     `python -m venv` as a child (S-9 chain). CPython's 0o700 DACL
+    #     is D:P(SY)(BA)(OW) — the OW (owner-rights) ACE is the only
+    #     entry that could authorize the sandboxed process, and it only
+    #     matches when the object owner == the process token owner ==
+    #     the AC SID (AC tokens have user/group SIDs use-for-allow-only,
+    #     but the AC SID itself can satisfy allow ACEs).
+    # ------------------------------------------------------------------
+    Run-Step 'bootstrap: AC python sets TokenOwner=AC SID, retests, child venv' @(
+        'run','--allow-cwd','--','python','ac_bootstrap.py')
 
     # ------------------------------------------------------------------
     # 2. Unsandboxed system python (baseline that works)
@@ -250,6 +421,34 @@ for d in [os.getcwd(), os.environ.get('TEMP', '')]:
     # ------------------------------------------------------------------
     # 5. ACL / owner dumps of everything involved
     # ------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "=== icacls: mode-created probe dirs (mkdir-mode matrix) ==="
+    foreach ($md in @(Get-ChildItem -LiteralPath $work -Directory -Filter 'm_*' -ErrorAction SilentlyContinue)) {
+        Write-Host "--- $($md.FullName)"
+        & icacls.exe $md.FullName 2>&1 | ForEach-Object { Write-Host "  $_" }
+        $acl = Get-Acl -LiteralPath $md.FullName
+        Write-Host ("  owner: {0}" -f $acl.Owner)
+    }
+    foreach ($bt in @((Join-Path $work 'bt700pre'), (Join-Path $work 'bt700'), (Join-Path $work '.btvenv'))) {
+        if (Test-Path -LiteralPath $bt) {
+            Write-Host "--- $bt"
+            & icacls.exe $bt 2>&1 | ForEach-Object { Write-Host "  $_" }
+            $acl = Get-Acl -LiteralPath $bt
+            Write-Host ("  owner: {0}" -f $acl.Owner)
+        }
+    }
+    $pkgsRoot2 = Join-Path $env:LOCALAPPDATA 'Packages'
+    foreach ($acDir2 in @(Get-ChildItem -LiteralPath $pkgsRoot2 -Directory -Filter 'sandbox.*.ac' -ErrorAction SilentlyContinue)) {
+        $acTemp2 = Join-Path $acDir2.FullName 'AC\Temp'
+        if (-not (Test-Path -LiteralPath $acTemp2)) { continue }
+        foreach ($sub in @(Get-ChildItem -LiteralPath $acTemp2 -Directory -ErrorAction SilentlyContinue)) {
+            Write-Host "--- $($sub.FullName)"
+            & icacls.exe $sub.FullName 2>&1 | ForEach-Object { Write-Host "  $_" }
+            $acl = Get-Acl -LiteralPath $sub.FullName
+            Write-Host ("  owner: {0}" -f $acl.Owner)
+        }
+    }
+
     Write-Host ""
     Write-Host "=== icacls: TEMP, cwd, venv python, AC temp dirs ==="
     foreach ($target in @(
