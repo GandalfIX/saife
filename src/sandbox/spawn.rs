@@ -76,6 +76,121 @@ fn set_child_token_owner_to_user(child: HANDLE) -> Result<()> {
     }
 }
 
+/// Decode TOKEN_GROUPS attribute flags into a short readable form.
+fn group_attr_desc(attrs: u32) -> String {
+    const MANDATORY: u32 = 0x1;
+    const ENABLED_BY_DEFAULT: u32 = 0x2;
+    const ENABLED: u32 = 0x4;
+    const OWNER: u32 = 0x8;
+    const USE_FOR_DENY_ONLY: u32 = 0x10;
+    const INTEGRITY: u32 = 0x20;
+    const INTEGRITY_ENABLED: u32 = 0x40;
+    let mut parts: Vec<&str> = Vec::new();
+    if attrs & MANDATORY != 0 {
+        parts.push("MANDATORY");
+    }
+    if attrs & ENABLED_BY_DEFAULT != 0 {
+        parts.push("ENABLED_BY_DEFAULT");
+    }
+    if attrs & ENABLED != 0 {
+        parts.push("ENABLED");
+    }
+    if attrs & OWNER != 0 {
+        parts.push("OWNER");
+    }
+    if attrs & USE_FOR_DENY_ONLY != 0 {
+        parts.push("USE_FOR_DENY_ONLY");
+    }
+    if attrs & INTEGRITY != 0 {
+        parts.push("INTEGRITY");
+    }
+    if attrs & INTEGRITY_ENABLED != 0 {
+        parts.push("INTEGRITY_ENABLED");
+    }
+    let named = parts.join("|");
+    format!("{attrs:#010x} ({named})")
+}
+
+/// Dump the child token's identity SIDs to stderr, for SANDBOX_DIAG runs.
+///
+/// whoami.exe, powershell.exe and _ctypes.pyd all die with 0xC0000142
+/// inside the AppContainer, so the supervisor — which holds the suspended
+/// child right after CreateProcessW — is the only vantage point for the
+/// token's contents. The group attribute flags answer which SIDs can
+/// satisfy allow ACEs (ENABLED vs USE_FOR_DENY_ONLY), and the integrity
+/// SID (S-1-16-*) rides in the group list.
+fn dump_child_token_diag(stage: &str, child: HANDLE) {
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
+        TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenGroups,
+        TokenOwner, TokenUser,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+    use crate::sandbox::appcontainer::sid_to_string;
+
+    let sid_str = |psid: windows::Win32::Security::PSID| -> String {
+        if psid.0.is_null() {
+            "(none)".to_string()
+        } else {
+            sid_to_string(psid).unwrap_or_else(|_| "(unrenderable)".to_string())
+        }
+    };
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(child, TOKEN_QUERY, &mut token) }.is_err() {
+        eprintln!("[tokdiag:{stage}] OpenProcessToken failed");
+        return;
+    }
+    unsafe {
+        let query = |class: TOKEN_INFORMATION_CLASS| -> windows::core::Result<Vec<u8>> {
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, class, None, 0, &mut needed);
+            if needed == 0 {
+                return Err(HRESULT::from_win32(GetLastError().0).into());
+            }
+            let mut buf = vec![0u8; needed as usize];
+            GetTokenInformation(
+                token,
+                class,
+                Some(buf.as_mut_ptr() as *mut _),
+                needed,
+                &mut needed,
+            )?;
+            Ok(buf)
+        };
+        if let Ok(buf) = query(TokenUser) {
+            let u = &*(buf.as_ptr() as *const TOKEN_USER);
+            eprintln!(
+                "[tokdiag:{stage}] user: {} attrs={}",
+                sid_str(u.User.Sid),
+                group_attr_desc(u.User.Attributes)
+            );
+        }
+        if let Ok(buf) = query(TokenOwner) {
+            let o = &*(buf.as_ptr() as *const TOKEN_OWNER);
+            eprintln!("[tokdiag:{stage}] owner: {}", sid_str(o.Owner));
+        }
+        if let Ok(buf) = query(TokenAppContainerSid) {
+            let a = &*(buf.as_ptr() as *const TOKEN_APPCONTAINER_INFORMATION);
+            eprintln!("[tokdiag:{stage}] appcontainer: {}", sid_str(a.TokenAppContainer));
+        }
+        for (class, label) in [(TokenGroups, "group"), (TokenCapabilities, "capability")] {
+            if let Ok(buf) = query(class) {
+                let g = &*(buf.as_ptr() as *const TOKEN_GROUPS);
+                let base = g.Groups.as_ptr();
+                for i in 0..g.GroupCount as usize {
+                    let sa = &*base.add(i);
+                    eprintln!(
+                        "[tokdiag:{stage}] {label}: {} attrs={}",
+                        sid_str(sa.Sid),
+                        group_attr_desc(sa.Attributes)
+                    );
+                }
+            }
+        }
+        let _ = CloseHandle(token);
+    }
+}
+
 /// Spawn `cmdline` under the AppContainer SID + Job Object.
 ///
 /// stdout/stderr/stdin are inherited from the supervisor so output flows
@@ -168,6 +283,9 @@ pub fn spawn(
             && std::env::var_os("SANDBOX_DIAG").is_some()
         {
             eprintln!("[spawn] token-owner fixup failed (continuing): {e}");
+        }
+        if std::env::var_os("SANDBOX_DIAG").is_some() {
+            dump_child_token_diag("post-fixup", pi.hProcess);
         }
         let _ = ResumeThread(pi.hThread);
 

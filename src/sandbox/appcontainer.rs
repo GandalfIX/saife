@@ -518,7 +518,7 @@ fn snapshot_prior_aces(dacl_ptr: *mut ACL, ac_sid: &PSID) -> Vec<PriorAce> {
 }
 
 /// SDDL-style string form of `sid` (ConvertSidToStringSidW + LocalFree).
-fn sid_to_string(sid: PSID) -> Result<String> {
+pub(crate) fn sid_to_string(sid: PSID) -> Result<String> {
     unsafe {
         let mut buf = PWSTR::null();
         ConvertSidToStringSidW(sid, &mut buf)?;
