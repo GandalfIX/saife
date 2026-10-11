@@ -20,9 +20,16 @@
       - probe_tempdir  replica of tempfile's candidate loop with per-
                        candidate winerrors (no guessing which candidate
                        failed or why)
-      - probe_ops      per-op probes in cwd + %TEMP% (or AC temp):
-                       plain open, open+unlink, O_TEMPORARY open,
-                       mkdtemp+write-inside+rmtree, mkdir+listdir
+      - probe_ops      per-op probes in cwd + %TEMP% (or AC temp), each
+                       op reported individually: listdir, plain open,
+                       open+unlink, O_TEMPORARY open, mkdir, write-
+                       inside, listdir-subdir, chmod-created-file,
+                       rmtree, mkdir+rmdir, subprocess spawn
+      - venv repro    exact S-9 flow (venv WITH pip) + a direct
+                       `ensurepip -v` on the resulting venv python —
+                       venv swallows the ensurepip subprocess's stderr,
+                       so the direct run is the only way to see the
+                       real error
 
     Each probe runs in four contexts:
       1. sandboxed system python   2. unsandboxed system python
@@ -130,7 +137,7 @@ for label, d in candidates:
 '@
 
     Set-Content -LiteralPath (Join-Path $work 'probe_ops.py') -Encoding ASCII -Value @'
-import os, sys, shutil
+import os, sys, shutil, subprocess
 def t(label, fn):
     try:
         r = fn()
@@ -152,12 +159,28 @@ for d in [os.getcwd(), os.environ.get('TEMP', '')]:
         os.close(fd)
     t('O_TEMPORARY open', _ot)
     def _mk():
-        sd = os.path.join(d, 'pd1')
-        os.mkdir(sd)
-        open(os.path.join(sd, 'f'), 'wb').write(b'x')
-        os.listdir(sd)
-        shutil.rmtree(sd)
-    t('mkdir + write-inside + rmtree', _mk)
+        os.mkdir(p('pd1')); return 'isdir=%s' % os.path.isdir(p('pd1'))
+    t('mkdir', _mk)
+    def _wi():
+        open(p('pd1/f'), 'wb').write(b'x'); return 'size=%s' % os.path.getsize(p('pd1/f'))
+    t('write-inside', _wi)
+    def _ls():
+        return os.listdir(p('pd1'))
+    t('listdir subdir', _ls)
+    def _ch():
+        os.chmod(p('pd1/f'), 0o700)
+    t('chmod created file', _ch)
+    def _rm():
+        shutil.rmtree(p('pd1'))
+    t('rmtree subdir', _rm)
+    def _rmdir():
+        os.mkdir(p('pd2')); os.rmdir(p('pd2'))
+    t('mkdir + rmdir', _rmdir)
+    def _sp():
+        r = subprocess.run([sys.executable, '-c', 'print("subproc-ok")'],
+                           capture_output=True, text=True)
+        return 'rc=%s out=%r err=%r' % (r.returncode, r.stdout.strip(), r.stderr.strip())
+    t('subprocess spawn', _sp)
 '@
 
     Write-Host "[s9dbg] workdir: $work"
@@ -191,6 +214,25 @@ for d in [os.getcwd(), os.environ.get('TEMP', '')]:
         Run-Py 'unsandboxed venv python: ops in cwd + TEMP' $venvPy 'probe_ops.py'
     } else {
         Write-Host '[s9dbg] venv python missing, skipping venv probes'
+    }
+
+    # ------------------------------------------------------------------
+    # 3b. Exact S-9 reproduction: venv WITH pip inside the sandbox.
+    #     The harness sees only venv's "Error: Command ... exit status 1"
+    #     because venv suppresses the ensurepip subprocess's stderr —
+    #     so immediately afterwards we run ensurepip DIRECTLY (-v) on
+    #     the same venv python to capture the real error.
+    # ------------------------------------------------------------------
+    Run-Step 'venv WITH pip (exact S-9 reproduction)' @(
+        'run','--allow-cwd','--','python','-m','venv','.dbgvenv2')
+    $venv2Py = Join-Path $work '.dbgvenv2\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venv2Py) {
+        Run-Step 'direct ensurepip -v on that venv (output venv swallows)' @(
+            'run','--allow-cwd','--',$venv2Py,'-m','ensurepip','--upgrade','--default-pip','-v')
+        Run-Step 'pip --version in venv (installed at all?)' @(
+            'run','--allow-cwd','--',$venv2Py,'-m','pip','--version')
+    } else {
+        Write-Host '[s9dbg] pip-venv python missing, skipping ensurepip probes'
     }
 
     # ------------------------------------------------------------------
