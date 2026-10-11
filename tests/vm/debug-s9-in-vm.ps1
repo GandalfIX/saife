@@ -1,7 +1,8 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Round-4 S-9 probe battery: pin the AppContainer 0xC0000142 cluster.
+    Round-5 S-9 probe battery: the window-station/desktop experiment on
+    top of the round-4 DLL-init matrix.
 
 .DESCRIPTION
     State of the hunt after rounds 1-3 (all findings VM-verified):
@@ -49,6 +50,28 @@
 
     VM-only by design: everything it mutates lives in the disposable
     test VM (VM deletion is the rollback).
+
+    Round-5 addition (the state after the round-4 run):
+
+      The in-AC dllprobe matrix split cleanly: user32, gdi32, ole32,
+      shell32 and imm32 all fail normal load with gle=1114 while
+      DONT_RESOLVE loads succeed - file access is fine, DLL *init*
+      fails. gdi32 imports neither user32 nor gdi32 itself; its only
+      real dependency is win32u.dll (the win32k syscall layer), so the
+      failure sits at the win32k connection, i.e. the window-station
+      /desktop access check that raw AppContainer tokens fail while
+      the interactive user passes (ole32 fails transitively via its
+      static user32/gdi32 imports; oleaut32/combase survive because
+      modern builds dropped their user32 dependency).
+
+      This round dumps the supervisor session's window-station and
+      desktop security descriptors, grants ALL APPLICATION PACKAGES
+      (S-1-15-2-1) generic-all on both, re-runs the whoami flip test,
+      the dllprobe matrix, the ctypes import and the FULL S-9 venv
+      flow with the grant in place, then restores the original
+      security descriptors. If the grant flips everything, S-9 is
+      solved and the product fix is a per-spawn grant of the session
+      AC SID on winsta+desktop inside spawn.rs.
 
 .PARAMETER VmName
     Name of the kept VM (e.g. sbx-test-20261011-234136-151). The VM must
@@ -407,6 +430,137 @@ fn main() {
             'run','--allow-cwd','--',$dllprobeExe) + $candidates)
     } else {
         Write-Host '[s9dbg] dllprobe build FAILED - skipping matrix'
+    }
+
+    # ------------------------------------------------------------------
+    # 6b. Window-station/desktop experiment. Baseline dump, AAP grant,
+    #     flip tests (whoami / matrix / ctypes / full S-9 venv), then
+    #     restore the original security descriptors.
+    # ------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "=== winsta/desktop: dump + AAP grant experiment ==="
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class WinSta {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetThreadDesktop(uint dwThreadId);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, IntPtr pvInfo, uint nLength, out uint lpnLengthNeeded);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetUserObjectSecurity(IntPtr hObj, ref uint pSecurityInformation, IntPtr pSecurityDescriptor, uint nLength, out uint lpnLengthNeeded);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetUserObjectSecurity(IntPtr hObj, ref uint SecurityInformation, IntPtr pSecurityDescriptor);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr SecurityDescriptor, uint RequestedRevision, uint SecurityInformation, out IntPtr SecurityDescriptorString, out uint SecurityDescriptorStringLength);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string StringSecurityDescriptor, uint StringSecurityDescriptorRevision, out IntPtr SecurityDescriptor, out uint SecurityDescriptorSize);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr hMem);
+
+    public const uint DACL_SI = 0x00000004;
+    public const int UOI_NAME = 2;
+
+    public static string GetName(IntPtr hObj) {
+        uint needed;
+        GetUserObjectInformation(hObj, UOI_NAME, IntPtr.Zero, 0, out needed);
+        if (needed == 0) return "<none>";
+        IntPtr buf = Marshal.AllocHGlobal((int)needed);
+        string name = null;
+        if (GetUserObjectInformation(hObj, UOI_NAME, buf, needed, out needed)) {
+            name = Marshal.PtrToStringUni(buf);
+        }
+        Marshal.FreeHGlobal(buf);
+        return name;
+    }
+
+    public static string GetSddl(IntPtr hObj) {
+        uint si = DACL_SI;
+        uint needed;
+        GetUserObjectSecurity(hObj, ref si, IntPtr.Zero, 0, out needed);
+        if (needed == 0) return "ERR zero length";
+        IntPtr sd = Marshal.AllocHGlobal((int)needed);
+        string sddl = null;
+        try {
+            if (!GetUserObjectSecurity(hObj, ref si, sd, needed, out needed)) {
+                return "ERR " + Marshal.GetLastWin32Error();
+            }
+            IntPtr strPtr;
+            uint strLen;
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, si, out strPtr, out strLen)) {
+                sddl = Marshal.PtrToStringUni(strPtr);
+                LocalFree(strPtr);
+            } else {
+                sddl = "ERR-conv " + Marshal.GetLastWin32Error();
+            }
+        } finally {
+            Marshal.FreeHGlobal(sd);
+        }
+        return sddl;
+    }
+
+    public static string Grant(IntPtr hObj, string ace) {
+        string s = GetSddl(hObj);
+        if (s == null || s.StartsWith("ERR")) return "dump failed: " + s;
+        int di = s.IndexOf("D:");
+        if (di < 0) return "no DACL section in SDDL: " + s;
+        int paren = s.IndexOf('(', di);
+        string mod = paren < 0 ? s + "D:" + ace : s.Insert(paren, ace);
+        return SetSddlRaw(hObj, mod);
+    }
+
+    public static string SetSddlRaw(IntPtr hObj, string sddl) {
+        IntPtr sd;
+        uint size;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out size)) {
+            return "convert failed: " + Marshal.GetLastWin32Error();
+        }
+        uint si = DACL_SI;
+        bool ok = SetUserObjectSecurity(hObj, ref si, sd);
+        int err = Marshal.GetLastWin32Error();
+        LocalFree(sd);
+        return ok ? "OK" : ("SetUserObjectSecurity failed gle=" + err);
+    }
+}
+'@
+    $wsHandle = [WinSta]::GetProcessWindowStation()
+    $dtHandle = [WinSta]::GetThreadDesktop([WinSta]::GetCurrentThreadId())
+    Write-Host ("  winsta : handle={0} name={1}" -f $wsHandle, [WinSta]::GetName($wsHandle))
+    Write-Host ("  desktop: handle={0} name={1}" -f $dtHandle, [WinSta]::GetName($dtHandle))
+    $wsSddl0 = [WinSta]::GetSddl($wsHandle)
+    $dtSddl0 = [WinSta]::GetSddl($dtHandle)
+    Write-Host "  winsta sddl (before): $wsSddl0"
+    Write-Host "  desktop sddl (before): $dtSddl0"
+    $aapAce = '(A;;GA;;;S-1-15-2-1)'
+    Write-Host ("  grant winsta  AAP GA: " + [WinSta]::Grant($wsHandle, $aapAce))
+    Write-Host ("  grant desktop AAP GA: " + [WinSta]::Grant($dtHandle, $aapAce))
+
+    Run-Step 'whoami flip test (WITH winsta/desktop grant)' @(
+        'run','--allow-cwd','--','whoami','/user','/groups')
+    if ($dllprobeExe -and (Test-Path -LiteralPath $dllprobeExe)) {
+        Run-Step 'dllprobe matrix (WITH winsta/desktop grant)' (@(
+            'run','--allow-cwd','--',$dllprobeExe) + $candidates)
+    }
+    Run-Step 'ctypes import (WITH winsta/desktop grant)' @(
+        'run','--allow-cwd','--','python','probe_ctypes.py')
+    Run-Step 'venv WITH pip (full S-9 flow, WITH winsta/desktop grant)' @(
+        'run','--allow-cwd','--','python','-m','venv','.dbgvenv4')
+    $venv4Py = Join-Path $work '.dbgvenv4\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venv4Py) {
+        Run-Step 'pip --version in venv4 (S-9 complete?)' @(
+            'run','--allow-cwd','--',$venv4Py,'-m','pip','--version')
+    }
+    Write-Host "=== winsta/desktop: restoring original security descriptors ==="
+    if ($wsSddl0 -and -not $wsSddl0.StartsWith('ERR')) {
+        Write-Host ("  restore winsta : " + [WinSta]::SetSddlRaw($wsHandle, $wsSddl0))
+    }
+    if ($dtSddl0 -and -not $dtSddl0.StartsWith('ERR')) {
+        Write-Host ("  restore desktop: " + [WinSta]::SetSddlRaw($dtHandle, $dtSddl0))
     }
 
     # ------------------------------------------------------------------
