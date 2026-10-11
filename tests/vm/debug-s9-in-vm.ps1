@@ -104,6 +104,21 @@ print('TMP      :', os.environ.get('TMP'))
 print('cwd      :', os.getcwd())
 '@
 
+    Set-Content -LiteralPath (Join-Path $work 'probe_shim.py') -Encoding ASCII -Value @'
+import os, sys, tempfile
+print('python     :', sys.version.split()[0])
+print('PYTHONPATH :', os.environ.get('PYTHONPATH'))
+print('sitecustomize imported:', 'sitecustomize' in sys.modules)
+print('os.mkdir patched     :', getattr(os.mkdir, '_sandbox_pyshim', None) is not None)
+try:
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, 'f'), 'w') as fp:
+        fp.write('x')
+    print('mkdtemp + write       : OK', os.path.basename(d))
+except Exception as e:
+    print('mkdtemp + write       : FAIL', repr(e))
+'@
+
     Set-Content -LiteralPath (Join-Path $work 'probe_tempdir.py') -Encoding ASCII -Value @'
 import os, tempfile
 # Exact replica of tempfile._get_default_tempdir's loop (3.12), but every
@@ -348,6 +363,7 @@ if r.returncode == 0:
     # 1. Sandboxed system python: env, tempdir-check replica, per-op probes
     # ------------------------------------------------------------------
     Run-Step 'sandboxed system python: env' @('run','--allow-cwd','--','python','probe_env.py')
+    Run-Step 'sandboxed system python: shim state + mkdtemp' @('run','--allow-cwd','--','python','probe_shim.py')
     Run-Step 'sandboxed system python: tempdir check replica' @('run','--allow-cwd','--','python','probe_tempdir.py')
     Run-Step 'sandboxed system python: ops in cwd + AC temp' @('run','--allow-cwd','--','python','probe_ops.py')
 
@@ -389,6 +405,8 @@ if r.returncode == 0:
         'run','--allow-cwd','--','python','-m','venv','--without-pip','.dbgvenv')
     $venvPy = Join-Path $work '.dbgvenv\Scripts\python.exe'
     if (Test-Path -LiteralPath $venvPy) {
+        Run-Step 'sandboxed venv python: shim state + mkdtemp' @(
+            'run','--allow-cwd','--',$venvPy,'probe_shim.py')
         Run-Step 'sandboxed venv python: tempdir check replica' @(
             'run','--allow-cwd','--',$venvPy,'probe_tempdir.py')
         Run-Py 'unsandboxed venv python: env' $venvPy 'probe_env.py'
@@ -487,6 +505,20 @@ if r.returncode == 0:
         $acl = Get-Acl -LiteralPath $venvPy
         Write-Host ("venv python.exe owner: {0}" -f $acl.Owner)
     }
+    Write-Host ""
+    Write-Host "=== pyshim dirs in battery sessions ==="
+    $sandRoot = Join-Path $work '.sandbox'
+    if (Test-Path -LiteralPath $sandRoot) {
+        foreach ($sess in @(Get-ChildItem -LiteralPath $sandRoot -Directory -ErrorAction SilentlyContinue)) {
+            $shim = Join-Path $sess.FullName 'pyshim\sitecustomize.py'
+            $present = Test-Path -LiteralPath $shim
+            Write-Host ("  {0}: sitecustomize.py present={1}" -f $sess.Name, $present)
+            if ($present) {
+                Get-Content -LiteralPath $shim -TotalCount 3 | ForEach-Object { Write-Host "    | $_" }
+            }
+        }
+    }
+
     Write-Host ""
     Write-Host "=== whoami (pwsh session, for token reference) ==="
     & whoami.exe /user 2>&1 | ForEach-Object { Write-Host "  $_" }
