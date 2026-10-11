@@ -33,7 +33,6 @@ pub fn ensure_session_dirs(cwd: &std::path::Path, sid: &str) -> std::io::Result<
     let base = cwd.join(".sandbox").join(sid);
     std::fs::create_dir_all(base.join("bin"))?;
     std::fs::create_dir_all(base.join("venv"))?;
-    std::fs::create_dir_all(base.join("tmp"))?;
     Ok(())
 }
 
@@ -143,15 +142,20 @@ pub fn build_allowlist(
         false,
         true,
     );
-    // Per-session temp dir (child TEMP/TMP point here — see build_env_block).
-    push_entry(
-        &mut entries,
-        cwd.join(".sandbox").join(sid).join("tmp"),
-        RWX,
-        ".sandbox/tmp".into(),
-        false,
-        true,
-    );
+
+    // AppContainer-private temp dir: Windows rewrites the child's TEMP/TMP
+    // env vars to `%LOCALAPPDATA%\Packages\<ac>\AC\Temp` (explicit env
+    // values do not survive CreateProcess for AppContainer tokens), and on
+    // some builds (26340) directories created inside it do not inherit a
+    // usable ACE — mkdtemp() succeeds but writing inside the new dir is
+    // denied, breaking pip/ensurepip and any tool that stages files via
+    // the temp dir. Create the dir if missing (it is provisioned lazily
+    // on first use) and grant the session's AC SID an inheritable RWX ACE
+    // so the whole tree works.
+    if let Some(ac_temp) = crate::sandbox::appcontainer::ac_private_temp_path(sid) {
+        let _ = std::fs::create_dir_all(&ac_temp);
+        push_entry(&mut entries, ac_temp, RWX, "ac-private-temp".into(), false, true);
+    }
 
     // Implicit grants for any Win32 process to start (windows_common group,
     // per the US-1 spec nono comparison): SystemRoot/System32 (RX).

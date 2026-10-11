@@ -36,8 +36,28 @@ pub struct AppContainerSession {
 /// Access is granted the direct way (per-directory DACL Allow ACEs for the
 /// AppContainer SID) — what `icacls /grant` does. The AppContainer SID is
 /// still a restricting identity, so anything without an ACE is denied.
+pub fn ac_profile_name(sid: &str) -> String {
+    format!("sandbox.{sid}.ac")
+}
+
+/// Path of the AppContainer-private temp dir Windows assigns to this
+/// session's child (`%LOCALAPPDATA%\Packages\<ac>\AC\Temp`). Windows
+/// rewrites the child's TEMP/TMP env vars to this path — explicit env
+/// values do NOT survive CreateProcess for AppContainer tokens (verified
+/// on build 26340) — so the sandbox must make this dir usable via a
+/// grant instead (see build_allowlist).
+pub fn ac_private_temp_path(sid: &str) -> Option<std::path::PathBuf> {
+    std::env::var("LOCALAPPDATA").ok().map(|local| {
+        std::path::PathBuf::from(local)
+            .join("Packages")
+            .join(ac_profile_name(sid))
+            .join("AC")
+            .join("Temp")
+    })
+}
+
 pub fn create_session(sid: &str) -> Result<AppContainerSession> {
-    let ac_name = format!("sandbox.{sid}.ac");
+    let ac_name = ac_profile_name(sid);
     let ac_name_w = HSTRING::from(&ac_name);
 
     // DeleteAppContainerProfile removes the profile base resources (the
@@ -621,18 +641,14 @@ fn builtin_admins_sid() -> Option<PSID> {
 }
 
 /// Build the child environment block: parent env + `PATH` prepended with
-/// `.sandbox\<sid>\bin`, `TEMP`/`TMP` redirected to `.sandbox\<sid>\tmp`,
-/// plus the proxy env vars.
+/// `.sandbox\<sid>\bin`, plus the proxy env vars.
 ///
-/// `TEMP`/`TMP` are redirected because the parent's `%TEMP%` is not in the
-/// allow-list, and the AppContainer-private `%TEMP%`
-/// (`%LOCALAPPDATA%\Packages\<ac>\AC\Temp`) has broken ACL inheritance on
-/// some Windows builds — directories created inside it deny their own
-/// creator (observed on build 26340), breaking every tool that stages
-/// files via the temp dir (pip/ensurepip, installers, compilers). Python's
-/// `tempfile` checks env `TEMP`/`TMP` before falling back to `GetTempPathW`
-/// (which ignores them for AppContainer tokens), so the redirect takes
-/// precedence.
+/// `TEMP`/`TMP` are NOT redirectable here: Windows rewrites them to the
+/// AppContainer-private `%LOCALAPPDATA%\Packages\<ac>\AC\Temp` even when
+/// an explicit environment block is passed (verified on build 26340 —
+/// the child reported the rewritten values). Usability of that dir is
+/// ensured by an inheritable allow-list grant on it instead
+/// (see `build_allowlist`).
 ///
 /// `proxy: Some(ProxyEnv)` injects `HTTP_PROXY`/`HTTPS_PROXY`/`X-Sandbox-Token`
 /// pointing at the localhost proxy and clears `NO_PROXY` (forces the proxy to
@@ -643,8 +659,6 @@ fn builtin_admins_sid() -> Option<PSID> {
 pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv>) -> Vec<u16> {
     let bin_abs = cwd.join(format!(".sandbox\\{sid}\\bin"));
     let bin_path = bin_abs.to_string_lossy().to_string();
-    let tmp_abs = cwd.join(format!(".sandbox\\{sid}\\tmp"));
-    let tmp_path = tmp_abs.to_string_lossy().to_string();
 
     // Decide the value (or absence) of the four proxy-related env vars.
     // `Some` → inject proxy URL + token, empty NO_PROXY.
@@ -662,16 +676,12 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     // Names of the four proxy vars, in the order we post-process them.
     // Comparison is case-insensitive (Windows env vars are case-insensitive).
     const PROXY_VARS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "X-Sandbox-Token", "NO_PROXY"];
-    // Temp vars to redirect into the per-session dir (case-insensitive).
-    const TEMP_VARS: [&str; 2] = ["TEMP", "TMP"];
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
     // Track which of the 4 proxy vars we've already emitted (by index) so we
     // can fill in any that were missing from the parent env afterwards.
     let mut proxy_seen = [false; 4];
-    // Same for TEMP/TMP.
-    let mut temp_seen = [false; 2];
     for (k, v) in std::env::vars() {
         if k.eq_ignore_ascii_case("PATH") {
             vars.push((k, format!("{};{}", bin_path, v)));
@@ -692,12 +702,6 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
             ][idx]
                 .clone();
             vars.push((k, replacement));
-        } else if let Some(idx) = TEMP_VARS
-            .iter()
-            .position(|name| k.eq_ignore_ascii_case(name))
-        {
-            temp_seen[idx] = true;
-            vars.push((k, tmp_path.clone()));
         } else {
             vars.push((k, v));
         }
@@ -710,12 +714,6 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     for (idx, name) in PROXY_VARS.iter().enumerate() {
         if !proxy_seen[idx] {
             vars.push((name.to_string(), proxy_values[idx].clone()));
-        }
-    }
-    // Append any temp vars that were not present in the parent env.
-    for (idx, name) in TEMP_VARS.iter().enumerate() {
-        if !temp_seen[idx] {
-            vars.push((name.to_string(), tmp_path.clone()));
         }
     }
 
@@ -761,7 +759,7 @@ mod env_block_tests {
     }
 
     #[test]
-    fn env_block_redirects_temp_and_prepends_path() {
+    fn env_block_prepends_path_and_clears_proxy_vars() {
         let sid = "testsid";
         let cwd = std::path::Path::new(r"C:\some\cwd");
         let vars = decode(&build_env_block(sid, cwd, None));
@@ -771,12 +769,6 @@ mod env_block_tests {
                 .map(|(_, v)| v.clone())
                 .expect("env var present")
         };
-        assert_eq!(
-            get("TEMP"),
-            r"C:\some\cwd\.sandbox\testsid\tmp",
-            "TEMP redirected to per-session dir"
-        );
-        assert_eq!(get("TMP"), r"C:\some\cwd\.sandbox\testsid\tmp");
         assert!(
             get("PATH").starts_with(r"C:\some\cwd\.sandbox\testsid\bin;"),
             "PATH prepended with session bin dir: {}",
