@@ -119,6 +119,36 @@ except Exception as e:
     print('mkdtemp + write       : FAIL', repr(e))
 '@
 
+    Set-Content -LiteralPath (Join-Path $work 'probe_registry.py') -Encoding ASCII -Value @'
+import winreg
+
+def probe(root, root_name, subkey):
+    try:
+        k = winreg.OpenKey(root, subkey)
+        nvals = winreg.QueryInfoKey(k)[1]
+        print('OpenKey', root_name, repr(subkey), ': OK,', nvals, 'values')
+    except OSError as e:
+        print('OpenKey', root_name, repr(subkey), ': FAIL', e)
+
+probe(winreg.HKEY_CURRENT_USER, 'HKCU',
+      r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')
+probe(winreg.HKEY_CURRENT_USER, 'HKCU',
+      r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders')
+probe(winreg.HKEY_CURRENT_USER, 'HKCU', r'Environment')
+probe(winreg.HKEY_LOCAL_MACHINE, 'HKLM',
+      r'SOFTWARE\Microsoft\Windows NT\CurrentVersion')
+
+# Exact call pip/platformdirs makes while discovering its config files.
+try:
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')
+    v, _t = winreg.QueryValueEx(key, 'Common AppData')
+    print('platformdirs call: OK ->', v)
+except OSError as e:
+    print('platformdirs call: FAIL', e)
+'@
+
     Set-Content -LiteralPath (Join-Path $work 'probe_tempdir.py') -Encoding ASCII -Value @'
 import os, tempfile
 # Exact replica of tempfile._get_default_tempdir's loop (3.12), but every
@@ -433,6 +463,73 @@ if r.returncode == 0:
             'run','--allow-cwd','--',$venv2Py,'-m','pip','--version')
     } else {
         Write-Host '[s9dbg] pip-venv python missing, skipping ensurepip probes'
+    }
+
+    # ------------------------------------------------------------------
+    # 3c. Registry-view probe (S-9 blocker #2: pip/platformdirs reads
+    #     HKCU\...\Shell Folders via winreg; inside the AppContainer the
+    #     merged registry view makes the key invisible -> FileNotFoundError
+    #     -> pip dies during config discovery).
+    #     Baseline probe, then grant ALL APPLICATION PACKAGES (S-1-15-2-1)
+    #     ReadKey on the two Shell Folders keys, re-probe, run the full
+    #     S-9 flow, then revoke. AAP sidesteps the chicken-and-egg of
+    #     per-session AC SIDs for this probe; the product fix would grant
+    #     the session's own AC SID. VM-only: VM deletion is the rollback.
+    # ------------------------------------------------------------------
+    Run-Step 'registry view probe: baseline (expect Shell Folders FAIL)' @(
+        'run','--allow-cwd','--','python','probe_registry.py')
+
+    $regKeys = @(
+        'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders',
+        'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders')
+    $regRuleType = [System.Security.AccessControl.RegistryRights]
+    $aap = New-Object System.Security.Principal.SecurityIdentifier('S-1-15-2-1')
+    function Open-RegKeyForAcl([string]$subkey) {
+        return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+            $subkey,
+            [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+            [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+    }
+    Write-Host '=== registry: grant AAP ReadKey on Shell Folders keys ==='
+    foreach ($rk in $regKeys) {
+        try {
+            $k = Open-RegKeyForAcl $rk
+            $acl = $k.GetAccessControl()
+            $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
+                $aap, $regRuleType::ReadKey,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($rule)
+            $k.SetAccessControl($acl)
+            $k.Close()
+            Write-Host "  granted AAP ReadKey on HKCU\$rk"
+        } catch {
+            Write-Host "  GRANT FAILED on HKCU\${rk}: $($_.Exception.Message)"
+        }
+    }
+    Run-Step 'registry view probe: after AAP grant (THE ANSWER)' @(
+        'run','--allow-cwd','--','python','probe_registry.py')
+    Run-Step 'venv WITH pip with registry grant in place (full S-9 flow)' @(
+        'run','--allow-cwd','--','python','-m','venv','.dbgvenv3')
+    $venv3Py = Join-Path $work '.dbgvenv3\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venv3Py) {
+        Run-Step 'pip --version in venv3 (installed at all?)' @(
+            'run','--allow-cwd','--',$venv3Py,'-m','pip','--version')
+    }
+    Write-Host '=== registry: revoke AAP ReadKey (restore original ACLs) ==='
+    foreach ($rk in $regKeys) {
+        try {
+            $k = Open-RegKeyForAcl $rk
+            $acl = $k.GetAccessControl()
+            foreach ($r in @($acl.Access |
+                Where-Object { $_.IdentityReference.Value -eq 'S-1-15-2-1' })) {
+                $acl.RemoveAccessRule($r) | Out-Null
+            }
+            $k.SetAccessControl($acl)
+            $k.Close()
+            Write-Host "  revoked AAP on HKCU\$rk"
+        } catch {
+            Write-Host "  REVOKE FAILED on HKCU\${rk}: $($_.Exception.Message)"
+        }
     }
 
     # ------------------------------------------------------------------
