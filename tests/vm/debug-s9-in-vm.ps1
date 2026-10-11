@@ -115,7 +115,7 @@ for label, d in candidates:
     try:
         fd = os.open(fn, flags, 0o600)
     except OSError as e:
-        print('  %-14s %-60s OPEN FAIL winerror=%d errno=%d %s'
+        print('  %-14s %-60s OPEN FAIL winerror=%s errno=%s %s'
               % (label, d, e.winerror, e.errno, e.strerror))
         continue
     try:
@@ -125,7 +125,7 @@ for label, d in candidates:
             os.unlink(fn)
             print('  %-14s %-60s OK' % (label, d))
         except OSError as e:
-            print('  %-14s %-60s OPEN OK, UNLINK FAIL winerror=%d %s'
+            print('  %-14s %-60s OPEN OK, UNLINK FAIL winerror=%s %s'
                   % (label, d, e.winerror, e.strerror))
 '@
 
@@ -136,7 +136,7 @@ def t(label, fn):
         r = fn()
         print('  %-28s OK %s' % (label, r if r is not None else ''))
     except OSError as e:
-        print('  %-28s FAIL winerror=%d errno=%d %s' % (label, e.winerror, e.errno, e.strerror))
+        print('  %-28s FAIL winerror=%s errno=%s %s' % (label, e.winerror, e.errno, e.strerror))
 for d in [os.getcwd(), os.environ.get('TEMP', '')]:
     if not d:
         continue

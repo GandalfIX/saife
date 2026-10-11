@@ -18,7 +18,20 @@ pub struct AllowEntry {
     pub inherit: bool,
 }
 
-pub const RWX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
+/// Read-write-execute INCLUDING delete. Granted trees must let the child
+/// create AND delete files: python's tempfile tempdir check does
+/// open+close+unlink on every candidate and rejects any directory whose
+/// unlink is denied — without DELETE bits in the inherited ACE the check
+/// fails everywhere and pip/ensurepip exit 1 silently (proven in-VM
+/// 2026-10-11: "OPEN OK, UNLINK FAIL winerror=5" in the granted cwd, and
+/// `open+unlink`/`rmtree` denied with winerror=5). `DELETE` is
+/// inherited onto created files (unlink needs it); `FILE_DELETE_CHILD`
+/// on directories covers deletions through the parent dir.
+pub const RWX: u32 = FILE_GENERIC_READ.0
+    | FILE_GENERIC_WRITE.0
+    | FILE_GENERIC_EXECUTE.0
+    | DELETE.0
+    | FILE_DELETE_CHILD.0;
 pub const RX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 
 /// Minimal ancestor mask: `FILE_READ_ATTRIBUTES` (stat the dir itself) +
@@ -152,6 +165,14 @@ pub fn build_allowlist(
     // the temp dir. Create the dir if missing (it is provisioned lazily
     // on first use) and grant the session's AC SID an inheritable RWX ACE
     // so the whole tree works.
+    //
+    // NOTE: AppContainer processes run at LOW integrity and everything
+    // they create inherits a Low mandatory label (`Mandatory
+    // Label\Low Mandatory Level:(NW)`) plus owner BUILTIN\Administrators
+    // (observed on the 26340 guest). Executables installed by a sandboxed
+    // process (e.g. a python venv) therefore start as LOW-integrity
+    // processes even OUTSIDE the sandbox and cannot write Medium objects —
+    // documented here because it looks like a sandbox bug when it bites.
     if let Some(ac_temp) = crate::sandbox::appcontainer::ac_private_temp_path(sid) {
         let _ = std::fs::create_dir_all(&ac_temp);
         push_entry(&mut entries, ac_temp, RWX, "ac-private-temp".into(), false, true);
