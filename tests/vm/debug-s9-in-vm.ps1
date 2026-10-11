@@ -1,33 +1,41 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Debug the S-9 venv/ensurepip failure inside a kept test VM.
+    Debug the S-9 venv/ensurepip failure inside a kept test VM (probe battery).
 
 .DESCRIPTION
-    Runs the S-9 failure steps DIRECTLY (no venv wrapper hiding the real
-    error) via PowerShell Direct in a kept VM, capturing every exit code
-    and all stdout/stderr:
+    S-9 fails with a silent exit 1 from `venv python -m ensurepip`, and the
+    2026-10-11 debug runs surfaced two unexplained behaviors:
 
-      1. sandbox run --allow-cwd -- python -c <print TEMP env + gettempdir()>
-         — verifies the per-session TEMP redirect (b5a2b0d) reaches the
-           child and that tempfile resolves to .sandbox\<sid>\tmp.
-      2. sandbox run --allow-cwd -- python -c <create a temp file>
-         — proves the redirected dir is actually writable.
-      3. sandbox run --allow-cwd -- python -m venv --without-pip <venv>
-         then sandbox run --allow-cwd -- <venv>\Scripts\python.exe -m
-         ensurepip -v --upgrade --default-pip
-         — reproduces the exact failing step with -v so pip/ensurepip
-           cannot fail silently.
+      a) sandboxed: tempfile's tempdir CHECK fails on every candidate,
+         including the granted cwd (run 2), though it passed inside the
+         OS-created AC\Temp in run 1;
+      b) unsandboxed: the VENV python.exe (created inside the sandbox)
+         fails the same check where the SYSTEM python succeeds.
 
-    Requires the VM to have the repo staged at C:\sbx-repo and the release
-    binary built (i.e. a kept VM from a failed Invoke-TestsInVM run with
-    -KeepOnFailure).
+    Instead of a one-shot fix, this script pins the divergence down with
+    explicit probes that report the exact winerror for every operation:
+
+      - probe_env      executable / TEMP / TMP / cwd
+      - probe_tempdir  replica of tempfile's candidate loop with per-
+                       candidate winerrors (no guessing which candidate
+                       failed or why)
+      - probe_ops      per-op probes in cwd + %TEMP% (or AC temp):
+                       plain open, open+unlink, O_TEMPORARY open,
+                       mkdtemp+write-inside+rmtree, mkdir+listdir
+
+    Each probe runs in four contexts:
+      1. sandboxed system python   2. unsandboxed system python
+      3. sandboxed venv python      4. unsandboxed venv python
+    Plus an exe-provenance experiment (a pwsh-copied python.exe run
+    unsandboxed) and icacls/owner dumps of everything involved.
 
 .PARAMETER VmName
-    Name of the kept VM (e.g. sbx-test-20261011-021559-414).
+    Name of the kept VM (e.g. sbx-test-20261011-123919-551). The VM must
+    have the repo staged at C:\sbx-repo and the release binary built.
 
 .EXAMPLE
-    pwsh -NoProfile -File tests\vm\debug-s9-in-vm.ps1 -VmName sbx-test-20261011-021559-414
+    pwsh -NoProfile -File tests\vm\debug-s9-in-vm.ps1 -VmName sbx-test-20261011-123919-551
 #>
 param(
     [Parameter(Mandatory)][string]$VmName
@@ -57,79 +65,179 @@ $out = Invoke-Command -VMName $VmName -Credential $guestCred -ScriptBlock {
         Write-Host ""
         Write-Host "=== $Label ==="
         & $sbx @SbxArgs 2>&1 | ForEach-Object { Write-Host "  $_" }
-        Write-Host ("--- exit: $LASTEXITCODE")
+        Write-Host ("--- sandbox exit: $LASTEXITCODE")
+    }
+    function Run-Py {
+        param([string]$Label, [string]$Exe, [string]$Script, [string[]]$ExtraArgs)
+        Write-Host ""
+        Write-Host "=== $Label ==="
+        & $Exe $Script @ExtraArgs 2>&1 | ForEach-Object { Write-Host "  $_" }
+        Write-Host "--- exit: $LASTEXITCODE"
     }
 
+    # ------------------------------------------------------------------
+    # Probe scripts (written as files: no -c quoting pitfalls).
+    # ------------------------------------------------------------------
+    Set-Content -LiteralPath (Join-Path $work 'probe_env.py') -Encoding ASCII -Value @'
+import os, sys
+print('executable:', sys.executable)
+print('TEMP     :', os.environ.get('TEMP'))
+print('TMP      :', os.environ.get('TMP'))
+print('cwd      :', os.getcwd())
+'@
+
+    Set-Content -LiteralPath (Join-Path $work 'probe_tempdir.py') -Encoding ASCII -Value @'
+import os, tempfile
+# Exact replica of tempfile._get_default_tempdir's loop (3.12), but every
+# candidate's OSError is reported instead of silently skipped.
+flags = getattr(tempfile, '_bin_openflags', None)
+if flags is None:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+print('check flags:', oct(flags))
+candidates = []
+for name in ('TMPDIR', 'TEMP', 'TMP'):
+    v = os.environ.get(name)
+    if v:
+        candidates.append(('env:' + name, v))
+gw = getattr(tempfile, '_get_win_temp', None)
+if gw:
+    try:
+        candidates.append(('GetTempPathW', gw()))
+    except OSError as e:
+        candidates.append(('GetTempPathW', 'RAISED %d %s' % (e.winerror, e.strerror)))
+candidates.append(('cwd', os.getcwd()))
+seen = set()
+for label, d in candidates:
+    if not d or d in seen:
+        continue
+    seen.add(d)
+    fn = os.path.join(d, 'probecheck')
+    try:
+        fd = os.open(fn, flags, 0o600)
+    except OSError as e:
+        print('  %-14s %-60s OPEN FAIL winerror=%d errno=%d %s'
+              % (label, d, e.winerror, e.errno, e.strerror))
+        continue
+    try:
+        os.close(fd)
+    finally:
+        try:
+            os.unlink(fn)
+            print('  %-14s %-60s OK' % (label, d))
+        except OSError as e:
+            print('  %-14s %-60s OPEN OK, UNLINK FAIL winerror=%d %s'
+                  % (label, d, e.winerror, e.strerror))
+'@
+
+    Set-Content -LiteralPath (Join-Path $work 'probe_ops.py') -Encoding ASCII -Value @'
+import os, sys, shutil
+def t(label, fn):
+    try:
+        r = fn()
+        print('  %-28s OK %s' % (label, r if r is not None else ''))
+    except OSError as e:
+        print('  %-28s FAIL winerror=%d errno=%d %s' % (label, e.winerror, e.errno, e.strerror))
+for d in [os.getcwd(), os.environ.get('TEMP', '')]:
+    if not d:
+        continue
+    print('dir:', d)
+    p = lambda n: os.path.join(d, n)
+    t('listdir', lambda: len(os.listdir(d)))
+    t('plain open wb', lambda: open(p('p1'), 'wb').write(b'x'))
+    def _ou():
+        open(p('p2'), 'wb').write(b'x'); os.unlink(p('p2'))
+    t('open + unlink', _ou)
+    def _ot():
+        fd = os.open(p('p3'), os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_TEMPORARY', 0))
+        os.close(fd)
+    t('O_TEMPORARY open', _ot)
+    def _mk():
+        sd = os.path.join(d, 'pd1')
+        os.mkdir(sd)
+        open(os.path.join(sd, 'f'), 'wb').write(b'x')
+        os.listdir(sd)
+        shutil.rmtree(sd)
+    t('mkdir + write-inside + rmtree', _mk)
+'@
+
     Write-Host "[s9dbg] workdir: $work"
-    Write-Host "[s9dbg] sandbox: $sbx"
     & python --version 2>&1 | ForEach-Object { Write-Host "[s9dbg] python: $_" }
 
-    # 1. Where does the child think TEMP is, and what does tempfile pick?
-    Run-Step 'TEMP redirect + gettempdir' @(
-        'run','--allow-cwd','--','python','-c',
-        "import os,tempfile;print('TEMP env  =',os.environ.get('TEMP'));print('TMP env   =',os.environ.get('TMP'));print('gettempdir=',tempfile.gettempdir())")
+    # ------------------------------------------------------------------
+    # 1. Sandboxed system python: env, tempdir-check replica, per-op probes
+    # ------------------------------------------------------------------
+    Run-Step 'sandboxed system python: env' @('run','--allow-cwd','--','python','probe_env.py')
+    Run-Step 'sandboxed system python: tempdir check replica' @('run','--allow-cwd','--','python','probe_tempdir.py')
+    Run-Step 'sandboxed system python: ops in cwd + AC temp' @('run','--allow-cwd','--','python','probe_ops.py')
 
-    # 2. Is the redirected dir actually writable end-to-end?
-    Run-Step 'tempfile write' @(
-        'run','--allow-cwd','--','python','-c',
-        "import tempfile;f=tempfile.NamedTemporaryFile(delete=False);f.write(b'x');f.close();print('wrote:',f.name)")
+    # ------------------------------------------------------------------
+    # 2. Unsandboxed system python (baseline that works)
+    # ------------------------------------------------------------------
+    Run-Py 'unsandboxed system python: env' python 'probe_env.py'
+    Run-Py 'unsandboxed system python: tempdir check replica' python 'probe_tempdir.py'
+    Run-Py 'unsandboxed system python: ops in cwd + TEMP' python 'probe_ops.py'
 
-    # 3. venv without pip (isolates venv creation from ensurepip).
-    Run-Step 'venv --without-pip' @(
+    # ------------------------------------------------------------------
+    # 3. Venv (created inside the sandbox, like S-9) + sandboxed venv python
+    # ------------------------------------------------------------------
+    Run-Step 'venv --without-pip (created inside sandbox)' @(
         'run','--allow-cwd','--','python','-m','venv','--without-pip','.dbgvenv')
+    $venvPy = Join-Path $work '.dbgvenv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venvPy) {
+        Run-Step 'sandboxed venv python: tempdir check replica' @(
+            'run','--allow-cwd','--',$venvPy,'probe_tempdir.py')
+        Run-Py 'unsandboxed venv python: env' $venvPy 'probe_env.py'
+        Run-Py 'unsandboxed venv python: tempdir check replica' $venvPy 'probe_tempdir.py'
+        Run-Py 'unsandboxed venv python: ops in cwd + TEMP' $venvPy 'probe_ops.py'
+    } else {
+        Write-Host '[s9dbg] venv python missing, skipping venv probes'
+    }
 
-    # 4. The exact failing step, verbose. Runs the venv python inside a
-    #    fresh sandbox session (like the S-9 flow) but WITHOUT venv's
-    #    subprocess wrapper, so pip/ensurepip cannot fail silently.
-    Run-Step 'venv python -m ensurepip -v (sandboxed)' @(
-        'run','--allow-cwd','--',
-        (Join-Path $work '.dbgvenv\Scripts\python.exe'),
-        '-m','ensurepip','-v','--upgrade','--default-pip')
-
-    # 5. Discriminating probes for the unsandboxed-temp anomaly (the
-    #    2026-10-11 control failed EVERY tempdir candidate, incl. cwd,
-    #    where pwsh writes had just worked):
-    #    a) system python (NOT the AC-created venv copy) tempdir check
-    #    b) raw open() for write in %TEMP% and cwd, system python
-    #    c) pwsh file write for comparison
-    #    d) tempdircheck* leftovers in %TEMP%
+    # ------------------------------------------------------------------
+    # 4. Exe provenance: same python.exe, but copied by pwsh (not by the
+    #    AC process) — isolates "exe created inside AppContainer".
+    # ------------------------------------------------------------------
     Write-Host ""
-    Write-Host "=== unsandboxed system python: gettempdir ==="
-    & python -c "import tempfile;print('gettempdir=',tempfile.gettempdir())" 2>&1 |
-        ForEach-Object { Write-Host "  $_" }
-    Write-Host "--- exit: $LASTEXITCODE"
-    Write-Host ""
-    Write-Host "=== unsandboxed system python: raw open() in TEMP and cwd ==="
-    & python -c "import os;open(os.path.join(os.environ['TEMP'],'rawwrite.chk'),'wb').write(b'x');print('TEMP write ok');open('rawwrite-cwd.chk','wb').write(b'x');print('cwd write ok')" 2>&1 |
-        ForEach-Object { Write-Host "  $_" }
-    Write-Host "--- exit: $LASTEXITCODE"
-    Write-Host ""
-    Write-Host "=== unsandboxed pwsh: file write in TEMP and cwd ==="
-    try {
-        Set-Content -LiteralPath (Join-Path $env:TEMP 'pshwrite.chk') -Value 'x' -ErrorAction Stop
-        Write-Host "  pwsh TEMP write ok"
-        Set-Content -LiteralPath (Join-Path $work 'pshwrite-cwd.chk') -Value 'x' -ErrorAction Stop
-        Write-Host "  pwsh cwd write ok"
-    } catch { Write-Host "  pwsh write FAILED: $($_.Exception.Message)" }
-    Write-Host ""
-    Write-Host "=== tempdircheck* leftovers in TEMP ==="
-    $left = @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'tempdircheck*' -Force -ErrorAction SilentlyContinue)
-    Write-Host ("  count: {0}" -f $left.Count)
-    foreach ($f in ($left | Select-Object -First 5)) { Write-Host "    $($f.Name)" }
-
-    # 6. Same as 5a but with the venv python (the one whose control failed).
-    Write-Host ""
-    Write-Host "=== unsandboxed venv python: gettempdir ==="
-    & (Join-Path $work '.dbgvenv\Scripts\python.exe') -c "import tempfile;print('gettempdir=',tempfile.gettempdir())" 2>&1 |
-        ForEach-Object { Write-Host "  $_" }
+    Write-Host "=== exe provenance: pwsh-copied python.exe, unsandboxed ==="
+    $sysPy = (Get-Command python).Source
+    $copyPy = Join-Path $work 'python-copy.exe'
+    Copy-Item -LiteralPath $sysPy -Destination $copyPy -Force
+    & $copyPy probe_tempdir.py 2>&1 | ForEach-Object { Write-Host "  $_" }
     Write-Host "--- exit: $LASTEXITCODE"
 
-    # 7. The original control: venv python -m ensurepip -v, unsandboxed.
+    # ------------------------------------------------------------------
+    # 5. ACL / owner dumps of everything involved
+    # ------------------------------------------------------------------
     Write-Host ""
-    Write-Host "=== venv python -m ensurepip -v (unsandboxed control) ==="
-    & (Join-Path $work '.dbgvenv\Scripts\python.exe') -m ensurepip -v --upgrade --default-pip 2>&1 |
-        ForEach-Object { Write-Host "  $_" }
-    Write-Host "--- exit: $LASTEXITCODE"
+    Write-Host "=== icacls: TEMP, cwd, venv python, AC temp dirs ==="
+    foreach ($target in @(
+        $env:TEMP, $work,
+        (Join-Path $work '.dbgvenv'), (Join-Path $work '.dbgvenv\Scripts'),
+        $venvPy)) {
+        if ($target -and (Test-Path -LiteralPath $target)) {
+            Write-Host "--- $target"
+            & icacls.exe $target 2>&1 | ForEach-Object { Write-Host "  $_" }
+        }
+    }
+    $pkgsRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+    foreach ($acDir in @(Get-ChildItem -LiteralPath $pkgsRoot -Directory -Filter 'sandbox.*.ac' -ErrorAction SilentlyContinue)) {
+        $acTemp = Join-Path $acDir.FullName 'AC\Temp'
+        if (Test-Path -LiteralPath $acTemp) {
+            Write-Host "--- $acTemp"
+            & icacls.exe $acTemp 2>&1 | ForEach-Object { Write-Host "  $_" }
+            foreach ($sub in @(Get-ChildItem -LiteralPath $acTemp -Directory -ErrorAction SilentlyContinue | Select-Object -First 3)) {
+                Write-Host "--- $($sub.FullName)"
+                & icacls.exe $sub.FullName 2>&1 | ForEach-Object { Write-Host "  $_" }
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $venvPy) {
+        $acl = Get-Acl -LiteralPath $venvPy
+        Write-Host ("venv python.exe owner: {0}" -f $acl.Owner)
+    }
+    Write-Host ""
+    Write-Host "=== whoami (pwsh session, for token reference) ==="
+    & whoami.exe /user 2>&1 | ForEach-Object { Write-Host "  $_" }
 
     Write-Host ""
     Write-Host "[s9dbg] left in VM for further poking: $work"
