@@ -342,7 +342,7 @@ function Invoke-Scenario-S9 {
     $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','python','-m','venv',".sandbox\$sid\venv") -WorkingDirectory $d
     $pyExe = Join-Path $d ".sandbox\$sid\venv\Scripts\python.exe"
     if ($r1.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pyExe)) {
-        return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe) stderr=$(($r1.Stderr -join "`n"))" }
+        return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe) stderr=$(($r1.Stderr -join "`n")) stdout=$(($r1.Stdout -join "`n"))" }
     }
     $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',$pyExe,'-c',"print('venv works')") -WorkingDirectory $d
     $out = ($r2.Stdout -join "`n")
@@ -1022,25 +1022,43 @@ function Invoke-Scenario-S54 {
 }
 
 # S-55 (AC-4.17): audit log survives sandbox crash; verify reports INCOMPLETE.
-# Uses `powershell -NoProfile -Command Start-Sleep` as the long-running child
-# because `ping` is blocked by --block-net (it needs the IP driver even for
-# 127.0.0.1) and `timeout /t` requires console input redirection (not
-# available under the sandbox's piped stdio). PowerShell's Start-Sleep needs
-# no network and no console input.
+# Long-running child: `python -c "__import__('time').sleep(30)#<marker>"` —
+# no spaces (no cmdline-quoting pitfalls), no network, no console input.
+# Windows PowerShell 5.1 must NOT be the child: powershell.exe fails DLL
+# init (exit -1073741502 / 0xC0000142) inside the AppContainer in a PS
+# Direct guest session, and this scenario's old defensive cleanup (kill ALL
+# powershell.exe with a *WindowsPowerShell* path) then murdered the PS
+# Direct session host — itself a powershell.exe — killing the suite stream
+# and breaking every later CreateAppContainerProfile with 0x80070002
+# (isolated with -Only 55, run 20261011-020625-428). The child kill is
+# now marker-precise: it matches a unique per-run snippet in the child's
+# command line and can never hit a session host. Skips cleanly when python
+# is absent (same gate as S-8/S-9/S-25).
 function Invoke-Scenario-S55 {
     $d = New-ScenarioDir 55
+    if (-not (Get-Python)) { return @{ Num=55; Name='S-55 (AC-4.17)'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
+    $marker = "S55-sleeper-$([guid]::NewGuid().ToString('N'))"
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
     $sid = ($psid.Stdout -join '').Trim()
+    # Marker-precise child kill. NEVER kill by process name/path here: the
+    # PS Direct session host is a powershell.exe too, and killing it takes
+    # the whole suite (and its session) down with it.
+    function Stop-S55Child {
+        Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like "*$marker*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
     # Start a long-running session. The child sleeps 30s; we kill the sandbox
     # supervisor after 2s, before the child exits naturally.
-    $proc = Start-SandboxProcess -Arguments "run --allow-cwd --block-net --sid $sid -- powershell -NoProfile -Command Start-Sleep -Seconds 30" -WorkingDirectory $d
+    $sleeper = "__import__('time').sleep(30)#$marker"
+    $proc = Start-SandboxProcess -Arguments "run --allow-cwd --block-net --sid $sid -- python -c $sleeper" -WorkingDirectory $d
     Start-Sleep -Seconds 2
     if ($proc.HasExited) {
-        Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsPowerShell*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Stop-S55Child
         return @{ Num=55; Name='S-55 (AC-4.17)'; Passed=$false; Skipped=$false; Detail="sandbox exited early (exit=$($proc.ExitCode)); child did not stay alive" }
     }
     # Force-kill sandbox.exe (the supervisor), not the child. The Job
-    # Object's KILL_ON_JOB_CLOSE will then kill the powershell child.
+    # Object's KILL_ON_JOB_CLOSE will then kill the python child.
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
@@ -1054,9 +1072,9 @@ function Invoke-Scenario-S55 {
     $s = Invoke-Sandbox -Args @('audit','show',$sid)
     $showWorks = $s.ExitCode -eq 0
     $passed = $logReadable -and $noRoot -and $incomplete -and $showWorks
-    # Cleanup any orphaned powershell child (defensive — the Job Object should
+    # Cleanup any orphaned python child (defensive — the Job Object should
     # have killed it, but be safe).
-    Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsPowerShell*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-S55Child
     return @{ Num=55; Name='S-55 (AC-4.17)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'crash -> INCOMPLETE, log readable' } else { "log=$logReadable noRoot=$noRoot incomplete=$incomplete show=$showWorks" } }
 }
