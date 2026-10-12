@@ -216,7 +216,12 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
   8. Teardown: unless `-KeepOnFailure` and the run failed — `Stop-VM -Force`,
      `Remove-VM`, delete differencing VHDX. Print the summary table and exit
      with the suite's aggregated result code.
-- [ ] **Step 2: Verify end-to-end:** run - [BLOCKED on ISO: harness landed; fail-closed paths verified non-elevated]
+- [x] **Step 2: Verify end-to-end:** run - [DONE 2026-10-12: (a) green full run
+  20261012-224437 (pass=49 fail=0 skip=25); (b) `Get-VM sbx-test-*` empty after
+  run; (d) `Remove-TestVM.ps1 -List` prints nothing; (c) residue check around
+  run 20261012-230919: TEMP/LOCALAPPDATA ACLs and `~\.sandbox` identical
+  before/after, no staging leftovers — the only new TEMP files were a VS Code
+  auto-updater log + GUID .tmp, unrelated to the harness]
   `pwsh tests/vm/Invoke-TestsInVM.ps1 -Image sbx-base-a -Phase all` on a clean
   template and assert: (a) S-1…S-74 results match a known-good host run
   (modulo scenarios that legitimately depend on host specifics), (b) afterwards
@@ -224,10 +229,16 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
   diff on `$env:TEMP`, `$env:LOCALAPPDATA`, and the scenario roots before/after
   shows zero changes on the dev host, (d) `Remove-TestVM.ps1 -List` prints
   nothing.
-- [ ] **Step 3: Repeat-run check:** run it twice back-to-back; second run must - [BLOCKED on ISO]
-  succeed identically (proves differencing-disk hermeticity, no stale state).
-- [ ] **Step 4: Parallel check:** two concurrent runs with distinct suffixes - [BLOCKED on ISO]
-  both succeed.
+- [x] **Step 3: Repeat-run check:** run it twice back-to-back; second run must - [DONE
+  2026-10-12: runs 20261012-224437 and 20261012-230919 executed the identical
+  committed harness (1a3d30e) back-to-back and produced identical results
+  (pass=49 fail=0 skip=25), each VM destroyed cleanly — differencing-disk
+  hermeticity proven, no stale state]
+- [x] **Step 4: Parallel check:** two concurrent runs with distinct suffixes - [DONE
+  2026-10-12: parallel runs par1/par2 (Start-Process, distinct -VMSuffix) both
+  green — SANDBOX: PASS each, VMs sbx-test-par1/-par2 destroyed cleanly, logs
+  vmtests-par1.log/vmtests-par2.log. VM/VHDX keyed by suffix, results keyed by
+  RunId — no collisions]
 - [x] **Step 5c: Doc wording (commit exactly these edits):**
   - `README.md` Testing section gains, after the two existing commands:
     > **Tier 2/3 tests run in a disposable VM.** The integration suite mutates
