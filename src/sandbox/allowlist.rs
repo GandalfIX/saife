@@ -451,6 +451,14 @@ mod tests {
             content.contains("mode == 0o700"),
             "sitecustomize.py must rewrite the 0o700 mode"
         );
+        assert!(
+            content.contains("SANDBOX_SESSION_SID"),
+            "sitecustomize.py must gate on the session marker (venv-root copies stay inert outside the sandbox)"
+        );
+        assert!(
+            content.contains("setup_python"),
+            "sitecustomize.py must interpose venv.EnvBuilder.setup_python to seed the venv-root copy"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 
