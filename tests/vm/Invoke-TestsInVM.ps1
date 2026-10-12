@@ -8,6 +8,12 @@
   template image), copies the working tree into it, runs build + tests
   inside the VM via PowerShell Direct (tests\vm\run-in-vm.ps1), fetches the
   result artifacts back to tests\vm\results\<runid>\, then destroys the VM.
+  With -TestCmd an arbitrary guest command runs INSTEAD of the suite
+  (VM-01 Task 6, the WBD D-01/D-02 discovery lane): repo copy, artifact
+  fetch, and teardown are identical, but the guest command is whatever
+  -TestCmd specifies, its console output is additionally teed into
+  C:\sbx-results\testcmd.log, and ALL files under C:\sbx-results are
+  fetched (there is no summary.json contract in this mode).
   With -KeepOnFailure a failed run keeps the VM behind (checkpoint
   'failed-run') for debugging. An artifact-fetch failure after a completed
   suite ALWAYS keeps the VM (with the same checkpoint) - results that took
@@ -56,8 +62,8 @@
          (the VM is then kept), or teardown failed
          (final line: VM HARNESS: FAIL)
     2  = not elevated (single remediation line, no verdict line)
-    3  = host readiness probe failed, or the requested template image is
-         missing or invalid
+    3  = host readiness probe failed, the requested template image is
+         missing or invalid, or -TestCmd is empty/whitespace
     4  = tests\vm\vm-settings.json missing or invalid
     99 = unexpected error (final line: VM HARNESS: FAIL)
 .PARAMETER Image
@@ -65,6 +71,19 @@
   (name only, no extension, no path separators). Default: sbx-base-a.
 .PARAMETER Phase
   Which phase(s) run-in-vm.ps1 runs: unit, integration, or all. Default: all.
+  Ignored when -TestCmd is given.
+.PARAMETER TestCmd
+  Run this command in the guest INSTEAD of the test suite, via
+  'pwsh -NoProfile -Command' inside the PowerShell Direct session.
+  Contract: the current working tree is expanded at C:\sbx-repo (as for a
+  suite run), artifacts the command wants fetched must be written under
+  C:\sbx-results (created by the harness in this mode), and the command's
+  console output is teed to C:\sbx-results\testcmd.log. After it exits,
+  EVERY file under C:\sbx-results is fetched to tests\vm\results\<runid>\;
+  a guest exit code of 0 counts as PASS (any other exit = harness FAIL).
+  -Phase/-Only are ignored in this mode. Useful for one-off probe/evidence
+  capture such as the WBD D-01/D-02 battery on image B
+  (tests\vm\wbd-d01-d02-probes.ps1).
 .PARAMETER Only
   Scenario ids passed through to tests\run-tests.ps1 (integration phase
   only). Same pwsh platform quirk as run-in-vm.ps1's -Only: multi-value
@@ -94,6 +113,10 @@
   pwsh -NoProfile -Command "& '<repoRoot>\tests\vm\Invoke-TestsInVM.ps1' -Phase integration -Only 1,2,6"
   Integration phase with scenario selection (the -Command wrapper is
   required for a multi-value -Only; see the parameter note above).
+.EXAMPLE
+  pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Invoke-TestsInVM.ps1 -Image sbx-base-b -TestCmd "pwsh -NoProfile -File C:\sbx-repo\tests\vm\wbd-d01-d02-probes.ps1"
+  WBD D-01/D-02 probe capture inside the image-B template (the probe
+  script ships with the repo copy, so the versioned script always runs).
 #>
 [CmdletBinding()]
 param(
@@ -101,6 +124,8 @@ param(
 
     [ValidateSet('unit', 'integration', 'all')]
     [string]$Phase = 'all',
+
+    [string]$TestCmd,
 
     [int[]]$Only,
 
@@ -230,6 +255,18 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # 1b. -TestCmd sanity gate (still before anything is created): an
+    #     explicitly supplied but empty/whitespace command is an operator
+    #     error, not a request for the suite - fail loudly instead of
+    #     silently falling back to a 30+ minute suite run.
+    # -----------------------------------------------------------------------
+    if ($PSBoundParameters.ContainsKey('TestCmd') -and -not $TestCmd.Trim()) {
+        Write-Host '[vm-run] invalid -TestCmd: empty or whitespace - provide the guest command, or omit -TestCmd to run the suite; nothing was created.' -ForegroundColor Red
+        Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
+        exit 3
+    }
+
+    # -----------------------------------------------------------------------
     # Run identity (computed only past the elevation gate).
     # -----------------------------------------------------------------------
     $script:RunId = (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
@@ -240,7 +277,8 @@ try {
     $stageDir = Join-Path $env:TEMP "sbx-repo-stage-$($script:RunId)"
     $zipPath = Join-Path $env:TEMP "sbx-repo-$($script:RunId).zip"
 
-    Write-Host ("[vm-run] run id: {0} | image: {1} | phase: {2} | vm: {3}" -f $script:RunId, $Image, $Phase, $vmName)
+    $modeLabel = if ($TestCmd) { "testcmd ($TestCmd)" } else { "suite/$Phase" }
+    Write-Host ("[vm-run] run id: {0} | image: {1} | mode: {2} | vm: {3}" -f $script:RunId, $Image, $modeLabel, $vmName)
 
     # -----------------------------------------------------------------------
     # 2. Host readiness probe. Its own tagged [vm-host] lines (including the
@@ -548,10 +586,21 @@ try {
     #     below for why it must not be captured). Any nonzero guest exit
     #     (0 only is success; run-in-vm.ps1 exits 1 or 99 on failure)
     #     surfaces as harness exit 1 (see the help exit-code table).
+    #     In -TestCmd mode the guest command is the operator's string
+    #     instead; the harness pre-creates C:\sbx-results and tees the
+    #     streamed lines into C:\sbx-results\testcmd.log so the console
+    #     transcript is fetched as an artifact too (step 11 fetches ALL
+    #     files there in this mode).
     # -----------------------------------------------------------------------
-    $escapedRunner = 'C:\sbx-repo\tests\vm\run-in-vm.ps1'.Replace("'", "''")
-    $guestCommand = "& '$escapedRunner' -Phase '$Phase' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results'"
-    if ($Only) { $guestCommand += ' -Only ' + ($Only -join ',') }
+    if ($TestCmd) {
+        $guestCommand = $TestCmd
+        $teeToLog = $true
+    } else {
+        $escapedRunner = 'C:\sbx-repo\tests\vm\run-in-vm.ps1'.Replace("'", "''")
+        $guestCommand = "& '$escapedRunner' -Phase '$Phase' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results'"
+        if ($Only) { $guestCommand += ' -Only ' + ($Only -join ',') }
+        $teeToLog = $false
+    }
     Write-Host "[vm-run] guest command: pwsh -NoProfile -Command $guestCommand"
 
     # Window-station/desktop AAP grant helper for the guest suite session.
@@ -647,7 +696,13 @@ public static class WinSta {
     $guestExit = $null
     try {
         $guestExit = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
-            param([string]$Command, [string]$WinstaHelper)
+            param([string]$Command, [string]$WinstaHelper, [bool]$TeeToLog)
+            # TestCmd mode artifact dir (run-in-vm.ps1 creates it for suite
+            # runs; a raw probe command must not have to). Best effort: a
+            # failure surfaces as the tee's Add-Content error below.
+            if ($TeeToLog) {
+                New-Item -ItemType Directory -Path 'C:\sbx-results' -Force | Out-Null
+            }
             # Grant ALL APPLICATION PACKAGES GA on this session's window
             # station + desktop BEFORE the suite: the suite's pwsh child
             # stays in this logon session, so every sandboxed process it
@@ -673,9 +728,15 @@ public static class WinSta {
                 # wildcard pattern ([...] is a char class) — with EAP=Stop
                 # this error record once killed the whole streaming session.
                 if ($_.StartsWith('[vm-guest]')) { Write-Host $_ } else { Write-Host "[vm-guest] $_" }
+                if ($TeeToLog) {
+                    # [string] on a pipeline object flattens ErrorRecords to
+                    # their message; the raw line (without the [vm-guest]
+                    # prefix) is what lands in the log.
+                    Add-Content -LiteralPath (Join-Path 'C:\sbx-results' 'testcmd.log') -Value ([string]$_)
+                }
             }
             $LASTEXITCODE
-        } -ArgumentList $guestCommand, $winstaHelper
+        } -ArgumentList $guestCommand, $winstaHelper, $teeToLog
     } catch {
         Write-Host "[vm-run] ERROR: suite session died: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -695,8 +756,17 @@ public static class WinSta {
     $summaryFetched = $false
     try {
         $artifactNames = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
-            param([string[]]$KnownArtifacts)
+            param([string[]]$KnownArtifacts, [bool]$AllArtifacts)
             $resultsRoot = 'C:\sbx-results'
+            if ($AllArtifacts) {
+                # TestCmd mode: no summary.json contract exists - fetch
+                # EVERY file the command left behind.
+                if (Test-Path -LiteralPath $resultsRoot) {
+                    return @(Get-ChildItem -LiteralPath $resultsRoot -File |
+                        ForEach-Object { [System.IO.Path]::GetFileName($_.Name) })
+                }
+                return @()
+            }
             $names = $null
             $summaryPath = Join-Path $resultsRoot 'summary.json'
             if (Test-Path -LiteralPath $summaryPath) {
@@ -709,7 +779,7 @@ public static class WinSta {
             $ordered = @($names | Where-Object { $_ -and ($_ -ne 'summary.json') } | Select-Object -Unique)
             $ordered += 'summary.json'
             return @($ordered | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-        } -ArgumentList @('build.log', 'unit.log', 'integration.log', 'guest-metrics.log', 'summary.json')
+        } -ArgumentList @('build.log', 'unit.log', 'integration.log', 'guest-metrics.log', 'summary.json'), ([bool]$TestCmd)
 
         New-Item -ItemType Directory -Path $hostResultsDir -Force | Out-Null
         $chunkSize = 4MB
@@ -775,6 +845,8 @@ public static class WinSta {
     }
     if ($summaryFetched) {
         Write-Host "[vm-run] artifacts fetched to $hostResultsDir (summary.json last)."
+    } elseif ($TestCmd) {
+        Write-Host "[vm-run] artifacts fetched to $hostResultsDir (TestCmd mode has no summary.json - all files fetched)."
     } else {
         Write-Host '[vm-run] WARNING: summary.json was not produced by the guest run - the suite died before completion.' -ForegroundColor Yellow
     }
@@ -799,7 +871,13 @@ public static class WinSta {
         try { $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json } catch { $summary = $null }
     }
     Write-Host '[vm-run] ---------------- run summary ----------------'
-    if ($summary) {
+    if ($TestCmd) {
+        $guestExitLabel = if ($null -ne $guestExit) { [string]$guestExit } else { 'unknown' }
+        Write-Host '[vm-run] mode:          testcmd'
+        Write-Host ("[vm-run] guest exit:    {0}" -f $guestExitLabel)
+        $fetchedCount = @(Get-ChildItem -LiteralPath $hostResultsDir -File -ErrorAction SilentlyContinue).Count
+        Write-Host ("[vm-run] artifacts:    {0} file(s)" -f $fetchedCount)
+    } elseif ($summary) {
         $buildOk = if ($null -ne $summary.build.ok) { [string]$summary.build.ok } else { '-' }
         $unitExit = if ($null -ne $summary.unit.exit) { [string]$summary.unit.exit } else { '-' }
         $integrationCounts = '-'

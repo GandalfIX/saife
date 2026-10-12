@@ -50,7 +50,7 @@ later refinement).
 |---|---|---|
 | V1 | **Hyper-V**, not Windows Sandbox / VirtualBox / WSL2 | Windows Sandbox is single-instance, desktop-oriented, and explicitly rejected by the WBD for our purposes; VirtualBox adds a third-party dependency; WSL2 is a Linux guest. Hyper-V is built into the host edition, supports PowerShell Direct (no network dependency for control), checkpoints, and differencing disks. The WBD itself standardizes on Hyper-V for its reference oracle (D-13). |
 | V2 | **Template base image + differencing VHDX per run** | The base VHDX is never booted directly. Each run creates a differencing disk, so runs are hermetic, parallelizable, and the template stays pristine. VM deletion is the rollback — nothing to "restore". |
-| V3 | **Two named images**: `sbx-base-a` (stable Windows, for the current AppContainer suite) and `sbx-base-b` (build `29671.1000` + pinned MXC, for WBD R0 discovery) | Image A is unblocked and serves the current product. Image B is blocked on image acquisition (decision D3 in the impact analysis) and slots directly into the WBD's dedicated-runner requirement. |
+| V3 | **Two named images**: `sbx-base-a` (stable Windows, for the current AppContainer suite) and `sbx-base-b` (build `29671.1000` + pinned MXC, for WBD R0 discovery) | Image A is unblocked and serves the current product. Image B is blocked on image acquisition (decision D3 in the impact analysis) and slots directly into the WBD's dedicated-runner requirement. **Update 2026-10-12: unblocked — ISO acquired (`29680_1000.iso`, accepted in place of 29671.1000, see Task 6).** |
 | V4 | **In-guest entry point is a single script** (`tests/vm/run-in-vm.ps1`) that builds and runs the suites and emits a machine-readable summary | Keeps the guest contract stable while the host-side harness evolves; the same entry point is reusable by CI later. |
 | V5 | **Rollback scripts first (AGENTS.md rule)** | `Remove-TestVM.ps1` is written before the first VM is created, so a killed harness run can always be cleaned up manually. This satisfies the repo's testing rule at the infrastructure level. |
 
@@ -260,17 +260,42 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
 - [x] **Step 6: Commit** — single branch; message:
   `test(infra): disposable-VM test harness (VM-01): spin up, run suites in-VM, collect, destroy`
 
-## Task 6 (BLOCKED — do not start): Base image B + WBD discovery lane
+## Task 6 (UNBLOCKED 2026-10-12): Base image B + WBD discovery lane
 
-**Blocked on:** acquisition of Windows Experimental Future Platforms build
-`29671.1000` Enterprise x64 media (impact-analysis decision D3). When unblocked:
+**ISO decision (2026-10-12, maintainer):** the originally pinned build
+`29671.1000` media was never acquired; the maintainer accepted the later
+flight of the same Experimental Future Platforms channel instead:
+`Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso` (in
+`Downloads`, 2026-10-05). All build references below therefore target
+`29680.1000`; the capability probes (not the build number) remain the
+authoritative evidence per the WBD. Scope:
 
-- Extend `BUILD-BASE-IMAGE.md` for `sbx-base-b`: same provisioning plus the
+- [x] **Extend `BUILD-BASE-IMAGE.md` for `sbx-base-b`**: same provisioning plus the
   **pinned MXC commit checked out at `C:\mxc`** with `wxc-exec.exe` built
-  (release), hash recorded.
-- `Invoke-TestsInVM.ps1 -Image sbx-base-b -TestCmd <probe/evidence command>`
-  gains a generic `-TestCmd` parameter so WBD D-01/D-02 probe capture runs
-  inside the image and writes evidence artifacts into `results/`.
+  (release), hash recorded. — done 2026-10-13: image-B section (single-image
+  `build-config.json` handling, same-credential rule, `prepare-mxc.ps1` step,
+  `sbx-base-b` export incl. derived `sbx-base-b-clean` checkpoint, image-B
+  record table, troubleshooting entries). `tests\vm\prepare-mxc.ps1` (guest
+  clone/pin `e7940f7`/release build/SHA256 record to `C:\mxc\mxc-build.json`;
+  never runs `wxc-host-prep`) and `tests\vm\wbd-d01-d02-probes.ps1` (D-01
+  baseline JSON + verbatim `--probe`/`--version`/upstream-D-02 logs + SHA256
+  artifact manifest into `C:\sbx-results`) landed with it; both parser-checked
+  and locally mock-verified (prereq gates, capture round-trip, empty-output
+  Set-Content fix).
+- [x] **`Invoke-TestsInVM.ps1 -Image sbx-base-b -TestCmd <probe/evidence command>`
+  gains a generic `-TestCmd` parameter** so WBD D-01/D-02 probe capture runs
+  inside the image and writes evidence artifacts into `results/`. — done
+  2026-10-13: `-TestCmd` runs the given command via the PS-Direct session
+  instead of the suite (same repo copy, winsta grant, streaming, teardown);
+  output teed to `C:\sbx-results\testcmd.log`; ALL files under
+  `C:\sbx-results` fetched (no `summary.json` contract); empty/whitespace
+  `-TestCmd` fails at a pre-creation gate (exit 3). Parser-checked; binding +
+  elevation gate + tee/fetch-all logic locally mock-verified. In-VM smoke run
+  still pending (image B not built yet; can also run against `sbx-base-a`).
+- [ ] **Build image B** from `29680_1000.iso` per the runbook section (manual
+  Windows Setup in the VM console is the only hands-on step), then run the
+  evidence-capture lane once and record the D-01/D-02 artifacts under
+  `tests\vm\results\`.
 - This lane is the seed of the WBD's Q-01 dedicated-runner tier; do not build
   product code from this evidence until the impact-analysis §5 decisions are
   recorded.
@@ -289,6 +314,6 @@ v1. The runbook must produce a **template VHDX** (`sbx-base-a.vhdx`) that is:
 
 - GitHub Actions Windows runners with a hosted image (CI wiring).
 - Automated ISO→VHDX image build (first image is manual).
-- Image B work (blocked, see above).
+- Image B work (unblocked 2026-10-12, see Task 6).
 - Hyper-V isolated-container oracle (that is the WBD's D-13, a separate
   ticket on the WBD track).

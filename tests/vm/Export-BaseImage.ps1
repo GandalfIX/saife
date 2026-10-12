@@ -23,7 +23,7 @@
     5. Asks for the template name (default: sbx-base-a, the harness's
        -Image default) and refuses to overwrite an existing template
        without confirmation - BEFORE any state change.
-    6. Takes the re-bake checkpoint 'sbx-base-a-clean' (skipped when it
+    6. Takes the re-bake checkpoint '<template-name>-clean' (skipped when it
        already exists), stops the VM (graceful-first via -Force), copies
        its VHDX to tests\vm\templates\<name>.vhdx, prints the SHA256.
     7. Runs tests\vm\Initialize-VMHost.ps1 and reports the verdict
@@ -56,6 +56,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configPath = Join-Path $script:ThisDir 'build-config.json'
+# Default for the first export (sbx-base-a); the step-5 template prompt
+# re-derives it per exported image.
 $checkpointName = 'sbx-base-a-clean'
 
 try {
@@ -194,6 +196,9 @@ try {
     $templateName = Read-Host '[vm-export] template name (default: sbx-base-a; the harness default -Image)'
     if ($templateName -eq '') { $templateName = 'sbx-base-a' }
     if ([System.IO.Path]::GetExtension($templateName) -ne '.vhdx') { $templateName = "$templateName.vhdx" }
+    # The re-bake checkpoint lives on THIS builder VM; name it after the
+    # template being exported so image B gets 'sbx-base-b-clean' etc.
+    $checkpointName = '{0}-clean' -f [System.IO.Path]::GetFileNameWithoutExtension($templateName)
     $templatePath = Join-Path $templatesDir $templateName
     if (Test-Path -LiteralPath $templatePath) {
         $answer = Read-Host "[vm-export] template already exists: $templatePath - overwrite it? (y/N)"

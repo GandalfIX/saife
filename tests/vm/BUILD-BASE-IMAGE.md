@@ -1,19 +1,23 @@
-# BUILD-BASE-IMAGE — disposable test-VM base image (`sbx-base-a`) runbook
+# BUILD-BASE-IMAGE — disposable test-VM base-image runbook (`sbx-base-a`, `sbx-base-b`)
 
-> **VM-01, Task 2.** One-time, **manual** runbook. Fully automated
+> **VM-01, Task 2 (image A) / Task 6 (image B).** One-time, **manual**
+> runbook per image. Fully automated
 > ISO→image builds are a documented non-goal for v1 (see
 > `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`); likewise
 > unattended Windows Setup and CredSSP. The template is only ever **cloned**
 > (differencing VHDX per run), never booted directly and never reused as a
 > daily driver — so **no sysprep** is performed.
 
-**Image role.** The downloaded ISO is the insider/experimental build that
-also serves the later MXC discovery track: **one image serves both tracks
-initially** — base image A (current AppContainer suite) is built from it,
-and the same template (or a derived one) later becomes image B by adding
-the pinned `mxc/` checkout (plan Task 6). If the experimental build proves
-too unstable for the AppContainer suite, add a stable-Windows template
-later; the harness is image-agnostic.
+**Image roles.** Two templates exist, each built from its own ISO:
+
+- **`sbx-base-a`** (current AppContainer suite) — installed from the
+  Dev Channel ISO (build 26340); see the [Current image](#current-image)
+  section.
+- **`sbx-base-b`** (WBD R0 discovery / MXC lane, VM-01 Task 6) — built
+  from the Experimental Future Platforms ISO `29680_1000.iso` with the
+  pinned MXC checkout added; see
+  [Image B](#image-b-sbx-base-b--wbdmxc-discovery-vm-01-task-6) below.
+  Same clone-only rules apply.
 
 > **Hyper-V command caveat:** the Hyper-V module cannot be imported in a
 > non-elevated shell on the dev host, so the commands below could not be
@@ -368,6 +372,103 @@ Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
 }
 ```
 
+### Image B record (`sbx-base-b`) — fill in after the build
+
+`Export-BaseImage.ps1` prints most of this table ready-to-paste; the
+MXC fields come from `C:\mxc\mxc-build.json` inside the image
+(collect them the same way, with the VM running).
+
+| Field            | Value |
+|------------------|-------|
+| Template name    | sbx-base-b.vhdx |
+| Edition (Caption)| _fill in_ |
+| OS build (BuildNumber) | _fill in (expected 29680.1000)_ |
+| ISO path         | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso |
+| Secure boot      | on / off |
+| MXC commit       | e7940f7 |
+| wxc-exec.exe SHA256 | _fill in from C:\mxc\mxc-build.json_ |
+| wxc-exec version | _fill in from C:\mxc\mxc-build.json_ |
+| Template SHA256  | _fill in_ |
+| Build date       | _fill in_ |
+
+## Image B (`sbx-base-b`) — WBD/MXC discovery (VM-01 Task 6)
+
+Purpose: the WBD R0 discovery lane — D-01/D-02 first evidence capture on
+the Experimental Future Platforms build. Everything in Steps 0-5 above is
+**identical** except for the values below; `Build-BaseImage.ps1`'s phase
+flow is reused unchanged.
+
+**ISO (decision 2026-10-12):**
+`Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso` —
+accepted in place of the originally pinned `29671.1000` (a superseded
+flight of the same channel; recorded in impact-analysis D3 and the VM-01
+plan Task 6). Per the WBD, the capability probes — never the build
+number — are the authoritative evidence.
+
+Differences from the image-A build:
+
+1. **`build-config.json` is single-image** (machine-local, gitignored).
+   Move the image-A config aside first, then run `New-BuilderVM.ps1` and
+   answer with the image-B values:
+
+   ```powershell
+   Rename-Item tests\vm\build-config.json build-config.base-a.json
+   pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\New-BuilderVM.ps1
+   ```
+
+   - vmName: `sbx-base-b-builder` (still outside `Remove-TestVM.ps1`'s
+     `sbx-test-` allow-list)
+   - isoPath: the 29680 ISO above
+   - vmDir / repoRoot: unchanged
+
+   Keep whichever config matches the image you re-bake next; values are
+   trivially re-entered.
+2. **Guest credential:** use the SAME `sbxadmin` password as image A so
+   the shared `tests\vm\vm-settings.json` serves both images.
+3. **Extra provisioning step** — run after `prepare-guest.ps1` (which
+   installs git + rustup + the MSVC toolchain), before the export:
+
+   ```powershell
+   Invoke-Command -VMName sbx-base-b-builder -Credential $cred -ScriptBlock {
+       pwsh -NoProfile -ExecutionPolicy Bypass -File C:\sbx-repo\tests\vm\prepare-mxc.ps1
+       if ($LASTEXITCODE -ne 0) { throw "prepare-mxc.ps1 failed (exit $LASTEXITCODE)" }
+   }
+   ```
+
+   `prepare-mxc.ps1` clones `microsoft/mxc` to `C:\mxc`, checks out the
+   pinned commit `e7940f7` (the analyzed upstream pin recorded in
+   `docs/mxc-source-analysis.md`), runs `cargo build --release` in the
+   workspace, and records the `wxc-exec.exe` SHA256 + VersionInfo in
+   `C:\mxc\mxc-build.json`. It never runs `wxc-host-prep` (a WBD stop
+   signal) and launches no workload. Expect the build to take a while on
+   first run (fresh cargo cache inside the image).
+4. **Export:** `Export-BaseImage.ps1` asks for the template name —
+   answer `sbx-base-b`. The re-bake checkpoint is derived from it
+   (`sbx-base-b-clean`). `Initialize-VMHost.ps1` must then print
+   `READY: sbx-base-b.vhdx`.
+
+**Evidence-capture lane (the point of image B):**
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Invoke-TestsInVM.ps1 -Image sbx-base-b -TestCmd "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\sbx-repo\tests\vm\wbd-d01-d02-probes.ps1"
+```
+
+`wbd-d01-d02-probes.ps1` captures the WBD D-01 baseline (edition/build,
+architecture, isolation-relevant optional features, MXC commit,
+`wxc-exec.exe` hash/version, elevation state, `--probe` and `--version`
+output verbatim with exit codes) plus the D-02 upstream probe test
+(`run_processcontainer_probes_test.ps1 -RequireTier base-container`), and
+writes `wbd-d01-baseline.json`, the raw logs and a SHA256 artifact
+manifest into `C:\sbx-results`; the harness fetches everything into
+`tests\vm\results\<runid>\` and destroys the VM. `--probe` may perform
+MXC stale-DACL recovery before capability detection (a security-state
+operation, recorded in the baseline) — which is exactly why it only ever
+runs inside disposable clones.
+
+**Scope guard (VM-01 Task 6):** this lane is evidence capture only. Do
+not build product code from this evidence until the impact-analysis §5
+decisions are recorded.
+
 ## Troubleshooting
 
 - **Secure-boot boot loop / `Secure Boot violation`** — disable secure boot
@@ -418,3 +519,15 @@ Invoke-Command -VMName $vmName -Credential $cred -ScriptBlock {
   different VM name) and re-run.
 - **robocopy "failed"** — robocopy exit codes 0–7 are success (1 = files
   copied); only ≥ 8 is an error.
+- **`prepare-mxc.ps1` exits 4 (commit unreachable / dirty tree)** — the
+  upstream history was rewritten, or the checkout has local changes
+  (never reset by the script). Record the new pin decision in
+  `docs/mxc-source-analysis.md` first, then re-run with
+  `-Commit <new-pin>`.
+- **`prepare-mxc.ps1` exits 5 (cargo build)** — same toolchain causes as
+  the prepare-guest cargo warm-up (see above); the full build log is at
+  `C:\mxc\mxc-build.log` inside the VM.
+- **`prepare-mxc.ps1` exits 6 (`wxc-exec.exe` missing)** — the pinned
+  workspace built without producing the release executor; check
+  `C:\mxc\mxc-build.log` and the pinned layout assumptions in the
+  script.

@@ -159,7 +159,7 @@ construction (VM deletion / checkpoint revert).
 |---|---|---|---|
 | D1 | Track strategy | (a) Hard-switch: abandon AppContainer tool, build only the WBD product. (b) Two-track: keep the current tool as the *interim* MVP on stable Windows; start the WBD product in parallel. | **(b) Two-track.** The current tool is the only thing usable on stable Windows today; the WBD product is blocked on an experimental-build VM image and months of discovery. The interim tool also de-risks UX, profiles, proxy policy, and audit design that port forward. |
 | D2 | Home for the WBD product | (a) Sibling directory `C:\Users\marku\tools\windows-agent-sandbox\` per the monorepo rule and the WBD's expected shape (with `mxc/` pinned checkout as its own sibling). (b) Subdirectory under `sandbox/`. | **(a) Sibling**, matching both the WBD's workspace assumptions and the repo's "one tool per directory" rule. Requires the rename ADR the WBD mentions only if we later move it. |
-| D3 | Build `29671.1000` access | Do we have ISO/VHDX access for the experimental build, or a designated R&D host? | **Acquire the image** (insider/experimental channel) and build VM image B (see VM plan Task 6). Until then, all WBD D-tickets stay blocked; the VM plan's image A work is independent and unblocked. |
+| D3 | Build `29671.1000` access | Do we have ISO/VHDX access for the experimental build, or a designated R&D host? | **DECIDED 2026-10-12: acquired.** The `29671.1000` media was superseded by a later flight of the same Experimental Future Platforms channel: `Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso` accepted by the maintainer. Image B build unblocked (VM plan Task 6); capability probes remain the authoritative evidence, not the build number. |
 | D4 | In-flight work | (a) Finish ADR-0001 slice (proxy/approvals) + mxc-derived Tasks 1–2. (b) Park everything now. | **(a) Land Task 1 (ingress warning) and complete or cleanly park ADR-0001 at its next checkpoint; drop Task 2 (`--lpac`) unless the interim track stays active.** Rationale: half-finished worktrees rot; the slice still serves the interim product that users run on stable Windows. |
 | D5 | Interim feature freeze | Keep evolving the AppContainer tool (e.g., US-4 kernel audit, `--reuse` stores) vs freeze after in-flight work? | **Freeze new interim features after the in-flight slice**; route new capability work into the WBD track where it isn't throwaway (e.g., audit event schema design, quota research feeding D-12). |
 
@@ -171,7 +171,9 @@ construction (VM deletion / checkpoint revert).
    `tests/run-tests.ps1` into the VM; dev-host runs become smoke-only.
 2. **Record the D1/D2 decisions as a short ADR** in `docs/adr/` once taken.
 3. **Acquire build `29671.1000`** (D3) → build VM image B → run WBD D-01/D-02
-   first evidence capture inside it.
+   first evidence capture inside it. **Done 2026-10-12: ISO acquired
+   (`29680_1000.iso`, a later flight accepted per D3) — image B build and
+   the D-01/D-02 capture are next.**
 4. **Finish or park in-flight work** (D4) so exactly one interim branch state is
    left clean.
 5. When the WBD track starts: create `windows-agent-sandbox/` per the WBD's
