@@ -344,11 +344,21 @@ function Invoke-Scenario-S9 {
     if ($r1.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pyExe)) {
         return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe) stderr=$(($r1.Stderr -join "`n")) stdout=$(($r1.Stdout -join "`n"))" }
     }
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',$pyExe,'-c',"print('venv works')") -WorkingDirectory $d
+    # r2 runs the venv python DIRECTLY. The previous form wrapped it in
+    # `cmd /c`, which is broken in two independent ways proven on
+    # 2026-10-12 (see tests/vm/confirm-s9-winsta.ps1 round W + local sims):
+    # (a) cmd's /c quote heuristics strip quotes once the command line has
+    #     more than two (spaced exe path, quoted -c arg), mangling it into
+    #     "Access is denied."; (b) in-VM, cmd inside the AppContainer
+    #     cannot spawn an exe under the PROTECTED .sandbox\<sid> subtree at
+    #     all (W1/W2; still an open product question), while the direct
+    #     spawn passes everywhere.
+    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--',$pyExe,'-c',"print('venv works')") -WorkingDirectory $d
     $out = ($r2.Stdout -join "`n")
+    $err = ($r2.Stderr -join "`n")
     $passed = ($r2.ExitCode -eq 0) -and ($out -match 'venv works')
     return @{ Num=9; Name='S-9'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "venv python ran; sid=$sid" } else { "exit=$($r2.ExitCode) stdout=$out" } }
+        Detail = if ($passed) { "venv python ran; sid=$sid" } else { "exit=$($r2.ExitCode) stdout=$out stderr=$err" } }
 }
 
 # S-10: child process inherits restrictions (depth 3).
@@ -654,16 +664,14 @@ function Invoke-Scenario-S36 {
     return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='deferred: proxy/loopback mechanism pending (admin-only API)' }
 }
 
-# S-37: AC-3.13 — raw-socket app fails closed (skips if no python).
+# S-37: AC-3.13 — raw-socket app fails closed. DEFERRED with the US-3
+# network slice: `--allow-domain` currently exits rc 1 with a deferral
+# warning BEFORE the child runs ("--allow-domain / --network-profile are
+# deferred in this slice"), so the fail-closed assertion cannot be
+# evaluated (observed in-VM 2026-10-12, run 20261012-223811). Mirror the
+# S-36/S-38/S-39 deferral skips; revive the scenario when US-3 lands.
 function Invoke-Scenario-S37 {
-    $d = New-ScenarioDir 37
-    $py = Get-Python
-    if (-not $py) { return @{ Num=37; Name='S-37 (AC-3.13)'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.openai.com','--','python','-c',"import socket; socket.create_connection(('api.openai.com',443))") -WorkingDirectory $d
-    $err = ($r.Stderr -join "`n")
-    $passed = ($r.ExitCode -ne 0) -and ($err -match '(?i)(access is denied|PermissionError|WSAEACCES|Operation not permitted)')
-    return @{ Num=37; Name='S-37 (AC-3.13)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'raw-socket direct connect denied by AC' } else { "exit=$($r.ExitCode) stderr=$err" } }
+    return @{ Num=37; Name='S-37 (AC-3.13)'; Passed=$true; Skipped=$true; Detail='deferred: --allow-domain exits with a slice-deferral warning before the child runs (US-3)' }
 }
 
 # S-38: AC-3.14 — proxy port released on sandbox exit. (DEFERRED — requires the proxy; see S-27.)

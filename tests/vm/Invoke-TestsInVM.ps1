@@ -553,6 +553,87 @@ try {
     $guestCommand = "& '$escapedRunner' -Phase '$Phase' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results'"
     if ($Only) { $guestCommand += ' -Only ' + ($Only -join ',') }
     Write-Host "[vm-run] guest command: pwsh -NoProfile -Command $guestCommand"
+
+    # Window-station/desktop AAP grant helper for the guest suite session.
+    # PS-Direct sessions run on a Service-0x0-*$ window station whose SD
+    # carries NO ALL APPLICATION PACKAGES ACE, so sandboxed children that
+    # touch user32 (venv/ensurepip's subprocess, ctypes, ...) die with
+    # 0xC0000142 and S-9 fails at ensurepip. Interactive WinSta0 carries
+    # the ACEs, which is why the same suite passes on the host. Grant AAP
+    # GA on the session's winsta + desktop before running the suite -
+    # identical to the round-5 battery and tests/vm/confirm-s9-winsta.ps1
+    # (verified in-VM 2026-10-12: with the grant, S-9 r1/venv creation
+    # passes). The grant lives only in this logon session and evaporates
+    # with it; the VM is disposable either way.
+    $winstaHelper = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class WinSta {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetThreadDesktop(uint dwThreadId);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetUserObjectSecurity(IntPtr hObj, ref uint pSecurityInformation, IntPtr pSecurityDescriptor, uint nLength, out uint lpnLengthNeeded);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetUserObjectSecurity(IntPtr hObj, ref uint SecurityInformation, IntPtr pSecurityDescriptor);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr SecurityDescriptor, uint RequestedRevision, uint SecurityInformation, out IntPtr SecurityDescriptorString, out uint SecurityDescriptorStringLength);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string StringSecurityDescriptor, uint StringSecurityDescriptorRevision, out IntPtr SecurityDescriptor, out uint SecurityDescriptorSize);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr hMem);
+
+    public const uint DACL_SI = 0x00000004;
+
+    public static string GetSddl(IntPtr hObj) {
+        uint si = DACL_SI;
+        uint needed;
+        GetUserObjectSecurity(hObj, ref si, IntPtr.Zero, 0, out needed);
+        if (needed == 0) return "ERR zero length";
+        IntPtr sd = Marshal.AllocHGlobal((int)needed);
+        string sddl = null;
+        try {
+            if (!GetUserObjectSecurity(hObj, ref si, sd, needed, out needed)) {
+                return "ERR " + Marshal.GetLastWin32Error();
+            }
+            IntPtr strPtr;
+            uint strLen;
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, si, out strPtr, out strLen)) {
+                sddl = Marshal.PtrToStringUni(strPtr);
+                LocalFree(strPtr);
+            } else {
+                sddl = "ERR-conv " + Marshal.GetLastWin32Error();
+            }
+        } finally {
+            Marshal.FreeHGlobal(sd);
+        }
+        return sddl;
+    }
+
+    public static string Grant(IntPtr hObj, string ace) {
+        string s = GetSddl(hObj);
+        if (s == null || s.StartsWith("ERR")) return "dump failed: " + s;
+        int di = s.IndexOf("D:");
+        if (di < 0) return "no DACL section in SDDL: " + s;
+        int paren = s.IndexOf('(', di);
+        string mod = paren < 0 ? s + "D:" + ace : s.Insert(paren, ace);
+        IntPtr sd;
+        uint size;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(mod, 1, out sd, out size)) {
+            return "convert failed: " + Marshal.GetLastWin32Error();
+        }
+        uint si = DACL_SI;
+        bool ok = SetUserObjectSecurity(hObj, ref si, sd);
+        int err = Marshal.GetLastWin32Error();
+        LocalFree(sd);
+        return ok ? "OK" : ("SetUserObjectSecurity failed gle=" + err);
+    }
+}
+'@
     # STREAM each suite line via Write-Host (Information stream) instead of
     # accumulating an in-memory array: the full suite output (cargo + unit
     # tests + the integration suite) plus the cargo build's own memory
@@ -566,7 +647,27 @@ try {
     $guestExit = $null
     try {
         $guestExit = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
-            param([string]$Command)
+            param([string]$Command, [string]$WinstaHelper)
+            # Grant ALL APPLICATION PACKAGES GA on this session's window
+            # station + desktop BEFORE the suite: the suite's pwsh child
+            # stays in this logon session, so every sandboxed process it
+            # spawns runs against the granted winsta (see the host-side
+            # comment for the full rationale). Non-fatal on failure - only
+            # the win32k-dependent scenarios (S-9) need it.
+            try {
+                Add-Type -TypeDefinition $WinstaHelper
+                $wsHandle = [WinSta]::GetProcessWindowStation()
+                $dtHandle = [WinSta]::GetThreadDesktop([WinSta]::GetCurrentThreadId())
+                $aap = '(A;;GA;;;S-1-15-2-1)'
+                $wsGrant = [WinSta]::Grant($wsHandle, $aap)
+                $dtGrant = [WinSta]::Grant($dtHandle, $aap)
+                Write-Host "[vm-guest] winsta AAP grant: winsta=$wsGrant desktop=$dtGrant"
+                if ($wsGrant -ne 'OK' -or $dtGrant -ne 'OK') {
+                    Write-Host "[vm-guest] WARNING: winsta/desktop AAP grant failed - S-9 (venv/ensurepip) will likely fail"
+                }
+            } catch {
+                Write-Host "[vm-guest] WARNING: winsta grant helper failed: $($_.Exception.Message)"
+            }
             & pwsh -NoProfile -Command $Command 2>&1 | ForEach-Object {
                 # NOTE: StartsWith, not -like: '[vm-guest]*' is an INVALID
                 # wildcard pattern ([...] is a char class) — with EAP=Stop
@@ -574,7 +675,7 @@ try {
                 if ($_.StartsWith('[vm-guest]')) { Write-Host $_ } else { Write-Host "[vm-guest] $_" }
             }
             $LASTEXITCODE
-        } -ArgumentList $guestCommand
+        } -ArgumentList $guestCommand, $winstaHelper
     } catch {
         Write-Host "[vm-run] ERROR: suite session died: $($_.Exception.Message)" -ForegroundColor Red
     }
