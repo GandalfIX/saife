@@ -81,6 +81,32 @@ impl DaclJournal {
         Ok(())
     }
 
+    /// Journal a whole batch BEFORE the caller applies any of it (one
+    /// open+write+fsync for the batch — a per-entry fsync is the dominant
+    /// cost when propagation covers a multi-thousand-object tree). The
+    /// crash contract holds at batch granularity: a torn tail line is
+    /// skipped by the parser, so a crash loses at most the not-yet-applied
+    /// remainder of the batch, and `restore_one` is idempotent against
+    /// never-applied entries (revoking a never-granted trustee and
+    /// re-merging already-present prior ACEs are no-ops).
+    pub fn record_many(&self, entries: &[JournalEntry]) -> std::io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)?;
+        let mut buf = String::new();
+        for e in entries {
+            buf.push_str(&serde_json::to_string(e).unwrap());
+            buf.push('\n');
+        }
+        f.write_all(buf.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
     /// Every entry (header line excluded). Unparseable lines are skipped.
     pub fn entries(&self) -> Vec<JournalEntry> {
         fs::read_to_string(&self.file)
@@ -236,6 +262,20 @@ mod tests {
                 inherit_flags: 0,
             }],
         }
+    }
+
+    #[test]
+    fn record_many_roundtrips_batch_in_order() {
+        let d = tmpdir("batch");
+        let j = DaclJournal::open(&d, header(4242)).unwrap();
+        let entries: Vec<JournalEntry> = (0..3)
+            .map(|i| entry(&format!("C:\\batch{i}")))
+            .collect();
+        j.record_many(&entries).unwrap();
+        let read = j.entries();
+        assert_eq!(read.len(), 3, "all batch entries journaled");
+        assert_eq!(read[0].path, "C:\\batch0");
+        assert_eq!(read[2].path, "C:\\batch2", "order preserved");
     }
 
     #[test]

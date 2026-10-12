@@ -285,7 +285,282 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry, journal: Option<&DaclJournal>) -> Re
         // kernel writes the DACL directly, no userspace tree propagation.
         // (Extracted as `apply_dacl_kernel` so the DACL-restore path uses the
         // identical write mechanism.)
-        apply_dacl_kernel(&path_str, new_acl, e.protected)
+        apply_dacl_kernel(&path_str, new_acl, e.protected)?;
+
+        // The kernel DOES propagate the inheritable ACE to pre-existing
+        // children, but via an asynchronous auto-inherit wave — near-instant
+        // on small trees, but observably incomplete for seconds on large ones
+        // (proven on a 4.6k-file uv python tree: the spawned child raced the
+        // wave and could not read its own interpreter DLLs — loader error
+        // 0xC0000135). Make the grant deterministic instead: write the ACE
+        // onto every pre-existing descendant synchronously before the child
+        // is spawned (propagate_grant).
+        if should_propagate(e) {
+            let stats = propagate_grant(ac_sid, e, journal, PROPAGATE_MAX_OBJECTS);
+            if stats.truncated {
+                eprintln!(
+                    "[sandbox] warning: grant propagation for {:?} truncated at {PROPAGATE_MAX_OBJECTS} objects; pre-existing files deeper in the tree may be unreadable inside the sandbox",
+                    e.win32_path
+                );
+            }
+            if std::env::var_os("SANDBOX_DIAG").is_some() {
+                eprintln!(
+                    "[grant] {:>16}  propagated: applied={} failed={} skipped={}",
+                    if e.deny {
+                        format!("{} [deny]", e.label)
+                    } else {
+                        e.label.to_string()
+                    },
+                    stats.applied,
+                    stats.failed,
+                    stats.skipped
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Upper bound on pre-existing objects visited by `propagate_grant` per
+/// entry. Bounds both the walk and the journal so a pathological `allow:`
+/// tree cannot wedge startup or grow the journal unbounded. Roots beyond
+/// the cap keep their own ACE; deeper pre-existing files may stay
+/// unreadable to the child (warned).
+const PROPAGATE_MAX_OBJECTS: usize = 20_000;
+
+/// Journal+apply batch size for `propagate_grant`: a batch is journaled
+/// with a single fsync (`record_many`) and only applied afterwards,
+/// preserving the journal-before-apply crash contract at batch
+/// granularity.
+const PROPAGATE_BATCH: usize = 256;
+
+#[derive(Debug, Default)]
+struct PropagateStats {
+    /// Children whose ACE write was applied.
+    applied: usize,
+    /// Children whose ACE write failed (tolerated — mirrors
+    /// grant_access's per-entry error tolerance).
+    failed: usize,
+    /// Children skipped without a write: PROTECTED DACL (inheritance — and
+    /// therefore propagation — stops at PROTECTED boundaries; also keeps
+    /// sibling sessions' `.sandbox\<sid>` subtrees isolated) or no DACL at
+    /// all (a null DACL is world-accessible: the child can already use the
+    /// object, and writing one would strip the owner's access).
+    skipped: usize,
+    /// True when the walk stopped early at `max_objects`.
+    truncated: bool,
+}
+
+/// One staged descendant write: the journal entry plus the merged DACL,
+/// applied by `flush_batch` once the whole batch is on disk.
+struct PendingChild {
+    path: String,
+    entry: JournalEntry,
+    acl: *mut ACL,
+}
+
+/// Should this entry's ACE be propagated synchronously to its pre-existing
+/// descendants? Only inheritable, non-PROTECTED grants — and never
+/// anything at/under SystemRoot (System32/SystemRoot are huge,
+/// system-owned, and already world-readable; their RX grants stay
+/// dir-level, and a failed grant there is harmless).
+fn should_propagate(e: &AllowEntry) -> bool {
+    e.inherit && !e.protected && !is_under_system_root(&e.win32_path)
+}
+
+/// Case-insensitive component-prefix test: is `path` SystemRoot itself or
+/// somewhere below it?
+fn is_under_system_root(path: &std::path::Path) -> bool {
+    let Some(root) = std::env::var_os("SystemRoot") else {
+        return false;
+    };
+    let mut root_comps = std::path::Path::new(&root).components();
+    let mut path_comps = path.components();
+    loop {
+        match root_comps.next() {
+            Some(r) => match path_comps.next() {
+                Some(p) => {
+                    if !r
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&p.as_os_str().to_string_lossy())
+                    {
+                        return false;
+                    }
+                }
+                None => return false,
+            },
+            None => return true,
+        }
+    }
+}
+
+/// Write the entry's ACE onto every pre-existing descendant of the granted
+/// root: files and reparse points get a non-inheritable ACE, subdirs an
+/// inheritable one (so files created later inherit at creation time).
+/// PROTECTED/null-DACL subtrees are skipped and not descended into.
+/// Every applied write is journaled, so teardown needs no walk of its own
+/// — journal replay covers the children exactly like the roots.
+fn propagate_grant(
+    ac_sid: &PSID,
+    e: &AllowEntry,
+    journal: Option<&DaclJournal>,
+    max_objects: usize,
+) -> PropagateStats {
+    let mut stats = PropagateStats::default();
+    let mut batch: Vec<PendingChild> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![e.win32_path.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            stats.failed += 1;
+            continue;
+        };
+        for item in rd.flatten() {
+            if stats.applied + stats.failed + stats.skipped + batch.len() >= max_objects {
+                stats.truncated = true;
+                break;
+            }
+            let Ok(ft) = item.file_type() else {
+                stats.failed += 1;
+                continue;
+            };
+            let path = item.path();
+            let mut descend = ft.is_dir() && !ft.is_symlink();
+            match prepare_child(ac_sid, &path, e, descend, &mut batch) {
+                // Queued: the batch flush applies + journals it.
+                Ok(true) => {}
+                // Skipped (PROTECTED or null DACL): leave untouched and do
+                // not descend — the subtree is outside this grant.
+                Ok(false) => {
+                    stats.skipped += 1;
+                    descend = false;
+                }
+                Err(_) => stats.failed += 1,
+            }
+            if descend {
+                stack.push(path);
+            }
+            if batch.len() >= PROPAGATE_BATCH {
+                flush_batch(journal, &mut batch, &mut stats);
+            }
+        }
+        if stats.truncated {
+            break;
+        }
+    }
+    flush_batch(journal, &mut batch, &mut stats);
+    stats
+}
+
+/// Read one child's DACL and stage its write. Returns Ok(false) when the
+/// child must be skipped WITHOUT a write and its subtree must not be
+/// walked (PROTECTED DACL or null DACL).
+fn prepare_child(
+    ac_sid: &PSID,
+    path: &std::path::Path,
+    e: &AllowEntry,
+    inheritable: bool,
+    batch: &mut Vec<PendingChild>,
+) -> Result<bool> {
+    let path_str = path.to_string_lossy().to_string();
+    let path_w = HSTRING::from(&path_str);
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+        let r = GetNamedSecurityInfoW(
+            &path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl_ptr),
+            None,
+            &mut sd,
+        );
+        if r.is_err() {
+            return Err(HRESULT::from_win32(r.0).into());
+        }
+
+        let mut control: u16 = 0;
+        let mut revision = 0u32;
+        let dacl_protected = GetSecurityDescriptorControl(sd, &mut control, &mut revision).is_ok()
+            && (control & SE_DACL_PROTECTED.0) != 0;
+        if dacl_protected || dacl_ptr.is_null() {
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            return Ok(false);
+        }
+
+        // Snapshot our trustee's explicit ACEs BEFORE mutating (same
+        // contract as the root grant; restored by journal replay).
+        let prior_aces = snapshot_prior_aces(dacl_ptr, ac_sid);
+        let entry = JournalEntry {
+            path: path_str.clone(),
+            sid: sid_to_string(*ac_sid)?,
+            granted_mask: e.access,
+            deny: e.deny,
+            protected: false,
+            inherit: inheritable,
+            prior_aces,
+        };
+
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: e.access,
+            grfAccessMode: if e.deny { DENY_ACCESS } else { SET_ACCESS },
+            grfInheritance: if inheritable {
+                SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            } else {
+                NO_INHERITANCE
+            },
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_GROUP,
+                ptstrName: PWSTR(ac_sid.0 as *mut _),
+                ..Default::default()
+            },
+        };
+        let mut new_acl: *mut ACL = std::ptr::null_mut();
+        let set_r = SetEntriesInAclW(Some(&[ea]), Some(dacl_ptr as *const ACL), &mut new_acl);
+        let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+        if set_r.is_err() {
+            return Err(HRESULT::from_win32(set_r.0).into());
+        }
+        batch.push(PendingChild {
+            path: path_str,
+            entry,
+            acl: new_acl,
+        });
+        Ok(true)
+    }
+}
+
+/// Journal the whole batch, then apply it (journal-before-apply at batch
+/// granularity). `apply_dacl_kernel` consumes (frees) every staged ACL.
+fn flush_batch(
+    journal: Option<&DaclJournal>,
+    batch: &mut Vec<PendingChild>,
+    stats: &mut PropagateStats,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    if let Some(j) = journal {
+        let entries: Vec<JournalEntry> = batch.iter().map(|c| c.entry.clone()).collect();
+        if let Err(err) = j.record_many(&entries) {
+            // Matches grant_one's tolerance: a journal failure is a
+            // warning; the run proceeds (teardown just won't restore this
+            // batch, like an unjournaled grant).
+            eprintln!(
+                "[journal] WARN: record_many failed for {} children: {err}",
+                entries.len()
+            );
+        }
+    }
+    for child in batch.drain(..) {
+        match apply_dacl_kernel(&child.path, child.acl, false) {
+            Ok(()) => stats.applied += 1,
+            Err(_) => stats.failed += 1,
+        }
     }
 }
 
@@ -686,6 +961,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
     let mut pythonpath_overridden = false;
+    let mut session_sid_overridden = false;
     // Track which of the 4 proxy vars we've already emitted (by index) so we
     // can fill in any that were missing from the parent env afterwards.
     let mut proxy_seen = [false; 4];
@@ -698,6 +974,14 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         if k.eq_ignore_ascii_case("PYTHONPATH") {
             vars.push((k, format!("{};{}", pyshim_path, v)));
             pythonpath_overridden = true;
+            continue;
+        }
+        // Session marker for the pyshim's active mode (see sitecustomize.py):
+        // survives child-side env sanitization (venv strips PYTHONPATH but
+        // copies every other var). A nested sandbox run overrides it.
+        if k.eq_ignore_ascii_case("SANDBOX_SESSION_SID") {
+            vars.push((k, sid.to_string()));
+            session_sid_overridden = true;
             continue;
         }
         // Check if this is one of the proxy vars we manage.
@@ -723,6 +1007,9 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     }
     if !pythonpath_overridden {
         vars.push(("PYTHONPATH".to_string(), pyshim_path));
+    }
+    if !session_sid_overridden {
+        vars.push(("SANDBOX_SESSION_SID".to_string(), sid.to_string()));
     }
     // Append any proxy vars that were not present in the parent env.
     let proxy_values = [http_proxy, https_proxy, token_val, no_proxy];
@@ -752,6 +1039,260 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
 pub fn delete_profile(ac_name: &str) {
     let w = HSTRING::from(ac_name);
     let _ = unsafe { DeleteAppContainerProfile(&w) };
+}
+
+#[cfg(test)]
+mod propagation_tests {
+    use super::*;
+    use crate::sandbox::allowlist::RWX;
+    use crate::sandbox::dacl_journal::{DaclJournal, JournalHeader};
+    use windows::Win32::Security::{
+        ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation,
+    };
+
+    // ACE type values with the Header/Mask/SidStart layout this helper
+    // reads (the ACE_*_ACE_TYPE consts are not exported by windows-rs 0.62).
+    const ACE_TYPE_ALLOWED: u8 = 0;
+    const ACE_TYPE_DENIED: u8 = 1;
+
+    const TEST_SID: &str = "S-1-15-2-3149-3149-3149";
+    const DIR_INHERIT_FLAGS: u8 = 0x3; // SUB_CONTAINERS_AND_OBJECTS_INHERIT
+
+    /// PSID from a SID string (leaks on purpose; tests are short-lived).
+    fn make_sid(s: &str) -> PSID {
+        let mut psid = PSID(std::ptr::null_mut());
+        unsafe {
+            ConvertStringSidToSidW(&HSTRING::from(s), &mut psid).unwrap();
+        }
+        psid
+    }
+
+    /// Removes the tree even when the test panics mid-way.
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_tag(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sbx-prop-{tag}-{}", std::process::id()))
+    }
+
+    /// All ACEs (explicit AND inherited) for `sid` on `path`: (mask, ace_flags).
+    /// Walks the raw ACL — GetExplicitEntriesFromAclW misses inherited ACEs.
+    fn trustee_ace_flags(path: &str, sid: &PSID) -> Vec<(u32, u8)> {
+        unsafe {
+            let path_w = HSTRING::from(path);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let r = GetNamedSecurityInfoW(
+                &path_w,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut sd,
+            );
+            assert!(r.is_ok(), "read DACL of {path}");
+            let mut out = Vec::new();
+            if !dacl.is_null() {
+                let mut info = ACL_SIZE_INFORMATION::default();
+                if GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION) as *mut _,
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+                .is_ok()
+                {
+                    for i in 0..info.AceCount {
+                        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                        if GetAce(dacl, i, &mut ace).is_err() {
+                            continue;
+                        }
+                        let hdr = &*(ace as *const ACE_HEADER);
+                        if hdr.AceType != ACE_TYPE_ALLOWED && hdr.AceType != ACE_TYPE_DENIED {
+                            continue;
+                        }
+                        let mask = *((ace as *const u8).add(4) as *const u32);
+                        let ace_sid = PSID((ace as *const u8).add(8) as *mut _);
+                        if EqualSid(*sid, ace_sid).is_ok() {
+                            out.push((mask, hdr.AceFlags));
+                        }
+                    }
+                }
+            }
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            out
+        }
+    }
+
+    /// Mark `path` as a PROTECTED-DACL dir owned by the current user
+    /// (models "someone else's protected subtree" inside a granted tree).
+    fn protect_dir(path: &str) {
+        unsafe {
+            let owner = current_user_sid().expect("current user SID");
+            let ea = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: 0x1f01ff, // FILE_ALL_ACCESS
+                grfAccessMode: SET_ACCESS,
+                grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+                Trustee: TRUSTEE_W {
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_USER,
+                    ptstrName: PWSTR(owner.0 as *mut _),
+                    ..Default::default()
+                },
+            };
+            let mut acl: *mut ACL = std::ptr::null_mut();
+            let set_r = SetEntriesInAclW(Some(&[ea]), None, &mut acl);
+            assert!(set_r.is_ok(), "SetEntriesInAclW: {set_r:?}");
+            let named_r = SetNamedSecurityInfoW(
+                &HSTRING::from(path),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(acl as *const ACL),
+                None,
+            );
+            assert!(named_r.is_ok(), "SetNamedSecurityInfoW: {named_r:?}");
+            let _ = LocalFree(Some(HLOCAL(acl as *mut _)));
+        }
+    }
+
+    fn test_entry(root: &std::path::Path) -> AllowEntry {
+        AllowEntry {
+            win32_path: root.to_path_buf(),
+            access: RWX,
+            label: "test".into(),
+            deny: false,
+            protected: false,
+            inherit: true,
+        }
+    }
+
+    #[test]
+    fn should_propagate_matches_entry_semantics() {
+        // Normal user tree with an inheritable grant: propagate.
+        assert!(should_propagate(&test_entry(std::path::Path::new(
+            r"C:\Users\u\proj"
+        ))));
+        // Non-inheritable (ancestor traverse) entries: no propagation.
+        assert!(!should_propagate(&AllowEntry {
+            inherit: false,
+            ..test_entry(std::path::Path::new(r"C:\Users\u"))
+        }));
+        // PROTECTED rebuild entries (per-session dirs): no propagation.
+        assert!(!should_propagate(&AllowEntry {
+            protected: true,
+            ..test_entry(std::path::Path::new(r"C:\Users\u\proj\.sandbox\sid"))
+        }));
+        // System32 / SystemRoot: never walked (huge, system-owned, and
+        // already world-readable).
+        let sysroot =
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        assert!(!should_propagate(&test_entry(
+            &std::path::PathBuf::from(&sysroot).join("System32")
+        )));
+        assert!(!should_propagate(&test_entry(std::path::Path::new(&sysroot))));
+    }
+
+    #[test]
+    fn grant_propagates_to_pre_existing_descendants_and_stops_at_protected() {
+        let sid = make_sid(TEST_SID);
+        let base = tmp_tag("main");
+        let _guard = TempDir(base.clone());
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("prot").join("deeper")).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), b"b").unwrap();
+        std::fs::write(root.join("prot").join("deeper").join("d.txt"), b"d").unwrap();
+        protect_dir(root.join("prot").to_string_lossy().as_ref());
+
+        let journal = DaclJournal::open(
+            &base.join("journal"),
+            JournalHeader {
+                run_id: format!("r{}", std::process::id()),
+                owner_pid: std::process::id(),
+                owner_created: 0,
+            },
+        )
+        .unwrap();
+
+        grant_access(&sid, &[test_entry(&root)], Some(&journal)).unwrap();
+
+        // Files: synchronous, non-inheritable ACE with the granted mask.
+        let a = trustee_ace_flags(&root.join("a.txt").to_string_lossy(), &sid);
+        assert!(!a.is_empty(), "a.txt ACE must exist right after grant");
+        assert_eq!(a[0].0, RWX, "a.txt mask must match the grant");
+        assert_eq!(a[0].1, 0, "file ACEs are non-inheritable: {:?}", a);
+        // Subdirs: inheritable ACE so future files inherit at creation.
+        let sub = trustee_ace_flags(&root.join("sub").to_string_lossy(), &sid);
+        assert!(
+            !sub.is_empty() && (sub[0].1 & DIR_INHERIT_FLAGS) == DIR_INHERIT_FLAGS,
+            "sub dir ACE must be inheritable: {sub:?}"
+        );
+        let b = trustee_ace_flags(&root.join("sub").join("b.txt").to_string_lossy(), &sid);
+        assert!(!b.is_empty(), "nested file ACE must exist: {b:?}");
+        assert_eq!(b[0].1, 0, "nested file ACE non-inheritable: {b:?}");
+        // PROTECTED subtree: untouched, including its descendants.
+        assert!(
+            trustee_ace_flags(&root.join("prot").to_string_lossy(), &sid).is_empty(),
+            "PROTECTED dir must not receive the session ACE"
+        );
+        assert!(
+            trustee_ace_flags(
+                &root.join("prot").join("deeper").join("d.txt").to_string_lossy(),
+                &sid
+            )
+            .is_empty(),
+            "PROTECTED subtree descendants must not be walked"
+        );
+
+        // Teardown via the journal leaves no session ACEs anywhere.
+        assert!(restore_or_warn(&journal), "journal replay must succeed");
+        for p in [
+            root.clone(),
+            root.join("a.txt"),
+            root.join("sub"),
+            root.join("sub").join("b.txt"),
+        ] {
+            assert!(
+                trustee_ace_flags(&p.to_string_lossy(), &sid).is_empty(),
+                "no session ACEs may survive teardown on {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn propagation_respects_cap_and_reports_truncation() {
+        let sid = make_sid(TEST_SID);
+        let base = tmp_tag("cap");
+        let _guard = TempDir(base.clone());
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let files: Vec<std::path::PathBuf> = (0..10)
+            .map(|i| {
+                let p = root.join(format!("f{i}.txt"));
+                std::fs::write(&p, b"x").unwrap();
+                p
+            })
+            .collect();
+
+        let stats = propagate_grant(&sid, &test_entry(&root), None, 4);
+        assert!(stats.truncated, "cap must report truncation: {stats:?}");
+        assert_eq!(stats.applied, 4, "exactly the cap in applied writes");
+        assert_eq!(stats.failed, 0);
+        let with_ace = files
+            .iter()
+            .filter(|f| !trustee_ace_flags(&f.to_string_lossy(), &sid).is_empty())
+            .count();
+        assert_eq!(with_ace, 4, "only the first 4 visited files carry the ACE");
+    }
 }
 
 #[cfg(test)]
@@ -798,5 +1339,9 @@ mod env_block_tests {
         // Block-net mode (proxy: None) clears the proxy vars.
         assert_eq!(get("HTTP_PROXY"), "");
         assert_eq!(get("NO_PROXY"), "");
+        // Session marker: gates the pyshim's active mode and survives
+        // child-side env sanitization (venv strips PYTHONPATH but copies
+        // every other var).
+        assert_eq!(get("SANDBOX_SESSION_SID"), "testsid");
     }
 }
