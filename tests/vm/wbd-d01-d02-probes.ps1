@@ -209,6 +209,11 @@ try {
         )
     }
     $baselinePath = Join-Path $ResultsDir 'wbd-d01-baseline.json'
+    # Durability: persist D-01 evidence before the riskier D-02 native
+    # invocations; the final serialization below re-writes the file with
+    # the d02Matrix block attached (the double write is deliberate).
+    $earlyBaselineJson = $baseline | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $baselinePath -Value $earlyBaselineJson -Encoding utf8
     Write-Host ("[wbd-capture] build {0} | mxc {1} | probe exit {2}" -f $os.BuildNumber, $mxcCommit.Substring(0, [Math]::Min(7, $mxcCommit.Length)), $probeExit)
     if ($pinnedFull -ne $mxcCommit) {
         Write-Host "[wbd-capture] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence is still captured, but the pin decision must be revisited (docs/mxc-source-analysis.md)." -ForegroundColor Yellow
@@ -309,10 +314,15 @@ try {
     $matrixRan = $false
     $matrixBlocker = $null
     $matrixRows = @()
+    $errorCount = 0
     if (-not (Test-Path -LiteralPath $commonPs1)) {
         $matrixBlocker = "upstream Common.ps1 missing at $commonPs1 - New-Config generator unavailable (D-02 matrix blocker)."
     } else {
         try {
+            # Dot-sourcing runs Common.ps1 in OUR scope: a future pin that
+            # assigns top-level variables beyond $Script:SchemaVersion
+            # (verified safe at pin 5d7a475a) could shadow ours - $baseline
+            # and $ResultsDir are used after this point. Re-verify on re-pin.
             . $commonPs1
             # New-Config Out-Files into $ScratchRoot\configs and reads
             # $Script:SchemaVersion ('1.0.0', set at dot-source time).
@@ -339,7 +349,19 @@ try {
             $matrixRows = foreach ($shape in 'empty', 'fs-rw', 'fs-ro', 'fs-denied',
                                              'ui', 'deny-all-network',
                                              'proxy-identityless', 'proxy-identity-scoped') {
-                $row = [ordered]@{ shape = $shape; error = $null }
+                # All keys pre-initialized: downstream consumers never see
+                # a ragged schema (early-failure rows previously carried
+                # only shape + error).
+                $row = [ordered]@{
+                    shape                 = $shape
+                    error                 = $null
+                    configArtifact        = $null
+                    configSha256          = $null
+                    exit                  = $null
+                    tier                  = $null
+                    needsDaclAugmentation = $null
+                    probeError            = $null
+                }
                 try {
                     $configPath = switch ($shape) {
                         'empty'                  { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' }
@@ -353,11 +375,34 @@ try {
                     }
                     $configArtifact = Join-Path $ResultsDir "d02-config-$shape.json"
                     Copy-Item -LiteralPath $configPath -Destination $configArtifact -Force
-                    $probeOut = & $wxcExec --probe --config $configPath 2>&1
-                    $probeCode = $LASTEXITCODE
-                    # Set-Content -Value (parameter), never the pipeline -
-                    # empty output must still produce the verbatim artifact.
-                    $probeText = (@($probeOut) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+                    # Hang guard: the harness has no timeout on the guest
+                    # command, and 4 of the 8 shapes are config inputs the
+                    # pinned binary has never been probed with in-VM - one
+                    # hung probe would lose the entire run. Output is
+                    # joined to plain strings INSIDE the job so only
+                    # strings and the exit code cross deserialization.
+                    $probeJob = Start-Job -ScriptBlock {
+                        param($Exe, $Cfg)
+                        $out = & $Exe --probe --config $Cfg 2>&1
+                        [pscustomobject]@{
+                            text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+                            exit = $LASTEXITCODE
+                        }
+                    } -ArgumentList $wxcExec, $configPath
+                    if (Wait-Job -Job $probeJob -Timeout 120) {
+                        $probeResult = Receive-Job -Job $probeJob
+                        $probeText = [string]$probeResult.text
+                        $probeCode = $probeResult.exit
+                    } else {
+                        Stop-Job -Job $probeJob -Force
+                        Remove-Job -Job $probeJob -Force
+                        $row['configArtifact'] = "d02-config-$shape.json"
+                        $row['configSha256'] = (Get-FileHash -LiteralPath $configArtifact -Algorithm SHA256).Hash
+                        $row['error'] = 'probe timed out after 120s (job killed; no probe artifact for this shape)'
+                        $row
+                        continue
+                    }
+                    Remove-Job -Job $probeJob -Force
                     Set-Content -LiteralPath (Join-Path $ResultsDir "d02-matrix-$shape.probe.json") -Value $probeText -Encoding utf8
                     $row['configArtifact'] = "d02-config-$shape.json"
                     $row['configSha256'] = (Get-FileHash -LiteralPath $configArtifact -Algorithm SHA256).Hash
@@ -379,6 +424,7 @@ try {
                 }
                 $row
             }
+            $errorCount = @($matrixRows | Where-Object { $_.error -or $_.probeError }).Count
             $matrixRan = $true
         } catch {
             $matrixBlocker = "dot-sourcing upstream Common.ps1 failed: $($_.Exception.Message)"
@@ -388,6 +434,7 @@ try {
         ran             = $matrixRan
         blocker         = $matrixBlocker
         shapes          = @($matrixRows)
+        errorCount      = $errorCount
         summaryArtifact = 'd02-matrix.json'
     }
     if ($matrixRan) {
@@ -396,13 +443,16 @@ try {
         Write-Host "[wbd-capture] D-02 matrix: $matrixBlocker (recorded)" -ForegroundColor Yellow
     }
 
-    [ordered]@{
-        schema  = 1
-        ran     = $matrixRan
-        blocker = $matrixBlocker
-        shapes  = @($matrixRows)
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $ResultsDir 'd02-matrix.json') -Encoding utf8
-    $baseline | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $baselinePath -Encoding utf8
+    $matrixJson = [ordered]@{
+        schema     = 1
+        ran        = $matrixRan
+        blocker    = $matrixBlocker
+        shapes     = @($matrixRows)
+        errorCount = $errorCount
+    } | ConvertTo-Json -Depth 6
+    Set-Content -LiteralPath (Join-Path $ResultsDir 'd02-matrix.json') -Value $matrixJson -Encoding utf8
+    $baselineJson = $baseline | ConvertTo-Json -Depth 6
+    Set-Content -LiteralPath $baselinePath -Value $baselineJson -Encoding utf8
     Write-Host "[wbd-capture] D-01 baseline:        $baselinePath"
 
     # ---------------------------------------------------------------------

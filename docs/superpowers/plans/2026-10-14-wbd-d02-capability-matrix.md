@@ -427,3 +427,43 @@ git commit -m "docs(wbd): D-02 capability matrix - <verdict headline: which shap
 - Mock: matrix scenarios A+B+C pass; parser clean; zero warnings.
 - In-VM: one capture lane run, `VM HARNESS: PASS`, 17 flat artifacts manifest-hashed.
 - Matrix doc: every cell artifact-cited; blocked rows carry evidence, never inference; acceptance criteria each mapped.
+
+---
+
+## Post-review hardening (2026-10-14)
+
+The code-quality review of the Task 1-3 implementation (commit f44ea5c)
+returned FIX_FIRST; these deltas were applied on top and the mock
+(scenarios A+B+C) re-run PASS:
+
+1. **Early baseline write restored** (Step 3 regression): the baseline is
+   now written twice - once immediately after `$baselinePath` is
+   assigned (pre-D-02 durability, `-Depth 5`, the original behavior),
+   and once at the end with the `d02Matrix` block attached. Without
+   this, a hung or killed D-02 step would lose all D-01 evidence.
+2. **Per-shape probe hang guard**: `--probe --config` now runs in a
+   `Start-Job` with `Wait-Job -Timeout 120`; on timeout the job is
+   killed, the row records `probe timed out after 120s`, and the run
+   continues. Rationale: the harness has no timeout on the guest
+   command, and 4 of the 8 shapes are config inputs the pinned binary
+   has never been probed with in-VM. The output join moved INSIDE the
+   job so only strings and the exit code cross deserialization.
+3. **`Set-Content -Value` convention** applied to the two Step 5
+   serializations (the plan's own code piped into Set-Content).
+4. **Uniform row schema**: all eight row keys pre-initialized to `$null`
+   (early-failure rows previously carried only shape + error).
+5. **`errorCount`** added to `d02-matrix.json` and the baseline's
+   `d02Matrix` block (a run where all shapes fail previously read as
+   `ran=true, blocker=null`).
+6. **Dot-source hazard note** next to `. $commonPs1` (future pins could
+   shadow script-scope variables; verified safe at pin 5d7a475a).
+
+Advisories NOT taken (with rationale):
+- Renaming `d02-matrix-<shape>.probe.json` to `.probe.log` (verbatim
+  output may be unparseable): the artifact name is spec'd in the
+  approved plan, header, and notes; the Task 5-8 doc generator already
+  treats these as verbatim captures. Renaming has high ripple for a
+  cosmetic concern.
+- Splatting the 8 duplicated `New-Config` common parameters: the
+  per-shape one-liners are deliberately explicit evidence (each
+  shape's exact request visible at a glance).
