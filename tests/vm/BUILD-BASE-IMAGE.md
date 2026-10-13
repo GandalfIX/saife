@@ -385,20 +385,35 @@ MXC fields come from `C:\mxc\mxc-build.json` inside the image
 | OS build (BuildNumber) | 29680 |
 | ISO path         | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso |
 | Secure boot      | On |
-| MXC commit       | e7940f7 (e7940f7ca9be09a3f0a184bff822793b87d65b32) |
-| wxc-exec.exe SHA256 | D9A44FA4D1C6FD2D311979D2E01694353430F5B53A9EAC7DCC20330B2BEF8FF4 |
-| wxc-exec version | 0.8.0+e7940f7c |
-| Template SHA256  | FD24D717FAA155724BFF8A3C7993390F7CE122BCD404A6678E805B8E08EE944D |
+| Template size (GB) | 25.44 |
+| MXC commit       | 5d7a475 (5d7a475a9fd5626bafb55c2c857989d2e5621245) |
+| wxc-exec.exe SHA256 | 3FD125498803970B3FC7E63FC36307DD7A3186318FA02B83034F141731006DAC |
+| wxc-exec version | 1.0.0+5d7a475a |
+| Template SHA256  | 95DAEA358027DF148620B71E247BD316632E83467E2E7A976317F4BBE202F5BE |
 | Build date       | 2026-10-13 |
 
-> **Export note (2026-10-13):** the export ran twice (template-name
-> prompt answered `sbx-base-b`, then `sbx-base-b-clean`), both after
-> `MXC PREPARED` — same guest state, two physical files. Kept the
-> recorded 23.72 GB template (SHA256 above, verified) and renamed it
-> `sbx-base-b-clean.vhdx` → `sbx-base-b.vhdx` to match the harness
-> contract; the duplicate was deleted. The builder VM consequently
-> carries a stray second checkpoint `sbx-base-b-clean-clean` next to
-> the documented `sbx-base-b-clean` — remove the stray before re-baking.
+> **Re-pin re-bake (2026-10-13, supersession):** the WBD D-02 entry point
+> (`tests\scripts\run_processcontainer_probes_test.ps1 -RequireTier`) only
+> exists upstream since `e4619e7f` (2026-09-22 suite split), so the maintainer
+> re-pinned image B from `e7940f7` to `5d7a475a9fd56…` (see
+> `docs/mxc-source-analysis.md`, "Pin decision (2026-10-13)"). This re-bake
+> **supersedes the first export** (template SHA256
+> `FD24D717FAA155724BFF8A3C7993390F7CE122BCD404A6678E805B8E08EE944D`,
+> 23.72 GB, wxc-exec 0.8.0+e7940f7c): the old template file was overwritten
+> in place by the export's overwrite prompt. The builder VM's first-pin
+> checkpoint `sbx-base-b-clean` was removed after `MXC PREPARED` and
+> re-taken by the export at the new pin. Evidence runs before 2026-10-13
+> (results `20261013-142920-051`, `20261013-150837-253`) refer to the
+> superseded pin; their D-01 baseline facts remain valid (same OS build).
+
+> **Export note (2026-10-13, superseded by the re-pin re-bake above):** the
+> first export ran twice (template-name prompt answered `sbx-base-b`, then
+> `sbx-base-b-clean`), both after `MXC PREPARED` — same guest state, two
+> physical files. Kept the recorded 23.72 GB template (hash-verified) and
+> renamed it `sbx-base-b-clean.vhdx` → `sbx-base-b.vhdx` to match the harness
+> contract; the duplicate was deleted. The stray second checkpoint
+> `sbx-base-b-clean-clean` this produced was removed before the re-pin
+> re-bake.
 
 ## Image B (`sbx-base-b`) — WBD/MXC discovery (VM-01 Task 6)
 
@@ -444,13 +459,22 @@ Differences from the image-A build:
    }
    ```
 
-   `prepare-mxc.ps1` clones `microsoft/mxc` to `C:\mxc`, checks out the
-   pinned commit `e7940f7` (the analyzed upstream pin recorded in
-   `docs/mxc-source-analysis.md`), runs `cargo build --release` in the
-   workspace, and records the `wxc-exec.exe` SHA256 + VersionInfo in
-   `C:\mxc\mxc-build.json`. It never runs `wxc-host-prep` (a WBD stop
-   signal) and launches no workload. Expect the build to take a while on
-   first run (fresh cargo cache inside the image).
+    `prepare-mxc.ps1` clones `microsoft/mxc` to `C:\mxc`, checks out the
+    pinned commit `5d7a475a9fd5626bafb55c2c857989d2e5621245` (the image-B
+    pin re-decided 2026-10-13; recorded in `docs/mxc-source-analysis.md`,
+    "Pin decision (2026-10-13)" — the script default matches), runs
+    `cargo build --release` in the workspace, and records the `wxc-exec.exe`
+    SHA256 + VersionInfo in `C:\mxc\mxc-build.json`. It never runs
+    `wxc-host-prep` (a WBD stop signal) and launches no workload. Expect
+    the build to take a while on first run (fresh cargo cache inside the
+    image).
+    > **Stale guest copy caveat:** `C:\sbx-repo` inside the *builder* VM is
+    > only refreshed by an explicit repo copy — a plain re-bake does NOT
+    > update it. The 2026-10-13 re-pin re-bake ran with `-Commit
+    > 5d7a475a9fd5626bafb55c2c857989d2e5621245` passed explicitly because
+    > the guest copy predates the new default; after the NEXT
+    > `Copy-RepoToVM.ps1` push to the builder, the bare command above is
+    > correct again. If in doubt, always pass `-Commit` explicitly.
 4. **Export:** `Export-BaseImage.ps1` asks for the template name —
    answer `sbx-base-b`. The re-bake checkpoint is derived from it
    (`sbx-base-b-clean`). `Initialize-VMHost.ps1` must then print

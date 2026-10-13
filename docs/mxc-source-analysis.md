@@ -8,6 +8,26 @@
 > **Companion plan:** `docs/superpowers/plans/2026-09-16-mxc-derived-hardening.md`
 > (turns the actionable findings into scheduled work).
 
+### Pin decision (2026-10-13)
+
+**New pin: `5d7a475a9fd5626bafb55c2c857989d2e5621245`** (upstream `main` HEAD as of
+2026-10-13, "docs: Add versioned containment policy references (#1471)"; contracts
+0.9.0-alpha, 1.0.0, 1.1.0-alpha).
+
+- **Why re-pin:** WBD D-02 evidence capture requires the per-area test-suite split
+  introduced upstream in `e4619e7f` (2026-09-22, PR #1217), which added
+  `tests/scripts/run_processcontainer_probes_test.ps1`, the `-RequireTier` gate, and
+  schema-0.8 directional network coverage (`hostLoopback`, `allowedProxyPeer`). The
+  previous pin `e7940f7` predates the split and only has the monolithic
+  `WinProcessContainer-Tests.ps1` (97 KB, pre-split, "almost no positive network
+  coverage" per upstream).
+- **Maintainer decision (2026-10-13):** re-pin to current main rather than pinning to
+  `e4619e7f`, so D-02 runs against the suite as it exists today.
+- **Effect on this document:** all findings below were analyzed at `e7940f7`
+  (2026-09-16). Source line references may have drifted at the new pin; re-verify
+  them on the next quarterly analysis pass. Update the "Analyzed" header above when
+  that happens.
+
 ## 1. Executive summary
 
 1. **MXC's stable-Windows story is architecturally identical to ours**: AppContainer +

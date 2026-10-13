@@ -40,7 +40,9 @@
 .PARAMETER MxcRoot
   Checkout location inside the VM. Default: C:\mxc (VM-01 Task 6).
 .PARAMETER Commit
-  Pinned upstream commit to check out. Default: e7940f7.
+  Pinned upstream commit to check out. Default: 5d7a475a9fd5626bafb55c2c857989d2e5621245
+  (the image-B pin re-decided 2026-10-13; see docs/mxc-source-analysis.md,
+  "Pin decision (2026-10-13)").
 .PARAMETER SkipBuild
   Skip the release build (quick re-runs; exit 6 is then reachable if
   the binary was never built).
@@ -51,7 +53,7 @@
 [CmdletBinding()]
 param(
     [string]$MxcRoot = 'C:\mxc',
-    [string]$Commit = 'e7940f7',
+    [string]$Commit = '5d7a475a9fd5626bafb55c2c857989d2e5621245',
     [switch]$SkipBuild
 )
 

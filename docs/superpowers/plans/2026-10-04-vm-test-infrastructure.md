@@ -322,6 +322,34 @@ authoritative evidence per the WBD. Scope:
   gap, pinMatches/dirtyPathList baseline fields) verified by the
   canonical re-run (pinMatches: true, 13 features captured,
   dirtyPathList = [mxc-build.json] only).
+  **Re-pin re-bake (2026-10-13, same day):** the D-02 blocker above was
+  resolved by re-pinning image B from `e7940f7` to
+  `5d7a475a9fd5626bafb55c2c857989d2e5621245` (maintainer decision; rationale
+  and D-02's upstream `e4619e7f` suite-split requirement recorded in
+  `docs/mxc-source-analysis.md`, "Pin decision (2026-10-13)"). Builder VM
+  re-prepared (fresh `mxc-build.json`: wxc-exec 1.0.0+5d7a475a, SHA256
+  `3FD125…06DAC`), old-pin checkpoint `sbx-base-b-clean` removed after
+  `MXC PREPARED` and re-taken at the new pin; template re-exported
+  (SHA256 `95DAEA…02F5BE`, 25.44 GB), superseding the FD24…/e7940f7
+  template above. `prepare-mxc.ps1` default `-Commit` and
+  `wbd-d01-d02-probes.ps1` `$pinnedCommit` updated to the new pin.
+  Capture run `20261013-173137-189` (canonical for the new pin, supersedes
+  `20261013-150837-253` which referred to the old pin/template): pinMatches
+  true against the full SHA, probe exit 0, tier base-container; D-01 facts
+  identical to the e7940f7 runs (same OS build 29680, same 13 optional
+  features, all classic isolation features Disabled). D-02: the upstream
+  probes test now EXISTS and EXECUTES, but aborts at its binary-contract
+  gate — `Initialize-WpcContext` (Common.ps1:1215) requires a debug-lane
+  `wxc-exec.exe` AND `plm.exe`/`winhttp-proxy-shim.exe` sidecars beside
+  each lane even for standalone runs; `prepare-mxc.ps1` builds the release
+  lane only (recorded verbatim in d02-upstream-probes.log — genuine
+  evidence, exit 1 ≠ capture error). Upstream contract fully analyzed
+  (2026-10-13): ContextJson can redirect the debug lane at the release
+  binary (documented override mechanism), but the two sidecar crates must
+  still be built — the minimal unblock is `cargo build -p plm -p
+  wxc_winhttp_proxy_shim --release` + a context JSON redirecting WxcDebug
+  to the release path. Follow-up decision (capture-time fix vs. image
+  re-provisioning) recorded with the WBD D-02 work.
 - This lane is the seed of the WBD's Q-01 dedicated-runner tier; do not build
   product code from this evidence until the impact-analysis §5 decisions are
   recorded.

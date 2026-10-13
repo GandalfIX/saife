@@ -109,13 +109,14 @@ try {
         }
     }
 
-    # The recorded upstream pin (docs/mxc-source-analysis.md), normalized
-    # to its FULL SHA before any comparison: git always reports 40-char
-    # SHAs, so comparing HEAD against the short literal fires a false
+    # The recorded upstream pin (docs/mxc-source-analysis.md,
+    # "Pin decision (2026-10-13)": 5d7a475a9fd5626bafb55c2c857989d2e5621245),
+    # normalized to its FULL SHA before any comparison: git always reports
+    # 40-char SHAs, so comparing HEAD against the short literal fires a false
     # 'NOT the pin' warning on every valid run (observed in run
     # 20261013-142920-051; same bug family as the prepare-mxc.ps1
     # comparison incident fixed the same day).
-    $pinnedCommit = 'e7940f7'
+    $pinnedCommit = '5d7a475a9fd5626bafb55c2c857989d2e5621245'
     Push-Location $MxcRoot
     $mxcCommit = (git rev-parse HEAD)
     $pinnedFull = (git rev-parse --verify "$pinnedCommit^{commit}" 2>$null)
