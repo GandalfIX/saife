@@ -39,9 +39,10 @@
   Re-runs are safe: every phase is idempotent or state-checking.
 
   Exits:
-    0   build finished (or user aborted a prompt deliberately)
+    0   build finished (or a phase-2 prompt was aborted deliberately)
     1   a phase failed; see the output above for which one
     2/4/99  propagated from the gate/probe of a sub-script
+    5   phase 5: export declined at a prompt - NO template was exported
     99  unexpected error
 
 .EXAMPLE
@@ -237,6 +238,13 @@ try {
     if ($phase5 -eq 2 -or $phase5 -eq 4 -or $phase5 -eq 99) {
         Write-Host "[vm-all] PHASE 5 failed (exit $phase5) - aborting." -ForegroundColor Red
         exit $phase5
+    }
+    if ($phase5 -eq 5) {
+        # Export-BaseImage's abort code: a prompt was declined, so no
+        # template exists - NEVER report the build as finished here
+        # (2026-10-13 incident: exit-0 aborts printed 'BASE IMAGE BUILT').
+        Write-Host '[vm-all] PHASE 5: export ABORTED at a prompt - NO template was exported; re-run tests\vm\Export-BaseImage.ps1 to resume.' -ForegroundColor Yellow
+        exit 5
     }
     if ($phase5 -ne 0) {
         Write-Host "[vm-all] PHASE 5 failed (exit $phase5) - the builder VM is untouched; re-run tests\vm\Export-BaseImage.ps1 to resume." -ForegroundColor Red

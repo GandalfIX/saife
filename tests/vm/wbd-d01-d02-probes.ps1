@@ -88,12 +88,38 @@ try {
             Where-Object { $_.FeatureName -match 'Containers|Hyper-V|Subsystem|VirtualMachinePlatform' } |
             ForEach-Object { [ordered]@{ feature = $_.FeatureName; state = [string]$_.State } })
     } catch {
+        # The DISM cmdlet's COM class may be unregistered on experimental
+        # builds ('Class not registered', run 20261013-142920-051). The
+        # Win32_OptionalFeature WMI class reads the same store without
+        # the DISM COM registration; when it also fails, the combined
+        # error is recorded instead.
         $featuresError = $_.Exception.Message
+        try {
+            $features = @(Get-CimInstance -ClassName Win32_OptionalFeature -ErrorAction Stop |
+                Where-Object { $_.Name -match 'Containers|Hyper-V|Subsystem|VirtualMachinePlatform' } |
+                ForEach-Object { [ordered]@{
+                    feature = $_.Name
+                    state   = if ($_.InstallState -eq 1) { 'Enabled' } elseif ($_.InstallState -eq 2) { 'Disabled' } else { [string]$_.InstallState }
+                } })
+            if ($features.Count -gt 0) {
+                $featuresError = "Get-WindowsOptionalFeature failed ($featuresError); Win32_OptionalFeature fallback used."
+            }
+        } catch {
+            $featuresError = "Get-WindowsOptionalFeature failed ($featuresError); Win32_OptionalFeature fallback also failed ($($_.Exception.Message))."
+        }
     }
 
+    # The recorded upstream pin (docs/mxc-source-analysis.md), normalized
+    # to its FULL SHA before any comparison: git always reports 40-char
+    # SHAs, so comparing HEAD against the short literal fires a false
+    # 'NOT the pin' warning on every valid run (observed in run
+    # 20261013-142920-051; same bug family as the prepare-mxc.ps1
+    # comparison incident fixed the same day).
+    $pinnedCommit = 'e7940f7'
     Push-Location $MxcRoot
     $mxcCommit = (git rev-parse HEAD)
-    $mxcDirtyCount = @(git status --porcelain).Count
+    $pinnedFull = (git rev-parse --verify "$pinnedCommit^{commit}" 2>$null)
+    $mxcDirtyPaths = @(git status --porcelain)
     Pop-Location
 
     $wxcItem = Get-Item -LiteralPath $wxcExec
@@ -134,7 +160,10 @@ try {
         mxc = [ordered]@{
             root             = $MxcRoot
             commit           = $mxcCommit
-            dirtyPaths       = $mxcDirtyCount
+            pinnedCommit     = $pinnedCommit
+            pinMatches       = ($pinnedFull -eq $mxcCommit)
+            dirtyPaths       = $mxcDirtyPaths.Count
+            dirtyPathList    = @($mxcDirtyPaths | ForEach-Object { [string]$_ })
             wxcExecSha256    = $wxcHash
             wxcExecSizeBytes = $wxcItem.Length
             fileVersion      = $wxcItem.VersionInfo.FileVersion
@@ -153,8 +182,8 @@ try {
     $baseline | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $baselinePath -Encoding utf8
     Write-Host "[wbd-capture] D-01 baseline:        $baselinePath"
     Write-Host ("[wbd-capture] build {0} | mxc {1} | probe exit {2}" -f $os.BuildNumber, $mxcCommit.Substring(0, [Math]::Min(7, $mxcCommit.Length)), $probeExit)
-    if ($mxcCommit -ne 'e7940f7') {
-        Write-Host "[wbd-capture] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin e7940f7 - evidence is still captured, but the pin decision must be revisited (docs/mxc-source-analysis.md)." -ForegroundColor Yellow
+    if ($pinnedFull -ne $mxcCommit) {
+        Write-Host "[wbd-capture] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence is still captured, but the pin decision must be revisited (docs/mxc-source-analysis.md)." -ForegroundColor Yellow
     }
 
     # ---------------------------------------------------------------------

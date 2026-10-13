@@ -38,7 +38,7 @@
 
   Prints a final verdict line and exits:
     TEMPLATE EXPORTED ...     -> 0
-    ABORTED (prompt)         -> 0
+    ABORTED (prompt)         -> 5  (declined at a prompt; nothing was changed)
     1  configuration invalid, guest unreachable, or copy/probe failed
     2  not elevated
     3  builder VM not found
@@ -123,7 +123,7 @@ try {
         $cred = Get-Credential -UserName 'sbxadmin' -Message "Guest credential for $vmName (account created during Windows Setup)"
         if (-not $cred) {
             Write-Host '[vm-export] ABORTED - credential prompt cancelled; nothing was changed.' -ForegroundColor Yellow
-            exit 0
+            exit 5
         }
     }
     if ($vm.State -ne 'Running') {
@@ -176,7 +176,7 @@ try {
         $answer = Read-Host "[vm-export] overwrite it with the credential just given (user: $guestUser, password: <hidden>)? (y/N)"
         if ($answer.Trim() -notmatch '^(?i)(y|yes)$') {
             Write-Host '[vm-export] ABORTED - keeping the existing vm-settings.json; nothing else was changed.' -ForegroundColor Yellow
-            exit 0
+            exit 5
         }
     } else {
         $answer = Read-Host "[vm-export] write $settingsPath (user: $guestUser, password: <hidden>)? (Y/n)"
@@ -204,7 +204,7 @@ try {
         $answer = Read-Host "[vm-export] template already exists: $templatePath - overwrite it? (y/N)"
         if ($answer.Trim() -notmatch '^(?i)(y|yes)$') {
             Write-Host '[vm-export] ABORTED - keeping the existing template; VM and settings were left as-is.' -ForegroundColor Yellow
-            exit 0
+            exit 5
         }
     }
 

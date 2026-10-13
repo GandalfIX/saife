@@ -92,28 +92,44 @@ try {
             Write-Host "[mxc-prep] $MxcRoot is dirty ($($dirty.Count) changed path(s)) - aborting; a dirty pinned checkout is not valid image state. Reset manually if this throwaway VM's changes do not matter." -ForegroundColor Red
             exit 4
         }
-        $head = (git rev-parse HEAD 2>$null)
-        if ($head -ne $Commit) {
-            # Idempotence + offline tolerance: skip the network round-trip
-            # when the pinned commit is already checked out.
+        # Resolve the pinned -Commit to its FULL SHA once. git checkout and
+        # rev-parse HEAD always report the 40-char form, so comparing either
+        # against the literal parameter (a short prefix like 'e7940f7')
+        # rejects validly pinned checkouts and re-enters the fetch path on
+        # every idempotent re-run (2026-10-13 incident). --verify prints
+        # NOTHING on stdout for unknown revisions, so an empty result
+        # reliably means 'not present locally (yet)'.
+        $commitFull = (git rev-parse --verify "$Commit^{commit}" 2>$null)
+        if ($LASTEXITCODE -ne 0 -or -not $commitFull) {
+            # Not present locally yet - one broad fetch, then one explicit
+            # fetch of the SHA (GitHub serves arbitrary SHAs).
             git fetch --quiet origin
             if ($LASTEXITCODE -ne 0) { $null = git fetch --quiet origin $Commit 2>$null }
-            git -c advice.detachedHead=false checkout --quiet $Commit
+            $commitFull = (git rev-parse --verify "$Commit^{commit}" 2>$null)
+        }
+        if ($LASTEXITCODE -ne 0 -or -not $commitFull) {
+            Write-Host "[mxc-prep] pinned commit $Commit is not reachable in the upstream repository - the history may have been rewritten. Record the new pin decision in docs/mxc-source-analysis.md, do not guess." -ForegroundColor Red
+            exit 4
+        }
+        $head = (git rev-parse HEAD 2>$null)
+        if ($head -ne $commitFull) {
+            # Idempotence + offline tolerance: skip the fetch round-trip
+            # entirely when the pinned commit is already checked out.
+            git -c advice.detachedHead=false checkout --quiet $commitFull
             if ($LASTEXITCODE -ne 0) {
-                # GitHub serves arbitrary SHAs; one explicit fetch, one retry.
                 git fetch --quiet origin $Commit
                 if ($LASTEXITCODE -eq 0) {
-                    git -c advice.detachedHead=false checkout --quiet $Commit
+                    git -c advice.detachedHead=false checkout --quiet $commitFull
                 }
             }
             if ($LASTEXITCODE -ne 0) {
-                Write-Host "[mxc-prep] pinned commit $Commit is not reachable in the upstream repository (exit $LASTEXITCODE) - the history may have been rewritten. Record the new pin decision in docs/mxc-source-analysis.md, do not guess." -ForegroundColor Red
+                Write-Host "[mxc-prep] checkout of $commitFull failed (exit $LASTEXITCODE) - see the fetch messages above." -ForegroundColor Red
                 exit 4
             }
         }
         $pinned = (git rev-parse HEAD)
-        if ($pinned -ne $Commit) {
-            Write-Host "[mxc-prep] checkout landed on $pinned instead of $Commit - refusing to continue." -ForegroundColor Red
+        if ($pinned -ne $commitFull) {
+            Write-Host "[mxc-prep] checkout landed on $pinned instead of $commitFull - refusing to continue." -ForegroundColor Red
             exit 4
         }
         Write-Host "[mxc-prep] checkout at pinned commit: $pinned"

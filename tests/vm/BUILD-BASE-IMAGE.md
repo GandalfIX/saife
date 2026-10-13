@@ -351,16 +351,16 @@ Fill in after the build (the operator records the exact ISO and resulting
 OS build here) — `Export-BaseImage.ps1` prints this table ready-to-paste
 with all values collected automatically:
 
-| Field            | Value |
-|------------------|-------|
-| Template name    | sbx-base-a.vhdx |
-| Template size (GB) | ~40 |
-| Edition (Caption)| Microsoft Windows 11 Enterprise Insider Preview |
-| OS build (BuildNumber) | 26340 |
-| ISO path         | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_26340_9577.iso |
-| Secure boot      | on / off |
-| Template SHA256  | 35FC6BAC8B463E7688BCED51DDF081E62CCD332F5F60EA3C2B37AFD8614DFBB1 |
-| Build date       | 2026-10-05 |
+| Field                 | Value |
+|-----------------------|-------|
+| Template name         | sbx-base-b.vhdx |
+| Template size (GB)    | 24,19 |
+| Edition (Caption)     | Microsoft Windows 11 Enterprise Insider Preview |
+| OS build (BuildNumber)| 29680 |
+| ISO path             | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso |
+| Secure boot           | On |
+| Template SHA256       | 095F62F20ED753CD75DDC2D7E98E0622B592973167474AEBDAC07BF4979B3AE3 |
+| Build date            | 2026-10-13 |
 
 Collect guest values (PowerShell Direct needs the VM RUNNING again, so
 start it first; if it just booted, retry after a few seconds):
@@ -381,15 +381,24 @@ MXC fields come from `C:\mxc\mxc-build.json` inside the image
 | Field            | Value |
 |------------------|-------|
 | Template name    | sbx-base-b.vhdx |
-| Edition (Caption)| _fill in_ |
-| OS build (BuildNumber) | _fill in (expected 29680.1000)_ |
+| Edition (Caption)| Microsoft Windows 11 Enterprise Insider Preview |
+| OS build (BuildNumber) | 29680 |
 | ISO path         | C:\Users\marku\Downloads\Windows11_InsiderPreview_EnterpriseVL_x64_en-gb_29680_1000.iso |
-| Secure boot      | on / off |
-| MXC commit       | e7940f7 |
-| wxc-exec.exe SHA256 | _fill in from C:\mxc\mxc-build.json_ |
-| wxc-exec version | _fill in from C:\mxc\mxc-build.json_ |
-| Template SHA256  | _fill in_ |
-| Build date       | _fill in_ |
+| Secure boot      | On |
+| MXC commit       | e7940f7 (e7940f7ca9be09a3f0a184bff822793b87d65b32) |
+| wxc-exec.exe SHA256 | D9A44FA4D1C6FD2D311979D2E01694353430F5B53A9EAC7DCC20330B2BEF8FF4 |
+| wxc-exec version | 0.8.0+e7940f7c |
+| Template SHA256  | FD24D717FAA155724BFF8A3C7993390F7CE122BCD404A6678E805B8E08EE944D |
+| Build date       | 2026-10-13 |
+
+> **Export note (2026-10-13):** the export ran twice (template-name
+> prompt answered `sbx-base-b`, then `sbx-base-b-clean`), both after
+> `MXC PREPARED` — same guest state, two physical files. Kept the
+> recorded 23.72 GB template (SHA256 above, verified) and renamed it
+> `sbx-base-b-clean.vhdx` → `sbx-base-b.vhdx` to match the harness
+> contract; the duplicate was deleted. The builder VM consequently
+> carries a stray second checkpoint `sbx-base-b-clean-clean` next to
+> the documented `sbx-base-b-clean` — remove the stray before re-baking.
 
 ## Image B (`sbx-base-b`) — WBD/MXC discovery (VM-01 Task 6)
 

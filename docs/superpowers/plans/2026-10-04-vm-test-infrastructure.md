@@ -288,14 +288,40 @@ authoritative evidence per the WBD. Scope:
   2026-10-13: `-TestCmd` runs the given command via the PS-Direct session
   instead of the suite (same repo copy, winsta grant, streaming, teardown);
   output teed to `C:\sbx-results\testcmd.log`; ALL files under
-  `C:\sbx-results` fetched (no `summary.json` contract); empty/whitespace
+  `C:\sbx-results` fetched (no `summary.json` contract);   empty/whitespace
   `-TestCmd` fails at a pre-creation gate (exit 3). Parser-checked; binding +
-  elevation gate + tee/fetch-all logic locally mock-verified. In-VM smoke run
-  still pending (image B not built yet; can also run against `sbx-base-a`).
-- [ ] **Build image B** from `29680_1000.iso` per the runbook section (manual
+  elevation gate + tee/fetch-all logic locally mock-verified. In-VM smoke
+  DONE 2026-10-13: the image-B capture lane run `20261013-142920-051`
+  exercised `-TestCmd` end-to-end (WBD CAPTURE: DONE; all artifacts fetched;
+  VM destroyed cleanly).
+- [x] **Build image B** from `29680_1000.iso` per the runbook section (manual
   Windows Setup in the VM console is the only hands-on step), then run the
   evidence-capture lane once and record the D-01/D-02 artifacts under
-  `tests\vm\results\`.
+  `tests\vm\results\`. — image BUILT 2026-10-13 (record in
+  BUILD-BASE-IMAGE.md: Enterprise Insider Preview build 29680, secure boot
+  on, MXC pin e7940f7…5b32 / wxc-exec 0.8.0+e7940f7c, template SHA256
+  FD24D7…EE944D, 23.72 GB; double-export artifact renamed to the harness
+  contract `sbx-base-b.vhdx` after hash verification; stray builder
+  checkpoint `sbx-base-b-clean-clean` to be removed before re-bake).
+  Capture lane run `20261013-150837-253` (canonical; WBD CAPTURE: DONE;
+  artifacts under `tests\vm\results\20261013-150837-253`, manifest-hashed;
+  superseding first run `20261013-142920-051`). D-01
+  probe green (exit 0, tier base-container): baseContainerApiPresent,
+  nativeCaptureAvailable, baseContainerSupportsDenyPaths and all ten UI
+  block capabilities TRUE; guardedCaptureAvailable, bfscfgPresent/
+  bfsCompiledIn, baseContainerSupportsEnumeratePaths,
+  baseContainerSupportsIngressHostLoopbackAllow, isolationSessionAvailable,
+  hyperlightAvailable FALSE. All classic isolation optional features
+  (Containers/Hyper-V/WSL/VirtualMachinePlatform) report Disabled while
+  baseContainerApiPresent is TRUE — the tier does not depend on them.
+  D-02 BLOCKED upstream: the pinned tree has no
+  `tests\scripts\run_processcontainer_probes_test.ps1` (layout drift,
+  recorded in d02-upstream-probes.log — WBD-track follow-up).
+  Capture-script fixes (pin-comparison false warning,
+  Win32_OptionalFeature fallback for the DISM 'Class not registered'
+  gap, pinMatches/dirtyPathList baseline fields) verified by the
+  canonical re-run (pinMatches: true, 13 features captured,
+  dirtyPathList = [mxc-build.json] only).
 - This lane is the seed of the WBD's Q-01 dedicated-runner tier; do not build
   product code from this evidence until the impact-analysis §5 decisions are
   recorded.
