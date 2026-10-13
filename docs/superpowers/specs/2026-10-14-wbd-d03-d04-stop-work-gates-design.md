@@ -98,8 +98,17 @@ first, mock-first TDD locally before the real run.
 
 **Section A — wxc-exec.exe subprocess lifecycle.** Configs authored via the
 pinned tree's `New-Config` (dot-source pattern; schema-exact by
-construction; config files are fetched evidence). Scenarios, each producing
-one artifact + one summary row:
+construction; config files are fetched evidence). The `probe` element of
+D-03's spike list rides on the D-02 canonical-run probe artifacts for this
+surface (`d02-matrix-<shape>.probe.json`, run `20261014-005531-844`) — the
+ADR-0002 checklist cites them directly rather than re-probing. **Every
+launch scenario in every section (A, B, C) runs under the established hang
+guard**
+(`Start-Job` + `Wait-Job -Timeout`, `wbd-d01-d02-probes.ps1:378-405`
+pattern): A3/A4 deliberately create long-running workloads against
+*unproven* timeout/cancellation enforcement, and one hung synchronous wait
+must not lose the run — a guard timeout is recorded as that scenario's
+blocker row. Scenarios, each producing one artifact + one summary row:
 
 | # | Scenario | Expected evidence |
 |---|---|---|
@@ -131,16 +140,24 @@ Build failure is a recorded blocker, not a capture error.
 
 - **C1 fail-before-exec:** launch — not just probe — the `enumeratePaths`
   request shape that D-02 proved adjudication-blocked
-  (`EnumeratePathsUnsupported`, matrix §5.2). Expect: nonzero exit, error
-  object recorded verbatim, and a marker file written by the workload
-  command proves the workload **never executed**.
-- **C2 AppContainer irrelevance:** demonstrate that the product gate
-  (request-scoped preflight refusing any tier ≠ `base-container`) rejects a
-  request the raw backend would serve on the `appcontainer-dacl` tier —
-  the weaker tier's availability does not make the product request succeed
-  (ticket criterion 3). Exact fixture request resolved at implementation
-  from source (candidate: a shape the fallback detector demotes to
-  `appcontainer-dacl`; plain-launch behavior recorded as evidence).
+  (`EnumeratePathsUnsupported`, matrix §5.2). Two recorded outcomes are both
+  acceptable evidence; the plan branches on whichever the artifact shows:
+  (a) **refused** — nonzero exit, error object recorded verbatim, and a
+  marker file written by the workload command proves the workload **never
+  executed** (direct criterion-2 proof); or (b) **demoted-and-run** — the
+  backend serves the shape on a weaker tier, in which case criterion 2's
+  proof path shifts to ADR-0003's adapter mechanism (request-scoped
+  preflight on the probe error + tier gate refusing any tier ≠
+  `base-container`), and the demotion artifact becomes C2's fixture.
+- **C2 AppContainer irrelevance:** the artifact that discharges ticket
+  criterion 3 is: plain-launch evidence that the raw backend *does* serve a
+  demoted shape on the `appcontainer-dacl` tier (C1 outcome (b), or a
+  fixture request resolved at implementation from `fallback_detector.rs` +
+  runtime probe), **combined with** the probe/tier evidence that the
+  product's preflight design (ADR-0003 §2) refuses — demonstrating that the
+  weaker tier's availability does not make the product request succeed.
+  Product code is out of scope; the refusal is proven at the evidence level
+  (probe error object + tier ≠ base-container), not by implementing the gate.
 - **C3 force-tier surface:** source-verify what exists at the pin —
   the `force-tier-testing` crate feature, any request-schema tier/backend
   field, any SDK require-tier API — and runtime-exercise whatever exists.
