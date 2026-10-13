@@ -45,6 +45,17 @@
   evidence - deliberately NOT done here (VM-01 Task 6: evidence capture
   only, no product code).
 
+  D-02 matrix (second addition): the five WBD request shapes as
+  COMPLETE requests, generated with the upstream New-Config helper
+  (dot-sourced from the pinned tree - schema-exact by construction;
+  each generated config is copied to a flat d02-config-<shape>.json
+  artifact because the harness fetches only top-level files), probed
+  read-only via --probe --config (no workload launch; the commandLine
+  is never executed). Filesystem splits into rw/ro/denied like the
+  upstream suite (ro is new evidence); proxy splits into identity-less
+  and identity-scoped model-2 variants. Common.ps1 absent or unloadable
+  at a future pin is a recorded blocker, never a capture error.
+
   This script NEVER runs wxc-host-prep and never launches a workload.
 
   Exit codes: 0 = capture complete (all sections); 3 = prerequisites
@@ -193,12 +204,11 @@ try {
         notes = @(
             'Probe output retained verbatim in d01-wxc-exec-probe.log.',
             'No workload was launched; wxc-host-prep was never run.',
-            'A second run may differ only in timestamps and per-boot fields.'
+            'A second run may differ only in timestamps and per-boot fields.',
+            'D-02 matrix: per-shape probe outputs are d02-matrix-<shape>.probe.json, request configs are d02-config-<shape>.json, summary in d02-matrix.json.'
         )
     }
     $baselinePath = Join-Path $ResultsDir 'wbd-d01-baseline.json'
-    $baseline | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $baselinePath -Encoding utf8
-    Write-Host "[wbd-capture] D-01 baseline:        $baselinePath"
     Write-Host ("[wbd-capture] build {0} | mxc {1} | probe exit {2}" -f $os.BuildNumber, $mxcCommit.Substring(0, [Math]::Min(7, $mxcCommit.Length)), $probeExit)
     if ($pinnedFull -ne $mxcCommit) {
         Write-Host "[wbd-capture] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence is still captured, but the pin decision must be revisited (docs/mxc-source-analysis.md)." -ForegroundColor Yellow
@@ -281,6 +291,119 @@ try {
             Set-Content -LiteralPath $d02Log -Encoding utf8
         Write-Host "[wbd-capture] D-02: upstream entry point missing at $upstreamTest (recorded)" -ForegroundColor Yellow
     }
+
+    # ---------------------------------------------------------------------
+    # D-02 matrix: the five WBD request shapes as complete requests.
+    # Configs come from the upstream New-Config helper (dot-sourced from
+    # the pinned tree) so a config-authoring bug on our side cannot
+    # masquerade as a policy verdict. New-Config writes into
+    # $ScratchRoot\configs (upstream layout); each config is COPIED to a
+    # flat d02-config-<shape>.json artifact because the harness fetches
+    # only top-level files (Invoke-TestsInVM.ps1 enumerates without
+    # -Recurse), and the manifest hashes flat files. Probing is
+    # read-only: --probe --config never launches the commandLine.
+    # Common.ps1 absent or unloadable at a future pin is a recorded
+    # blocker (layout-drift pattern), never a capture error.
+    # ---------------------------------------------------------------------
+    $commonPs1 = Join-Path $MxcRoot 'tests\scripts\lib\WinProcessContainer.Common.ps1'
+    $matrixRan = $false
+    $matrixBlocker = $null
+    $matrixRows = @()
+    if (-not (Test-Path -LiteralPath $commonPs1)) {
+        $matrixBlocker = "upstream Common.ps1 missing at $commonPs1 - New-Config generator unavailable (D-02 matrix blocker)."
+    } else {
+        try {
+            . $commonPs1
+            # New-Config Out-Files into $ScratchRoot\configs and reads
+            # $Script:SchemaVersion ('1.0.0', set at dot-source time).
+            # Scratch lives in the guest TEMP (the VM is destroyed after
+            # the run); only the flat copies below are fetched evidence.
+            $ScratchRoot = Join-Path $env:TEMP 'mxc-sbx-d02-matrix'
+            New-Item -ItemType Directory -Path (Join-Path $ScratchRoot 'configs') -Force | Out-Null
+            foreach ($sub in 'rw', 'ro', 'denied') {
+                New-Item -ItemType Directory -Path (Join-Path $ScratchRoot $sub) -Force | Out-Null
+            }
+            $fsRw = Join-Path $ScratchRoot 'rw'
+            $fsRo = Join-Path $ScratchRoot 'ro'
+            $fsDenied = Join-Path $ScratchRoot 'denied'
+            # Loopback URL never dialed: probe mode does not launch the
+            # workload. Port is arbitrary; the proxy shapes assert tier
+            # resolution, not reachability.
+            $proxyUrl = 'http://127.0.0.1:18080'
+            # Planned-R1 UI request: maximal restriction (values verified
+            # from the pinned tree's ui_policy_matrix area, 2026-10-14).
+            # Model-2 proxy shapes per the pinned tree's network_proxy
+            # area: egress deny + ingress allow required; identity-less
+            # adds hostLoopback=allow, identity-scoped adds the peer with
+            # hostLoopback=deny.
+            $matrixRows = foreach ($shape in 'empty', 'fs-rw', 'fs-ro', 'fs-denied',
+                                             'ui', 'deny-all-network',
+                                             'proxy-identityless', 'proxy-identity-scoped') {
+                $row = [ordered]@{ shape = $shape; error = $null }
+                try {
+                    $configPath = switch ($shape) {
+                        'empty'                  { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' }
+                        'fs-rw'                  { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -ReadWrite @($fsRw) }
+                        'fs-ro'                  { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -ReadOnly @($fsRo) }
+                        'fs-denied'              { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -Denied @($fsDenied) }
+                        'ui'                     { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -UiDisable $true -Clipboard 'none' -Injection $false -BpUiIsolation 'container' -BpUiDesktopControl $false -BpUiSystemSettings 'none' -BpUiIme $false }
+                        'deny-all-network'       { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -EgressDefault 'deny' -IngressDefault 'deny' }
+                        'proxy-identityless'     { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -EgressDefault 'deny' -IngressDefault 'allow' -HostLoopback 'allow' -NetworkProxy $proxyUrl }
+                        'proxy-identity-scoped'  { New-Config -Name "d02-$shape" -CommandLine 'cmd /c exit 0' -EgressDefault 'deny' -IngressDefault 'allow' -HostLoopback 'deny' -NetworkProxy $proxyUrl -AllowedProxyPeer 'Contoso.Proxy_8wekyb3d8bbwe' }
+                    }
+                    $configArtifact = Join-Path $ResultsDir "d02-config-$shape.json"
+                    Copy-Item -LiteralPath $configPath -Destination $configArtifact -Force
+                    $probeOut = & $wxcExec --probe --config $configPath 2>&1
+                    $probeCode = $LASTEXITCODE
+                    # Set-Content -Value (parameter), never the pipeline -
+                    # empty output must still produce the verbatim artifact.
+                    $probeText = (@($probeOut) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+                    Set-Content -LiteralPath (Join-Path $ResultsDir "d02-matrix-$shape.probe.json") -Value $probeText -Encoding utf8
+                    $row['configArtifact'] = "d02-config-$shape.json"
+                    $row['configSha256'] = (Get-FileHash -LiteralPath $configArtifact -Algorithm SHA256).Hash
+                    $row['exit'] = $probeCode
+                    $row['tier'] = $null
+                    $row['needsDaclAugmentation'] = $null
+                    $row['probeError'] = $null
+                    try {
+                        $parsed = $probeText | ConvertFrom-Json -ErrorAction Stop
+                        if ($parsed.PSObject.Properties['tier']) { $row['tier'] = [string]$parsed.tier }
+                        if ($parsed.PSObject.Properties['needsDaclAugmentation']) { $row['needsDaclAugmentation'] = [bool]$parsed.needsDaclAugmentation }
+                        if ($parsed.PSObject.Properties['error']) { $row['probeError'] = [string]$parsed.error }
+                    } catch {
+                        $row['probeError'] = 'unparseable probe output (recorded verbatim alongside)'
+                    }
+                    if ($probeCode -ne 0 -and -not $row['probeError']) { $row['probeError'] = "probe exit $probeCode" }
+                } catch {
+                    $row['error'] = "$($_.Exception.Message)"
+                }
+                $row
+            }
+            $matrixRan = $true
+        } catch {
+            $matrixBlocker = "dot-sourcing upstream Common.ps1 failed: $($_.Exception.Message)"
+        }
+    }
+    $baseline['d02Matrix'] = [ordered]@{
+        ran             = $matrixRan
+        blocker         = $matrixBlocker
+        shapes          = @($matrixRows)
+        summaryArtifact = 'd02-matrix.json'
+    }
+    if ($matrixRan) {
+        Write-Host ("[wbd-capture] D-02 matrix: {0} shapes probed (flat artifacts d02-matrix-<shape>.probe.json)." -f @($matrixRows).Count)
+    } else {
+        Write-Host "[wbd-capture] D-02 matrix: $matrixBlocker (recorded)" -ForegroundColor Yellow
+    }
+
+    [ordered]@{
+        schema  = 1
+        ran     = $matrixRan
+        blocker = $matrixBlocker
+        shapes  = @($matrixRows)
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $ResultsDir 'd02-matrix.json') -Encoding utf8
+    $baseline | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $baselinePath -Encoding utf8
+    Write-Host "[wbd-capture] D-01 baseline:        $baselinePath"
 
     # ---------------------------------------------------------------------
     # Manifest: every artifact + SHA256, so the fetched evidence is
