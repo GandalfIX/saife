@@ -9,8 +9,12 @@
 
 Complete WBD ticket D-02: the **capability matrix** for empty, filesystem,
 UI, deny-all-network, and proxy requests on the Experimental Future
-Platforms build (29680), with raw request-scoped probe evidence and a
-source-verified mapping from MXC's exposed capability booleans to the
+Platforms build — the WBD names build `29671.1000` in its heading; the
+evidence runs on `29680.1000` per impact-analysis decision **D3**
+(2026-10-12: the later flight of the same channel was accepted, and the
+capability probes — never the build number — are the authoritative
+evidence). The deliverable includes raw request-scoped probe evidence and
+a source-verified mapping from MXC's exposed capability booleans to the
 required PSEC contract versions and support bits.
 
 D-02 acceptance criteria (from the WBD, binding):
@@ -54,8 +58,10 @@ Decisions already taken (this design session):
 - **Scope:** exactly the five WBD shapes — empty, filesystem (rw/ro/denied),
   UI, deny-all-network, proxy. No directional-network refinements, no
   full-schema sweep.
-- **Doc home:** `sandbox/docs/wbd-d02-capability-matrix.md`, flat next to
-  the other WBD-track docs.
+- **Doc home:** `sandbox/docs/wbd-d02-capability-matrix.md` (new file;
+  the other WBD-track documents — `mxc-source-analysis.md`,
+  `impact-analysis-windows-cli-sandbox-wbd.md` — already live flat in
+  `sandbox/docs/`).
 - **Mechanism:** upstream `New-Config` generator (Approach 1), extending
   the existing capture script.
 
@@ -77,6 +83,20 @@ directory under the results directory so `New-Config` writes the generated
 requests into the artifact tree; the generated config files themselves are
 fetched evidence (`d02-configs\`), so every matrix cell traces to the
 exact request JSON that produced it.
+
+**Shape-coverage gate (first implementation step).** The upstream suite
+only exercises the empty/rw/denied shapes through `New-Config`; UI,
+deny-all-network and proxy authoring via the generator is
+**unverified until read**. The plan's first step therefore reads
+`Common.ps1` in the pinned tree and confirms `New-Config`'s parameter
+surface can express all five shapes (including the `processContainer.ui`
+and `network` blocks). If a shape cannot be expressed, the fallback is
+recorded in the implementation plan as an explicit per-shape decision:
+either hand-author that one shape against the pinned `docs/schema.md`
+(with the config still recorded verbatim as evidence, so the matrix cell
+remains traceable), or record it as a blocked shape in the artifacts.
+The existing layout-drift blocker path covers `Common.ps1`/`New-Config`
+being *absent*; this gate covers *present but insufficient*.
 
 Layout drift handling (established pattern): if `Common.ps1` (or
 `New-Config` in it) is missing at a future pin, the section records the
