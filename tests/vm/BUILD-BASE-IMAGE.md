@@ -464,7 +464,11 @@ Differences from the image-A build:
     pin re-decided 2026-10-13; recorded in `docs/mxc-source-analysis.md`,
     "Pin decision (2026-10-13)" — the script default matches), runs
     `cargo build --release` in the workspace, and records the `wxc-exec.exe`
-    SHA256 + VersionInfo in `C:\mxc\mxc-build.json`. It never runs
+    SHA256 + VersionInfo in `C:\mxc\mxc-build.json`. Because the build is
+    whole-workspace, the upstream suite's sidecar binaries (`plm.exe`,
+    `winhttp-proxy-shim.exe`) land beside `wxc-exec.exe` for free
+    (observed run `20261013-220007-020`); only the debug lane is absent,
+    which the capture script's context redirect handles. It never runs
     `wxc-host-prep` (a WBD stop signal) and launches no workload. Expect
     the build to take a while on first run (fresh cargo cache inside the
     image).
@@ -497,6 +501,23 @@ manifest into `C:\sbx-results`; the harness fetches everything into
 MXC stale-DACL recovery before capability detection (a security-state
 operation, recorded in the baseline) — which is exactly why it only ever
 runs inside disposable clones.
+
+D-02 binary contract (2026-10-13): upstream standalone area runs
+require a debug-lane `wxc-exec.exe` and `plm.exe` /
+`winhttp-proxy-shim.exe` sidecars beside each lane (Common.ps1
+`Initialize-WpcContext`), but `prepare-mxc.ps1` builds the release lane
+only. The capture script satisfies the contract in the disposable VM: it
+builds the two sidecar crates (release lane, warm cargo cache) if
+missing and passes a context JSON (`d02-wpc-context.json`, itself a
+fetched artifact) that redirects the debug lane at the pinned release
+binary — the upstream-documented override mechanism — plus
+`-SkipNetwork` (the probes phase is read-only; no dependency on VM NAT
+reachability) and `-ResultsJson` so the upstream suite's own
+machine-readable results land in the fetched artifact set. If the image
+is ever re-provisioned to build the full artifact set natively (debug
+lane + sidecars, dedicated-runner Q-01 track), the capture script's
+idempotency check skips the build and the context redirect stays
+harmless.
 
 **Scope guard (VM-01 Task 6):** this lane is evidence capture only. Do
 not build product code from this evidence until the impact-analysis §5

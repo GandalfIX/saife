@@ -348,8 +348,29 @@ authoritative evidence per the WBD. Scope:
   binary (documented override mechanism), but the two sidecar crates must
   still be built — the minimal unblock is `cargo build -p plm -p
   wxc_winhttp_proxy_shim --release` + a context JSON redirecting WxcDebug
-  to the release path. Follow-up decision (capture-time fix vs. image
-  re-provisioning) recorded with the WBD D-02 work.
+  to the release path.
+  **D-02 UNBLOCKED (2026-10-13, capture-time fix; maintainer decision: no
+  re-bake):** `wbd-d01-d02-probes.ps1` now satisfies the upstream binary
+  contract inside the disposable VM — it builds the two sidecar crates
+  (release lane) if missing and passes a context JSON (`d02-wpc-context.json`,
+  itself a fetched artifact) redirecting the debug lane at the pinned
+  release binary, plus `-SkipNetwork` (read-only phase; no VM-NAT
+  dependency) and `-ResultsJson` (the upstream suite's machine-readable
+  results land in the fetched artifacts). Locally mock-verified in both
+  branches (idempotent sidecar skip + redirect forwarding; cargo-failure
+  recorded as evidence, run still completes). Canonical run
+  `20261013-220007-020` (supersedes `20261013-173137-189`): **D-02 upstream
+  probes test 10/10 PASS, exit 0** — P0 tier prerequisite (host selects
+  base-container), P1 empty/rw/denied-policy probes all resolve
+  tier=base-container with needsDaclAugmentation=False (BaseContainer
+  enforces natively, incl. denied paths — matches the D-01
+  baseContainerSupportsDenyPaths=TRUE), allowDaclMutation=false is a no-op
+  on this tier, supportsEnumeratePaths reported present-but-False (matches
+  D-01). Bonus finding: the re-bake's full-workspace `cargo build --release`
+  in prepare-mxc had already produced the sidecar binaries beside wxc-exec,
+  so the idempotency check skipped the build — the debug-lane redirect was
+  the only gap. The prepare-mxc extension (native full artifact set incl.
+  the debug lane) stays recorded as a dedicated-runner (Q-01) follow-up.
 - This lane is the seed of the WBD's Q-01 dedicated-runner tier; do not build
   product code from this evidence until the impact-analysis §5 decisions are
   recorded.

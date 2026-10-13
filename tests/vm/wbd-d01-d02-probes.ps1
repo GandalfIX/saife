@@ -23,10 +23,27 @@
   D-02 starter: the upstream probe test entry point
   (tests\scripts\run_processcontainer_probes_test.ps1 -RequireTier
   base-container) runs request-scoped probes; its output is captured
-  verbatim with its exit code. Building the full D-02 capability matrix
-  (empty/fs/UI/deny-all-network/proxy requests, blocked markings) is
-  WBD-track analysis on top of this raw evidence - deliberately NOT
-  done here (VM-01 Task 6: evidence capture only, no product code).
+  verbatim with its exit code, plus the suite's own machine-readable
+  -ResultsJson. Upstream binary contract (Common.ps1
+  Initialize-WpcContext, analyzed 2026-10-13): a standalone area run
+  requires BOTH lane binaries to exist and plm.exe /
+  winhttp-proxy-shim.exe sidecars beside each lane, even though the
+  probes area only ever invokes wxc-exec via --probe. prepare-mxc.ps1
+  builds the release lane only, so this script builds the two small
+  sidecar crates (release lane, warm cargo cache, ~a minute) inside the
+  DISPOSABLE VM - nothing persists - and writes a context JSON
+  redirecting the debug lane at the pinned release binary: the
+  upstream-documented override mechanism (explicit parameters and
+  ContextJson keys both beat the default paths, Common.ps1:1161-1187),
+  and both lanes reading the one recorded artifact keeps Assert-BfsSafety
+  and the capture-provider probes on the exact binary mxc-build.json
+  hashed. -SkipNetwork keeps the read-only phase independent of VM NAT
+  reachability. A failing sidecar build or upstream test is EVIDENCE,
+  not a capture error: outcomes are recorded in the artifacts. Building
+  the full D-02 capability matrix (empty/fs/UI/deny-all-network/proxy
+  requests, blocked markings) is WBD-track analysis on top of this raw
+  evidence - deliberately NOT done here (VM-01 Task 6: evidence capture
+  only, no product code).
 
   This script NEVER runs wxc-host-prep and never launches a workload.
 
@@ -190,16 +207,75 @@ try {
     # ---------------------------------------------------------------------
     # D-02 starter: the upstream request-scoped probe test, verbatim.
     # Absence of the upstream entry point in the pinned tree is recorded
-    # as evidence (upstream layout drift), not as a script error.
+    # as evidence (upstream layout drift), not as a script error. Same
+    # for a failed sidecar build: the blocker text lands in the log and
+    # the run continues (D-01 evidence is already complete).
     # ---------------------------------------------------------------------
     $d02Log = Join-Path $ResultsDir 'd02-upstream-probes.log'
     $upstreamTest = Join-Path $MxcRoot 'tests\scripts\run_processcontainer_probes_test.ps1'
     if (Test-Path -LiteralPath $upstreamTest) {
-        Write-Host '[wbd-capture] running upstream probe test (output to d02-upstream-probes.log) ...'
-        $d02Output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $upstreamTest -RequireTier base-container 2>&1
-        $d02Exit = $LASTEXITCODE
-        $d02Output | Set-Content -LiteralPath $d02Log -Encoding utf8
-        Write-Host "[wbd-capture] D-02 upstream test exit: $d02Exit (recorded verbatim; a failure is evidence, not a capture error)"
+        # Satisfy the upstream binary contract (see .DESCRIPTION): the
+        # release-lane sidecars are built here if missing - inside the
+        # disposable VM, so nothing persists. Idempotent: a re-run with
+        # sidecars already present skips the build entirely.
+        $wxcDir = Split-Path -Parent $wxcExec
+        $sidecarBuildLog = Join-Path $ResultsDir 'd02-sidecar-build.log'
+        $sidecarsMissing = @('plm.exe', 'winhttp-proxy-shim.exe') |
+            Where-Object { -not (Test-Path -LiteralPath (Join-Path $wxcDir $_)) }
+        $d02Ran = $false
+        if (@($sidecarsMissing).Count -eq 0) {
+            Set-Content -LiteralPath $sidecarBuildLog -Value 'sidecars already present beside the release binary' -Encoding utf8
+            $d02Ran = $true
+        } elseif (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            $blocker = 'cargo not on PATH in this session - cannot build the upstream sidecar crates (plm, wxc_winhttp_proxy_shim)'
+            Set-Content -LiteralPath $sidecarBuildLog -Value $blocker -Encoding utf8
+            Set-Content -LiteralPath $d02Log -Value $blocker -Encoding utf8
+            Write-Host "[wbd-capture] D-02: $blocker (recorded)" -ForegroundColor Yellow
+        } else {
+            Write-Host ("[wbd-capture] building upstream sidecar crates ({0}) - release lane, warm cargo cache ..." -f ($sidecarsMissing -join ', '))
+            Push-Location (Join-Path $MxcRoot 'src')
+            try {
+                # Same invocation pattern as prepare-mxc.ps1: 2>&1 merge +
+                # Tee-Object keeps the compiler output as evidence.
+                cargo build --release -p plm -p wxc_winhttp_proxy_shim 2>&1 |
+                    Tee-Object -FilePath $sidecarBuildLog | Out-Null
+                $sidecarExit = $LASTEXITCODE
+            } finally {
+                Pop-Location
+            }
+            $stillMissing = @('plm.exe', 'winhttp-proxy-shim.exe') |
+                Where-Object { -not (Test-Path -LiteralPath (Join-Path $wxcDir $_)) }
+            if ($sidecarExit -eq 0 -and @($stillMissing).Count -eq 0) {
+                $d02Ran = $true
+            } else {
+                $blocker = "sidecar build failed (cargo exit $sidecarExit; still missing: $(@($stillMissing) -join ', ')) - see d02-sidecar-build.log"
+                Set-Content -LiteralPath $d02Log -Value $blocker -Encoding utf8
+                Write-Host "[wbd-capture] D-02: $blocker (recorded)" -ForegroundColor Yellow
+            }
+        }
+        if ($d02Ran) {
+            # The context JSON is itself an artifact (auditable override):
+            # redirect the debug lane at the pinned release binary. Only
+            # keys Initialize-WpcContext declares are honored; explicit
+            # command-line parameters still beat the file upstream.
+            $ctxPath = Join-Path $ResultsDir 'd02-wpc-context.json'
+            [ordered]@{
+                RepoRoot   = $MxcRoot
+                CargoRoot  = (Join-Path $MxcRoot 'src')
+                WxcDebug   = $wxcExec
+                WxcRelease = $wxcExec
+            } | ConvertTo-Json | Set-Content -LiteralPath $ctxPath -Encoding utf8
+            Write-Host '[wbd-capture] running upstream probe test (output to d02-upstream-probes.log) ...'
+            $resultsJson = Join-Path $ResultsDir 'd02-probes-results.json'
+            $d02Output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $upstreamTest -ContextJson $ctxPath -RequireTier base-container -SkipNetwork -ResultsJson $resultsJson 2>&1
+            $d02Exit = $LASTEXITCODE
+            # Set-Content -Value (parameter), never the pipeline: an EMPTY
+            # output stream must still produce the (empty) verbatim log -
+            # same empty-output bug fixed for the D-01 logs.
+            $d02Text = (@($d02Output) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+            Set-Content -LiteralPath $d02Log -Value $d02Text -Encoding utf8
+            Write-Host "[wbd-capture] D-02 upstream test exit: $d02Exit (recorded verbatim; a failure is evidence, not a capture error)"
+        }
     } else {
         "upstream probe test not found at $upstreamTest - pinned tree layout drift; record as an upstream blocker (D-02)." |
             Set-Content -LiteralPath $d02Log -Encoding utf8
