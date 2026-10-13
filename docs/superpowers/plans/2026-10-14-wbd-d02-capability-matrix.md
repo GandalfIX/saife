@@ -458,6 +458,14 @@ returned FIX_FIRST; these deltas were applied on top and the mock
 6. **Dot-source hazard note** next to `. $commonPs1` (future pins could
    shadow script-scope variables; verified safe at pin 5d7a475a).
 
+Follow-up (same day): the re-review of the hardening commit caught that
+delta 2's timeout branch called `Stop-Job -Force` — `Stop-Job` has no
+`-Force` parameter (runtime-verified), so the branch would have thrown
+into the per-shape catch instead of recording the timeout. Fixed to
+`Stop-Job -Job $probeJob`; `Remove-Job -Force` carries the force. The
+mock could not catch this (where.exe never hangs); behavioral timeout
+coverage remains static-analysis-verified only.
+
 Advisories NOT taken (with rationale):
 - Renaming `d02-matrix-<shape>.probe.json` to `.probe.log` (verbatim
   output may be unparseable): the artifact name is spec'd in the

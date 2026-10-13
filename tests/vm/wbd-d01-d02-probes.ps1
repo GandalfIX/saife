@@ -394,7 +394,7 @@ try {
                         $probeText = [string]$probeResult.text
                         $probeCode = $probeResult.exit
                     } else {
-                        Stop-Job -Job $probeJob -Force
+                        Stop-Job -Job $probeJob
                         Remove-Job -Job $probeJob -Force
                         $row['configArtifact'] = "d02-config-$shape.json"
                         $row['configSha256'] = (Get-FileHash -LiteralPath $configArtifact -Algorithm SHA256).Hash
