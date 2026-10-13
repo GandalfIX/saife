@@ -27,6 +27,18 @@
   (2026-09-16). Source line references may have drifted at the new pin; re-verify
   them on the next quarterly analysis pass. Update the "Analyzed" header above when
   that happens.
+- **Partial refresh (2026-10-14, WBD D-02):** the fallback/serviceability chain
+  was re-verified at `5d7a475a` for the capability-boolean → PSEC contract
+  mapping — `fallback_detector.rs` (§2.1's subject), `base_container_runner.rs`,
+  `base_container_helpers.rs`, `secenv.rs`, `probe.rs`, `request_probe.rs`,
+  `job_object.rs`, `ui_policy.rs`, `network_policy_helpers.rs`. The at-pin line
+  references live in `docs/wbd-d02-capability-matrix.md` §4; the refs in the
+  findings sections below (including §2.1) still key to `e7940f7` until the
+  quarterly pass. Substantive new finding at the pin: the image-B host
+  (build 29680) advertises a PSEC **1.0-only** contract — `FileSystemDeny`
+  yes, `FileSystemEnumerate`/`NetworkIngress` (PSEC 1.1) no — so the
+  identity-less loopback proxy rides a temporary upstream PSEC-1.0 workaround
+  (matrix doc §5.1; re-verify on every re-pin).
 
 ## 1. Executive summary
 
