@@ -463,8 +463,10 @@ delta 2's timeout branch called `Stop-Job -Force` — `Stop-Job` has no
 `-Force` parameter (runtime-verified), so the branch would have thrown
 into the per-shape catch instead of recording the timeout. Fixed to
 `Stop-Job -Job $probeJob`; `Remove-Job -Force` carries the force. The
-mock could not catch this (where.exe never hangs); behavioral timeout
-coverage remains static-analysis-verified only.
+mock could not catch this (where.exe never hangs); the fixed branch was
+then verified behaviorally against a hung job (row emitted with the
+timeout error, config evidence recorded, job state Stopped) alongside a
+mock A+B+C re-run.
 
 Advisories NOT taken (with rationale):
 - Renaming `d02-matrix-<shape>.probe.json` to `.probe.log` (verbatim
