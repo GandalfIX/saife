@@ -87,7 +87,8 @@ class FakeWxcExec {
     }
 }
 '@ | Set-Content -LiteralPath $cs -Encoding utf8
-    & $csc /nologo /out:(Join-Path $Path 'src\target\release\wxc-exec.exe') $cs
+    $exeOut = Join-Path $Path 'src\target\release\wxc-exec.exe'
+    & $csc /nologo "/out:$exeOut" $cs
     if ($LASTEXITCODE -ne 0) { throw "csc failed building fake wxc-exec" }
     if ($WithCommonPs1) {
         $libDir = Join-Path $Path 'tests\scripts\lib'
@@ -97,11 +98,11 @@ $Script:SchemaVersion = '1.0.0'
 function New-Config {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$CommandLine,
           [string[]]$ReadWrite = @(), [string[]]$ReadOnly = @(), [string[]]$Denied = @(),
-          [int]$TimeoutMs = 30000, [string]$Cwd = $null)
+          [string]$Cwd = $null)
     $dir = Join-Path $ScratchRoot 'configs'
     $path = Join-Path $dir "$Name.json"
     @{ version = '1.0.0'; containerId = "MxcWinPC-$Name"; containment = 'processcontainer';
-       process = @{ commandLine = $CommandLine; timeout = $TimeoutMs };
+        process = @{ commandLine = $CommandLine; timeout = 30000 };
        filesystem = @{ readwritePaths = $ReadWrite; readonlyPaths = $ReadOnly; deniedPaths = $Denied };
        ui = @{ disable = $false } } |
         ConvertTo-Json -Depth 5 | Out-File -LiteralPath $path -Encoding utf8 -Force
@@ -125,18 +126,43 @@ force-tier-testing = []
 '@ | Set-Content -LiteralPath (Join-Path $Path 'src\mxc-sdk\Cargo.toml') -Encoding utf8
         @'
 // Stub of the documented mxc_sdk::v1 surface (docs/api-reference/rust/v1).
-// Field names match types.md so the committed spike compiles against it.
+// Mirrors EVERY item src/main.rs touches (configs module layout, all 11
+// ProbeFacts booleans + 10 ui bits, Default for ProcessContainerConfig,
+// MxcProcess::{wait, warnings, ...}) so the committed spike compiles in the
+// mock; the real crate is exercised in the VM run.
 pub mod v1 {
-    pub struct ProbeFacts { pub base_container_api_present: bool, pub native_capture_available: bool }
-    pub struct UiCapabilitySupport { pub can_block_clipboard_read: bool }
+    pub mod configs {
+        #[derive(Default)]
+        pub struct ProcessContainerConfig {
+            pub filesystem: Option<ProcessContainerFilesystem>,
+        }
+        pub struct ProcessContainerFilesystem {
+            pub enumerate_paths: Vec<String>,
+        }
+    }
+    pub struct UiCapabilitySupport {
+        pub can_block_clipboard_read: bool, pub can_block_clipboard_write: bool,
+        pub can_block_input_injection: bool, pub can_block_input_method_changes: bool,
+        pub can_block_external_ui_objects: bool, pub can_block_global_ui_namespace: bool,
+        pub can_block_desktop_switching: bool, pub can_block_logoff_or_shutdown: bool,
+        pub can_block_system_parameter_changes: bool, pub can_block_display_settings_changes: bool,
+    }
+    pub struct ProbeFacts {
+        pub base_container_api_present: bool, pub native_capture_available: bool,
+        pub guarded_capture_available: bool, pub bfscfg_present: bool,
+        pub bfs_compiled_in: bool, pub base_container_supports_deny_paths: bool,
+        pub base_container_supports_enumerate_paths: bool,
+        pub base_container_supports_ingress_host_loopback_allow: bool,
+        pub base_container_supports_identityless_loopback_proxy: bool,
+        pub isolation_session_available: bool, pub hyperlight_available: bool,
+        pub ui_capabilities: UiCapabilitySupport,
+    }
     pub struct ProbeOutput {
         pub tier: Option<&'static str>, pub needs_dacl_augmentation: Option<bool>,
         pub warnings: Vec<String>, pub probes: ProbeFacts, pub error: Option<String>,
     }
     pub struct FilesystemPolicy { pub readwrite_paths: Vec<String>, pub readonly_paths: Vec<String>, pub denied_paths: Vec<String> }
-    pub struct ProcessContainerFilesystem { pub enumerate_paths: Vec<String> }
-    pub struct ProcessContainerConfig { pub filesystem: Option<ProcessContainerFilesystem> }
-    pub enum Containment { Process, ProcessContainer(ProcessContainerConfig) }
+    pub enum Containment { Process, ProcessContainer(configs::ProcessContainerConfig) }
     pub struct ContainerRequest {
         pub command: String, pub timeout_ms: Option<u32>,
         pub filesystem: Option<FilesystemPolicy>, pub containment: Containment,
@@ -151,8 +177,10 @@ pub mod v1 {
         pub fn id(&self) -> u32 { 4242 }
         pub fn try_wait(&mut self) -> std::io::Result<Option<i32>> { Ok(Some(0)) }
         pub fn kill(&mut self) -> std::io::Result<()> { Ok(()) }
+        pub fn warnings(&self) -> Vec<String> { Vec::new() }
+        pub fn wait(&mut self) -> Result<WaitResult, Error> { Ok(WaitResult::Exited(0)) }
         pub fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
-            Some(Box::new(Vec::new()))
+            Some(Box::new(std::io::sink()))
         }
         pub fn wait_with_output(self) -> std::io::Result<ExecutionResult> {
             Ok(ExecutionResult { outcome: WaitResult::Exited(0), warnings: vec![],
@@ -165,11 +193,27 @@ pub mod v1 {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
     }
     pub struct AvailableBackend { pub backend: String, pub tier: Option<String>, pub warnings: Vec<String> }
+    fn stub_probe_facts() -> ProbeFacts {
+        ProbeFacts {
+            base_container_api_present: true, native_capture_available: true,
+            guarded_capture_available: true, bfscfg_present: true,
+            bfs_compiled_in: true, base_container_supports_deny_paths: true,
+            base_container_supports_enumerate_paths: true,
+            base_container_supports_ingress_host_loopback_allow: true,
+            base_container_supports_identityless_loopback_proxy: true,
+            isolation_session_available: true, hyperlight_available: true,
+            ui_capabilities: UiCapabilitySupport {
+                can_block_clipboard_read: true, can_block_clipboard_write: true,
+                can_block_input_injection: true, can_block_input_method_changes: true,
+                can_block_external_ui_objects: true, can_block_global_ui_namespace: true,
+                can_block_desktop_switching: true, can_block_logoff_or_shutdown: true,
+                can_block_system_parameter_changes: true, can_block_display_settings_changes: true,
+            },
+        }
+    }
     pub fn probe(_request: Option<&ContainerRequest>) -> Result<ProbeOutput, Error> {
         Ok(ProbeOutput { tier: Some("stub-base-container"), needs_dacl_augmentation: Some(false),
-            warnings: Vec::new(),
-            probes: ProbeFacts { base_container_api_present: true, native_capture_available: true },
-            error: None })
+            warnings: Vec::new(), probes: stub_probe_facts(), error: None })
     }
     pub fn run(request: ContainerRequest, _o: ()) -> Result<ExecutionResult, Error> {
         let code = if request.command.contains("exit 7") { 7 } else { 0 };
@@ -212,6 +256,24 @@ if ($summary.sdk.ran -ne $true) { $fail += 'A: sdk section ran != true (stub bui
 if ($summary.c.ran -ne $true) { $fail += 'A: c section ran != true' }
 if (@($summary.wxc.rows).Count -ne 7) { $fail += "A: expected 7 wxc rows, got $(@($summary.wxc.rows).Count)" }
 if (@($summary.sdk.rows).Count -ne 8) { $fail += "A: expected 8 sdk rows, got $(@($summary.sdk.rows).Count)" }
+# uniform row schema + real exit values: proves the guarded calls actually
+# bound their arguments (a lost -ArgumentList shows up as exit -1 rows)
+$wxcByName = @{}
+foreach ($row in @($summary.wxc.rows)) { $wxcByName[$row.scenario] = $row }
+foreach ($row in @($summary.wxc.rows)) {
+    foreach ($k in 'scenario','error','configArtifact','exit','elapsedMs') {
+        if (-not ($row.PSObject.Properties.Name -contains $k)) { $fail += "A: wxc row $($row.scenario) missing key $k" }
+    }
+}
+if ($wxcByName['a1-exit0'].exit -ne 0) { $fail += "A: a1-exit0 expected exit 0, got $($wxcByName['a1-exit0'].exit)" }
+if ($wxcByName['a1-exit7'].exit -ne 7) { $fail += "A: a1-exit7 expected exit 7 (fake executor maps 'exit 7'), got $($wxcByName['a1-exit7'].exit)" }
+foreach ($s in 'a2-stdout','a2-stderr','a2-stdin','a3-timeout') {
+    if ($wxcByName[$s].exit -ne 0) { $fail += "A: $s expected exit 0, got $($wxcByName[$s].exit)" }
+}
+if ($wxcByName['a4-cancel'].executorKilled -ne $true) { $fail += "A: a4-cancel executorKilled != true" }
+foreach ($row in @($summary.sdk.rows)) {
+    if ($row.exit -ne 0) { $fail += "A: sdk $($row.scenario) expected exit 0, got $($row.exit)" }
+}
 foreach ($s in $wxcScenarios) {
     if (-not (Test-Path (Join-Path $resA "d03-wxc-$s.json"))) { $fail += "A: missing d03-wxc-$s.json" }
 }
@@ -414,13 +476,14 @@ fn scenario_spawn_stdin() -> Result<Value, String> {
         Default::default(),
     )
     .map_err(fmt_err)?;
-    let stdin_taken = proc.take_stdin().is_some();
-    {
-        let mut stdin = proc.take_stdin();
-        if let Some(w) = stdin.as_mut() {
-            let _ = w.write_all(b"HELLO-STDIN\r\n");
-        }
+    // take_stdin has take semantics - take ONCE, write through the handle,
+    // then drop it before wait_with_output consumes the process.
+    let mut stdin = proc.take_stdin();
+    let stdin_taken = stdin.is_some();
+    if let Some(w) = stdin.as_mut() {
+        let _ = w.write_all(b"HELLO-STDIN\r\n");
     }
+    drop(stdin);
     let result = proc.wait_with_output().map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     Ok(json!({
@@ -535,7 +598,7 @@ Note: `v1::Error` implements `Display`; `probe_json` maps `ProbeOutput` field-by
 **Files:**
 - Create: `tests/vm/wbd-d03-d04-spike.ps1`
 
-Established patterns reused from `wbd-d01-d02-probes.ps1`: exit codes 0/3/99, prerequisites fail-loud, flat artifacts only (the harness fetch is flat), `Set-Content -Value` never the pipeline, per-step try/catch with blocker-verbatim continuation, `Start-Job` + `Wait-Job -Timeout` hang guard on **every** launch scenario (spec advisory 3), pin re-verification, manifest with SHA256. **This script launches workloads — inside the disposable VM only, never on the host, and it never runs `wxc-host-prep`.**
+Established patterns reused from `wbd-d01-d02-probes.ps1`: exit codes 0/3/99, prerequisites fail-loud, flat artifacts only (the harness fetch is flat), `Set-Content -Value` never the pipeline, per-step try/catch with blocker-verbatim continuation, `Start-Job` + `Wait-Job -Timeout` hang guard on **every** launch scenario (spec advisory 3; the single documented exception is a4-cancel — it must Stop-Process the executor from the parent and uses only bounded waits — and the Section B cargo build is guarded at 1800s because force-tier-testing changes mxc-sdk's feature fingerprint → full rebuild), pin re-verification, manifest with SHA256. **This script launches workloads — inside the disposable VM only, never on the host, and it never runs `wxc-host-prep`.**
 
 - [ ] **Step 1: Write the script**:
 
@@ -603,11 +666,16 @@ $ErrorActionPreference = 'Stop'
 # only strings and the exit code cross deserialization
 # (wbd-d01-d02-probes.ps1:378-405 pattern; Stop-Job has no -Force).
 function Invoke-Guarded {
-    param([scriptblock]$ScriptBlock, [int]$TimeoutSec = 120)
-    $job = Start-Job -ScriptBlock $ScriptBlock
+    param([scriptblock]$ScriptBlock, [object[]]$ArgumentList = @(), [int]$TimeoutSec = 120)
+    $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
     if (Wait-Job -Job $job -Timeout $TimeoutSec) {
-        $r = Receive-Job -Job $job
-        $result = if ($r) { $r } else { [pscustomobject]@{ text = ''; exit = -1 } }
+        try {
+            $r = Receive-Job -Job $job -ErrorAction Stop
+            $result = if ($r) { $r } else { [pscustomobject]@{ text = ''; exit = -1 } }
+        } catch {
+            # a thrown child error becomes recorded evidence, not a lost scenario
+            $result = [pscustomobject]@{ text = "job error: $($_.Exception.Message)"; exit = -1 }
+        }
     } else {
         Stop-Job -Job $job
         $result = [pscustomobject]@{ text = "timed out after ${TimeoutSec}s (job killed)"; exit = -1 }
@@ -684,14 +752,14 @@ try {
             New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
 
             function Invoke-WxcScenario {
-                param([string]$Name, [string]$CommandLine, [int]$TimeoutMs = 30000)
+                param([string]$Name, [string]$CommandLine)
                 $row = [ordered]@{ scenario = $Name; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
                 try {
-                    $configPath = New-Config -Name "d03-$Name" -CommandLine $CommandLine -TimeoutMs $TimeoutMs
+                    $configPath = New-Config -Name "d03-$Name" -CommandLine $CommandLine
                     $row['configArtifact'] = "d03-config-$Name.json"
                     Copy-Item -LiteralPath $configPath -Destination (Join-Path $script:ResultsDir "d03-config-$Name.json") -Force
                     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                    $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+                    $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $configPath) -ScriptBlock {
                         param($Exe, $Cfg)
                         $out = & $Exe $Cfg 2>&1
                         [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -713,19 +781,20 @@ try {
             $wxcRows += Invoke-WxcScenario -Name 'a2-stderr' -CommandLine 'cmd /d /s /c echo WXC-STDERR-MARKER 1>&2'
 
             # stdin forwarding: pipe a marker in; find /v "" echoes it back
-            $row = [ordered]@{ scenario = 'a2-stdin'; error = $null; configArtifact = $null; exit = $null }
+            $row = [ordered]@{ scenario = 'a2-stdin'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
                 $configPath = New-Config -Name 'd03-a2-stdin' -CommandLine 'cmd /d /s /c find /v ""'
                 $row['configArtifact'] = 'd03-config-a2-stdin.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a2-stdin.json') -Force
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+                $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $configPath) -ScriptBlock {
                     param($Exe, $Cfg)
                     $out = 'WXC-STDIN-MARKER' | & $Exe $Cfg 2>&1
                     [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
                 }
                 $sw.Stop()
                 $row['exit'] = $r.exit
+                $row['elapsedMs'] = $sw.ElapsedMilliseconds
                 Set-Content -LiteralPath (Join-Path $ResultsDir 'd03-wxc-a2-stdin.json') -Value ([string]$r.text) -Encoding utf8
                 $row['stdinRoundTrip'] = ([string]$r.text) -match 'WXC-STDIN-MARKER'
             } catch { $row['error'] = "$($_.Exception.Message)" }
@@ -734,11 +803,19 @@ try {
             # timeout: request-level process.timeout vs a 60s sleep workload
             $row = [ordered]@{ scenario = 'a3-timeout'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
-                $configPath = New-Config -Name 'd03-a3-timeout' -CommandLine 'pwsh -NoProfile -Command Start-Sleep -Seconds 60' -TimeoutMs 3000
+                # New-Config's timeout parameter surface is unverified upstream
+                # (the observed D-02 usage never passes one) - build the base
+                # config with the helper, then patch process.timeout. Key name
+                # verified against the fetched d02-config-fs-rw.json; re-verified
+                # against the pinned schema in Task 8 Step 6.
+                $configPath = New-Config -Name 'd03-a3-timeout' -CommandLine 'pwsh -NoProfile -Command Start-Sleep -Seconds 60'
+                $a3Json = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+                $a3Json.process.timeout = 3000
+                $a3Json | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $configPath -Encoding utf8
                 $row['configArtifact'] = 'd03-config-a3-timeout.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a3-timeout.json') -Force
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+                $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $configPath) -ScriptBlock {
                     param($Exe, $Cfg)
                     $out = & $Exe $Cfg 2>&1
                     [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -751,8 +828,13 @@ try {
 
             # cancellation: kill the executor mid-run, then check for
             # surviving workload processes (process-tree teardown)
-            $row = [ordered]@{ scenario = 'a4-cancel'; error = $null; configArtifact = $null; exit = $null }
+            # Not under Invoke-Guarded (the single documented exception): the
+            # scenario must Stop-Process the executor from the parent, and every
+            # wait below is bounded (WaitForExit(15000) + fixed sleeps) - no
+            # unbounded synchronous wait on the executor exists.
+            $row = [ordered]@{ scenario = 'a4-cancel'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 $configPath = New-Config -Name 'd03-a4-cancel' -CommandLine "pwsh -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'"
                 $row['configArtifact'] = 'd03-config-a4-cancel.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a4-cancel.json') -Force
@@ -763,10 +845,12 @@ try {
                 $proc.WaitForExit(15000) | Out-Null
                 Start-Sleep -Seconds 3
                 $survivors = @(Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%WBD-D03-A4-MARKER%'" -ErrorAction SilentlyContinue)
-                $row['exit'] = 'executor killed (Stop-Process; no exit code)'
+                $sw.Stop()
+                $row['executorKilled'] = $true
                 $row['workloadProcessesBeforeKill'] = @($runningBefore | ForEach-Object { $_.ProcessId })
                 $row['workloadProcessSurvivors'] = @($survivors | ForEach-Object { $_.ProcessId })
                 $row['treeTornDown'] = (@($survivors).Count -eq 0)
+                $row['elapsedMs'] = $sw.ElapsedMilliseconds
                 @{ scenario = 'a4-cancel'; executorKilled = $true; survivors = @($survivors | ForEach-Object { $_.ProcessId }) } |
                     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ResultsDir 'd03-wxc-a4-cancel.json') -Encoding utf8
             } catch { $row['error'] = "$($_.Exception.Message)" }
@@ -783,7 +867,7 @@ try {
     # run the 8 scenarios each as its own guarded process invocation.
     # Build failure = recorded blocker (Section A evidence stands alone).
     # ---------------------------------------------------------------------
-    $sdkRan = $false; $sdkBlocker = $null; $sdkRows = @()
+    $sdkRan = $false; $sdkBlocker = $null; $sdkRows = @(); $buildExit = $null; $buildElapsedMs = $null
     $templatePath = Join-Path $SpikeDir 'Cargo.toml.template'
     if (-not (Test-Path -LiteralPath $templatePath)) {
         $sdkBlocker = "spike crate template missing at $templatePath (Section B blocker)."
@@ -795,15 +879,24 @@ try {
             Set-Content -LiteralPath (Join-Path $SpikeDir 'Cargo.toml') -Value $cargoToml -Encoding utf8
             Copy-Item -LiteralPath (Join-Path $SpikeDir 'Cargo.toml') -Destination (Join-Path $ResultsDir 'd03-sdk-cargo.toml') -Force
 
-            Push-Location $SpikeDir
-            try {
-                $buildLog = Join-Path $ResultsDir 'd03-sdk-build.log'
-                cargo build --release --offline 2>&1 | Tee-Object -FilePath $buildLog | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    cargo build --release 2>&1 | Tee-Object -FilePath $buildLog -Append | Out-Null
+            # Guarded build: force-tier-testing changes mxc-sdk's feature
+            # fingerprint -> full rebuild of the upstream tree (~155k lines);
+            # a wedged build must become a recorded blocker, not a lost run.
+            $buildLog = Join-Path $ResultsDir 'd03-sdk-build.log'
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Guarded -TimeoutSec 1800 -ArgumentList @((Join-Path $SpikeDir 'Cargo.toml'), $buildLog) -ScriptBlock {
+                param($Manifest, $Log)
+                cargo build --release --offline --manifest-path $Manifest 2>&1 | Tee-Object -FilePath $Log | Out-Null
+                $code = $LASTEXITCODE
+                if ($code -ne 0) {
+                    cargo build --release --manifest-path $Manifest 2>&1 | Tee-Object -FilePath $Log -Append | Out-Null
+                    $code = $LASTEXITCODE
                 }
-                $buildExit = $LASTEXITCODE
-            } finally { Pop-Location }
+                [pscustomobject]@{ text = "cargo exit $code (full log: $Log)"; exit = $code }
+            }
+            $sw.Stop()
+            $buildExit = $r.exit
+            $buildElapsedMs = $sw.ElapsedMilliseconds
 
             $spikeBin = Join-Path $SpikeDir 'target\release\wbd-d03-sdk-spike.exe'
             if ($buildExit -eq 0 -and (Test-Path -LiteralPath $spikeBin)) {
@@ -811,7 +904,7 @@ try {
                 foreach ($s in 'probe','run-exit','run-stdio','spawn-stdin','timeout','cancel','tier-query') {
                     $row = [ordered]@{ scenario = $s; error = $null; exit = $null }
                     try {
-                        $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+                        $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($spikeBin, $s) -ScriptBlock {
                             param($Bin, $S)
                             $out = & $Bin $S 2>&1
                             [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -824,7 +917,7 @@ try {
                 # force-tier passes the forced value as argv[2]
                 $row = [ordered]@{ scenario = 'force-tier'; error = $null; exit = $null; forcedValue = 'appcontainer-dacl' }
                 try {
-                    $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+                    $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($spikeBin) -ScriptBlock {
                         param($Bin)
                         $out = & $Bin force-tier appcontainer-dacl 2>&1
                         [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -835,7 +928,7 @@ try {
                 $sdkRows += $row
                 $sdkRan = $true
             } else {
-                $sdkBlocker = "spike build failed (cargo exit $buildExit) - see d03-sdk-build.log"
+                $sdkBlocker = "spike build failed (cargo exit $buildExit): $($r.text)"
             }
         } catch {
             $sdkBlocker = "Section B failed: $($_.Exception.Message)"
@@ -866,7 +959,7 @@ try {
             $c1Json | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $c1ConfigArtifact -Encoding utf8
 
             # probe the hand-authored request (verbatim artifact)
-            $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+            $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $c1ConfigArtifact) -ScriptBlock {
                 param($Exe, $Cfg)
                 $out = & $Exe --probe --config $Cfg 2>&1
                 [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -875,7 +968,7 @@ try {
             $c1ProbeExit = $r.exit
 
             # launch it
-            $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+            $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $c1ConfigArtifact) -ScriptBlock {
                 param($Exe, $Cfg)
                 $out = & $Exe $Cfg 2>&1
                 [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -894,7 +987,7 @@ try {
             $prev = $env:MXC_FORCE_TIER
             $env:MXC_FORCE_TIER = 'appcontainer-dacl'
             try {
-                $r = Invoke-Guarded -TimeoutSec 120 -ScriptBlock {
+                $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $cfgEmpty) -ScriptBlock {
                     param($Exe, $Cfg)
                     $out = & $Exe --probe --config $Cfg 2>&1
                     [pscustomobject]@{ text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine; exit = $LASTEXITCODE }
@@ -918,7 +1011,7 @@ try {
         schema = 1
         ran    = ($wxcRan -or $sdkRan -or $cRan)
         wxc    = [ordered]@{ ran = $wxcRan; blocker = $wxcBlocker; rows = @($wxcRows) }
-        sdk    = [ordered]@{ ran = $sdkRan; blocker = $sdkBlocker; rows = @($sdkRows) }
+        sdk    = [ordered]@{ ran = $sdkRan; blocker = $sdkBlocker; buildExit = $buildExit; buildElapsedMs = $buildElapsedMs; rows = @($sdkRows) }
         c      = [ordered]@{ ran = $cRan; blocker = $cBlocker; rows = @($cRows) }
     }
     $summary.errorCount = @($wxcRows + $sdkRows + $cRows | Where-Object { $_.error }).Count
@@ -955,6 +1048,9 @@ try {
 
 Implementation notes (binding):
 - The `summary.ran` gate uses OR (a run where only Section A succeeded still fetched its evidence); each section's own `ran`/`blocker` records the truth. `errorCount` counts per-row `error` fields.
+- `Invoke-Guarded` passes job arguments via `Start-Job -ArgumentList` (the D-02 pattern) and turns a thrown child error into recorded evidence (`job error: …`, exit -1) so the scenario artifact is still written — a lost scenario is never acceptable.
+- a4-cancel is the single documented exception to the hang-guard rule: the scenario needs the executor PID in the parent to Stop-Process it; every wait is bounded (`WaitForExit(15000)` + fixed sleeps). The Section B cargo build is guarded at 1800s (feature-fingerprint rebuild of ~155k upstream lines) — a wedged build becomes a recorded blocker, never a lost run.
+- a3's config patches `process.timeout` after New-Config instead of passing a timeout parameter: the observed upstream `New-Config` usage (probes.ps1:367-374) never passes one, and the mock's stub helper cannot catch that drift. Every parameter the capture script does pass (`-Name`, `-CommandLine`, `-ReadWrite`) is directly observed in the D-02 usage. Task 8 Step 6 re-verifies both hand-touched keys against the pinned schema.
 - The C1 config's `enumeratePaths` value `C:\Windows` is deliberately a directory the marker-writing workload never touches — the enumerate grant itself is unexercised; only the *adjudication* of the key is under test.
 - The C1 hand-authored key: `Add-Member -NotePropertyName` on a `ConvertFrom-Json` object then re-serialize. If the pinned schema expects a different shape for `filesystem.enumeratePaths`, that surfaces as the probe/launch error text in the artifacts — recorded verbatim either way (evidence, not capture error).
 - Baseline gets `Depth 7` (summary rows nest one deeper than D-02's 6).
@@ -988,7 +1084,7 @@ git -C $pinRoot checkout FETCH_HEAD
 
 ```powershell
 $spike = 'C:\Users\marku\tools\sandbox\tests\vm\spikes\wbd-d03-sdk-spike'
-(Get-Content -Raw (Join-Path $spike 'Cargo.toml.template')) -replace '__MXC_ROOT__', $pinRoot -replace '\\', '\' |
+(Get-Content -Raw (Join-Path $spike 'Cargo.toml.template')) -replace '__MXC_ROOT__', ($pinRoot -replace '\\', '\\') |
     Set-Content (Join-Path $spike 'Cargo.toml')
 cargo check --manifest-path (Join-Path $spike 'Cargo.toml')
 ```
@@ -1015,7 +1111,7 @@ Expected: `MOCK PASSED (d03d04 scenarios A+B+C; …)` — Section A completes wi
 
 - [ ] **Step 3: Clean up the mock root**
 
-Run: `Remove-Item -Path (Join-Path $env:TEMP 'opencode\wbd-mock-d03*') -Recurse -Force -ErrorAction SilentlyContinue` (`-Path`, not `-LiteralPath` — the wildcard must expand).
+Run: `Remove-Item -Path (Join-Path $env:TEMP 'opencode\wbd-mock-d03*'), (Join-Path $env:TEMP 'mxc-sbx-d03-spike') -Recurse -Force -ErrorAction SilentlyContinue` (`-Path`, not `-LiteralPath` — the wildcard must expand; the second path is the capture script's scratch root created by the mock runs).
 
 - [ ] **Step 4: Commit** (spike crate + capture script only — the mock is temp scratch):
 
@@ -1062,7 +1158,7 @@ Targeted `raw.githubusercontent.com` fetches at `5d7a475a9fd5626bafb55c2c857989d
 - [ ] **Step 3: FFI exports** — `src/ffi/` listing + the C ABI module it wraps (`mxc_sdk::__ffi` in `src/mxc-sdk/src/lib.rs`, already fetched): language targets, stability labels ("not SDK authoring APIs"), consumers (Node/.NET SDKs).
 - [ ] **Step 4: Job Object controls** — `common/job_object.rs` (29 KB): which resource controls the base-container tier applies (UI limits confirmed in D-02 §4.2; memory/process-count/die-on-close flags feed the D-03 "Job Object resource controls" investigation item).
 - [ ] **Step 5: Dispatcher launch order + attestation surfaces** — `common/dispatcher.rs` (64 KB): where `choose_backend_tier` is called relative to process creation, what the dispatcher can attest post-launch, generation/correlation identifiers (also `sandbox_tracking.rs`), and the `EnforcementDegraded` audit emission (already seen in `fallback_detector.rs`).
-- [ ] **Step 6: C1 schema-key confirmation** — the pinned `docs/schema.md` / `schemas/stable` entry for `filesystem.enumeratePaths` (the hand-authored key) — confirm or record the drift.
+- [ ] **Step 6: C1/A3 schema-key confirmation** — the pinned `docs/schema.md` / `schemas/stable` entries for `filesystem.enumeratePaths` (the C1 hand-added key) and `process.timeout` (the a3 patched key), plus the upstream `New-Config` helper's actual parameter surface in `tests/scripts/lib/WinProcessContainer.Common.ps1` (confirm the capture script only passes observed parameters) — confirm or record the drift.
 - [ ] **Step 7: Assemble the line-ref tables** into the raw material for both ADRs (every ADR claim gets a `file:line` at the pin or a fetched artifact name).
 
 ---
@@ -1091,7 +1187,7 @@ git commit -m "docs(adr): 0002 - WBD D-03 MXC integration surface decision - <he
 - Create: `docs/adr/0003-basecontainer-only-enforcement.md`
 - Modify: `docs/superpowers/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md` (final annotation)
 
-- [ ] **Step 1: Write ADR-0003** per the spec §3.3 structure: provenance (same canonical run; consumes ADR-0002's selected surface); the no-fallback mechanism decision — grounded in the resolved findings: **no supported require-tier input** (the `MXC_FORCE_TIER` seam is `cfg(any(test, feature = "force-tier-testing"))`, test/feature-only, silently ignored by the shipped executor — runtime-proven by `d03-c2-env-immunity.json` and `d03-sdk-force-tier.json`); no policy shape demotes on this host (unsupported forms hard-error — `d03-c1-*.json`); the adapter mechanism therefore = request-scoped preflight (`v1::probe` / `--probe --config` on the exact rendered request, refusing any tier ≠ `base-container` and any absent required capability) **plus** the strongest post-launch attestation the selected surface allows (per ADR-0002's query-back finding — if none exists before resume, that is recorded as the upstream requirement it is, not waved away); race analysis (probe→launch TOCTOU: no atomic require-tier at the pin → upstream requirement + attestation-before-resume mitigation); the staging-point statement for D-08 (the launch-sequence point where mandatory controls are installed and attested before workload code executes, consuming Task 8's C4 verdict); D-04 criteria 1–5 each mapped to proof artifacts.
+- [ ] **Step 1: Write ADR-0003** per the spec §3.3 structure: provenance (same canonical run; consumes ADR-0002's selected surface); the no-fallback mechanism decision — grounded in the resolved findings: **no supported require-tier input** (the `MXC_FORCE_TIER` seam is `cfg(any(test, feature = "force-tier-testing"))`, test/feature-only, silently ignored by the shipped executor — runtime-proven by `d03-c2-env-immunity.json` and `d03-sdk-force-tier.json`); no policy shape demotes on this host (unsupported forms hard-error — `d03-c1-*.json`); the adapter mechanism therefore = request-scoped preflight (`v1::probe` / `--probe --config` on the exact rendered request, refusing any tier ≠ `base-container` and any absent required capability) **plus** the strongest post-launch attestation the selected surface allows (per ADR-0002's query-back finding — if none exists before resume, that is recorded as the upstream requirement it is, not waved away); race analysis (probe→launch TOCTOU: no atomic require-tier at the pin → upstream requirement + attestation-before-resume mitigation); the staging-point statement for D-08 (the launch-sequence point where mandatory controls are installed and attested before workload code executes, consuming Task 8's C4 verdict); D-04 criteria 1–5 each mapped to **named** proof artifacts — for the expected refused outcome of C1, criterion 3 (appcontainer machinery exists but never engages without opt-in) discharges via the combination `d03-sdk-tier-query.json` (available_backends shows the appcontainer tier machinery exists in the binary) + `d03-c1-probe.json`/`d03-c1-launch.json` (the same request still fails closed) + the preflight-refuses-tier≠base-container design statement; if the C1 outcome is instead demoted-and-ran, the C1 artifacts become the adapter fixture per the spec's primary path.
 - [ ] **Step 2: Cross-check** every claim against fetched artifacts + Task 8 line refs.
 - [ ] **Step 3: Plan annotation + commit** — completes PR2:
 
