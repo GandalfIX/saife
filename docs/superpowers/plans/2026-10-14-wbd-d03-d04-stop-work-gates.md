@@ -841,17 +841,24 @@ try {
                 $proc = Start-Process -FilePath $wxcExec -ArgumentList "`"$configPath`"" -PassThru
                 Start-Sleep -Seconds 5
                 $runningBefore = @(Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%WBD-D03-A4-MARKER%'" -ErrorAction SilentlyContinue)
-                Stop-Process -Id $proc.Id -Force
+                # Guarded kill: the mock's fake executor exits in milliseconds,
+                # so the PID may already be gone here (real run: mid-workload).
+                # wasAliveAtKill carries the liveness evidence (true in the VM,
+                # false against the instant-exit fake); executorKilled records
+                # that the teardown step completed either way.
+                $wasAliveAtKill = $null -ne (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)
+                if ($wasAliveAtKill) { Stop-Process -Id $proc.Id -Force }
                 $proc.WaitForExit(15000) | Out-Null
                 Start-Sleep -Seconds 3
                 $survivors = @(Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%WBD-D03-A4-MARKER%'" -ErrorAction SilentlyContinue)
                 $sw.Stop()
                 $row['executorKilled'] = $true
+                $row['wasAliveAtKill'] = $wasAliveAtKill
                 $row['workloadProcessesBeforeKill'] = @($runningBefore | ForEach-Object { $_.ProcessId })
                 $row['workloadProcessSurvivors'] = @($survivors | ForEach-Object { $_.ProcessId })
                 $row['treeTornDown'] = (@($survivors).Count -eq 0)
                 $row['elapsedMs'] = $sw.ElapsedMilliseconds
-                @{ scenario = 'a4-cancel'; executorKilled = $true; survivors = @($survivors | ForEach-Object { $_.ProcessId }) } |
+                @{ scenario = 'a4-cancel'; executorKilled = $true; wasAliveAtKill = $wasAliveAtKill; survivors = @($survivors | ForEach-Object { $_.ProcessId }) } |
                     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ResultsDir 'd03-wxc-a4-cancel.json') -Encoding utf8
             } catch { $row['error'] = "$($_.Exception.Message)" }
             $wxcRows += $row
@@ -1142,7 +1149,7 @@ Expected: `VM HARNESS: PASS`, `WBD SPIKE CAPTURE: DONE`. Flat artifact set (~31 
 - Read: `tests/vm/results/<new-runid>/` — all artifacts listed above
 
 - [ ] **Step 1: Provenance** — `pinMatches: true`, wxc-exec SHA256 matches `3FD125498803970B3FC7E63FC36307DD7A3186318FA02B83034F141731006DAC`, spike-bin SHA256 present; every artifact hash-verified against `capture-manifest.json` (the `testcmd.log` prefix caveat from D-02 is structural and expected).
-- [ ] **Step 2: Section A verdicts** — exit codes (0 vs 7 as workload outcomes), stdio markers captured on the right streams, stdin round-trip, timeout elapsed ≈ 3s not 60s, a4: no workload-process survivors (tree torn down).
+- [ ] **Step 2: Section A verdicts** — exit codes (0 vs 7 as workload outcomes), stdio markers captured on the right streams, stdin round-trip, timeout elapsed ≈ 3s not 60s, a4: `wasAliveAtKill: true` + no workload-process survivors (tree torn down).
 - [ ] **Step 3: Section B verdicts** — all 8 scenario JSONs parse; probe reproduces the D-01/D-02 boolean surface; run-exit outcomes `Exited(0)`/`Exited(7)`; timeout outcome `TimedOut`; cancel waits cleanly; force-tier `honored: true` (the feature compiled the seam) with tier string `appcontainer-dacl`; tier-query lists `processcontainer` at `base-container`.
 - [ ] **Step 4: Section C verdicts** — c1: probe error `EnumeratePathsUnsupported` expected; launch outcome = whichever of `refused-before-exec` / `demoted-and-ran` the artifact shows (both are valid evidence; the spec branches on it); c2: `tierStillBaseContainer: true`.
 - [ ] **Step 5: Record any deviation verbatim** — every anomaly is a finding for the ADRs, never something to re-run away.
