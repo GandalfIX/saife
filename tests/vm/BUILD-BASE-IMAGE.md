@@ -507,6 +507,23 @@ MXC stale-DACL recovery before capability detection (a security-state
 operation, recorded in the baseline) — which is exactly why it only ever
 runs inside disposable clones.
 
+**Workload-launch spike lane (D-03/D-04, 2026-10-17):** a second capture
+script on the same image — `tests/vm/wbd-d03-d04-spike.ps1`, invoked the
+same way via `-TestCmd` — extends the posture from read-only probing to
+*launching workloads* inside the disposable VM. It covers the wxc-exec
+subprocess lifecycle (exit propagation, stdout/stderr/stdin capture,
+request-level `process.timeout`, executor-kill tree teardown), the
+committed mxc-sdk spike crate (`tests/vm/spikes/wbd-d03-sdk-spike/`,
+built in-VM against the pinned tree, eight `v1` scenarios), and D-04
+enforcement evidence (enumeratePaths refused-before-exec with a marker
+canary; `MXC_FORCE_TIER` immunity of the default-feature release
+executor). Canonical runs: `20261017-121539-354` (pre-amendment findings)
+and `20261017-130259-402` (Amendment 1 — all lifecycle axes discharged);
+see `docs/adr/0002-mxc-integration-surface.md`. Workload-shape note: sleep
+workloads are System32-resident `powershell.exe Start-Sleep` with a
+`readonlyPaths C:\Windows` grant — `pwsh` is unresolvable under the PSEC
+token and `ping -n` dies in-container.
+
 D-02 binary contract (2026-10-13): upstream standalone area runs
 require a debug-lane `wxc-exec.exe` and `plm.exe` /
 `winhttp-proxy-shim.exe` sidecars beside each lane (Common.ps1

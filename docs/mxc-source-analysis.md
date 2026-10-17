@@ -39,6 +39,20 @@
   yes, `FileSystemEnumerate`/`NetworkIngress` (PSEC 1.1) no — so the
   identity-less loopback proxy rides a temporary upstream PSEC-1.0 workaround
   (matrix doc §5.1; re-verify on every re-pin).
+- **Partial refresh (2026-10-17, WBD D-03/D-04):** the SDK/FFI/dispatcher/
+  workload-creation areas were re-verified at `5d7a475a` for the integration-
+  surface decision — `mxc-sdk/src/lib.rs` (`v1` re-exports, spawn/run),
+  `sandbox.rs` (MxcProcess surface), `backends/process_container/common/`
+  (`base_container_runner.rs` suspended-create sequence, `working_directory.rs`
+  drive-root fallback, `launch_diagnostics.rs`, `dispatcher.rs` tier reporting,
+  `fallback_detector.rs` EnumeratePathsUnsupported), `configs/process_container.rs`
+  (non_exhaustive shapes), `sandbox_tracking.rs` (dead-code status),
+  `policy.rs` (ContainerRequest/FilesystemPolicy), `src/ffi/mxc_ffi` (48-export
+  C ABI, stability labels), `src/tools/wxc` (CLI surface, no require-tier flag),
+  and the schema contract (`stable.rs` nested `processContainer.filesystem.
+  enumeratePaths`). At-pin line references live in
+  `docs/adr/0002-mxc-integration-surface.md` §2/§3; findings sections below still
+  key to `e7940f7` until the quarterly pass.
 
 ## 1. Executive summary
 
