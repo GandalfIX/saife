@@ -3,6 +3,7 @@ pub mod learned;
 pub mod loopback;
 pub mod matcher;
 pub mod profile;
+pub mod prompt;
 pub mod proxy;
 pub mod token;
 
