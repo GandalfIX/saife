@@ -28,6 +28,14 @@
   S-69 (AC-5.9) covers windows_common (System32) reachable from an empty profile.
   S-70 (AC-5.10) covers CLI `--allow` merging on top of the profile.
   S-71 (AC-5.17) covers a portable profile (only $HOME/$CWD/groups, no abs paths).
+  S-72, S-75..S-80, S-82..S-84 (ADR-0001 Task 3.8) exercise the D-1/D-3/D-4/D-5
+  prompt+intent+learned wiring: deny_domain blocklist, hard-deny IP expansion,
+  wildcard apex allow, loopback CONNECT refusal, --no-prompt, /sandbox/intent
+  POST+GET, learned list/revoke, and the audit `source` filter. S-78 (learned
+  persistence) is a MANUAL scenario and skips; S-81 is reserved for the plan's
+  Phase 4 D-2 NO_PROXY scenario. Plan slots S-73/S-74 moved to S-82/S-83 (the
+  MXC journal scenarios took those numbers on this branch after the plan was
+  written) — see the numbering note above the S-72 section.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -127,12 +135,42 @@ function Invoke-Sandbox {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     if (-not $proc.Start()) { return @{ Stdout=@(); Stderr=@('failed to start'); ExitCode=-1 } }
-    $so = @($proc.StandardOutput.ReadToEnd() -split "`r?`n")
-    $se = @($proc.StandardError.ReadToEnd() -split "`r?`n")
+    # Read BOTH pipes concurrently: a sequential ReadToEnd on stdout while the
+    # child blocks writing a full stderr pipe (or vice versa) deadlocks the
+    # child and hangs the harness (observed: S-83 with curl -v stalled >6min).
+    $soTask = $proc.StandardOutput.ReadToEndAsync()
+    $seTask = $proc.StandardError.ReadToEndAsync()
     $proc.WaitForExit()
+    $so = @($soTask.GetAwaiter().GetResult() -split "`r?`n")
+    $se = @($seTask.GetAwaiter().GetResult() -split "`r?`n")
     $exit = $proc.ExitCode
     $proc.Close()
     return @{ Stdout=$so; Stderr=$se; ExitCode=$exit }
+}
+
+# Run a sandbox CLI subcommand with an overridden USERPROFILE — the S-63/
+# S-64/S-65 direct-invocation pattern, factored out for the Task 3.8 learned
+# scenarios, which must never touch the real %USERPROFILE%\.sandbox\learned\
+# store. Returns Stdout/Stderr as single strings + ExitCode.
+function Invoke-SandboxCliHome { param([string]$FakeHome, [string]$CliArgs)
+    $pi = New-Object System.Diagnostics.ProcessStartInfo
+    $pi.FileName = $SandboxExe
+    $pi.Arguments = $CliArgs
+    $pi.UseShellExecute = $false
+    $pi.RedirectStandardOutput = $true
+    $pi.RedirectStandardError = $true
+    $pi.CreateNoWindow = $true
+    $pi.EnvironmentVariables['USERPROFILE'] = $FakeHome
+    $proc = [System.Diagnostics.Process]::Start($pi)
+    $soTask = $proc.StandardOutput.ReadToEndAsync()
+    $seTask = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    $stdout = $soTask.GetAwaiter().GetResult()
+    $stderr = $seTask.GetAwaiter().GetResult()
+    $proc.WaitForExit()
+    $rc = $proc.ExitCode
+    $proc.Close()
+    return @{ Stdout=$stdout; Stderr=$stderr; ExitCode=$rc }
 }
 
 function Get-Python { $py = Get-Command python -ErrorAction SilentlyContinue; if (-not $py) { return $null }; return $py.Source }
@@ -1429,8 +1467,11 @@ function Invoke-Scenario-S63 {
     $pi.RedirectStandardError = $true
     $pi.EnvironmentVariables['USERPROFILE'] = $fakeHome
     $proc = [System.Diagnostics.Process]::Start($pi)
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
+    $soTask = $proc.StandardOutput.ReadToEndAsync()
+    $seTask = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    $stdout = $soTask.GetAwaiter().GetResult()
+    $stderr = $seTask.GetAwaiter().GetResult()
     $proc.WaitForExit()
     $passed = ($proc.ExitCode -eq 0) -and ($stdout -match 'alpha') -and ($stdout -match 'beta')
     return @{ Num=63; Name='S-63 (AC-5.14)'; Passed=$passed; Skipped=$false
@@ -1453,8 +1494,10 @@ function Invoke-Scenario-S64 {
     $pi.RedirectStandardError = $true
     $pi.EnvironmentVariables['USERPROFILE'] = $fakeHome
     $proc = [System.Diagnostics.Process]::Start($pi)
+    $seTask = $proc.StandardError.ReadToEndAsync()
     $stdout = $proc.StandardOutput.ReadToEnd()
     $proc.WaitForExit()
+    [void]$seTask.GetAwaiter().GetResult()
     $passed = ($proc.ExitCode -eq 0) -and ($stdout -match 'python_runtime') -and ($stdout -match '\$CWD') -and ($stdout -notmatch 'security_groups_expanded')
     return @{ Num=64; Name='S-64 (AC-5.15)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'raw view printed as-authored' } else { "exit=$($proc.ExitCode) stdout=$stdout" } }
@@ -1477,8 +1520,10 @@ function Invoke-Scenario-S65 {
     $pi.EnvironmentVariables['USERPROFILE'] = $fakeHome
     $pi.WorkingDirectory = $d
     $proc = [System.Diagnostics.Process]::Start($pi)
+    $seTask = $proc.StandardError.ReadToEndAsync()
     $stdout = $proc.StandardOutput.ReadToEnd()
     $proc.WaitForExit()
+    [void]$seTask.GetAwaiter().GetResult()
     $passed = ($proc.ExitCode -eq 0) -and ($stdout -match 'security_groups_expanded') -and ($stdout -notmatch '\$CWD') -and ($stdout -match '"name": "expanded"')
     return @{ Num=65; Name='S-65 (expanded)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'expanded view emitted resolved JSON' } else { "exit=$($proc.ExitCode) stdout=$stdout" } }
@@ -1585,8 +1630,19 @@ function Invoke-Scenario-S71 {
 }
 
 # ---------------------------------------------------------------------------
-# Dispatched-vector scenarios end at S-71; S-72 is reserved (Task 2, LPAC,
-# another branch). S-73/S-74 register via $script:ScenarioFunctions above.
+# Dispatched-vector scenarios end at S-71; higher numbers register in
+# $script:ScenarioFunctions below (numbering above S-71 is per-branch).
+#
+# ADR-0001 Task 3.8 numbering note: the plan (2026-07-30) numbered its new
+# network scenarios S-72..S-80, but the MXC journal scenarios took S-73/S-74
+# on this branch on 2026-09-19 (commit 9970ef4, post-dating the plan), so
+# the two colliding plan slots moved to the next free numbers: plan S-73
+# (hard-deny expansion) -> S-82, plan S-74 (wildcard apex) -> S-83. S-72
+# keeps the plan's number (the earlier "reserved for LPAC/Task 2" note
+# described another branch's harness copy, not this one). S-81 stays
+# unregistered so the plan's own Phase 4 D-2 NO_PROXY scenario (plan S-81)
+# keeps its number; S-84 is the extra seeded `*.`-prefixed learned-revoke
+# coverage from the 3.7 review advisory.
 # ---------------------------------------------------------------------------
 
 # Count non-inherited session AppContainer ACEs on a path. Excludes
@@ -1679,6 +1735,331 @@ function Invoke-Scenario-S74 {
 }
 
 # ---------------------------------------------------------------------------
+# ADR-0001 Task 3.8 scenarios — integration coverage for the D-1/D-3/D-4/D-5
+# prompt + intent + learned wiring (Tasks 3.1..3.7). Every automated network
+# scenario passes --no-prompt as harness safety: each asserted policy stage
+# (blocklist, hard-deny, loopback, allow-list) runs BEFORE the prompt in the
+# proxy pipeline, so a wrong expectation yields a clean deny/allow outcome
+# rather than a modal dialog hanging an unattended run. Scenarios skip
+# cleanly without curl.exe or AppContainer loopback (the S-27+ convention).
+# ---------------------------------------------------------------------------
+
+# S-72 (D-1): deny_domain blocklist — a host on BOTH the allow-list and the
+# deny-list is denied with audit source "blocklist" (blocklist precedes the
+# allow-list in the pipeline, [G-32/G-33]).
+# Plan note: the plan's literal flags (`--deny-domain *.evil.com` aimed at
+# evil.example.com) cannot match — matcher::matches is dot-bounded [G-55],
+# and the unit suite's deny_domain_wins_over_allow precedent pairs
+# `*.example.com` with `evil.example.com`. The deny pattern is therefore
+# `*.example.com`; the target is ALSO explicitly allowed so the scenario
+# proves deny-wins-over-allow (the plan matrix labels S-72 "deny_domain
+# precedence").
+function Invoke-Scenario-S72 {
+    if (-not (Get-Curl)) { return @{ Num=72; Name='S-72 (D-1 deny_domain)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=72; Name='S-72 (D-1 deny_domain)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 72
+    $flags = @('run','--allow-cwd',
+        '--allow-domain','api.anthropic.com',
+        '--allow-domain','evil.example.com',
+        '--deny-domain','*.example.com',
+        '--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=72; Name='S-72 (D-1 deny_domain)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://evil.example.com')) -WorkingDirectory $d
+    $code = (($r.Stdout -join '') -replace '\s','')
+    $denied = ($r.ExitCode -ne 0) -and ($code -eq '000' -or $code -eq '')
+    # The audit must attribute the deny to the blocklist stage (not
+    # prompt/default) — that attribution is the D-5 half of the assertion.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $blocklistSeen = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.disposition -eq 'deny' -and $o.source -eq 'blocklist' -and $o.host -eq 'evil.example.com') { $blocklistSeen = $true }
+    }
+    $passed = $denied -and $blocklistSeen
+    return @{ Num=72; Name='S-72 (D-1 deny_domain)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'deny_domain beat the explicit allow; audit source=blocklist' }
+                 else { "denied=$denied blocklistAudit=$blocklistSeen exit=$($r.ExitCode) code=$code sid=$sid" } }
+}
+
+# S-75 (D-1): a CONNECT to a loopback target is refused pre-prompt with
+# 403 + `X-Sandbox: denied` [G-44/G-52]. The inner script (S-21's
+# wrapper-file precedent, written into the scenario dir under --allow-cwd):
+# (a) clears the injected loopback NO_PROXY so curl actually sends the
+# CONNECT to the proxy instead of dialing the loopback target directly, and
+# (b) puts the session token — extracted from the injected HTTPS_PROXY
+# userinfo — into the -x proxy URL so curl authenticates past the 407 token
+# gate on its own. curl -v makes the 403 + header visible on stderr.
+function Invoke-Scenario-S75 {
+    if (-not (Get-Curl)) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 75
+    $inner = @'
+$m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
+if (-not $m.Success) { Write-Output 'S75_NO_TOKEN'; exit 3 }
+$tok = $m.Groups[1].Value
+# Loopback sits in NO_PROXY (so intent endpoints stay direct) - clear it or
+# curl bypasses the proxy for the 127.0.0.1 target and never issues CONNECT.
+$env:NO_PROXY = ''
+$env:no_proxy = ''
+& curl.exe -s -m 10 -v -x "http://sandbox:$tok@127.0.0.1:$($env:SANDBOX_PROXY_PORT)" -o NUL https://127.0.0.1:5432
+exit $LASTEXITCODE
+'@
+    Set-Content -LiteralPath (Join-Path $d 's75-loopback-connect.ps1') -Value $inner -Encoding ASCII
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','s75-loopback-connect.ps1')) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    if ($out -match 'S75_NO_TOKEN') { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail='inner script could not extract the session token from HTTPS_PROXY' } }
+    $err = ($r.Stderr -join "`n")
+    $got403 = ($err -match '403')
+    $gotHeader = ($err -match 'X-Sandbox: denied')
+    # The audit must show the loopback branch (source hard-deny + the
+    # dedicated loopback_refused reason), not a generic deny.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $loopbackAudit = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.disposition -eq 'deny' -and $o.source -eq 'hard-deny' -and $o.reason -eq 'loopback_refused' -and $o.host -eq '127.0.0.1') { $loopbackAudit = $true }
+    }
+    $passed = $got403 -and $gotHeader -and $loopbackAudit
+    $errHead = ((($err -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 5 | ForEach-Object { $_ -replace 'Basic [A-Za-z0-9+/=]+', 'Basic [REDACTED]' }) -join ' | ')
+    return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'CONNECT 127.0.0.1:5432 refused: 403 + X-Sandbox: denied; audit loopback_refused' }
+                 else { "403=$got403 header=$gotHeader audit=$loopbackAudit exit=$($r.ExitCode) err=$errHead" } }
+}
+
+# S-76 (D-3): --no-prompt — an unlisted host is denied with NO dialog and
+# audit source "default" (the prompt-disabled branch of the default stage;
+# reason "prompting disabled; host not allow-listed").
+function Invoke-Scenario-S76 {
+    if (-not (Get-Curl)) { return @{ Num=76; Name='S-76 (D-3 no-prompt)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=76; Name='S-76 (D-3 no-prompt)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 76
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=76; Name='S-76 (D-3 no-prompt)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://evil.example.com')) -WorkingDirectory $d
+    $code = (($r.Stdout -join '') -replace '\s','')
+    $denied = ($r.ExitCode -ne 0) -and ($code -eq '000' -or $code -eq '')
+    # Audit: the deny must carry source "default", and no prompt-path event
+    # (prompt/prompt_overload/unavailable) may exist — the dialog never ran.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $defaultSeen = $false
+    $promptSeen = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.disposition -eq 'deny') {
+            if ($o.source -eq 'default' -and $o.host -eq 'evil.example.com') { $defaultSeen = $true }
+            if ($o.source -eq 'prompt' -or $o.source -eq 'prompt_overload' -or $o.source -eq 'unavailable') { $promptSeen = $true }
+        }
+    }
+    $passed = $denied -and $defaultSeen -and (-not $promptSeen)
+    return @{ Num=76; Name='S-76 (D-3 no-prompt)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'denied without a dialog; audit source=default' }
+                 else { "denied=$denied defaultAudit=$defaultSeen promptAudit=$promptSeen exit=$($r.ExitCode) code=$code sid=$sid" } }
+}
+
+# S-77 (D-4): the intent control-plane endpoints, exercised from INSIDE the
+# sandbox. NO_PROXY covers loopback so the request goes direct to the proxy
+# listener; the session token (from HTTPS_PROXY userinfo) rides an explicit
+# Proxy-Authorization header — the 3.6 review's child-side note. POST the
+# intent (204), then GET it back (200 + the declared reason + hint
+# "declared"). The JSON body is a file so no shell-quoting can mangle it.
+function Invoke-Scenario-S77 {
+    if (-not (Get-Curl)) { return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 77
+    $bodyPath = Join-Path $d 's77-intent-body.json'
+    Set-Content -LiteralPath $bodyPath -Value '{"target":"api.example.com","reason":"s77-intent-roundtrip"}' -Encoding ASCII
+    $inner = @'
+param([string]$BodyPath)
+$m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
+if (-not $m.Success) { Write-Output 'POST_STATUS=NO_TOKEN'; exit 3 }
+$creds = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
+$port = $env:SANDBOX_PROXY_PORT
+Write-Output "DIAG body=$BodyPath exists=$(Test-Path -LiteralPath $BodyPath)"
+$post = & curl.exe -s -m 8 -o NUL -w '%{http_code}' -H "Proxy-Authorization: Basic $creds" --data "@$BodyPath" "http://127.0.0.1:$port/sandbox/intent"
+Write-Output "POST_STATUS=$post"
+$get = & curl.exe -s -m 8 -w '%{http_code}' -H "Proxy-Authorization: Basic $creds" "http://127.0.0.1:$port/sandbox/intent?host=api.example.com"
+Write-Output "GET_BODY=$get"
+exit 0
+'@
+    Set-Content -LiteralPath (Join-Path $d 's77-intent.ps1') -Value $inner -Encoding ASCII
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt','--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','s77-intent.ps1','-BodyPath',$bodyPath) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $err = ($r.Stderr -join "`n")
+    $post204 = ($out -match 'POST_STATUS=204')
+    $get200 = ($out -match 'GET_BODY=.*200\s*$')
+    $getReason = ($out -match '"reason":"s77-intent-roundtrip"')
+    $getHost = ($out -match '"host":"api.example.com"')
+    $getHint = ($out -match '"hint":"declared"')
+    $passed = ($r.ExitCode -eq 0) -and $post204 -and $get200 -and $getReason -and $getHost -and $getHint
+    return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'POST /sandbox/intent 204; GET returned the declared reason (hint=declared)' }
+                 else { "exit=$($r.ExitCode) post204=$post204 get200=$get200 reason=$getReason host=$getHost hint=$getHint out=$($out -replace "`r?`n", ' | ') err=$err" } }
+}
+
+# S-78 (D-3): learned persistence across a sandbox restart — run with an
+# allow-list, click "Allow permanently" on the interactive dialog, restart
+# the sandbox, and the learned host is allowed with no new flags.
+# MANUAL APPROVAL REQUIRED — a human must click the TaskDialog; the harness
+# never simulates dialog clicks. Harness convention for manual scenarios is a
+# clean skip with the manual marker (cf. S-15). The Checkpoint 3 flow (plan
+# items 3-4) exercises this live; S-79 seeds the exact persisted state so
+# the automated list/revoke leg still runs.
+function Invoke-Scenario-S78 {
+    return @{ Num=78; Name='S-78 (D-3 learned persistence)'; Passed=$true; Skipped=$true
+        Detail='MANUAL APPROVAL required — interactive dialog click; see plan Task 3.8 / Checkpoint 3 items 3-4 (S-79 seeds this state for automation)' }
+}
+
+# S-79 (D-3): `sandbox learned list/revoke` round-trip. The plan runs this
+# after the MANUAL S-78 approval; since the harness cannot click dialogs,
+# this scenario SEEDS the exact state the S-78 "Allow permanently" click
+# persists (LearnedStore::record("github.com","suffix",allow=true) — the
+# pipeline keys suffix entries by the bare suffix, so list shows
+# `github.com`, NOT `api.github.com`; 3.7 review advisory #1). A
+# per-scenario fake USERPROFILE isolates the real learned store.
+function Invoke-Scenario-S79 {
+    $d = New-ScenarioDir 79
+    $fakeHome = Join-Path $d 'fake-home'
+    $learnedDir = Join-Path $fakeHome '.sandbox\learned'
+    New-Item -ItemType Directory -Path $learnedDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $learnedDir 'default.json') -Value '{"schema":1,"allow":[{"host":"github.com","scope":"suffix"}],"deny":[]}' -Encoding ASCII
+    $list1 = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned list'
+    $okList = ($list1.ExitCode -eq 0) -and ($list1.Stdout -match 'github\.com') -and ($list1.Stdout -match 'suffix') -and ($list1.Stdout -match 'allow')
+    $rev = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned revoke github.com'
+    $okRev = ($rev.ExitCode -eq 0) -and ($rev.Stdout -match 'revoked github\.com')
+    $list2 = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned list'
+    $okEmpty = ($list2.ExitCode -eq 0) -and ($list2.Stdout -match '\(no learned entries\)')
+    $passed = $okList -and $okRev -and $okEmpty
+    return @{ Num=79; Name='S-79 (D-3 learned list/revoke)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'list -> revoke -> list-empty over the seeded github.com suffix entry' }
+                 else { "list=$okList revoke=$okRev empty=$okEmpty out1='$($list1.Stdout)' rev='$($rev.Stdout)$($rev.Stderr)' out2='$($list2.Stdout)'" } }
+}
+
+# S-80 (D-5): the audit `source` filter. The plan wording ("after
+# S-72/S-73/S-76") assumed one shared session; the harness gives every
+# scenario its own sid, so this scenario is self-contained: ONE session
+# fires a blocklist deny, a hard-deny, and an allowlist allow, then asserts
+# `--filter "source=hard-deny"` yields ONLY hard-deny events while the
+# unfiltered log proves the session really contains the other sources.
+# Note (3.6 review advisory #2): post-admission failures log allow-then-
+# deny pairs — parse per line, never per connection. The allowlist CONNECT's
+# audit event is emitted before the dial, so this scenario does not depend
+# on external network success.
+function Invoke-Scenario-S80 {
+    if (-not (Get-Curl)) { return @{ Num=80; Name='S-80 (D-5 audit source filter)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=80; Name='S-80 (D-5 audit source filter)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 80
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--deny-domain','*.example.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=80; Name='S-80 (D-5 audit source filter)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://evil.example.com')) -WorkingDirectory $d | Out-Null
+    Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://169.254.169.253')) -WorkingDirectory $d | Out-Null
+    Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com')) -WorkingDirectory $d | Out-Null
+    # Filtered view: every line must be a hard-deny event, at least one must
+    # exist, and the 169.254.169.253 target must be among them.
+    $f = Invoke-Sandbox -Args @('audit','show',$sid,'--json','--filter','source=hard-deny')
+    $allHardDeny = $true
+    $hardDenyCount = 0
+    $sawTarget = $false
+    foreach ($l in @($f.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { $allHardDeny = $false; break }
+        if ($o.source -ne 'hard-deny') { $allHardDeny = $false; break }
+        if ($o.host -eq '169.254.169.253') { $sawTarget = $true }
+        $hardDenyCount++
+    }
+    # Unfiltered view: the session really contains the other sources, so the
+    # filter did the narrowing (not an empty-vs-nonempty artifact).
+    $u = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $sawBlocklist = $false
+    $sawAllowlist = $false
+    foreach ($l in @($u.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT') {
+            if ($o.source -eq 'blocklist') { $sawBlocklist = $true }
+            if ($o.source -eq 'allowlist') { $sawAllowlist = $true }
+        }
+    }
+    $passed = ($hardDenyCount -ge 1) -and $allHardDeny -and $sawTarget -and $sawBlocklist -and $sawAllowlist
+    return @{ Num=80; Name='S-80 (D-5 audit source filter)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "filtered to $hardDenyCount hard-deny event(s) only; unfiltered also had blocklist+allowlist" }
+                 else { "count=$hardDenyCount allHardDeny=$allHardDeny target=$sawTarget blocklist=$sawBlocklist allowlist=$sawAllowlist sid=$sid filterExit=$($f.ExitCode)" } }
+}
+
+# S-82 (D-1; plan slot S-73, renumbered — see the numbering note above):
+# hard-deny IP expansion — 169.254.169.253 sits in the same link-local
+# block as the canonical metadata address; the CONNECT must be denied with
+# audit source "hard-deny" (pre-prompt, overriding everything else).
+function Invoke-Scenario-S82 {
+    if (-not (Get-Curl)) { return @{ Num=82; Name='S-82 (D-1 hard-deny expansion)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=82; Name='S-82 (D-1 hard-deny expansion)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 82
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=82; Name='S-82 (D-1 hard-deny expansion)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://169.254.169.253')) -WorkingDirectory $d
+    $code = (($r.Stdout -join '') -replace '\s','')
+    $denied = ($r.ExitCode -ne 0) -and ($code -eq '000' -or $code -eq '')
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $hardDenySeen = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.disposition -eq 'deny' -and $o.source -eq 'hard-deny' -and $o.host -eq '169.254.169.253') { $hardDenySeen = $true }
+    }
+    $passed = $denied -and $hardDenySeen
+    return @{ Num=82; Name='S-82 (D-1 hard-deny expansion)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { '169.254.169.253 denied; audit source=hard-deny' }
+                 else { "denied=$denied hardDenyAudit=$hardDenySeen exit=$($r.ExitCode) code=$code sid=$sid" } }
+}
+
+# S-83 (D-1; plan slot S-74, renumbered — see the numbering note above):
+# wildcard apex — `*.anthropic.com` must allow the apex `anthropic.com`
+# itself ([G-55]: the wildcard covers the apex and subdomains, dot-bounded).
+# This makes a REAL connection to anthropic.com:443 through the tunnel
+# (plan-intended); PASS iff curl reaches the server (any 1xx-5xx code).
+function Invoke-Scenario-S83 {
+    if (-not (Get-Curl)) { return @{ Num=83; Name='S-83 (D-1 wildcard apex)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=83; Name='S-83 (D-1 wildcard apex)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 83
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--no-prompt','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://anthropic.com') -WorkingDirectory $d
+    $code = (($r.Stdout -join '') -replace '\s','')
+    $connected = Test-CurlReachedServer -ExitCode $r.ExitCode -HttpCode $code
+    $passed = $connected
+    return @{ Num=83; Name='S-83 (D-1 wildcard apex)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "wildcard allowed the apex (http_code=$code)" } else { "exit=$($r.ExitCode) http_code=$code err=$((($r.Stderr | Where-Object { $_.Trim() } | Select-Object -First 10) -join ' | '))" } }
+}
+
+# S-84 (D-3, extra; 3.7 review advisory #2 — "no test currently revokes a
+# `*.`-prefixed stored entry"): seed a wildcard-form entry, list it (list
+# shows the stored key — the exact revoke round-trip form), revoke by that
+# stored key, and assert the store is empty afterwards.
+function Invoke-Scenario-S84 {
+    $d = New-ScenarioDir 84
+    $fakeHome = Join-Path $d 'fake-home'
+    $learnedDir = Join-Path $fakeHome '.sandbox\learned'
+    New-Item -ItemType Directory -Path $learnedDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $learnedDir 'default.json') -Value '{"schema":1,"allow":[{"host":"*.example.com","scope":"suffix"}],"deny":[]}' -Encoding ASCII
+    $list1 = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned list'
+    $okList = ($list1.ExitCode -eq 0) -and ($list1.Stdout -match [regex]::Escape('*.example.com')) -and ($list1.Stdout -match 'suffix')
+    $rev = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned revoke *.example.com'
+    $okRev = ($rev.ExitCode -eq 0) -and ($rev.Stdout -match [regex]::Escape('revoked *.example.com'))
+    $list2 = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned list'
+    $okEmpty = ($list2.ExitCode -eq 0) -and ($list2.Stdout -match '\(no learned entries\)')
+    $passed = $okList -and $okRev -and $okEmpty
+    return @{ Num=84; Name='S-84 (D-3 learned revoke *.key)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'list -> revoke-by-stored-key -> list-empty over a `*.`-prefixed entry' }
+                 else { "list=$okList revoke=$okRev empty=$okEmpty out1='$($list1.Stdout)' rev='$($rev.Stdout)$($rev.Stderr)' out2='$($list2.Stdout)'" } }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -1709,11 +2090,22 @@ $script:Scenarios = @(
 )
 
 # Scenarios beyond the positional array register explicitly (number -> block);
-# this keeps reserved numbers (e.g. S-72, owned by another branch) free.
-$script:MaxScenario = 74
+# this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
+# Task 3.8 numbering note above the S-72 section).
+$script:MaxScenario = 84
 $script:ScenarioFunctions = @{
+    72 = { Invoke-Scenario-S72 }
     73 = { Invoke-Scenario-S73 }
     74 = { Invoke-Scenario-S74 }
+    75 = { Invoke-Scenario-S75 }
+    76 = { Invoke-Scenario-S76 }
+    77 = { Invoke-Scenario-S77 }
+    78 = { Invoke-Scenario-S78 }
+    79 = { Invoke-Scenario-S79 }
+    80 = { Invoke-Scenario-S80 }
+    82 = { Invoke-Scenario-S82 }
+    83 = { Invoke-Scenario-S83 }
+    84 = { Invoke-Scenario-S84 }
 }
 
 function Invoke-Scenario { param([int]$Number)
@@ -1721,7 +2113,7 @@ function Invoke-Scenario { param([int]$Number)
     if ($script:ScenarioFunctions.ContainsKey($Number)) { return & $script:ScenarioFunctions[$Number] }
     if ($Number -gt $script:Scenarios.Count) {
         return @{ Num=$Number; Name="S-$Number (reserved)"; Passed=$false; Skipped=$true
-            Detail = 'scenario number reserved (owned by another branch)' }
+            Detail = 'scenario number not registered on this branch (reserved — see the numbering note above the S-72 section)' }
     }
     return & $script:Scenarios[$Number - 1]
 }
