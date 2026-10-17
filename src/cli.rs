@@ -98,6 +98,18 @@ pub enum Cmd {
         action: ProfileAction,
     },
 
+    /// Manage the learned allow/deny store (permanent prompt decisions).
+    Learned {
+        /// Learned-file profile name (selects
+        /// %USERPROFILE%\.sandbox\learned\<name>.json; defaults to
+        /// default.json). Must be given before the subcommand.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+
+        #[command(subcommand)]
+        subcommand: LearnedSub,
+    },
+
     /// Check host compatibility and feature availability.
     Setup {
         /// Only check and report; do not make changes.
@@ -152,6 +164,20 @@ pub enum ProfileAction {
         #[arg(long)]
         expanded: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum LearnedSub {
+    /// List learned entries (host, scope, disposition).
+    List,
+    /// Remove the learned entry for a host.
+    Revoke {
+        /// Host whose entry to remove (as shown by `sandbox learned list`).
+        host: String,
+    },
+    /// Remove all learned entries. The designated recovery path for a
+    /// corrupt learned file ([G-5]).
+    Clear,
 }
 
 /// Resolved CLI inputs for `run`, after parsing flags into a single struct.
@@ -216,4 +242,86 @@ pub fn profiles_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     userprofile.join(".sandbox").join("profiles")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_learned_list() {
+        let cli = Cli::parse_from(["sandbox", "learned", "list"]);
+        let Cmd::Learned {
+            subcommand,
+            profile,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Learned");
+        };
+        assert!(matches!(subcommand, LearnedSub::List));
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_learned_revoke_host() {
+        let cli = Cli::parse_from(["sandbox", "learned", "revoke", "evil.example.com"]);
+        let Cmd::Learned {
+            subcommand,
+            profile,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Learned");
+        };
+        let LearnedSub::Revoke { host } = subcommand else {
+            panic!("expected LearnedSub::Revoke");
+        };
+        assert_eq!(host, "evil.example.com");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_learned_clear() {
+        let cli = Cli::parse_from(["sandbox", "learned", "clear"]);
+        let Cmd::Learned {
+            subcommand,
+            profile,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Learned");
+        };
+        assert!(matches!(subcommand, LearnedSub::Clear));
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_learned_profile_flag_before_subcommand() {
+        let cli = Cli::parse_from(["sandbox", "learned", "--profile", "dev", "revoke", "a.com"]);
+        let Cmd::Learned {
+            subcommand,
+            profile,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Learned");
+        };
+        assert!(matches!(subcommand, LearnedSub::Revoke { .. }));
+        assert_eq!(profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn parse_learned_revoke_requires_host() {
+        assert!(Cli::try_parse_from(["sandbox", "learned", "revoke"]).is_err());
+    }
+
+    #[test]
+    fn parse_learned_unknown_subcommand_rejected() {
+        assert!(Cli::try_parse_from(["sandbox", "learned", "bogus"]).is_err());
+    }
+
+    /// The `--profile` flag lives on the `learned` level (plan Step 1), so
+    /// it must be given before the subcommand — clap rejects it after.
+    #[test]
+    fn parse_learned_profile_after_subcommand_rejected() {
+        assert!(Cli::try_parse_from(["sandbox", "learned", "list", "--profile", "dev"]).is_err());
+    }
 }

@@ -4,12 +4,12 @@
 //! here immediately and atomically. Loaded at startup into the filter
 //! pipeline (D-3.6). Our own camelCase format ([G-20, G-39]).
 //!
-//! The store's public API (`LearnedStore`, `learned_file_path`, etc.) is
-//! not yet called from the release binary — it is wired in by D-3.6
-//! (pipeline) and D-3.7 (`sandbox learned` CLI). Until then the whole
-//! module is `#[allow(dead_code)]` to keep `cargo build --release` clean.
-//! Tests exercise the full API, so the code is verified even though the
-//! non-test binary does not yet link it in.
+//! The store is wired into the release binary by D-3.6 (run-path load +
+//! proxy lookup/record) and D-3.7 (`sandbox learned` CLI: list/revoke/
+//! clear). The USERPROFILE-rooted `learned_file_path` helper is still
+//! not called from the release binary, so the module keeps
+//! `#![allow(dead_code)]` to keep `cargo build --release` clean.
+//! Tests exercise the full API.
 
 #![allow(dead_code)]
 
@@ -241,6 +241,24 @@ impl LearnedStore {
     }
 }
 
+/// Clear the learned file for `profile_name` WITHOUT loading it — the
+/// [G-5] recovery path, used by `sandbox learned clear`. A corrupt or
+/// schema-mismatched file cannot be loaded, but `clear` is the only
+/// non-editorial way out of a learned file that hard-aborts every
+/// `sandbox run`, so this validates the profile name and atomically
+/// rewrites the file empty regardless of its current contents.
+pub fn clear_learned_file_in(base: &Path, profile_name: Option<&str>) -> Result<()> {
+    if let Some(name) = profile_name {
+        validate_profile_name(name)?;
+    }
+    let store = LearnedStore {
+        file_path: learned_file_path_in(base, profile_name),
+        allow: BTreeMap::new(),
+        deny: BTreeMap::new(),
+    };
+    store.persist()
+}
+
 /// Validate a learned-file profile name. Rejects anything that could
 /// escape the `.sandbox/learned/` directory or corrupt the path:
 /// - path separators (`/` or `\`)
@@ -299,9 +317,12 @@ pub fn learned_file_path(profile_name: Option<&str>) -> PathBuf {
 ///
 /// Does **not** validate `profile_name` — callers passing untrusted input
 /// must call [`validate_profile_name`] first. `load_in` validates
-/// internally.
+/// internally. The name is trimmed before use, matching
+/// [`validate_profile_name`]'s trimmed validation, so a padded name like
+/// `" dev "` mints `dev.json` (not `" dev .json"`).
 pub fn learned_file_path_in(base: &Path, profile_name: Option<&str>) -> PathBuf {
     let name = profile_name
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("default");
     base.join(".sandbox").join("learned").join(format!("{name}.json"))
@@ -558,6 +579,21 @@ mod tests {
         assert!(validate_profile_name("na\x01me").is_err(), "control char");
     }
 
+    /// The validator approves the *trimmed* name (a leading/trailing space
+    /// is not a control char), so the path builder must use the same
+    /// trimmed name — otherwise `--profile " dev "` validates but mints a
+    /// `" dev .json"` file that no later `--profile dev` invocation finds
+    /// (quality-review advisory, Task 3.7).
+    #[test]
+    fn learned_file_path_in_uses_the_trimmed_profile_name() {
+        let p = learned_file_path_in(Path::new("C:/base"), Some(" dev "));
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            "dev.json",
+            "path builder must trim like validate_profile_name does"
+        );
+    }
+
     /// `load_in` must reject a path-traversing profile name (defense at
     /// the load boundary, not just at the pure validator).
     #[test]
@@ -596,6 +632,50 @@ mod tests {
         assert!(raw.contains("\"deny\""), "deny field present: {raw}");
         assert!(raw.contains("\"host\""), "host field present: {raw}");
         assert!(raw.contains("\"scope\""), "scope field present: {raw}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `clear_learned_file_in` is the corrupt-file recovery path ([G-5]):
+    /// it must reset an unloadable file without loading it.
+    #[test]
+    fn clear_learned_file_in_resets_corrupt_file() {
+        let tmp = temp_dir("clear-corrupt");
+        let path = learned_file_path_in(&tmp, Some("corrupt-clear"));
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, "}}} not json {{{").ok();
+        // Sanity: the file is indeed unloadable.
+        assert!(LearnedStore::load_in(&tmp, Some("corrupt-clear")).is_err());
+        clear_learned_file_in(&tmp, Some("corrupt-clear")).unwrap();
+        // Now valid + empty.
+        let reloaded = LearnedStore::load_in(&tmp, Some("corrupt-clear")).unwrap();
+        assert!(reloaded.entries().is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn clear_learned_file_in_creates_empty_file_when_missing() {
+        let tmp = temp_dir("clear-missing");
+        clear_learned_file_in(&tmp, None).unwrap();
+        assert!(learned_file_path_in(&tmp, None).exists());
+        let store = LearnedStore::load_in(&tmp, None).unwrap();
+        assert!(store.entries().is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Same path-traversal defense as `load_in` — the D-3.7 CLI passes
+    /// untrusted `--profile` input, so clearing must validate the name.
+    #[test]
+    fn clear_learned_file_in_validates_profile_name() {
+        let tmp = temp_dir("clear-validate");
+        assert!(clear_learned_file_in(&tmp, Some("a/b")).is_err(), "slash");
+        assert!(
+            clear_learned_file_in(&tmp, Some("../escape")).is_err(),
+            "traversal"
+        );
+        assert!(clear_learned_file_in(&tmp, Some("..")).is_err(), "bare ..");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

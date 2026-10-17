@@ -48,6 +48,10 @@ fn main() {
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { action } => profile_cmd(action),
+        Cmd::Learned {
+            subcommand,
+            profile,
+        } => learned_cmd(subcommand, profile),
         Cmd::Setup {
             check_only,
             grant_drive_root,
@@ -129,6 +133,116 @@ fn profile_cmd(action: cli::ProfileAction) -> i32 {
         }
         ProfileAction::Show { name, expanded } => profile::show_profile(&name, expanded),
     }
+}
+
+fn learned_cmd(action: cli::LearnedSub, profile: Option<String>) -> i32 {
+    let base = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let (rc, out, err) = learned_cmd_in(action, profile.as_deref(), &base);
+    print!("{out}");
+    eprint!("{err}");
+    rc
+}
+
+/// Core of `sandbox learned`, rooted at `base` and returning the exit
+/// code plus the stdout/stderr text (printed by [`learned_cmd`]). Split
+/// out so the behavior is unit-testable against temp dirs without
+/// capturing real process output.
+fn learned_cmd_in(
+    action: cli::LearnedSub,
+    profile: Option<&str>,
+    base: &std::path::Path,
+) -> (i32, String, String) {
+    use cli::LearnedSub;
+    match action {
+        LearnedSub::List => match net::learned::LearnedStore::load_in(base, profile) {
+            Ok(store) => {
+                let entries = store.entries();
+                if entries.is_empty() {
+                    return (0, "(no learned entries)\n".to_string(), String::new());
+                }
+                // Aligned plain-text columns, no color codes (`sandbox ps`
+                // style). Suffix entries keep the `*.` prefix they are
+                // stored with, so `list` shows the exact revoke key.
+                let host_w = entries
+                    .iter()
+                    .map(|e| e.0.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max("HOST".len());
+                let scope_w = entries
+                    .iter()
+                    .map(|e| e.1.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max("SCOPE".len());
+                let mut out = format!("{:<host_w$}  {:<scope_w$}  DISPOSITION\n", "HOST", "SCOPE");
+                for (host, scope, allow) in &entries {
+                    let disposition = if *allow { "allow" } else { "deny" };
+                    out.push_str(&format!(
+                        "{:<host_w$}  {:<scope_w$}  {disposition}\n",
+                        host, scope
+                    ));
+                }
+                (0, out, String::new())
+            }
+            Err(e) => learned_load_failure(e),
+        },
+        LearnedSub::Revoke { host } => match net::learned::LearnedStore::load_in(base, profile) {
+            Ok(mut store) => match store.revoke(&host) {
+                Ok(true) => (0, format!("revoked {host}\n"), String::new()),
+                // A missing entry fails loudly rather than silently
+                // succeeding — honest behavior for a scripted CLI.
+                Ok(false) => (
+                    1,
+                    String::new(),
+                    format!(
+                        "[sandbox] no learned entry for {host} \
+                         (run `sandbox learned list` to see stored keys)\n"
+                    ),
+                ),
+                Err(e) => (
+                    1,
+                    String::new(),
+                    format!("[sandbox] failed to rewrite learned file: {e:#}\n"),
+                ),
+            },
+            Err(e) => learned_load_failure(e),
+        },
+        LearnedSub::Clear => {
+            // [G-5] recovery: a corrupt learned file hard-aborts
+            // `sandbox run`, and `clear` is the only non-editorial way
+            // out — so it must succeed even when the file cannot be
+            // loaded. Happy path reuses `LearnedStore::clear`; the
+            // unloadable case rewrites the file empty directly.
+            let cleared = match net::learned::LearnedStore::load_in(base, profile) {
+                Ok(mut store) => store.clear(),
+                Err(_) => net::learned::clear_learned_file_in(base, profile),
+            };
+            match cleared {
+                Ok(()) => (0, String::new(), String::new()),
+                Err(e) => (
+                    1,
+                    String::new(),
+                    format!("[sandbox] failed to clear learned file: {e:#}\n"),
+                ),
+            }
+        }
+    }
+}
+
+/// Load failure for list/revoke: corrupt file, schema mismatch, or a
+/// rejected profile name all point the user at the [G-5] recovery path.
+fn learned_load_failure(e: anyhow::Error) -> (i32, String, String) {
+    (
+        1,
+        String::new(),
+        format!(
+            "[sandbox] failed to load learned file: {e:#} \
+             (run `sandbox learned clear` to reset it)\n"
+        ),
+    )
 }
 
 fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
@@ -337,8 +451,9 @@ fn run_inner(
             // Task 3.6 Step 5: load the learned policy BEFORE starting the
             // proxy. A corrupt learned file is a hard error by design — the
             // user notices immediately and can fix or revoke it ([G-5]).
-            let learned = net::learned::LearnedStore::load(profile_name.as_deref())
-                .context("load learned policy file")?;
+            let learned = net::learned::LearnedStore::load(profile_name.as_deref()).context(
+                "load learned policy file ('sandbox learned clear' resets a corrupt one)",
+            )?;
             // D-4 registry + D-3.5 coordinator: created in the supervisor
             // (all sync) before the proxy runtime exists and Arc-shared
             // into every handler. The registry's `Drop` joins its sweeper
@@ -544,5 +659,206 @@ mod tests {
         );
         assert_eq!(join_cmdline(&["echo".into(), "".into()]), "echo \"\"");
         assert_eq!(join_cmdline(&["a".into()]), "a");
+    }
+
+    /// Unique temp dir per test (learned.rs's pattern) so the learned-CLI
+    /// tests run in parallel without racing on a shared directory.
+    fn learned_temp_dir(test_name: &str) -> std::path::PathBuf {
+        let name = format!("sb-cli-learned-{}-{test_name}", std::process::id());
+        let d = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn learned_list_missing_file_is_empty() {
+        let tmp = learned_temp_dir("list-missing");
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
+        assert_eq!(rc, 0);
+        assert_eq!(out, "(no learned entries)\n");
+        assert!(err.is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_list_shows_host_scope_disposition_table() {
+        let tmp = learned_temp_dir("list-table");
+        {
+            let mut store = net::learned::LearnedStore::load_in(&tmp, Some("t37")).unwrap();
+            store.record("api.example.com", "host", true).unwrap();
+            store.record("*.npmjs.org", "suffix", true).unwrap();
+            store.record("evil.com", "host", false).unwrap();
+        }
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::List, Some("t37"), &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.contains("HOST"), "header: {out}");
+        assert!(out.contains("SCOPE"), "header: {out}");
+        assert!(out.contains("DISPOSITION"), "header: {out}");
+        // Stored representation: suffix entries keep their `*.` prefix.
+        assert!(out.contains("api.example.com"), "allow host: {out}");
+        assert!(out.contains("*.npmjs.org"), "suffix host: {out}");
+        assert!(out.contains("suffix"), "scope: {out}");
+        assert!(out.contains("evil.com"), "deny host: {out}");
+        assert!(out.matches("allow").count() >= 2, "dispositions: {out}");
+        assert!(out.matches("deny").count() >= 1, "dispositions: {out}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_revoke_removes_entry_and_persists() {
+        let tmp = learned_temp_dir("revoke");
+        {
+            let mut store = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+            store.record("api.example.com", "host", true).unwrap();
+            store.record("evil.com", "host", false).unwrap();
+        }
+        let (rc, out, err) = learned_cmd_in(
+            cli::LearnedSub::Revoke {
+                host: "api.example.com".into(),
+            },
+            None,
+            &tmp,
+        );
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.contains("revoked api.example.com"), "{out}");
+        // The unrelated deny entry is untouched.
+        let reloaded = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+        assert!(reloaded.lookup("api.example.com").is_none());
+        assert!(reloaded.lookup("evil.com").is_some_and(|d| !d.allow));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_revoke_normalizes_input_like_the_store() {
+        let tmp = learned_temp_dir("revoke-norm");
+        {
+            let mut store = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+            store.record("api.example.com", "host", true).unwrap();
+        }
+        // Case + trailing dot are normalized the same way `record` does.
+        let (rc, _out, err) = learned_cmd_in(
+            cli::LearnedSub::Revoke {
+                host: "API.Example.COM.".into(),
+            },
+            None,
+            &tmp,
+        );
+        assert_eq!(rc, 0, "stderr: {err}");
+        let reloaded = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+        assert!(reloaded.lookup("api.example.com").is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_revoke_unknown_host_fails_loudly() {
+        let tmp = learned_temp_dir("revoke-unknown");
+        let (rc, out, err) = learned_cmd_in(
+            cli::LearnedSub::Revoke {
+                host: "nope.example.com".into(),
+            },
+            None,
+            &tmp,
+        );
+        assert_eq!(rc, 1);
+        assert!(out.is_empty());
+        assert!(
+            err.contains("no learned entry for nope.example.com"),
+            "{err}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_clear_empties_file() {
+        let tmp = learned_temp_dir("clear");
+        {
+            let mut store = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+            store.record("a.example.com", "host", true).unwrap();
+            store.record("b.example.com", "host", false).unwrap();
+        }
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::Clear, None, &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+        let reloaded = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+        assert!(reloaded.entries().is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// [G-5] corrupt-file recovery: a corrupt learned file hard-aborts
+    /// `sandbox run`, and `clear` is the only non-editorial way out — so
+    /// it must succeed even though the file cannot be loaded.
+    #[test]
+    fn learned_clear_resets_corrupt_file() {
+        let tmp = learned_temp_dir("clear-corrupt");
+        let path = net::learned::learned_file_path_in(&tmp, None);
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, "}}} not json {{{").ok();
+        // List proves the file is unreadable and the error points at the
+        // recovery path.
+        let (rc, _out, err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
+        assert_eq!(rc, 1);
+        assert!(err.contains("sandbox learned clear"), "hint: {err}");
+        // Clear is the recovery path and must succeed despite the corrupt file.
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::Clear, None, &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.is_empty() && err.is_empty());
+        let reloaded = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+        assert!(reloaded.entries().is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_clear_missing_file_is_ok() {
+        let tmp = learned_temp_dir("clear-missing");
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::Clear, None, &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.is_empty() && err.is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_profile_selects_learned_file() {
+        let tmp = learned_temp_dir("profile");
+        {
+            let mut store = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+            store.record("api.example.com", "host", true).unwrap();
+        }
+        // default.json has one entry; the `dev` learned file does not exist.
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::List, Some("dev"), &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert_eq!(out, "(no learned entries)\n");
+        let (rc, out, _err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
+        assert_eq!(rc, 0);
+        assert!(out.contains("api.example.com"), "{out}");
+        // Clearing the `dev` file must not touch default.json.
+        let (rc, _out, err) = learned_cmd_in(cli::LearnedSub::Clear, Some("dev"), &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        let (rc, out, _err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
+        assert_eq!(rc, 0);
+        assert!(out.contains("api.example.com"), "{out}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn learned_invalid_profile_name_fails() {
+        let tmp = learned_temp_dir("invalid-profile");
+        let (rc, _out, err) = learned_cmd_in(cli::LearnedSub::List, Some("a/b"), &tmp);
+        assert_eq!(rc, 1);
+        assert!(!err.is_empty());
+        let (rc, _out, err) = learned_cmd_in(cli::LearnedSub::Clear, Some("../escape"), &tmp);
+        assert_eq!(rc, 1);
+        assert!(!err.is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
