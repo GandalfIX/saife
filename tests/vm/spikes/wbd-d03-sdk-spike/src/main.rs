@@ -20,6 +20,21 @@ fn empty_request() -> ContainerRequest {
     ContainerRequest::new("cmd /d /s /c exit 0")
 }
 
+fn granted_request(command: &str, timeout_ms: Option<u32>) -> ContainerRequest {
+    // Run-1 finding (20261017-121539-354): without a granted existing directory
+    // the engine falls back to a traverse-only C:\ CWD (working_directory.rs:41)
+    // and System32-resident external commands fail ("The current directory is
+    // invalid."). A readonly SystemRoot grant gives the child a usable CWD
+    // (models.rs:1124-1145 first-existing-directory rule).
+    let mut fs = v1::FilesystemPolicy::default();
+    fs.readonly_paths = vec!["C:\\Windows".into()];
+    ContainerRequest {
+        filesystem: Some(fs),
+        timeout_ms,
+        ..ContainerRequest::new(command)
+    }
+}
+
 fn enumerate_request() -> ContainerRequest {
     let temp = std::env::temp_dir().join("wbd-d03-enumerate-probe");
     // ProcessContainerConfig/ProcessContainerFilesystem are #[non_exhaustive]
@@ -82,12 +97,10 @@ fn scenario_probe() -> Result<Value, String> {
     }))
 }
 
-fn run_one(command: &str, timeout_ms: Option<u32>) -> Result<Value, String> {
+fn run_request(request: ContainerRequest) -> Result<Value, String> {
     let started = std::time::Instant::now();
-    let request = ContainerRequest {
-        timeout_ms,
-        ..ContainerRequest::new(command)
-    };
+    let command = request.command.clone();
+    let timeout_ms = request.timeout_ms;
     let out = v1::run(request, Default::default()).map_err(fmt_err)?;
     Ok(json!({
         "command": command,
@@ -98,6 +111,13 @@ fn run_one(command: &str, timeout_ms: Option<u32>) -> Result<Value, String> {
         "stderr": String::from_utf8_lossy(&out.stderr),
         "warnings": out.warnings,
     }))
+}
+
+fn run_one(command: &str, timeout_ms: Option<u32>) -> Result<Value, String> {
+    run_request(ContainerRequest {
+        timeout_ms,
+        ..ContainerRequest::new(command)
+    })
 }
 
 fn scenario_run_exit() -> Result<Value, String> {
@@ -116,7 +136,7 @@ fn scenario_run_stdio() -> Result<Value, String> {
 
 fn scenario_spawn_stdin() -> Result<Value, String> {
     let mut proc = v1::spawn(
-        ContainerRequest::new("cmd /d /s /c find /v \"\""),
+        granted_request("cmd /d /s /c find /v \"\"", None),
         Default::default(),
     )
     .map_err(fmt_err)?;
@@ -139,10 +159,13 @@ fn scenario_spawn_stdin() -> Result<Value, String> {
 }
 
 fn scenario_timeout() -> Result<Value, String> {
-    let out = run_one(
-        "pwsh -NoProfile -Command Start-Sleep -Seconds 60",
+    // Amendment 1: System32-resident powershell.exe sleeper (upstream-proven
+    // ProcessContainer pattern, run_processcontainer_crash_recovery_test.ps1:47)
+    // with a readonly SystemRoot grant; pwsh failed to resolve in run 1.
+    let out = run_request(granted_request(
+        "powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 60",
         Some(3_000),
-    )?;
+    ))?;
     Ok(json!({
         "timeout": out,
         "note": "WaitResult::TimedOut expected; README: timeouts cancel outstanding reads and return partial output",
@@ -152,12 +175,10 @@ fn scenario_timeout() -> Result<Value, String> {
 fn scenario_cancel() -> Result<Value, String> {
     let started = std::time::Instant::now();
     let mut proc = v1::spawn(
-        ContainerRequest {
-            timeout_ms: None,
-            ..ContainerRequest::new(
-                "pwsh -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'",
-            )
-        },
+        granted_request(
+            "powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'",
+            None,
+        ),
         Default::default(),
     )
     .map_err(fmt_err)?;

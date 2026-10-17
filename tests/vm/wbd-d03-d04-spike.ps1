@@ -178,7 +178,7 @@ try {
             # stdin forwarding: pipe a marker in; find /v "" echoes it back
             $row = [ordered]@{ scenario = 'a2-stdin'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
-                $configPath = New-Config -Name 'd03-a2-stdin' -CommandLine 'cmd /d /s /c find /v ""'
+                $configPath = New-Config -Name 'd03-a2-stdin' -CommandLine 'cmd /d /s /c find /v ""' -ReadOnly @('C:\Windows')
                 $row['configArtifact'] = 'd03-config-a2-stdin.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a2-stdin.json') -Force
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -198,12 +198,12 @@ try {
             # timeout: request-level process.timeout vs a 60s sleep workload
             $row = [ordered]@{ scenario = 'a3-timeout'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
-                # New-Config's timeout parameter surface is unverified upstream
-                # (the observed D-02 usage never passes one) - build the base
-                # config with the helper, then patch process.timeout. Key name
-                # verified against the fetched d02-config-fs-rw.json; re-verified
-                # against the pinned schema in Task 8 Step 6.
-                $configPath = New-Config -Name 'd03-a3-timeout' -CommandLine 'pwsh -NoProfile -Command Start-Sleep -Seconds 60'
+                # Amendment 1: System32-resident powershell.exe sleeper with a
+                # readonly SystemRoot grant (pwsh failed to resolve in run 1);
+                # -TimeoutMs exists at the pin (:543, emitted :602) but the
+                # post-New-Config patch of process.timeout is retained - it is
+                # the shape already proven schema-valid in run 1.
+                $configPath = New-Config -Name 'd03-a3-timeout' -CommandLine 'powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 60' -ReadOnly @('C:\Windows')
                 $a3Json = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
                 $a3Json.process.timeout = 3000
                 $a3Json | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $configPath -Encoding utf8
@@ -230,7 +230,7 @@ try {
             $row = [ordered]@{ scenario = 'a4-cancel'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                $configPath = New-Config -Name 'd03-a4-cancel' -CommandLine "pwsh -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'"
+                $configPath = New-Config -Name 'd03-a4-cancel' -CommandLine "powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'" -ReadOnly @('C:\Windows')
                 $row['configArtifact'] = 'd03-config-a4-cancel.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a4-cancel.json') -Force
                 $proc = Start-Process -FilePath $wxcExec -ArgumentList "`"$configPath`"" -PassThru
@@ -351,14 +351,16 @@ try {
             # shows which of the spec's two outcomes occurs:
             # (a) refused (nonzero, no marker) or (b) demoted-and-run.
             $c1Marker = Join-Path $markerDir 'c1-ran.txt'
-            $configPath = New-Config -Name 'd03-c1-enumerate' -CommandLine "cmd /d /s /c echo C1-WORKLOAD-RAN > `"$c1Marker`"" -ReadWrite @($markerDir)
-            $c1Json = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
-            # Hand-author the enumeratePaths key (upstream New-Config does
-            # not expose it): added under filesystem; key name verified
-            # against the pinned schema - recorded in the baseline notes.
-            $c1Json.filesystem | Add-Member -NotePropertyName enumeratePaths -NotePropertyValue @('C:\Windows') -Force
+            # Amendment 1: enumeratePaths is a NESTED schema key
+            # (processContainer.filesystem.enumeratePaths, stable.rs:310-315);
+            # upstream New-Config exposes it directly via -EnumeratePaths
+            # (WinProcessContainer.Common.ps1:572, emitted :666-668). Run 1's
+            # top-level hand-authored key was schema-rejected (recorded);
+            # this form reaches the EnumeratePathsUnsupported adjudication
+            # (fallback_detector.rs:238-241, raised :301).
             $c1ConfigArtifact = Join-Path $ResultsDir 'd03-config-c1-enumerate.json'
-            $c1Json | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $c1ConfigArtifact -Encoding utf8
+            $configPath = New-Config -Name 'd03-c1-enumerate' -CommandLine "cmd /d /s /c echo C1-WORKLOAD-RAN > `"$c1Marker`"" -ReadWrite @($markerDir) -EnumeratePaths @('C:\Windows')
+            Copy-Item -LiteralPath $configPath -Destination $c1ConfigArtifact -Force
 
             # probe the hand-authored request (verbatim artifact)
             $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $c1ConfigArtifact) -ScriptBlock {
