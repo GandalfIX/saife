@@ -65,6 +65,8 @@ Manual verification (elevated shell, loopback exemption registered):
 
 **CHECKPOINT 3** — STOP for user approval
 
+> 2026-10-17: item 1 verified by user in an elevated PS against the worktree build (74f0fa1): dialog appeared, "Deny once" → curl 403. Items 2-7 pending user run. Note for future runs: the MAIN checkout's `sandbox.exe` (C:\Users\marku\tools\sandbox\target\release) predates ADR-0001 and still downgrades --allow-domain to --block-net; checkpoint commands must use the worktree binary at .worktrees/adr-0001-network/sandbox/sandbox/target/release/sandbox.exe, elevated (AppContainer loopback exemption is admin-only).
+
 ## Phase 4: D-2 — Upstream corporate proxy chaining
 
 | Task | Status | Implementer | Spec | Quality | Commit | Notes |
