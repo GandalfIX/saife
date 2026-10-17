@@ -1004,7 +1004,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
 
     // Admission done — dial (Step 2): chained through the upstream
     // proxy, or DNS-pinned + Happy Eyeballs on the direct path.
-    let upstream_stream = match dial_upstream(ctx.upstream.as_deref(), &host, port).await {
+    let mut upstream_stream = match dial_upstream(ctx.upstream.as_deref(), &host, port).await {
         Ok(s) => s,
         Err(DialFailure::Denied(d)) => {
             emit_decision(&ctx.writer, &host, port, &d);
@@ -1037,11 +1037,15 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     let _ = sock
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await;
-    let (mut ri, mut wi) = sock.into_split();
-    let (mut ro, mut wo) = upstream_stream.into_split();
-    let c2u = tokio::io::copy(&mut ri, &mut wo);
-    let u2c = tokio::io::copy(&mut ro, &mut wi);
-    let _ = tokio::join!(c2u, u2c);
+    // Splice both directions with `copy_bidirectional`, not two `copy`s under
+    // a `join!`: `copy` never shuts down the peer's write half, so a client
+    // that closed (a normal end to a CONNECT tunnel) left the
+    // upstream→client copy parked against a keep-alive upstream — one leaked
+    // handler task and two leaked fds per request (S-83). `copy_bidirectional`
+    // forwards a read-side EOF as a FIN, so the upstream responds and closes,
+    // and both halves complete. Errors stay swallowed: a mid-tunnel RST is
+    // not worth logging.
+    let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream_stream).await;
     Ok(())
 }
 
@@ -2991,5 +2995,160 @@ mod tests {
             fake.heads()
         );
         assert_eq!(connect_events(&t.sid).len(), 1);
+    }
+
+    // =================================================================
+    // Task 4.4 — tunnel half-close: the client's EOF must reach the
+    // upstream as a FIN.
+    //
+    // Regression for the 4.2 review's live hang (S-83): the split +
+    // `join!(copy, copy)` tunnel never shut down the other side's write
+    // half, so a client that closed left `copy(upstream → client)` parked
+    // forever against a keep-alive upstream — one leaked task and two leaked
+    // fds per request. With `copy_bidirectional` the FIN propagates, the
+    // upstream answers with its own EOF, and the handler returns.
+    // =================================================================
+
+    /// Async fake upstream proxy for the half-close test: answers the
+    /// CONNECT with `200`, echoes until it reads EOF, then closes and
+    /// resolves with the number of bytes it echoed. The head is read one
+    /// byte at a time so no tunnel byte is swallowed by the CONNECT parse.
+    async fn echoing_upstream_until_eof() -> (u16, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept fake upstream");
+            let mut head = Vec::new();
+            let mut one = [0u8; 1];
+            loop {
+                if s.read(&mut one).await.unwrap_or(0) == 0 {
+                    return 0;
+                }
+                head.push(one[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("write fake 200");
+            let mut echoed = 0usize;
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        echoed += n;
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            echoed
+        });
+        (port, task)
+    }
+
+    /// Minimal `ConnCtx` for a chained tunnel test: `api.example.com` is
+    /// allow-listed (so the prompt is never consulted), and the upstream
+    /// dialer points at the fake proxy above. Returns the scratch dir too
+    /// so the caller can drop it with the context.
+    fn tunnel_ctx(label: &str, upstream_port: u16) -> (Arc<ConnCtx>, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("sandbox-t44-{}", temp_sid(label)));
+        std::fs::create_dir_all(&base).unwrap();
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let prompt = PromptGate {
+            enabled: false,
+            config: PromptConfig {
+                timeout: Duration::from_secs(1),
+                on_unavailable: PromptPolicy::Deny,
+            },
+            coordinator: Arc::new(PromptCoordinator::with_dialog(dialog)),
+            intent: Arc::new(IntentRegistry::new(DEFAULT_TTL)),
+            learned: Arc::new(StdMutex::new(
+                LearnedStore::load_in(&base, Some("t44")).expect("empty learned store"),
+            )),
+        };
+        let sid = temp_sid(label);
+        let writer = Arc::new(crate::audit::AuditWriter::open(&sid, false).unwrap());
+        let ctx = Arc::new(ConnCtx {
+            token: TEST_TOKEN.to_string(),
+            deny: Vec::new(),
+            allow: vec!["api.example.com".to_string()],
+            writer,
+            upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
+            prompt,
+        });
+        (ctx, base)
+    }
+
+    /// The 4.4 regression: after the client closes its socket the handler
+    /// must finish promptly, and only if the EOF crossed the tunnel does the
+    /// upstream's read-EOF-terminated loop end.
+    #[tokio::test]
+    async fn client_eof_reaches_the_upstream_and_the_handler_finishes() {
+        let (upstream_port, upstream_task) = echoing_upstream_until_eof().await;
+        let (ctx, _base) = tunnel_ctx("half-close", upstream_port);
+
+        // The production accept loop hands `handle_conn` one end of a
+        // loopback socket; this listener provides exactly that pair.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .expect("connect handler socket");
+            s.write_all(connect_req("api.example.com:443").as_bytes())
+                .await
+                .unwrap();
+            let mut head = Vec::new();
+            let mut one = [0u8; 1];
+            loop {
+                if s.read(&mut one).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(one[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let payload = b"half-close payload";
+            s.write_all(payload).await.unwrap();
+            let mut echoed = vec![0u8; payload.len()];
+            s.read_exact(&mut echoed).await.unwrap();
+            // Close the client socket outright — no explicit shutdown, no
+            // lingering write half. The handler has to forward this EOF.
+            drop(s);
+            (String::from_utf8_lossy(&head).into_owned(), echoed)
+        });
+
+        let (server, _peer) = listener.accept().await.unwrap();
+        let handled = tokio::time::timeout(Duration::from_secs(2), handle_conn(server, ctx)).await;
+        assert!(
+            handled.is_ok(),
+            "handle_conn was still running 2s after the client closed: the client EOF \
+             never reached the upstream write half, so a keep-alive upstream parks the \
+             handler (and two fds) forever"
+        );
+
+        let (head, echoed) = client.await.expect("client task");
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        assert_eq!(
+            echoed,
+            b"half-close payload".to_vec(),
+            "payload must round-trip before the close"
+        );
+
+        // The fake upstream's loop ends only on read-EOF, so a task that
+        // resolves proves the FIN crossed the tunnel (and echoes the count).
+        let echoed_upstream = tokio::time::timeout(Duration::from_secs(2), upstream_task)
+            .await
+            .expect("fake upstream never observed the tunnel's EOF")
+            .expect("fake upstream task panicked");
+        assert_eq!(echoed_upstream, b"half-close payload".len());
     }
 }
