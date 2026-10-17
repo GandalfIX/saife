@@ -12,6 +12,8 @@
 
 **PR boundary (binding, per the spec's thread decision):** Tasks 1–9 are **PR1 (D-03)**: spike script + spike crate + canonical run + ADR-0002 + companion updates, one commit batch. Tasks 10 is **PR2 (D-04)**: ADR-0003 + companion updates, consuming ADR-0002's outcome and the same canonical run. PR1 must be complete (and mergeable on its own) before PR2 starts.
 
+**Amendment 1 (2026-10-17, user-approved after canonical run `20261017-121539-354` + the Task 8 source-verification pack):** run 1 proved that `pwsh` workloads cannot resolve under the PSEC token (Program Files-resident + root-drive readonly requirement, `launch_diagnostics.rs:243-250`), that the drive-root `C:\` CWD fallback (`working_directory.rs:41`) breaks cmd's external commands ("The current directory is invalid."), and that top-level `filesystem.enumeratePaths` is schema-rejected (`stable.rs:58-69`) rather than adjudication-refused — leaving the timeout/cancel/stdin axes unproven and C1 refusing one layer early. This amendment (a) swaps sleep workloads to the upstream-proven System32-resident `powershell.exe Start-Sleep` pattern with a `readonlyPaths` `C:\Windows` grant, (b) emits `enumeratePaths` via `New-Config -EnumeratePaths` (the nested schema key), so one supplementary canonical run discharges those axes. Run 1 remains recorded evidence with all findings; the ADRs cite both runs.
+
 ---
 
 ## Resolved spec open items (upstream evidence, read at the pin 2026-10-14)
@@ -33,9 +35,9 @@ All refs are valid at commit `5d7a475a9fd5626bafb55c2c857989d2e5621245`.
 5. **wxc-exec subprocess surface (Section A).** `src/tools/wxc` — a "thin process entry point that depends on `mxc-sdk`" (crate README "Internal modules and executor binaries"). Documented CLI: `--probe`, `--version`, `--debug`, `--audit`; run mode is the config path positional (`wxc-exec.exe config.json`; README `--debug` example). Upstream classifies it as "non-SDK consumption … Use for testing or when the SDK cannot be embedded in your app".
 6. **FFI surface.** `src/mxc-sdk/src/lib.rs` exposes `#[doc(hidden)] pub mod __ffi` — `spawn_container_json`, `run_json`, `spawn_with_pty_json`, `run_lifecycle_json`, `execute_lifecycle_json` ("Internal adapters for the C ABI and native contract tests, **not SDK authoring APIs**"); the `src/ffi` directory builds on it (exact exports read at Task 8). `experimental` backends are an API parameter, deliberately never a JSON field.
 7. **C4 (created-not-running / pre-resume).** Deliberately NOT resolved at planning time: `base_container_runner.rs` (145 KB) gets a targeted read at Task 8 (CREATE_SUSPENDED / ResumeThread / PSEC environment attach order). The spike does not depend on the answer; if no surface exposes it, ADR-0002 §3 records the blocker and both ADRs restate the binding stop-work consequence (no product launch path until an upstream mechanism exists).
-8. **Config JSON shape at schema 1.0.0** (fetched `d02-config-fs-rw.json`): `{ version, containerId, containment: "processcontainer", process: { commandLine, timeout }, filesystem: { readwritePaths, … }, ui: { disable } }` — the C1 hand-authored `enumeratePaths` key goes under `filesystem` (exact key name re-verified against the pinned schema at implementation; `fallback_detector.rs` names the field `processContainer.filesystem.enumeratePaths`).
+8. **Config JSON shape at schema 1.0.0** (fetched `d02-config-fs-rw.json`): `{ version, containerId, containment: "processcontainer", process: { commandLine, timeout }, filesystem: { readwritePaths, … }, ui: { disable } }` — the C1 `enumeratePaths` key goes under the NESTED path `processContainer.filesystem.enumeratePaths` — verified at the pin: top-level `Filesystem` is `deny_unknown_fields` with only readwrite/readonly/denied (`stable.rs:58-69`), the nested `ProcessContainerFilesystem` carries `enumeratePaths` (`stable.rs:310-315`), and upstream `New-Config` exposes `-EnumeratePaths` emitting exactly that nested key (`WinProcessContainer.Common.ps1:572`, emitted `:666-668`). Run 1's top-level key was schema-rejected (recorded); the amended script uses `-EnumeratePaths` so the refusal surfaces the adjudication-level `EnumeratePathsUnsupported` (`fallback_detector.rs:238-241`, raised `:301`).
 
-**Workload command choice note:** sleep workloads use `pwsh -NoProfile -Command Start-Sleep -Seconds <n>` (guest pwsh is guaranteed by the harness; `timeout /t` rejects redirected stdin). No network dependence in any scenario.
+**Workload command choice note (Amendment 1, 2026-10-17):** sleep workloads use System32-resident `powershell.exe -NoLogo -NoProfile -Command "Start-Sleep -Seconds <n>"` plus a `readonlyPaths` grant of `C:\Windows` — the upstream-proven ProcessContainer sleeper pattern (`tests/scripts/run_processcontainer_crash_recovery_test.ps1:47`; `run_processcontainer_process_plumbing_test.ps1:106-116`). Do NOT use `pwsh` (Program Files-resident; requires root-drive readonly, `launch_diagnostics.rs:243-250` `missing_root_readonly` — proven failing in run 1) and do NOT use `ping -n` (dies instantly inside the container: "Unable to contact IP driver", upstream plumbing-test comment :106). `timeout /t` rejects redirected stdin. No network dependence in any scenario.
 
 ---
 
@@ -46,7 +48,7 @@ All refs are valid at commit `5d7a475a9fd5626bafb55c2c857989d2e5621245`.
 
 The mock drives the REAL capture script in a child pwsh against fake MXC repos. The fake `wxc-exec.exe` is a real small exe compiled once with the .NET Framework csc (always present at `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`): `--probe`/`--version` → text + exit 0; a config-path positional → reads the JSON, prints `MOCK-STDOUT <containerId>`, and exits 7 if the commandLine contains `exit 7`, else 0. The fake mxc tree additionally carries a **stub `mxc-sdk` crate** so Section B compiles and all eight SDK scenarios run in the mock (validating the full plumbing: template materialization → cargo build → scenario JSON parsing).
 
-- [ ] **Step 1: Write the mock**
+- [x] **Step 1: Write the mock**
 
 ```powershell
 #requires -Version 7
@@ -98,14 +100,15 @@ $Script:SchemaVersion = '1.0.0'
 function New-Config {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$CommandLine,
           [string[]]$ReadWrite = @(), [string[]]$ReadOnly = @(), [string[]]$Denied = @(),
-          [string]$Cwd = $null)
+          [string[]]$EnumeratePaths = @(), [string]$Cwd = $null)
     $dir = Join-Path $ScratchRoot 'configs'
     $path = Join-Path $dir "$Name.json"
-    @{ version = '1.0.0'; containerId = "MxcWinPC-$Name"; containment = 'processcontainer';
+    $cfg = @{ version = '1.0.0'; containerId = "MxcWinPC-$Name"; containment = 'processcontainer';
         process = @{ commandLine = $CommandLine; timeout = 30000 };
        filesystem = @{ readwritePaths = $ReadWrite; readonlyPaths = $ReadOnly; deniedPaths = $Denied };
-       ui = @{ disable = $false } } |
-        ConvertTo-Json -Depth 5 | Out-File -LiteralPath $path -Encoding utf8 -Force
+       ui = @{ disable = $false } }
+    if ($EnumeratePaths.Count) { $cfg.processContainer = @{ filesystem = @{ enumeratePaths = $EnumeratePaths } } }
+    $cfg | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $path -Encoding utf8 -Force
     return $path
 }
 '@ | Set-Content -LiteralPath (Join-Path $libDir 'WinProcessContainer.Common.ps1') -Encoding utf8
@@ -127,7 +130,8 @@ force-tier-testing = []
         @'
 // Stub of the documented mxc_sdk::v1 surface (docs/api-reference/rust/v1).
 // Mirrors EVERY item src/main.rs touches (configs module layout, all 11
-// ProbeFacts booleans + 10 ui bits, Default for ProcessContainerConfig,
+// ProbeFacts booleans + 10 ui bits, Default for ProcessContainerConfig and
+// ProcessContainerFilesystem (both #[non_exhaustive] at the pin),
 // MxcProcess::{wait, warnings, ...}) so the committed spike compiles in the
 // mock; the real crate is exercised in the VM run.
 pub mod v1 {
@@ -136,6 +140,7 @@ pub mod v1 {
         pub struct ProcessContainerConfig {
             pub filesystem: Option<ProcessContainerFilesystem>,
         }
+        #[derive(Default)]
         pub struct ProcessContainerFilesystem {
             pub enumerate_paths: Vec<String>,
         }
@@ -161,6 +166,7 @@ pub mod v1 {
         pub tier: Option<&'static str>, pub needs_dacl_augmentation: Option<bool>,
         pub warnings: Vec<String>, pub probes: ProbeFacts, pub error: Option<String>,
     }
+    #[derive(Default)]
     pub struct FilesystemPolicy { pub readwrite_paths: Vec<String>, pub readonly_paths: Vec<String>, pub denied_paths: Vec<String> }
     pub enum Containment { Process, ProcessContainer(configs::ProcessContainerConfig) }
     pub struct ContainerRequest {
@@ -313,7 +319,7 @@ Write-Host "MOCK PASSED (d03d04 scenarios A+B+C; mock root: $mockRoot)" -Foregro
 exit 0
 ```
 
-- [ ] **Step 2: Run the mock — expect FAIL**
+- [x] **Step 2: Run the mock — expect FAIL**
 
 Run: `pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\Users\marku\AppData\Local\Temp\opencode\wbd-mock-d03\run-mock.ps1"`
 Expected: `MOCK FAILED` — scenario A fails because `wbd-d03-d04-spike.ps1` does not exist yet (child pwsh exits 61/2; B fails the exit-3 assertion trivially since a missing script also yields a nonzero code — that's fine, it proves the mock exercises new behavior; the meaningful red is A).
@@ -327,7 +333,7 @@ Expected: `MOCK FAILED` — scenario A fails because `wbd-d03-d04-spike.ps1` doe
 - Create: `tests/vm/spikes/wbd-d03-sdk-spike/.gitignore`
 - Create: `tests/vm/spikes/wbd-d03-sdk-spike/src/main.rs`
 
-- [ ] **Step 1: `Cargo.toml.template`** — the capture script materializes `Cargo.toml` from this template by replacing `__MXC_ROOT__` with the `-MxcRoot` value (the materialized file is gitignored and copied into the artifact set for provenance):
+- [x] **Step 1: `Cargo.toml.template`** — the capture script materializes `Cargo.toml` from this template by replacing `__MXC_ROOT__` with the `-MxcRoot` value (the materialized file is gitignored and copied into the artifact set for provenance):
 
 ```toml
 [package]
@@ -345,7 +351,7 @@ serde_json = "1"
 
 Notes: the empty `[workspace]` table keeps the crate standalone even though it lives inside the monorepo (prevents cargo workspace-member errors). `force-tier-testing` is enabled deliberately — it is a no-dependency cfg gate that compiles the `MXC_FORCE_TIER` seam into a runnable binary (the exact D-03/D-04 behavior under investigation; the shipped executor leaves it off).
 
-- [ ] **Step 2: `.gitignore`**:
+- [x] **Step 2: `.gitignore`**:
 
 ```
 /target
@@ -353,7 +359,7 @@ Cargo.toml
 Cargo.lock
 ```
 
-- [ ] **Step 3: `src/main.rs`** — one JSON line per scenario on stdout; spoke-level failures are serialized as JSON, never panics (the capture script records exit codes and output verbatim):
+- [x] **Step 3: `src/main.rs`** — one JSON line per scenario on stdout; spoke-level failures are serialized as JSON, never panics (the capture script records exit codes and output verbatim):
 
 ```rust
 // WBD D-03/D-04 spike: exercises the documented mxc_sdk::v1 surface
@@ -378,15 +384,32 @@ fn empty_request() -> ContainerRequest {
     ContainerRequest::new("cmd /d /s /c exit 0")
 }
 
+fn granted_request(command: &str, timeout_ms: Option<u32>) -> ContainerRequest {
+    // Run-1 finding (20261017-121539-354): without a granted existing directory
+    // the engine falls back to a traverse-only C:\ CWD (working_directory.rs:41)
+    // and System32-resident external commands fail ("The current directory is
+    // invalid."). A readonly SystemRoot grant gives the child a usable CWD
+    // (models.rs:1124-1145 first-existing-directory rule).
+    let mut fs = v1::FilesystemPolicy::default();
+    fs.readonly_paths = vec!["C:\\Windows".into()];
+    ContainerRequest {
+        filesystem: Some(fs),
+        timeout_ms,
+        ..ContainerRequest::new(command)
+    }
+}
+
 fn enumerate_request() -> ContainerRequest {
     let temp = std::env::temp_dir().join("wbd-d03-enumerate-probe");
+    // ProcessContainerConfig/ProcessContainerFilesystem are #[non_exhaustive]
+    // at the pin: Default + pub-field mutation is the sanctioned out-of-crate
+    // construction (struct expressions are E0639 from outside the crate).
+    let mut fs = configs::ProcessContainerFilesystem::default();
+    fs.enumerate_paths = vec![temp.to_string_lossy().into_owned()];
+    let mut cfg = configs::ProcessContainerConfig::default();
+    cfg.filesystem = Some(fs);
     ContainerRequest {
-        containment: Containment::ProcessContainer(configs::ProcessContainerConfig {
-            filesystem: Some(configs::ProcessContainerFilesystem {
-                enumerate_paths: vec![temp.to_string_lossy().into_owned()],
-            }),
-            ..Default::default()
-        }),
+        containment: Containment::ProcessContainer(cfg),
         ..empty_request()
     }
 }
@@ -438,12 +461,10 @@ fn scenario_probe() -> Result<Value, String> {
     }))
 }
 
-fn run_one(command: &str, timeout_ms: Option<u32>) -> Result<Value, String> {
+fn run_request(request: ContainerRequest) -> Result<Value, String> {
     let started = std::time::Instant::now();
-    let request = ContainerRequest {
-        timeout_ms,
-        ..ContainerRequest::new(command)
-    };
+    let command = request.command.clone();
+    let timeout_ms = request.timeout_ms;
     let out = v1::run(request, Default::default()).map_err(fmt_err)?;
     Ok(json!({
         "command": command,
@@ -454,6 +475,13 @@ fn run_one(command: &str, timeout_ms: Option<u32>) -> Result<Value, String> {
         "stderr": String::from_utf8_lossy(&out.stderr),
         "warnings": out.warnings,
     }))
+}
+
+fn run_one(command: &str, timeout_ms: Option<u32>) -> Result<Value, String> {
+    run_request(ContainerRequest {
+        timeout_ms,
+        ..ContainerRequest::new(command)
+    })
 }
 
 fn scenario_run_exit() -> Result<Value, String> {
@@ -472,7 +500,7 @@ fn scenario_run_stdio() -> Result<Value, String> {
 
 fn scenario_spawn_stdin() -> Result<Value, String> {
     let mut proc = v1::spawn(
-        ContainerRequest::new("cmd /d /s /c find /v \"\""),
+        granted_request("cmd /d /s /c find /v \"\"", None),
         Default::default(),
     )
     .map_err(fmt_err)?;
@@ -495,10 +523,13 @@ fn scenario_spawn_stdin() -> Result<Value, String> {
 }
 
 fn scenario_timeout() -> Result<Value, String> {
-    let out = run_one(
-        "pwsh -NoProfile -Command Start-Sleep -Seconds 60",
+    // Amendment 1: System32-resident powershell.exe sleeper (upstream-proven
+    // ProcessContainer pattern, run_processcontainer_crash_recovery_test.ps1:47)
+    // with a readonly SystemRoot grant; pwsh failed to resolve in run 1.
+    let out = run_request(granted_request(
+        "powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 60",
         Some(3_000),
-    )?;
+    ))?;
     Ok(json!({
         "timeout": out,
         "note": "WaitResult::TimedOut expected; README: timeouts cancel outstanding reads and return partial output",
@@ -508,10 +539,10 @@ fn scenario_timeout() -> Result<Value, String> {
 fn scenario_cancel() -> Result<Value, String> {
     let started = std::time::Instant::now();
     let mut proc = v1::spawn(
-        ContainerRequest {
-            timeout_ms: None,
-            ..ContainerRequest::new("pwsh -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'")
-        },
+        granted_request(
+            "powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'",
+            None,
+        ),
         Default::default(),
     )
     .map_err(fmt_err)?;
@@ -528,7 +559,9 @@ fn scenario_cancel() -> Result<Value, String> {
 }
 
 fn scenario_force_tier() -> Result<Value, String> {
-    let forced = std::env::args().nth(2).unwrap_or_else(|| "appcontainer-dacl".to_string());
+    let forced = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "appcontainer-dacl".to_string());
     // SAFETY: single-threaded scenario process; the var dies with this process.
     std::env::set_var("MXC_FORCE_TIER", &forced);
     let empty = v1::probe(Some(&empty_request())).map_err(fmt_err)?;
@@ -600,7 +633,7 @@ Note: `v1::Error` implements `Display`; `probe_json` maps `ProbeOutput` field-by
 
 Established patterns reused from `wbd-d01-d02-probes.ps1`: exit codes 0/3/99, prerequisites fail-loud, flat artifacts only (the harness fetch is flat), `Set-Content -Value` never the pipeline, per-step try/catch with blocker-verbatim continuation, `Start-Job` + `Wait-Job -Timeout` hang guard on **every** launch scenario (spec advisory 3; the single documented exception is a4-cancel — it must Stop-Process the executor from the parent and uses only bounded waits — and the Section B cargo build is guarded at 1800s because force-tier-testing changes mxc-sdk's feature fingerprint → full rebuild), pin re-verification, manifest with SHA256. **This script launches workloads — inside the disposable VM only, never on the host, and it never runs `wxc-host-prep`.**
 
-- [ ] **Step 1: Write the script**:
+- [x] **Step 1: Write the script**:
 
 ```powershell
 #Requires -Version 7
@@ -783,7 +816,7 @@ try {
             # stdin forwarding: pipe a marker in; find /v "" echoes it back
             $row = [ordered]@{ scenario = 'a2-stdin'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
-                $configPath = New-Config -Name 'd03-a2-stdin' -CommandLine 'cmd /d /s /c find /v ""'
+                $configPath = New-Config -Name 'd03-a2-stdin' -CommandLine 'cmd /d /s /c find /v ""' -ReadOnly @('C:\Windows')
                 $row['configArtifact'] = 'd03-config-a2-stdin.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a2-stdin.json') -Force
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -803,12 +836,12 @@ try {
             # timeout: request-level process.timeout vs a 60s sleep workload
             $row = [ordered]@{ scenario = 'a3-timeout'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
-                # New-Config's timeout parameter surface is unverified upstream
-                # (the observed D-02 usage never passes one) - build the base
-                # config with the helper, then patch process.timeout. Key name
-                # verified against the fetched d02-config-fs-rw.json; re-verified
-                # against the pinned schema in Task 8 Step 6.
-                $configPath = New-Config -Name 'd03-a3-timeout' -CommandLine 'pwsh -NoProfile -Command Start-Sleep -Seconds 60'
+                # Amendment 1: System32-resident powershell.exe sleeper with a
+                # readonly SystemRoot grant (pwsh failed to resolve in run 1);
+                # -TimeoutMs exists at the pin (:543, emitted :602) but the
+                # post-New-Config patch of process.timeout is retained - it is
+                # the shape already proven schema-valid in run 1.
+                $configPath = New-Config -Name 'd03-a3-timeout' -CommandLine 'powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 60' -ReadOnly @('C:\Windows')
                 $a3Json = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
                 $a3Json.process.timeout = 3000
                 $a3Json | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $configPath -Encoding utf8
@@ -835,7 +868,7 @@ try {
             $row = [ordered]@{ scenario = 'a4-cancel'; error = $null; configArtifact = $null; exit = $null; elapsedMs = $null }
             try {
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                $configPath = New-Config -Name 'd03-a4-cancel' -CommandLine "pwsh -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'"
+                $configPath = New-Config -Name 'd03-a4-cancel' -CommandLine "powershell.exe -NoLogo -NoProfile -Command Start-Sleep -Seconds 120; 'WBD-D03-A4-MARKER'" -ReadOnly @('C:\Windows')
                 $row['configArtifact'] = 'd03-config-a4-cancel.json'
                 Copy-Item -LiteralPath $configPath -Destination (Join-Path $ResultsDir 'd03-config-a4-cancel.json') -Force
                 $proc = Start-Process -FilePath $wxcExec -ArgumentList "`"$configPath`"" -PassThru
@@ -956,14 +989,16 @@ try {
             # shows which of the spec's two outcomes occurs:
             # (a) refused (nonzero, no marker) or (b) demoted-and-run.
             $c1Marker = Join-Path $markerDir 'c1-ran.txt'
-            $configPath = New-Config -Name 'd03-c1-enumerate' -CommandLine "cmd /d /s /c echo C1-WORKLOAD-RAN > `"$c1Marker`"" -ReadWrite @($markerDir)
-            $c1Json = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
-            # Hand-author the enumeratePaths key (upstream New-Config does
-            # not expose it): added under filesystem; key name verified
-            # against the pinned schema - recorded in the baseline notes.
-            $c1Json.filesystem | Add-Member -NotePropertyName enumeratePaths -NotePropertyValue @('C:\Windows') -Force
+            # Amendment 1: enumeratePaths is a NESTED schema key
+            # (processContainer.filesystem.enumeratePaths, stable.rs:310-315);
+            # upstream New-Config exposes it directly via -EnumeratePaths
+            # (WinProcessContainer.Common.ps1:572, emitted :666-668). Run 1's
+            # top-level hand-authored key was schema-rejected (recorded);
+            # this form reaches the EnumeratePathsUnsupported adjudication
+            # (fallback_detector.rs:238-241, raised :301).
             $c1ConfigArtifact = Join-Path $ResultsDir 'd03-config-c1-enumerate.json'
-            $c1Json | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $c1ConfigArtifact -Encoding utf8
+            $configPath = New-Config -Name 'd03-c1-enumerate' -CommandLine "cmd /d /s /c echo C1-WORKLOAD-RAN > `"$c1Marker`"" -ReadWrite @($markerDir) -EnumeratePaths @('C:\Windows')
+            Copy-Item -LiteralPath $configPath -Destination $c1ConfigArtifact -Force
 
             # probe the hand-authored request (verbatim artifact)
             $r = Invoke-Guarded -TimeoutSec 120 -ArgumentList @($wxcExec, $c1ConfigArtifact) -ScriptBlock {
@@ -1057,12 +1092,12 @@ Implementation notes (binding):
 - The `summary.ran` gate uses OR (a run where only Section A succeeded still fetched its evidence); each section's own `ran`/`blocker` records the truth. `errorCount` counts per-row `error` fields.
 - `Invoke-Guarded` passes job arguments via `Start-Job -ArgumentList` (the D-02 pattern) and turns a thrown child error into recorded evidence (`job error: …`, exit -1) so the scenario artifact is still written — a lost scenario is never acceptable.
 - a4-cancel is the single documented exception to the hang-guard rule: the scenario needs the executor PID in the parent to Stop-Process it; every wait is bounded (`WaitForExit(15000)` + fixed sleeps). The Section B cargo build is guarded at 1800s (feature-fingerprint rebuild of ~155k upstream lines) — a wedged build becomes a recorded blocker, never a lost run.
-- a3's config patches `process.timeout` after New-Config instead of passing a timeout parameter: the observed upstream `New-Config` usage (probes.ps1:367-374) never passes one, and the mock's stub helper cannot catch that drift. Every parameter the capture script does pass (`-Name`, `-CommandLine`, `-ReadWrite`) is directly observed in the D-02 usage. Task 8 Step 6 re-verifies both hand-touched keys against the pinned schema.
+- a3's config patches `process.timeout` after New-Config: the post-patch is retained because it is the shape proven schema-valid in run 1 (upstream `-TimeoutMs` verified at the pin, `WinProcessContainer.Common.ps1:543` emitted `:602` — Task 8 Step 6). Parameters the capture script passes (`-Name`, `-CommandLine`, `-ReadWrite`, `-ReadOnly`, `-EnumeratePaths`) are all verified upstream (`:537-:572`).
 - The C1 config's `enumeratePaths` value `C:\Windows` is deliberately a directory the marker-writing workload never touches — the enumerate grant itself is unexercised; only the *adjudication* of the key is under test.
-- The C1 hand-authored key: `Add-Member -NotePropertyName` on a `ConvertFrom-Json` object then re-serialize. If the pinned schema expects a different shape for `filesystem.enumeratePaths`, that surfaces as the probe/launch error text in the artifacts — recorded verbatim either way (evidence, not capture error).
+- The C1 key is emitted by upstream `New-Config -EnumeratePaths` as the nested `processContainer.filesystem.enumeratePaths` (verified at the pin; run 1's top-level hand-authored key was schema-rejected — recorded verbatim in the run-1 artifacts). Any schema mismatch surfaces as the probe/launch error text — recorded verbatim either way (evidence, not capture error).
 - Baseline gets `Depth 7` (summary rows nest one deeper than D-02's 6).
 
-- [ ] **Step 2: Parser check**
+- [x] **Step 2: Parser check**
 
 Run:
 ```powershell
@@ -1076,7 +1111,7 @@ Expected: `parse OK`
 
 Before burning a capture-lane run on a compile error, `cargo check` the spike against the real `src/mxc-sdk` at the pin. This is a host-side **compile-only** check (temp dir + cargo cache; nothing is executed, no host mutation beyond `%LOCALAPPDATA%\Temp\opencode`):
 
-- [ ] **Step 1: Fetch the pin into temp** (scratch, not committed):
+- [x] **Step 1: Fetch the pin into temp** (scratch, not committed):
 
 ```powershell
 $pinRoot = Join-Path $env:LOCALAPPDATA 'Temp\opencode\mxc-pincheck'
@@ -1087,7 +1122,7 @@ git -C $pinRoot fetch --depth 1 origin 5d7a475a9fd5626bafb55c2c857989d2e5621245
 git -C $pinRoot checkout FETCH_HEAD
 ```
 
-- [ ] **Step 2: Materialize + check**
+- [x] **Step 2: Materialize + check**
 
 ```powershell
 $spike = 'C:\Users\marku\tools\sandbox\tests\vm\spikes\wbd-d03-sdk-spike'
@@ -1098,7 +1133,7 @@ cargo check --manifest-path (Join-Path $spike 'Cargo.toml')
 
 Expected: exit 0, **zero warnings** (AGENTS.md acceptance bar). If rustc < 1.93 (mxc's pinned toolchain) or a network fetch fails, record the reason and skip — the in-VM build (warm cache, correct toolchain) remains authoritative; note the skip in the Task 5 commit message. Fix any API mismatches this surfaces in `src/main.rs` (the documented API above is the source of truth; do not invent replacements for anything that fails to compile — adjust to the real signature and record drift in the commit message).
 
-- [ ] **Step 3: Clean the temp checkout**
+- [x] **Step 3: Clean the temp checkout**
 
 ```powershell
 Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'Temp\opencode\mxc-pincheck')
@@ -1109,18 +1144,18 @@ Remove-Item -Recurse -Force (Join-Path $spike 'target') -ErrorAction SilentlyCon
 
 ### Task 5: Run the mock — expect PASS — commit (PR1 code batch)
 
-- [ ] **Step 1: Run the mock**
+- [x] **Step 1: Run the mock**
 
 Run: `pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\Users\marku\AppData\Local\Temp\opencode\wbd-mock-d03\run-mock.ps1"`
 Expected: `MOCK PASSED (d03d04 scenarios A+B+C; …)` — Section A completes with fake executor semantics, the stub SDK build succeeds and all 8 scenario JSONs appear, C rows present, baseline + summary + manifest complete; B exits 3; C records the sdk blocker and still completes.
 
-- [ ] **Step 2: Fix everything the mock catches, re-run to green** (the mock's job is plumbing drift — e.g. wrong artifact names, row-shape raggedness, blocker paths).
+- [x] **Step 2: Fix everything the mock catches, re-run to green** (the mock's job is plumbing drift — e.g. wrong artifact names, row-shape raggedness, blocker paths).
 
-- [ ] **Step 3: Clean up the mock root**
+- [x] **Step 3: Clean up the mock root**
 
 Run: `Remove-Item -Path (Join-Path $env:TEMP 'opencode\wbd-mock-d03*'), (Join-Path $env:TEMP 'mxc-sbx-d03-spike') -Recurse -Force -ErrorAction SilentlyContinue` (`-Path`, not `-LiteralPath` — the wildcard must expand; the second path is the capture script's scratch root created by the mock runs).
 
-- [ ] **Step 4: Commit** (spike crate + capture script only — the mock is temp scratch):
+- [x] **Step 4: Commit** (spike crate + capture script only — the mock is temp scratch):
 
 ```powershell
 git add tests/vm/wbd-d03-d04-spike.ps1 tests/vm/spikes/wbd-d03-sdk-spike
@@ -1131,7 +1166,7 @@ git commit -m "test(vm): WBD D-03/D-04 spike lane - wxc-exec subprocess lifecycl
 
 ### Task 6: In-VM capture run (USER-DRIVEN, elevated pwsh)
 
-- [ ] **Step 1: Run the capture lane** (maintainer, from `C:\Users\marku\tools\sandbox`):
+- [x] **Step 1: Run the capture lane** (maintainer, from `C:\Users\marku\tools\sandbox`):
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Invoke-TestsInVM.ps1 -Image sbx-base-b -TestCmd "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\sbx-repo\tests\vm\wbd-d03-d04-spike.ps1"
@@ -1139,7 +1174,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Invoke-TestsInVM.ps1 -Ima
 
 Expected: `VM HARNESS: PASS`, `WBD SPIKE CAPTURE: DONE`. Flat artifact set (~31 files): `d03d04-baseline.json`, 8 `d03-config-*.json`, 7 `d03-wxc-*.json`, `d03-sdk-build.log`, `d03-sdk-cargo.toml`, 8 `d03-sdk-*.json`, `d03-c1-probe.json`, `d03-c1-launch.json`, `d03-c2-env-immunity.json`, `d03d04-spike.json`, `capture-manifest.json`.
 
-- [ ] **Step 2: Paste the run summary back** to the assistant (harness tail + `wxc: ran=… | sdk: ran=… | c: ran=…` line).
+- [x] **Step 2: Paste the run summary back** to the assistant (harness tail + `wxc: ran=… | sdk: ran=… | c: ran=…` line).
 
 ---
 
@@ -1148,11 +1183,11 @@ Expected: `VM HARNESS: PASS`, `WBD SPIKE CAPTURE: DONE`. Flat artifact set (~31 
 **Files:**
 - Read: `tests/vm/results/<new-runid>/` — all artifacts listed above
 
-- [ ] **Step 1: Provenance** — `pinMatches: true`, wxc-exec SHA256 matches `3FD125498803970B3FC7E63FC36307DD7A3186318FA02B83034F141731006DAC`, spike-bin SHA256 present; every artifact hash-verified against `capture-manifest.json` (the `testcmd.log` prefix caveat from D-02 is structural and expected).
-- [ ] **Step 2: Section A verdicts** — exit codes (0 vs 7 as workload outcomes), stdio markers captured on the right streams, stdin round-trip, timeout elapsed ≈ 3s not 60s, a4: `wasAliveAtKill: true` + no workload-process survivors (tree torn down).
-- [ ] **Step 3: Section B verdicts** — all 8 scenario JSONs parse; probe reproduces the D-01/D-02 boolean surface; run-exit outcomes `Exited(0)`/`Exited(7)`; timeout outcome `TimedOut`; cancel waits cleanly; force-tier `honored: true` (the feature compiled the seam) with tier string `appcontainer-dacl`; tier-query lists `processcontainer` at `base-container`.
-- [ ] **Step 4: Section C verdicts** — c1: probe error `EnumeratePathsUnsupported` expected; launch outcome = whichever of `refused-before-exec` / `demoted-and-ran` the artifact shows (both are valid evidence; the spec branches on it); c2: `tierStillBaseContainer: true`.
-- [ ] **Step 5: Record any deviation verbatim** — every anomaly is a finding for the ADRs, never something to re-run away.
+- [x] **Step 1: Provenance** — `pinMatches: true`, wxc-exec SHA256 matches `3FD125498803970B3FC7E63FC36307DD7A3186318FA02B83034F141731006DAC`, spike-bin SHA256 present; every artifact hash-verified against `capture-manifest.json` (the `testcmd.log` prefix caveat from D-02 is structural and expected).
+- [x] **Step 2: Section A verdicts** — exit codes (0 vs 7 as workload outcomes), stdio markers captured on the right streams, stdin round-trip, timeout elapsed ≈ 3s not 60s, a4: `wasAliveAtKill: true` + no workload-process survivors (tree torn down).
+- [x] **Step 3: Section B verdicts** — all 8 scenario JSONs parse; probe reproduces the D-01/D-02 boolean surface; run-exit outcomes `Exited(0)`/`Exited(7)`; timeout outcome `TimedOut`; cancel waits cleanly; force-tier `honored: true` (the feature compiled the seam) with tier string `appcontainer-dacl`; tier-query lists `processcontainer` at `base-container`.
+- [x] **Step 4: Section C verdicts** — c1: probe error `EnumeratePathsUnsupported` expected; launch outcome = whichever of `refused-before-exec` / `demoted-and-ran` the artifact shows (both are valid evidence; the spec branches on it); c2: `tierStillBaseContainer: true`.
+- [x] **Step 5: Record any deviation verbatim** — every anomaly is a finding for the ADRs, never something to re-run away.
 
 ---
 
@@ -1160,13 +1195,13 @@ Expected: `VM HARNESS: PASS`, `WBD SPIKE CAPTURE: DONE`. Flat artifact set (~31 
 
 Targeted `raw.githubusercontent.com` fetches at `5d7a475a9fd5626bafb55c2c857989d2e5621245` (the evidence the ADRs cite; several facts are already verified this session — re-cite, don't re-derive):
 
-- [ ] **Step 1: C4 staging point** — `src/mxc-sdk/src/backends/process_container/common/base_container_runner.rs` (145 KB): locate the workload creation sequence — `CREATE_SUSPENDED` / `ResumeThread` / PSEC environment attach order / any created-not-running window. Also check `appcontainer_runner.rs` (`spawn_suspended`/`resume` at e7940f7 per `mxc-source-analysis.md` §2.4 — re-verify at the pin). Verdict recorded either way; **if no surface exposes created-not-running, this is the binding blocker**: ADR-0002 §3 records it, ADR-0003 restates the stop-work consequence.
-- [ ] **Step 2: wxc-exec CLI surface** — `src/tools/wxc/src/` (list + main): the full flag surface of the shipped executor (no require-tier flag expected; confirm `--experimental` handling); exact line refs for the ADR's subprocess row.
-- [ ] **Step 3: FFI exports** — `src/ffi/` listing + the C ABI module it wraps (`mxc_sdk::__ffi` in `src/mxc-sdk/src/lib.rs`, already fetched): language targets, stability labels ("not SDK authoring APIs"), consumers (Node/.NET SDKs).
-- [ ] **Step 4: Job Object controls** — `common/job_object.rs` (29 KB): which resource controls the base-container tier applies (UI limits confirmed in D-02 §4.2; memory/process-count/die-on-close flags feed the D-03 "Job Object resource controls" investigation item).
-- [ ] **Step 5: Dispatcher launch order + attestation surfaces** — `common/dispatcher.rs` (64 KB): where `choose_backend_tier` is called relative to process creation, what the dispatcher can attest post-launch, generation/correlation identifiers (also `sandbox_tracking.rs`), and the `EnforcementDegraded` audit emission (already seen in `fallback_detector.rs`).
-- [ ] **Step 6: C1/A3 schema-key confirmation** — the pinned `docs/schema.md` / `schemas/stable` entries for `filesystem.enumeratePaths` (the C1 hand-added key) and `process.timeout` (the a3 patched key), plus the upstream `New-Config` helper's actual parameter surface in `tests/scripts/lib/WinProcessContainer.Common.ps1` (confirm the capture script only passes observed parameters) — confirm or record the drift.
-- [ ] **Step 7: Assemble the line-ref tables** into the raw material for both ADRs (every ADR claim gets a `file:line` at the pin or a fetched artifact name).
+- [x] **Step 1: C4 staging point** — `src/mxc-sdk/src/backends/process_container/common/base_container_runner.rs` (145 KB): locate the workload creation sequence — `CREATE_SUSPENDED` / `ResumeThread` / PSEC environment attach order / any created-not-running window. Also check `appcontainer_runner.rs` (`spawn_suspended`/`resume` at e7940f7 per `mxc-source-analysis.md` §2.4 — re-verify at the pin). Verdict recorded either way; **if no surface exposes created-not-running, this is the binding blocker**: ADR-0002 §3 records it, ADR-0003 restates the stop-work consequence.
+- [x] **Step 2: wxc-exec CLI surface** — `src/tools/wxc/src/` (list + main): the full flag surface of the shipped executor (no require-tier flag expected; confirm `--experimental` handling); exact line refs for the ADR's subprocess row.
+- [x] **Step 3: FFI exports** — `src/ffi/` listing + the C ABI module it wraps (`mxc_sdk::__ffi` in `src/mxc-sdk/src/lib.rs`, already fetched): language targets, stability labels ("not SDK authoring APIs"), consumers (Node/.NET SDKs).
+- [x] **Step 4: Job Object controls** — `common/job_object.rs` (29 KB): which resource controls the base-container tier applies (UI limits confirmed in D-02 §4.2; memory/process-count/die-on-close flags feed the D-03 "Job Object resource controls" investigation item).
+- [x] **Step 5: Dispatcher launch order + attestation surfaces** — `common/dispatcher.rs` (64 KB): where `choose_backend_tier` is called relative to process creation, what the dispatcher can attest post-launch, generation/correlation identifiers (also `sandbox_tracking.rs`), and the `EnforcementDegraded` audit emission (already seen in `fallback_detector.rs`).
+- [x] **Step 6: C1/A3 schema-key confirmation** — the pinned `docs/schema.md` / `schemas/stable` entries for `filesystem.enumeratePaths` (the C1 hand-added key) and `process.timeout` (the a3 patched key), plus the upstream `New-Config` helper's actual parameter surface in `tests/scripts/lib/WinProcessContainer.Common.ps1` (confirm the capture script only passes observed parameters) — confirm or record the drift.
+- [x] **Step 7: Assemble the line-ref tables** into the raw material for both ADRs (every ADR claim gets a `file:line` at the pin or a fetched artifact name).
 
 ---
 
@@ -1208,7 +1243,7 @@ git commit -m "docs(adr): 0003 - WBD D-04 BaseContainer-only enforcement decisio
 ### Verification summary (whole plan)
 
 - Mock: scenarios A+B+C pass; parser clean; `cargo check` against the real pinned crate clean (or the skip reason recorded); zero warnings on everything committed.
-- In-VM: one capture-lane run, `VM HARNESS: PASS`, ~31 flat artifacts manifest-hashed, all three sections' `ran`/`blocker` state recorded.
+- In-VM: canonical capture-lane run (`VM HARNESS: PASS`, ~31 flat artifacts manifest-hashed, all three sections' `ran`/`blocker` state recorded) plus the Amendment-1 supplementary run discharging the timeout/cancel/stdin axes; both runs' artifacts manifest-hashed.
 - ADRs: every claim cites a fetched artifact or a `file:line` at the pin; both tickets' acceptance criteria each mapped to evidence or a recorded blocker; the created-not-running/pre-resume outcome stated with its binding stop-work consequence if blocked.
 - Both PR batches respect the one-ticket-per-PR gate: PR1 = D-03 (Tasks 1–9), PR2 = D-04 (Task 10), PR1 mergeable standalone.
 
