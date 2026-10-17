@@ -63,9 +63,9 @@ Manual verification (elevated shell, loopback exemption registered):
 | 3.7 sandbox learned CLI | [x] | impl | pass | pass | cb9b0da | 21 tests: 7 parse + list/revoke/clear behavior incl. corrupt-file clear recovery [G-5]; post-review controller trim fix (path builder now trims like the validator). |
 | 3.8 Integration tests | [x] | impl | pass | pass | 15a588c | 10 scenarios registered (S-72/75/76/77/79/80/82/83/84 automated, S-78 manual skip; S-81 reserved). Elevated pass 7/7 network; non-elevated suite 51 pass/6 fail (A/B-proven pre-existing at HEAD)/27 skip. Execution-found fixes: S-77 AppContainer cwd (absolute -BodyPath), harness pipe deadlock (async reads in 5 helpers). |
 
-**CHECKPOINT 3** — STOP for user approval
+**CHECKPOINT 3** — ✅ APPROVED by user 2026-10-17 (all 7 items passed)
 
-> 2026-10-17: item 1 verified by user in an elevated PS against the worktree build (74f0fa1): dialog appeared, "Deny once" → curl 403. Items 2-7 pending user run. Note for future runs: the MAIN checkout's `sandbox.exe` (C:\Users\marku\tools\sandbox\target\release) predates ADR-0001 and still downgrades --allow-domain to --block-net; checkpoint commands must use the worktree binary at .worktrees/adr-0001-network/sandbox/sandbox/target/release/sandbox.exe, elevated (AppContainer loopback exemption is admin-only).
+> 2026-10-17: **CHECKPOINT 3 APPROVED** — all 7 items verified by the user in an elevated PS against the worktree build: (1) dialog appears, "Deny once" → 403; (2) intent POST → dialog shows `Agent reason: "fetching releases"`; (3) "Allow permanently (*.github.com)" → success, restart → learned allow with no dialog; (4) `sandbox learned list` → `github.com`/suffix (the amended wording), revoke works, list empty; (5) `--no-prompt` → silent deny; (6) audit sources present (`prompt`, `hard-deny`, plus `learned`/`allowlist`/`default` across sessions); (7) nine concurrent hosts → 8 dialogs + 1 immediate `prompt_overload` deny. Phase 4 (D-2) may proceed. Operational note: checkpoint runs must use the worktree binary at .worktrees/adr-0001-network/sandbox/sandbox/target/release/sandbox.exe, elevated (AppContainer loopback exemption is admin-only) — the MAIN checkout's sandbox.exe predates ADR-0001 and still downgrades --allow-domain to --block-net.
 
 ## Phase 4: D-2 — Upstream corporate proxy chaining
 
