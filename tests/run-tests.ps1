@@ -173,8 +173,8 @@ function Get-Curl { $c = Get-Command curl.exe -ErrorAction SilentlyContinue; if 
 # listening and reachable from the supervisor process.
 #
 # This probe runs a sandboxed curl through the proxy (HTTP_PROXY env path) to
-# a host that is NOT on the allow-list, so the proxy returns 403 quickly. If
-# curl gets any response (even 000/403) within the timeout, loopback works.
+# a host that is NOT on the allow-list, so the proxy refuses quickly. If
+# curl gets any response (even 000/400) within the timeout, loopback works.
 # If curl times out (exit 28), loopback is blocked. The result is cached so
 # the US-3 network scenarios skip cleanly (rather than fail the whole suite)
 # when the host has not enabled AppContainer loopback.
@@ -186,8 +186,9 @@ function Test-LoopbackProxyReachable {
     $d = New-ScenarioDir 9999
     # Clear NO_PROXY so curl does not bypass the proxy for loopback. The target
     # host (denied.invalid) is not in NO_PROXY, so curl routes through the
-    # proxy regardless. Use HTTP (not HTTPS) so the proxy sees a plain request
-    # and denies fast (no CONNECT round-trip).
+    # proxy regardless. Use HTTP (not HTTPS) so the proxy sees a plain
+    # request and refuses it fast with a 400 (no CONNECT round-trip; plain
+    # HTTP forwarding is refused per D-4).
     $oldNoProxy = $env:NO_PROXY
     $env:NO_PROXY = ''
     try {

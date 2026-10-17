@@ -48,7 +48,11 @@ fn main() {
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { action } => profile_cmd(action),
-        Cmd::Setup { check_only, grant_drive_root, enable_loopback } => {
+        Cmd::Setup {
+            check_only,
+            grant_drive_root,
+            enable_loopback,
+        } => {
             if let Err(e) = setup::check(check_only, grant_drive_root, enable_loopback) {
                 eprintln!("[sandbox] setup check failed: {e:#}");
                 std::process::exit(1);
@@ -306,7 +310,9 @@ fn run_inner(
     {
         eprintln!("[sandbox] warning: loopback exemption failed: {e}");
         eprintln!("[sandbox]          Re-run 'sandbox run' as administrator (loopback is");
-        eprintln!("[sandbox]          registered automatically when elevated), or use --block-net.");
+        eprintln!(
+            "[sandbox]          registered automatically when elevated), or use --block-net."
+        );
     }
 
     // Start the proxy (if not blocked) and hold the handle until the child
@@ -318,14 +324,50 @@ fn run_inner(
             proxy_env = None;
             None
         }
-        net::NetworkConfig::Allow { allow_domain, deny_domain, .. } => {
+        net::NetworkConfig::Allow {
+            allow_domain,
+            deny_domain,
+            prompt_enabled,
+            on_unavailable,
+            prompt_timeout_secs,
+            profile_name,
+            ..
+        } => {
             let token = net::token::gen_token().context("generate session token")?;
+            // Task 3.6 Step 5: load the learned policy BEFORE starting the
+            // proxy. A corrupt learned file is a hard error by design — the
+            // user notices immediately and can fix or revoke it ([G-5]).
+            let learned = net::learned::LearnedStore::load(profile_name.as_deref())
+                .context("load learned policy file")?;
+            // D-4 registry + D-3.5 coordinator: created in the supervisor
+            // (all sync) before the proxy runtime exists and Arc-shared
+            // into every handler. The registry's `Drop` joins its sweeper
+            // once the last reference is gone.
+            let intent =
+                std::sync::Arc::new(net::intent::IntentRegistry::new(net::intent::DEFAULT_TTL));
+            let coordinator = std::sync::Arc::new(net::prompt::PromptCoordinator::new());
+            let on_unavailable = if on_unavailable == "allow" {
+                net::prompt::PromptPolicy::Allow
+            } else {
+                net::prompt::PromptPolicy::Deny
+            };
+            let prompt = net::proxy::PromptGate {
+                enabled: *prompt_enabled,
+                config: net::prompt::PromptConfig {
+                    timeout: std::time::Duration::from_secs(u64::from(*prompt_timeout_secs)),
+                    on_unavailable,
+                },
+                coordinator,
+                intent,
+                learned: std::sync::Arc::new(std::sync::Mutex::new(learned)),
+            };
             let handle = net::proxy::spawn(net::proxy::ProxyConfig {
                 session_id: sid.clone(),
                 token: token.clone(),
                 allow_domain: allow_domain.clone(),
                 deny_domain: deny_domain.clone(),
                 writer: audit_writer.clone(),
+                prompt,
             })
             .context("start localhost proxy")?;
             proxy_env = Some(net::ProxyEnv {
@@ -349,8 +391,15 @@ fn run_inner(
 
     let job = sandbox::Job::create().context("create Job Object")?;
 
-    let exit_code = sandbox::spawn(&session, &job, &cwd, env_block, &cmdline, !net_cfg.is_blocked())
-        .context("spawn sandboxed process")?;
+    let exit_code = sandbox::spawn(
+        &session,
+        &job,
+        &cwd,
+        env_block,
+        &cmdline,
+        !net_cfg.is_blocked(),
+    )
+    .context("spawn sandboxed process")?;
 
     // US-4a: commit the audit root + signature on clean child exit.
     //
