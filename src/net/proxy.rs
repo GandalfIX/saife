@@ -45,6 +45,7 @@ use crate::net::matcher::{self, DenyReason, Verdict};
 use crate::net::prompt::{
     PromptConfig, PromptCoordinator, PromptOutcome, PromptPolicy, PromptResult, is_loopback_host,
 };
+use crate::net::upstream::{UpstreamDialer, UpstreamError};
 
 /// The complete set of valid `source` values for a CONNECT audit event
 /// (D-5 taxonomy). Kept as a const so future validation logic and tests
@@ -72,6 +73,10 @@ pub struct ProxyConfig {
     /// allow-list ([G-32, G-33]). Wired in D-3.2; the full prompt/learned-deny
     /// pipeline lands in D-3.6.
     pub deny_domain: Vec<String>,
+    /// Upstream chaining dialer ([G-10, G-22]). `None` = direct dial
+    /// only. Parsed once by the supervisor at startup and shared by
+    /// every handler through the `Arc`.
+    pub upstream: Option<Arc<UpstreamDialer>>,
     pub writer: Arc<AuditWriter>,
     /// Prompt/intent/learned wiring (Task 3.6). Built by the supervisor
     /// before `spawn`; see [`PromptGate`].
@@ -109,6 +114,7 @@ struct ConnCtx {
     deny: Vec<String>,
     allow: Vec<String>,
     writer: Arc<AuditWriter>,
+    upstream: Option<Arc<UpstreamDialer>>,
     prompt: PromptGate,
 }
 
@@ -202,6 +208,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         allow_domain,
         deny_domain,
         writer,
+        upstream,
         prompt,
     } = cfg;
     let ctx = Arc::new(ConnCtx {
@@ -209,6 +216,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         deny: deny_domain,
         allow: allow_domain,
         writer,
+        upstream,
         prompt,
     });
 
@@ -794,6 +802,127 @@ fn parse_connect_target(target: &str) -> (String, u16) {
     (h.to_string(), p.parse().unwrap_or(443))
 }
 
+// =====================================================================
+// Task 4.2 — upstream chaining in the dial path ([G-22, G-30, G-49])
+// =====================================================================
+
+/// Why the post-admission dial produced no tunnel.
+enum DialFailure {
+    /// Direct path: the pinned answer was empty, resolution failed, or a
+    /// pinned address is hard-denied — a fail-closed denial ([G-12]).
+    Denied(Decision),
+    /// Direct path: no connection could be made. Unchanged 3.6 behaviour —
+    /// a bare `502` and no extra audit leaf.
+    Direct(io::Error),
+    /// Upstream chaining failed ([G-30]): `endpoint` and `body` name the
+    /// proxy as `host:port` only, `error` carries the path-neutral reason.
+    Upstream {
+        endpoint: String,
+        body: String,
+        error: UpstreamError,
+    },
+}
+
+/// Resolve (or deliberately not) and dial the admitted CONNECT target.
+///
+/// Chained (`upstream.is_some() && chains_host(host)`): hostname-only
+/// admission — no [`resolve_pinned`], no DNS-failure denial, no pinned-IP
+/// hard-deny ([G-22]). The upstream proxy resolves the name itself, and a
+/// local answer could disagree with what it sees. The hostname-set and
+/// IP-literal hard-denies already ran in [`decide`] before admission and need
+/// no DNS, so they still apply here.
+///
+/// Direct: pin once ([G-12]), hard-deny the pinned set, then race the addresses
+/// with Happy Eyeballs ([G-49] keeps that path intact).
+async fn dial_upstream(
+    upstream: Option<&UpstreamDialer>,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, DialFailure> {
+    // One normalization, used by every branch below. `parse_connect_target`
+    // keeps an IPv6 literal's brackets, but `chains_host`/`host_matches_no_proxy`
+    // compare bare names and `host_port` re-brackets for the CONNECT line — so
+    // a decision taken on the bracketed form would disagree with the dial's own
+    // `NO_PROXY` re-check (bypass missed here, taken there: direct dial with no
+    // pinned addresses, reported as an unreachable proxy).
+    let host = strip_host_brackets(host.trim());
+
+    if let Some(dialer) = upstream.filter(|u| u.chains_host(host)) {
+        // The pinned list is empty on purpose: under chaining it is never
+        // consulted ([G-22]).
+        return dialer
+            .dial(host, port, &[])
+            .await
+            .map_err(|error| DialFailure::Upstream {
+                endpoint: dialer.proxy_endpoint(),
+                body: upstream_error_body(host, port, &dialer.proxy_endpoint(), &error),
+                error,
+            });
+    }
+
+    let addrs = match resolve_pinned(host, port).await {
+        Ok(a) if a.is_empty() => {
+            return Err(DialFailure::Denied(Decision::dns_failure(
+                "DNS resolution returned no addresses",
+            )));
+        }
+        Ok(a) => a,
+        Err(e) => {
+            return Err(DialFailure::Denied(Decision::dns_failure(&format!(
+                "DNS resolution failed: {e}"
+            ))));
+        }
+    };
+    // The pinned IP set gets the hard-deny check too: a hostname that resolves
+    // into a hard-denied range is refused before any dial (fail-closed
+    // [G-12, G-45]).
+    if addrs.iter().any(|sa| matcher::is_hard_denied_ip(sa.ip())) {
+        return Err(DialFailure::Denied(denied_by(DenyReason::DeniedCidr)));
+    }
+
+    happy_eyeballs_dial(addrs)
+        .await
+        .map_err(DialFailure::Direct)
+}
+
+/// The [G-30] `502` body: target, the proxy as `host:port`, and the
+/// path-neutral `Display` reason. Never the proxy URL, its userinfo, or the
+/// `Proxy-Authorization` value.
+fn upstream_error_body(host: &str, port: u16, endpoint: &str, error: &UpstreamError) -> String {
+    format!(
+        "sandbox: CONNECT to {host}:{port} could not be established through the upstream \
+         proxy {endpoint} ({error}).\n\
+         Remediation: check that the upstream proxy is reachable and that \
+         network.upstreamProxy / HTTPS_PROXY is correct, or add the host to \
+         NO_PROXY to dial it directly.\n"
+    )
+}
+
+/// The `upstream_error` audit leaf. A transport failure is not a policy
+/// answer, but it rides the existing `default` source and a free-form
+/// `reason`, so the D-5 taxonomy needs no new value (plan 4.2 Step 3).
+fn upstream_error_decision() -> Decision {
+    Decision {
+        allowed: false,
+        source: "default",
+        scope: None,
+        persisted: false,
+        reason: Some("upstream_error".into()),
+        intent_hint: false,
+    }
+}
+
+/// Write the [G-30] `502`: `X-Sandbox: upstream-error` plus the redacted body.
+async fn respond_upstream_error(sock: &mut TcpStream, body: &str) {
+    write_response(
+        sock,
+        "502 Bad Gateway",
+        "X-Sandbox: upstream-error\r\nConnection: close\r\n",
+        body,
+    )
+    .await;
+}
+
 /// Handle one client connection: token gate, then either the CONNECT
 /// pipeline (D-1) or the /sandbox/* routing (D-4).
 async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
@@ -873,41 +1002,35 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     }
     emit_decision(&ctx.writer, &host, port, &decision);
 
-    // Admission done — DNS-pin and dial (Step 2). A resolution failure
-    // or an empty answer is a fail-closed denial [G-12].
-    let addrs = match resolve_pinned(&host, port).await {
-        Ok(a) if a.is_empty() => {
-            let d = Decision::dns_failure("DNS resolution returned no addresses");
-            emit_decision(&ctx.writer, &host, port, &d);
-            respond_deny(&mut sock, &host, port, &d).await?;
-            return Ok(());
-        }
-        Ok(a) => a,
-        Err(e) => {
-            let d = Decision::dns_failure(&format!("DNS resolution failed: {e}"));
-            emit_decision(&ctx.writer, &host, port, &d);
-            respond_deny(&mut sock, &host, port, &d).await?;
-            return Ok(());
-        }
-    };
-    // The pinned IP set gets the hard-deny check too: a hostname that
-    // resolves into a hard-denied range is refused before any dial
-    // (fail-closed [G-12, G-45]).
-    if addrs.iter().any(|sa| matcher::is_hard_denied_ip(sa.ip())) {
-        let d = denied_by(DenyReason::DeniedCidr);
-        emit_decision(&ctx.writer, &host, port, &d);
-        respond_deny(&mut sock, &host, port, &d).await?;
-        return Ok(());
-    }
-
-    // Happy Eyeballs: race the pinned addresses, first connection wins.
-    let upstream = match happy_eyeballs_dial(addrs).await {
+    // Admission done — dial (Step 2): chained through the upstream
+    // proxy, or DNS-pinned + Happy Eyeballs on the direct path.
+    let upstream_stream = match dial_upstream(ctx.upstream.as_deref(), &host, port).await {
         Ok(s) => s,
-        Err(e) => {
+        Err(DialFailure::Denied(d)) => {
+            emit_decision(&ctx.writer, &host, port, &d);
+            respond_deny(&mut sock, &host, port, &d).await?;
+            return Ok(());
+        }
+        Err(DialFailure::Direct(e)) => {
             let _ = sock
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 .await;
-            eprintln!("[proxy] upstream connect to {host}:{port} failed: {e}");
+            eprintln!("[proxy] direct dial to {host}:{port} failed: {e}");
+            return Ok(());
+        }
+        Err(DialFailure::Upstream {
+            endpoint,
+            body,
+            error,
+        }) => {
+            // The admission leaf was already emitted above, so a chained
+            // failure is two leaves: `allow` THEN this `upstream_error`. That
+            // differs from the direct 502 path, which emits only the
+            // admission leaf — consumers must not assume the pair is
+            // universal.
+            eprintln!("[proxy] upstream chaining to {host}:{port} via {endpoint} failed: {error}");
+            emit_decision(&ctx.writer, &host, port, &upstream_error_decision());
+            respond_upstream_error(&mut sock, &body).await;
             return Ok(());
         }
     };
@@ -915,7 +1038,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await;
     let (mut ri, mut wi) = sock.into_split();
-    let (mut ro, mut wo) = upstream.into_split();
+    let (mut ro, mut wo) = upstream_stream.into_split();
     let c2u = tokio::io::copy(&mut ri, &mut wo);
     let u2c = tokio::io::copy(&mut ro, &mut wi);
     let _ = tokio::join!(c2u, u2c);
@@ -1594,6 +1717,7 @@ mod tests {
         enabled: bool,
         timeout: Duration,
         policy: PromptPolicy,
+        upstream: Option<Arc<UpstreamDialer>>,
     ) -> T36 {
         let learned_base = std::env::temp_dir().join(format!(
             "sandbox-t36-{label}-{}-{}",
@@ -1625,6 +1749,7 @@ mod tests {
             token: TEST_TOKEN.to_string(),
             allow_domain: allow.iter().map(|s| s.to_string()).collect(),
             deny_domain: deny.iter().map(|s| s.to_string()).collect(),
+            upstream,
             writer,
             prompt: gate,
         })
@@ -1651,6 +1776,7 @@ mod tests {
             true,
             Duration::from_secs(60),
             PromptPolicy::Deny,
+            None,
         )
     }
 
@@ -2022,6 +2148,7 @@ mod tests {
             true, // prompt_enabled, but timeout 0 → coordinator returns Disabled
             Duration::ZERO,
             PromptPolicy::Deny,
+            None,
         );
         let resp = exchange(t.port, &connect_req("zero-timeout.invalid:443"));
         assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
@@ -2044,6 +2171,7 @@ mod tests {
             false,
             Duration::from_secs(60),
             PromptPolicy::Deny,
+            None,
         );
         let resp = exchange(t.port, &connect_req("noprompt-deny.invalid:443"));
         assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
@@ -2066,6 +2194,7 @@ mod tests {
             false,
             Duration::from_secs(60),
             PromptPolicy::Allow,
+            None,
         );
         let resp = exchange(t.port, &connect_req("noprompt-allow.invalid:443"));
         assert!(
@@ -2403,5 +2532,464 @@ mod tests {
         let resp = exchange(t.port, &get_req("/sandbox/intent/explain"));
         assert!(resp.starts_with("HTTP/1.1 405"), "got: {resp}");
         assert!(resp.contains("Allow: POST"), "got: {resp}");
+    }
+
+    // =================================================================
+    // Task 4.2 — upstream chaining (D-2): [G-10, G-22, G-30, G-49]
+    // =================================================================
+
+    /// Read one HTTP head (through CRLFCRLF) a byte at a time, so no byte
+    /// of a following tunnel is consumed.
+    fn read_head(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut out: Vec<u8> = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match s.read(&mut b) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    out.push(b[0]);
+                    if out.ends_with(b"\r\n\r\n") || out.len() >= 8192 {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A fake upstream proxy: answers each CONNECT head with `status` (200 =
+    /// established + echoing tunnel; anything else = refused CONNECT) and
+    /// records every head it saw. The accept loop is non-blocking behind a
+    /// stop flag so the thread never outlives the test.
+    struct FakeUpstream {
+        port: u16,
+        seen: Arc<StdMutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeUpstream {
+        fn start(status: u16) -> FakeUpstream {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
+            let port = l.local_addr().unwrap().port();
+            l.set_nonblocking(true).unwrap();
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_t = Arc::clone(&seen);
+            let stop_t = Arc::clone(&stop);
+            let join = std::thread::spawn(move || {
+                while !stop_t.load(Ordering::SeqCst) {
+                    let Ok((mut s, _)) = l.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    // Windows hands back an accepted socket in the
+                    // listener's non-blocking mode; the echo loop needs
+                    // blocking reads.
+                    s.set_nonblocking(false).ok();
+                    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                    let head = read_head(&mut s);
+                    if head.is_empty() {
+                        continue;
+                    }
+                    seen_t.lock().unwrap().push(head);
+                    let resp = if status == 200 {
+                        "HTTP/1.1 200 Connection Established\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    if s.write_all(resp.as_bytes()).is_err() || status != 200 {
+                        continue;
+                    }
+                    // Echo the tunnel until the peer closes it.
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if s.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            FakeUpstream {
+                port,
+                seen,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        /// `http://127.0.0.1:<port>` — no credentials.
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        /// The same endpoint with userinfo, for the [G-30] redaction tests.
+        fn cred_url(&self) -> String {
+            format!("http://alice:s3cret@127.0.0.1:{}", self.port)
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeUpstream {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    /// CONNECT through the test proxy; on a 2xx head send `payload` through
+    /// the tunnel and read the echo back. Returns `(head, echo)` — `echo` is
+    /// empty when the proxy did not establish a tunnel.
+    fn tunnel(port: u16, target: &str, payload: &[u8]) -> (String, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect test proxy");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(connect_req(target).as_bytes()).unwrap();
+        let head = read_head(&mut s);
+        if !head.starts_with("HTTP/1.1 2") {
+            return (head, String::new());
+        }
+        s.write_all(payload).unwrap();
+        let mut echo = vec![0u8; payload.len()];
+        s.read_exact(&mut echo).expect("tunnel echo");
+        (head, String::from_utf8_lossy(&echo).into_owned())
+    }
+
+    /// A chaining dialer over `url` with the given `NO_PROXY` entries.
+    fn dialer(url: &str, no_proxy: &[&str]) -> Arc<UpstreamDialer> {
+        Arc::new(
+            UpstreamDialer::from_url(url, no_proxy.iter().map(|s| s.to_string()).collect())
+                .expect("test upstream url parses"),
+        )
+    }
+
+    /// A loopback port nothing listens on: 1 is reserved for tcpmux and never
+    /// bound by the toolchain, so `connect` is refused at once — no
+    /// bind-then-drop TOCTOU window (a race that could hand the port to
+    /// something else between `drop` and the dial).
+    const DEAD_PORT: u16 = 1;
+
+    /// The 3.6 fixture with an optional upstream dialer.
+    fn t42_setup(label: &str, allow: &[&str], upstream: Option<Arc<UpstreamDialer>>) -> T36 {
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        t36_setup_cfg(
+            label,
+            allow,
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            upstream,
+        )
+    }
+
+    // (a) admission → chained CONNECT → the tunnel round-trips.
+    #[test]
+    fn chained_connect_tunnels_through_upstream_proxy() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "chain-ok",
+            &["api.example.com"],
+            Some(dialer(&fake.cred_url(), &[])),
+        );
+        let (head, echo) = tunnel(t.port, "api.example.com:443", b"hello through the tunnel");
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        assert_eq!(echo, "hello through the tunnel");
+
+        let heads = fake.heads();
+        assert_eq!(heads.len(), 1, "exactly one upstream CONNECT");
+        assert!(
+            heads[0].starts_with("CONNECT api.example.com:443 HTTP/1.1"),
+            "request line: {:?}",
+            heads[0]
+        );
+        assert!(
+            heads[0]
+                .to_ascii_lowercase()
+                .contains("host: api.example.com:443"),
+            "Host header: {:?}",
+            heads[0]
+        );
+        // Exact value, not a prefix: the header is `Basic base64(user:pass)`,
+        // and a prefix-only check would still pass if the userinfo were
+        // dropped on the floor.
+        let expected = base64::engine::general_purpose::STANDARD.encode("alice:s3cret");
+        assert!(
+            heads[0].contains(&format!("Proxy-Authorization: Basic {expected}")),
+            "auth header: {:?}",
+            heads[0]
+        );
+        // [G-30] the cleartext userinfo never reaches the wire.
+        assert!(
+            !heads[0].contains("s3cret"),
+            "leaked password: {:?}",
+            heads[0]
+        );
+
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["disposition"], "allow");
+        assert_eq!(ev["source"], "allowlist");
+    }
+
+    // (b) [G-11, G-49] a NO_PROXY match dials direct: the upstream proxy is
+    // never contacted. De-flaked per 3.6: the target is unresolvable here, so
+    // the direct leg normally ends in the fail-closed 403, but a resolver that
+    // hijacks `.invalid` (some captive/ISP resolvers do) turns it into a
+    // direct 502. Both are direct-path outcomes; the security property is
+    // "nothing chained", so neither may look like an upstream failure.
+    #[test]
+    fn no_proxy_match_dials_direct_and_never_contacts_upstream() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "chain-bypass",
+            &["bypass.invalid"],
+            Some(dialer(&fake.url(), &["bypass.invalid"])),
+        );
+        let resp = exchange(t.port, &connect_req("bypass.invalid:443"));
+        assert!(
+            !resp.contains("X-Sandbox: upstream-error"),
+            "a NO_PROXY host must never chain: {resp}"
+        );
+        assert!(
+            fake.heads().is_empty(),
+            "NO_PROXY host must never reach the upstream proxy"
+        );
+        let ev = last_connect_event(&t.sid);
+        if resp.starts_with("HTTP/1.1 403") {
+            // The un-hijacked case: fail-closed DNS denial.
+            assert_eq!(ev["source"], "dns");
+        } else {
+            assert!(
+                resp.starts_with("HTTP/1.1 502"),
+                "direct leg expected (403 dns-deny or 502 dial failure): {resp}"
+            );
+            // The bare 502 adds no leaf, so the admission allow is last.
+            assert_eq!(ev["source"], "allowlist");
+            assert_eq!(ev["disposition"], "allow");
+        }
+    }
+
+    // (c) [G-30] upstream unreachable → 502 + X-Sandbox: upstream-error.
+    #[test]
+    fn upstream_unreachable_returns_502_with_upstream_error_header() {
+        let port = DEAD_PORT;
+        let t = t42_setup(
+            "chain-dead",
+            &["api.example.com"],
+            Some(dialer(
+                &format!("http://alice:s3cret@127.0.0.1:{port}"),
+                &[],
+            )),
+        );
+        let resp = exchange(t.port, &connect_req("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway"), "got: {resp}");
+        assert!(resp.contains("X-Sandbox: upstream-error"), "got: {resp}");
+        assert!(
+            resp.contains(&format!("127.0.0.1:{port}")),
+            "body must name the proxy host:port: {resp}"
+        );
+        for secret in ["alice", "s3cret", "@"] {
+            assert!(!resp.contains(secret), "body leaked {secret:?}: {resp}");
+        }
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["disposition"], "deny");
+        assert_eq!(ev["source"], "default");
+        assert_eq!(ev["reason"], "upstream_error");
+        // Two leaves: the admission `allow` (emitted before the dial) and then
+        // the `upstream_error` denial. The direct 502 path emits only the
+        // admission leaf — chained failures are the two-event shape.
+        let evs = connect_events(&t.sid);
+        assert_eq!(evs.len(), 2, "expected admission + upstream_error: {evs:?}");
+        assert_eq!(evs[0]["disposition"], "allow");
+        assert_eq!(evs[0]["source"], "allowlist");
+    }
+
+    // (d) a non-2xx answer to the chained CONNECT maps to the same 502.
+    #[test]
+    fn upstream_non_200_returns_502_with_upstream_error_header() {
+        let fake = FakeUpstream::start(403);
+        let t = t42_setup(
+            "chain-403",
+            &["api.example.com"],
+            Some(dialer(&fake.cred_url(), &[])),
+        );
+        let resp = exchange(t.port, &connect_req("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway"), "got: {resp}");
+        assert!(resp.contains("X-Sandbox: upstream-error"), "got: {resp}");
+        assert!(
+            resp.contains(&format!("127.0.0.1:{}", fake.port)),
+            "body must name the proxy host:port: {resp}"
+        );
+        assert!(resp.contains("403"), "body should carry the status: {resp}");
+        assert!(!resp.contains("s3cret"), "leaked password: {resp}");
+        assert_eq!(fake.heads().len(), 1);
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["source"], "default");
+        assert_eq!(ev["reason"], "upstream_error");
+    }
+
+    // (e) [G-22] chaining is hostname-only: a name that cannot resolve
+    // locally still tunnels, because the upstream proxy does the DNS.
+    #[test]
+    fn chained_path_skips_local_dns_resolution() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "chain-no-dns",
+            &["*.invalid"],
+            Some(dialer(&fake.url(), &[])),
+        );
+        let (head, echo) = tunnel(t.port, "nx-4-2.invalid:443", b"hostname-only");
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        assert_eq!(echo, "hostname-only");
+        let heads = fake.heads();
+        assert_eq!(heads.len(), 1);
+        assert!(
+            heads[0].starts_with("CONNECT nx-4-2.invalid:443 HTTP/1.1"),
+            "the hostname (not an IP) is what chains: {:?}",
+            heads[0]
+        );
+    }
+
+    // (e') the same hostname with no upstream configured dials directly — the
+    // contrast that proves (e) skipped local DNS. De-flaked like (b): a
+    // resolver that hijacks `.invalid` makes the direct dial succeed, so the
+    // pinned property is "never chained", not a single status code.
+    #[test]
+    fn direct_path_dns_failure_fails_closed() {
+        let t = t42_setup("direct-no-dns", &["*.invalid"], None);
+        let resp = exchange(t.port, &connect_req("nx-4-2.invalid:443"));
+        assert!(
+            !resp.contains("X-Sandbox: upstream-error"),
+            "no upstream is configured, so nothing may chain: {resp}"
+        );
+        match resp.split_whitespace().nth(1) {
+            Some("403") => {
+                assert!(resp.contains("X-Sandbox: denied"), "got: {resp}");
+                assert_eq!(last_connect_event(&t.sid)["source"], "dns");
+            }
+            // Hijacked resolver: the direct leg completed (200) or failed to
+            // connect (502). Neither is a chained request.
+            Some("200") | Some("502") => {}
+            other => panic!("unexpected CONNECT answer {other:?} in: {resp}"),
+        }
+    }
+
+    // (f) [G-22] the hostname hard-deny still runs before chaining.
+    #[test]
+    fn hard_deny_hostname_wins_on_chained_path() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup("chain-hard-deny-name", &[], Some(dialer(&fake.url(), &[])));
+        let resp = exchange(t.port, &connect_req("metadata.google.internal:80"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(fake.heads().is_empty(), "hard-deny must not chain");
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["source"], "hard-deny");
+        assert_eq!(ev["reason"], "denied_dns");
+    }
+
+    // (g) [G-22] the IP-literal hard-deny still runs before chaining.
+    #[test]
+    fn hard_deny_ip_literal_wins_on_chained_path() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup("chain-hard-deny-ip", &[], Some(dialer(&fake.url(), &[])));
+        let resp = exchange(t.port, &connect_req("169.254.169.253:80"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(fake.heads().is_empty(), "hard-deny must not chain");
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["source"], "hard-deny");
+        assert_eq!(ev["reason"], "denied_cidr");
+    }
+
+    // (h) bracketed IPv6 target: `parse_connect_target` keeps the brackets,
+    // the chained dial must strip them (else `host_port` emits `[[::1]]`).
+    #[test]
+    fn chained_bracketed_ipv6_target_is_unbracketed_for_the_dial() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "chain-ipv6",
+            &["[2606:4700::1111]"],
+            Some(dialer(&fake.url(), &[])),
+        );
+        let (head, _echo) = tunnel(t.port, "[2606:4700::1111]:443", b"v6");
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        let heads = fake.heads();
+        assert_eq!(heads.len(), 1);
+        assert!(
+            heads[0].starts_with("CONNECT [2606:4700::1111]:443 HTTP/1.1"),
+            "exactly one bracket pair: {:?}",
+            heads[0]
+        );
+    }
+
+    // (i) [G-11, B1] a conventional *bare* IPv6 `NO_PROXY` entry must bypass
+    // the upstream for a bracketed CONNECT target. `parse_connect_target`
+    // keeps the brackets, so the decision point has to normalize the host
+    // once: otherwise `chains_host` misses, the bypass only fires inside
+    // `UpstreamDialer::dial`'s own re-check, and that call dials the direct
+    // path with no pinned addresses — reporting a proxy that was never
+    // contacted as unreachable (502 + a spurious `upstream_error` leaf).
+    #[test]
+    fn bare_ipv6_no_proxy_entry_bypasses_upstream_for_a_bracketed_target() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "chain-v6-bare-noproxy",
+            &["[::]"],
+            Some(dialer(&fake.url(), &["::"])),
+        );
+        // `::` is the unspecified address: nothing can route to it, so the
+        // direct leg fails at once and the test needs no external network.
+        let resp = exchange(t.port, &connect_req("[::]:443"));
+        assert!(
+            !resp.contains("X-Sandbox: upstream-error"),
+            "the NO_PROXY bypass must win before any chaining: {resp}"
+        );
+        assert!(
+            fake.heads().is_empty(),
+            "the upstream proxy must never be contacted: {:?}",
+            fake.heads()
+        );
+        let evs = connect_events(&t.sid);
+        assert_eq!(evs.len(), 1, "only the admission leaf: {evs:?}");
+        assert_eq!(evs[0]["disposition"], "allow");
+        assert_eq!(evs[0]["source"], "allowlist");
+    }
+
+    // (i') the bracket form of the same entry keeps working: entries are
+    // normalized to the bare host when the dialer is built, so both spellings
+    // of an IPv6 bypass agree with the single normalized host.
+    #[test]
+    fn bracketed_ipv6_no_proxy_entry_still_bypasses_the_upstream() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "chain-v6-bracketed-noproxy",
+            &["[::]"],
+            Some(dialer(&fake.url(), &["[::]"])),
+        );
+        let resp = exchange(t.port, &connect_req("[::]:443"));
+        assert!(
+            !resp.contains("X-Sandbox: upstream-error"),
+            "a bracketed NO_PROXY entry must bypass as well: {resp}"
+        );
+        assert!(
+            fake.heads().is_empty(),
+            "the upstream proxy must never be contacted: {:?}",
+            fake.heads()
+        );
+        assert_eq!(connect_events(&t.sid).len(), 1);
     }
 }

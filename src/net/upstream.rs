@@ -28,14 +28,12 @@
 //! build) or `px --proxy=...` listening on `127.0.0.1:<port>`, then point
 //! `network.upstreamProxy` at that bridge (`http://user:pass@127.0.0.1:3128`).
 //!
-//! Not yet wired into the proxy pipeline: Task 4.2 branches on
-//! `chains_host` inside `proxy.rs` and maps `UpstreamError` to a 502 with
-//! `X-Sandbox: upstream-error`. Until then the module keeps
-//! `#![allow(dead_code)]` so `cargo build --release` stays warning-free
-//! (same posture as `learned.rs`/`intent.rs`); the tests exercise the whole
-//! API.
-
-#![allow(dead_code)]
+//! Wired into the proxy pipeline by Task 4.2: `proxy::dial_upstream` branches
+//! on `chains_host` and maps `UpstreamError` to `502` +
+//! `X-Sandbox: upstream-error`, while `main.rs` builds the dialer once from
+//! `network.upstreamProxy` / `HTTPS_PROXY` ([G-10]). The module-level
+//! `#![allow(dead_code)]` is gone; the few items no production path consumes
+//! yet carry a per-item allow saying so.
 
 use std::fmt;
 use std::io;
@@ -228,11 +226,15 @@ impl ProxyUrl {
         })
     }
 
-    /// Proxy host without IPv6 brackets.
+    /// Proxy host without IPv6 brackets. Test-only today: production names a
+    /// proxy through [`Self::endpoint`] ([G-30]).
+    #[allow(dead_code)]
     pub fn host(&self) -> &str {
         &self.host
     }
 
+    /// Test-only, same reason as [`Self::host`].
+    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
     }
@@ -241,6 +243,7 @@ impl ProxyUrl {
     /// Crate-private with [`Self::password`] ([G-30]): userinfo is half of a
     /// credential, so it does not leave the crate where a caller could log
     /// it.
+    #[allow(dead_code)]
     pub(crate) fn user(&self) -> Option<&str> {
         self.user.as_deref()
     }
@@ -248,6 +251,7 @@ impl ProxyUrl {
     /// Userinfo password, if present. Crate-private on purpose ([G-30]):
     /// only [`Self::auth_header`] and tests may touch it, so a future
     /// caller cannot accidentally log it.
+    #[allow(dead_code)]
     pub(crate) fn password(&self) -> Option<&str> {
         self.password.as_deref()
     }
@@ -405,6 +409,20 @@ fn normalize_host(h: &str) -> String {
     h.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// `[v6]` → `v6`; any other entry unchanged.
+///
+/// `NO_PROXY` entries are matched against the *bare* host: the dial path
+/// normalizes a bracketed CONNECT target once before the decision, so a
+/// bracketed entry has to be stored bare too or the two spellings would
+/// disagree ([G-11]).
+fn strip_bracket_entry(entry: &str) -> String {
+    let e = entry.trim();
+    e.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(e)
+        .to_string()
+}
+
 // =====================================================================
 // Direct dialer
 // =====================================================================
@@ -413,8 +431,9 @@ fn normalize_host(h: &str) -> String {
 ///
 /// The race itself lives in `proxy::happy_eyeballs_dial` (8 concurrent
 /// dials per batch, first winner wins, losers aborted) — this type exists so
-/// the upstream dialer has a clean "direct path" seam and so that Task 4.2
-/// can branch on dialer identity without reaching into `proxy.rs` internals.
+/// the `NO_PROXY` leg has a clean direct seam. Task 4.2 does *not* branch on
+/// dialer identity: `proxy::dial_upstream` branches on `chains_host(host)`
+/// and only reaches this type through `UpstreamDialer::dial`'s bypass arm.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DirectDialer;
 
@@ -454,7 +473,10 @@ impl UpstreamDialer {
         UpstreamDialer {
             proxy_url,
             proxy_auth,
-            no_proxy,
+            // Both `chains_host` and `dial`'s own re-check see the *bare*
+            // host, so `[2606:4700::1111]` and `2606:4700::1111` must land on
+            // the same entry ([G-11]).
+            no_proxy: no_proxy.iter().map(|e| strip_bracket_entry(e)).collect(),
             direct: DirectDialer::new(),
         }
     }
@@ -474,6 +496,7 @@ impl UpstreamDialer {
     /// Cached `Proxy-Authorization` value, `None` when the URL has no
     /// userinfo. Crate-private ([G-30]) like the userinfo it encodes: tests
     /// only, never log the value.
+    #[allow(dead_code)]
     pub(crate) fn proxy_auth_header(&self) -> Option<String> {
         self.proxy_auth.clone()
     }

@@ -267,6 +267,132 @@ fn decode_hex_vec(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// [G-10] Where the chosen upstream proxy came from.
+///
+/// Named in diagnostics: when a configured proxy cannot be used, the operator
+/// has to know which knob to fix ([G-42]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpstreamSource {
+    /// `network.upstreamProxy` in the profile.
+    Profile,
+    /// The host's `HTTPS_PROXY` / `HTTP_PROXY`.
+    HostEnv,
+}
+
+impl UpstreamSource {
+    fn label(self) -> &'static str {
+        match self {
+            UpstreamSource::Profile => "profile network.upstreamProxy",
+            UpstreamSource::HostEnv => "host HTTPS_PROXY/HTTP_PROXY",
+        }
+    }
+}
+
+/// [G-10] Pick the upstream proxy: profile `network.upstreamProxy`, else host
+/// `HTTPS_PROXY`, else host `HTTP_PROXY`, else none.
+///
+/// `env_get` is injected so the precedence is unit-testable without touching
+/// the process environment. The real caller passes `std::env::var`, which on
+/// Windows reads through `GetEnvironmentVariableW` and is therefore
+/// case-insensitive — one lookup for `HTTPS_PROXY` also finds a `https_proxy`
+/// entry. A blank value counts as unset (Windows environments routinely carry
+/// an empty `HTTPS_PROXY=`).
+///
+/// Returns `(chosen_url, warning, source)`. The warning is the [G-42]
+/// diagnostic and is present only when the profile value and the host-env
+/// value are both set and name *different* endpoints; it names both proxies as
+/// `host:port` only ([G-30]: a proxy URL may carry a password). The chosen
+/// value is returned verbatim, because the caller has to parse it — only
+/// diagnostics are redacted.
+fn select_upstream(
+    profile: Option<&str>,
+    env_get: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>, Option<UpstreamSource>) {
+    let host_env = non_blank(env_get("HTTPS_PROXY")).or_else(|| non_blank(env_get("HTTP_PROXY")));
+    let profile = non_blank(profile.map(str::to_string));
+
+    let warn = match (profile.as_deref(), host_env.as_deref()) {
+        (Some(p), Some(h)) if !same_upstream_endpoint(p, h) => Some(format!(
+            "profile network.upstreamProxy ({}) differs from host HTTPS_PROXY/HTTP_PROXY ({}); \
+             using the profile value",
+            redact_proxy_url(p),
+            redact_proxy_url(h)
+        )),
+        _ => None,
+    };
+    let source = match (&profile, &host_env) {
+        (Some(_), _) => Some(UpstreamSource::Profile),
+        (None, Some(_)) => Some(UpstreamSource::HostEnv),
+        (None, None) => None,
+    };
+    (profile.or(host_env), warn, source)
+}
+
+/// Do two configured proxy URLs name the same endpoint?
+///
+/// Compared as parsed `host:port` when both parse — `http://p:8080` and
+/// `http://p:8080/` are the same proxy, and the [G-42] override notice must
+/// not fire for an override that overrides nothing — and as raw strings
+/// otherwise (an unparsable value has no endpoint to compare, so distinct
+/// typos stay distinct).
+fn same_upstream_endpoint(a: &str, b: &str) -> bool {
+    match (
+        net::upstream::ProxyUrl::parse(a),
+        net::upstream::ProxyUrl::parse(b),
+    ) {
+        (Ok(ua), Ok(ub)) => ua.endpoint() == ub.endpoint(),
+        _ => a == b,
+    }
+}
+
+/// Trim a value; blank counts as unset.
+fn non_blank(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// `host:port` for a proxy URL, else a static placeholder ([G-30]). A proxy URL
+/// can carry `user:password@`, so diagnostics never echo one.
+fn redact_proxy_url(raw: &str) -> String {
+    net::upstream::ProxyUrl::parse(raw)
+        .map(|u| u.endpoint())
+        .unwrap_or_else(|_| "(unparsable)".to_string())
+}
+
+/// Host-env `NO_PROXY` entries for chaining ([G-11]): comma-separated, trimmed,
+/// blanks dropped. Deliberately the *host* list — the child's `NO_PROXY` is the
+/// loopback-only one we inject, and it says nothing about corporate egress.
+///
+/// Both spellings go through [`non_blank`], so a blank `NO_PROXY=` (common on
+/// Windows) falls through to `no_proxy` instead of swallowing it.
+fn host_no_proxy(env_get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    non_blank(env_get("NO_PROXY"))
+        .or_else(|| non_blank(env_get("no_proxy")))
+        .unwrap_or_default()
+        .split(',')
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+/// The *ungated* degradation line for an upstream URL that will not parse:
+/// names the source knob, the redacted endpoint (or `(unparsable)`) and the
+/// static reason, and states the consequence.
+///
+/// Deliberately never the URL ([G-30]: it may carry a password). Kept pure so
+/// both sources and the unparsable case are unit-testable.
+fn upstream_parse_failure_warning(
+    source: UpstreamSource,
+    raw: &str,
+    reason: &net::upstream::UpstreamError,
+) -> String {
+    format!(
+        "the upstream proxy configured via {} is unusable — {} ({reason}); \
+         this session dials direct, with no upstream chaining",
+        source.label(),
+        redact_proxy_url(raw)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cmd(
     profile: Option<String>,
@@ -444,6 +570,7 @@ fn run_inner(
             prompt_enabled,
             on_unavailable,
             prompt_timeout_secs,
+            upstream_proxy,
             profile_name,
             ..
         } => {
@@ -476,11 +603,58 @@ fn run_inner(
                 intent,
                 learned: std::sync::Arc::new(std::sync::Mutex::new(learned)),
             };
+            // [G-10] Upstream chaining: profile `network.upstreamProxy` > host
+            // `HTTPS_PROXY` > `HTTP_PROXY` > none, resolved here once in the
+            // supervisor. The child never sees any of it — it keeps the
+            // loopback-only proxy env we build for it.
+            let (upstream_url, upstream_warn, upstream_source) =
+                select_upstream(upstream_proxy.as_deref(), |k| std::env::var(k).ok());
+            // [G-42] The override notice rides the SANDBOX_DIAG stream.
+            if let Some(w) = upstream_warn
+                && std::env::var_os("SANDBOX_DIAG").is_some()
+            {
+                eprintln!("[sandbox] SANDBOX_DIAG: {w}");
+            }
+            let upstream = match upstream_url {
+                Some(raw) => match net::upstream::UpstreamDialer::from_url(
+                    &raw,
+                    host_no_proxy(|k| std::env::var(k).ok()),
+                ) {
+                    Ok(d) => Some(std::sync::Arc::new(d)),
+                    Err(e) => {
+                        // Policy: a bad proxy URL must not brick the run. Fall
+                        // back to direct-only ([G-49] keeps that path alive)
+                        // and say why. A session that silently loses its
+                        // egress proxy is a security-relevant degradation, so
+                        // — like the journal / loopback / ACL warnings above —
+                        // this line is NOT SANDBOX_DIAG-gated; the gated line
+                        // below adds the parse detail. The reason is static
+                        // and the endpoint redacted: the URL itself is never
+                        // echoed ([G-30]).
+                        if let Some(source) = upstream_source {
+                            eprintln!(
+                                "[sandbox] warning: {}",
+                                upstream_parse_failure_warning(source, &raw, &e)
+                            );
+                        }
+                        if std::env::var_os("SANDBOX_DIAG").is_some() {
+                            eprintln!(
+                                "[sandbox] SANDBOX_DIAG: ignoring upstream proxy {} ({e}); \
+                                 dialing direct",
+                                redact_proxy_url(&raw)
+                            );
+                        }
+                        None
+                    }
+                },
+                None => None,
+            };
             let handle = net::proxy::spawn(net::proxy::ProxyConfig {
                 session_id: sid.clone(),
                 token: token.clone(),
                 allow_domain: allow_domain.clone(),
                 deny_domain: deny_domain.clone(),
+                upstream,
                 writer: audit_writer.clone(),
                 prompt,
             })
@@ -860,5 +1034,172 @@ mod tests {
         assert!(!err.is_empty());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- Task 4.2: [G-10] upstream-proxy selection + [G-11] NO_PROXY ------
+
+    /// A `select_upstream` / `host_no_proxy` env lookup over fixed pairs.
+    /// Matching is case-insensitive on purpose: Windows reads the environment
+    /// with `GetEnvironmentVariableW`, so one `HTTPS_PROXY` lookup also covers
+    /// a `https_proxy` entry. The fake mirrors that.
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(kk, _)| kk.eq_ignore_ascii_case(k))
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn select_upstream_profile_only() {
+        let (chosen, warn, src) = select_upstream(
+            Some("http://corp-proxy:8080"),
+            env_of(&[("HTTPS_PROXY", "http://corp-proxy:8080")]),
+        );
+        assert_eq!(chosen.as_deref(), Some("http://corp-proxy:8080"));
+        assert!(warn.is_none(), "equal values must not warn: {warn:?}");
+        assert_eq!(src, Some(UpstreamSource::Profile));
+    }
+
+    #[test]
+    fn select_upstream_env_only_prefers_https_proxy() {
+        let (chosen, warn, src) = select_upstream(
+            None,
+            env_of(&[
+                ("HTTPS_PROXY", "http://https-proxy:8080"),
+                ("HTTP_PROXY", "http://http-proxy:8080"),
+            ]),
+        );
+        assert_eq!(chosen.as_deref(), Some("http://https-proxy:8080"));
+        assert!(
+            warn.is_none(),
+            "host-env-only detection is silent [G-42]: {warn:?}"
+        );
+        assert_eq!(src, Some(UpstreamSource::HostEnv));
+    }
+
+    #[test]
+    fn select_upstream_env_only_falls_back_to_http_proxy() {
+        let (chosen, warn, _src) =
+            select_upstream(None, env_of(&[("HTTP_PROXY", "http://http-proxy:8080")]));
+        assert_eq!(chosen.as_deref(), Some("http://http-proxy:8080"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn select_upstream_none_when_nothing_is_set() {
+        let (chosen, warn, _src) = select_upstream(None, env_of(&[]));
+        assert!(chosen.is_none());
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn select_upstream_blank_values_count_as_unset() {
+        let (chosen, warn, _src) =
+            select_upstream(None, env_of(&[("HTTPS_PROXY", "   "), ("HTTP_PROXY", "")]));
+        assert!(chosen.is_none(), "blank proxy values must not be used");
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn select_upstream_profile_over_env_warns_and_redacts() {
+        let (chosen, warn, _src) = select_upstream(
+            Some("http://alice:s3cret@profile-proxy:8080"),
+            env_of(&[("HTTPS_PROXY", "http://bob:hunter2@env-proxy:3128")]),
+        );
+        // [G-10] the profile wins, and the caller gets the URL verbatim so it
+        // can parse it (only diagnostics are redacted).
+        assert_eq!(
+            chosen.as_deref(),
+            Some("http://alice:s3cret@profile-proxy:8080")
+        );
+        let warn = warn.expect("differing values must warn [G-42]");
+        assert!(warn.contains("profile-proxy:8080"), "{warn}");
+        assert!(warn.contains("env-proxy:3128"), "{warn}");
+        for secret in ["s3cret", "hunter2", "alice", "bob"] {
+            assert!(!warn.contains(secret), "warning leaked {secret:?}: {warn}");
+        }
+    }
+
+    #[test]
+    fn select_upstream_unparsable_values_still_warn_without_echoing_them() {
+        let (chosen, warn, _src) = select_upstream(
+            Some("https://profile-proxy:8443"),
+            env_of(&[("HTTPS_PROXY", "http://env-proxy:3128")]),
+        );
+        assert_eq!(chosen.as_deref(), Some("https://profile-proxy:8443"));
+        let warn = warn.expect("differing values must warn [G-42]");
+        // No TLS-to-proxy: `https://` is unparsable here, so it is named by a
+        // placeholder rather than echoed.
+        assert!(warn.contains("(unparsable)"), "{warn}");
+        assert!(!warn.contains("profile-proxy:8443"), "{warn}");
+    }
+
+    #[test]
+    fn upstream_parse_failure_warning_names_the_profile_source_without_credentials() {
+        let raw = "https://alice:s3cret@profile-proxy:8443";
+        let e = net::upstream::ProxyUrl::parse(raw).expect_err("https is not a proxy scheme");
+        let w = upstream_parse_failure_warning(UpstreamSource::Profile, raw, &e);
+        assert!(w.contains("profile network.upstreamProxy"), "{w}");
+        assert!(w.contains("(unparsable)"), "{w}");
+        assert!(w.contains("unsupported upstream proxy scheme"), "{w}");
+        assert!(w.contains("direct"), "{w}");
+        for secret in ["alice", "s3cret", "profile-proxy:8443"] {
+            assert!(!w.contains(secret), "warning leaked {secret:?}: {w}");
+        }
+    }
+
+    #[test]
+    fn upstream_parse_failure_warning_names_the_host_env_source() {
+        let raw = "http://proxy.corp:notaport";
+        let e = net::upstream::ProxyUrl::parse(raw).expect_err("port does not parse");
+        let w = upstream_parse_failure_warning(UpstreamSource::HostEnv, raw, &e);
+        assert!(w.contains("host HTTPS_PROXY/HTTP_PROXY"), "{w}");
+        assert!(w.contains("(unparsable)"), "{w}");
+        assert!(!w.contains("proxy.corp"), "{w}");
+    }
+
+    #[test]
+    fn select_upstream_trailing_slash_is_not_a_difference() {
+        // `http://p:8080` and `http://p:8080/` name the same endpoint, so the
+        // [G-42] override notice must not fire for an "override" that changes
+        // nothing.
+        let (chosen, warn, _src) = select_upstream(
+            Some("http://p:8080"),
+            env_of(&[("HTTPS_PROXY", "http://p:8080/")]),
+        );
+        assert_eq!(chosen.as_deref(), Some("http://p:8080"));
+        assert!(
+            warn.is_none(),
+            "equivalent endpoints must not warn: {warn:?}"
+        );
+    }
+
+    #[test]
+    fn host_no_proxy_blank_no_proxy_falls_through_to_the_lowercase_name() {
+        // A *blank* `NO_PROXY` counts as unset, like every other env read
+        // here (Windows routinely carries `NO_PROXY=`), so the lowercase
+        // lookup must still be tried. Case-sensitive fake on purpose: the
+        // real Windows lookup is case-insensitive, but the fallback logic is
+        // what is under test.
+        let env = |k: &str| match k {
+            "NO_PROXY" => Some("   ".to_string()),
+            "no_proxy" => Some("a.test, b.test".to_string()),
+            _ => None,
+        };
+        assert_eq!(host_no_proxy(env), vec!["a.test", "b.test"]);
+    }
+
+    #[test]
+    fn host_no_proxy_parses_comma_separated_entries() {
+        let entries = host_no_proxy(env_of(&[("NO_PROXY", "a.test, b.test,,c.test ")]));
+        assert_eq!(entries, vec!["a.test", "b.test", "c.test"]);
+    }
+
+    #[test]
+    fn host_no_proxy_missing_is_empty() {
+        assert!(host_no_proxy(env_of(&[])).is_empty());
+        assert!(host_no_proxy(env_of(&[("NO_PROXY", "  ")])).is_empty());
     }
 }
