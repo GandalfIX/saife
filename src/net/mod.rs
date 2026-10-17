@@ -6,6 +6,7 @@ pub mod profile;
 pub mod prompt;
 pub mod proxy;
 pub mod token;
+pub mod upstream;
 
 use crate::profile::NetworkSlice;
 

@@ -339,7 +339,7 @@ const MAX_PARALLEL_DIALS: usize = 8;
 /// the first successful connection wins, stragglers are aborted. A loser
 /// that already connected is closed when its task is dropped — half-open
 /// sockets are never spliced into a tunnel.
-async fn happy_eyeballs_dial(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
+pub(crate) async fn happy_eyeballs_dial(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
     let mut last_err = None;
     for start in (0..addrs.len()).step_by(MAX_PARALLEL_DIALS) {
         let end = (start + MAX_PARALLEL_DIALS).min(addrs.len());
