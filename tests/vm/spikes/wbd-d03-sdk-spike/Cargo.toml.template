@@ -1,0 +1,11 @@
+[package]
+name = "wbd-d03-sdk-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+mxc-sdk = { path = "__MXC_ROOT__/src/mxc-sdk", features = ["force-tier-testing"] }
+serde_json = "1"
