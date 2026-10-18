@@ -13,6 +13,20 @@ use clap::Parser;
 use cli::Cli;
 use cli::Cmd;
 
+/// Serializes the tests that read or mutate process-wide environment variables
+/// (`USERPROFILE` in particular). Those tests share one global process state, so
+/// an unlocked reader can observe a mutator's temporary value and fail for a
+/// reason that has nothing to do with the code under test.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV_LOCK`], tolerating a previous holder's panic (the value it guards
+/// is the process environment itself, so a poisoned lock carries no state).
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn main() {
     let cli = Cli::parse();
     let rc = match cli.cmd {

@@ -687,6 +687,9 @@ mod tests {
 
     #[test]
     fn expand_multiple() {
+        // Reads USERPROFILE ($HOME) below, so it must not race a test that
+        // temporarily repoints the variable (see crate::ENV_LOCK).
+        let _env = crate::env_lock();
         let p = PathBuf::from("C:\\projekte\\myapp");
         let s = expand_vars("$HOME/.ssh and $CWD/x", &p).unwrap();
         assert!(s.starts_with("C:\\Users\\"));
@@ -858,6 +861,7 @@ mod tests {
 
     #[test]
     fn list_profiles_returns_user_global_json_files() {
+        let _env = crate::env_lock();
         let tmp = std::env::temp_dir().join(format!("sb-list-test-{}", std::process::id()));
         let profiles_dir = tmp.join(".sandbox").join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();

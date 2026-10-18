@@ -240,9 +240,9 @@ fn push_entry(
 
 /// Like `push_entry` but with `inherit=false` — the ACE applies to this
 /// directory only and does NOT propagate to children. Used for ancestor
-/// traverse grants to avoid the recursive DACL rewrite that Windows
-/// performs when an inheritable ACE is added to a large tree (e.g. the
-/// user profile root `C:\Users\<user>`).
+/// traverse grants, which are deliberately kept non-recursive on the large
+/// profile trees (e.g. the user profile root `C:\Users\<user>`) where an ACL
+/// write does not complete on this host (see [`collect_ancestors`]).
 fn push_entry_noninherit(
     entries: &mut Vec<AllowEntry>,
     p: std::path::PathBuf,
@@ -259,6 +259,100 @@ fn push_entry_noninherit(
     });
 }
 
+/// The current user's profile directory as *the OS* records it.
+///
+/// Deliberately NOT `USERPROFILE`: that variable belongs to the caller's
+/// environment (the integration harness repoints it at a throwaway directory so
+/// the learned store is isolated), and the ancestor-walk stop set below must
+/// keep matching the REAL profile tree whatever the environment says
+/// (ADR-0001 Task 4.5).
+fn system_profile_root() -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DEFAULT, None).ok()?;
+        if raw.is_null() {
+            return None;
+        }
+        let path = known_folder_path_from_wide(raw.as_wide());
+        CoTaskMemFree(Some(raw.0 as *const _));
+        Some(path).filter(|p| p.is_absolute())
+    }
+}
+
+/// Decode a known-folder result and normalize it for the textual stop compare.
+///
+/// Lossy on purpose: an unpaired surrogate must not turn the lookup into
+/// `None`, because a `None` here silently leaves the stop set without the OS
+/// profile root — i.e. disables the guard rather than falling back to it.
+///
+/// A verbatim prefix is stripped for the same reason: `\\?\C:\Users\alice`
+/// names the same directory as `C:\Users\alice` but is not `eq` to it, so a
+/// verbatim return would silently defeat the stop compare in
+/// [`collect_ancestors_with_stops`].
+fn known_folder_path_from_wide(wide: &[u16]) -> std::path::PathBuf {
+    strip_verbatim_prefix(std::path::PathBuf::from(String::from_utf16_lossy(wide)))
+}
+
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\server\share` → `\\server\share`.
+///
+/// Windows APIs may hand back verbatim (extended-length) paths; the ancestor
+/// walk compares paths textually, so the prefix has to go before those paths
+/// can match the stop set.
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    const VERBATIM: &str = r"\\?\";
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+    let Some(s) = path.to_str() else {
+        return path;
+    };
+    if s.get(..VERBATIM_UNC.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(VERBATIM_UNC))
+    {
+        return std::path::PathBuf::from(format!("{}{}", r"\\", &s[VERBATIM_UNC.len()..]));
+    }
+    match s.strip_prefix(VERBATIM) {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path,
+    }
+}
+
+/// Directories at which the ancestor walk stops: the profile root plus its
+/// `AppData` and `AppData\Local` children (see [`collect_ancestors`]).
+fn profile_stop_dirs() -> Vec<std::path::PathBuf> {
+    profile_stop_dirs_from(
+        system_profile_root(),
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from),
+    )
+}
+
+/// Build the stop set from the authoritative OS profile root plus the
+/// `USERPROFILE` hint.
+///
+/// The OS value wins, but both are kept: an extra stop point that is not on a
+/// granted path's ancestor chain is inert, while one that *is* truncates the
+/// walk there (it is a stop, not a filter) — and keeping the hint preserves the
+/// pre-Task-4.5 behavior on the (unexpected) path where the known-folder
+/// lookup fails.
+fn profile_stop_dirs_from(
+    system_profile: Option<std::path::PathBuf>,
+    env_profile: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut stops: Vec<std::path::PathBuf> = Vec::new();
+    for root in [system_profile, env_profile].into_iter().flatten() {
+        let dirs = [
+            root.clone(),
+            root.join("AppData"),
+            root.join("AppData").join("Local"),
+        ];
+        for dir in dirs {
+            if !stops.iter().any(|s| paths_eq_ci(s, &dir)) {
+                stops.push(dir);
+            }
+        }
+    }
+    stops
+}
+
 /// Collect every ancestor directory of `path` up to (but not including) the
 /// drive root. The drive root itself is covered by the one-time
 /// `setup --grant-drive-root` ACE (or by inheritance on user-owned drives),
@@ -267,22 +361,36 @@ fn push_entry_noninherit(
 /// and `$HOME/.config/opencode` both live under `C:\Users\<user>`).
 ///
 /// **Stops at the user profile root (`C:\Users\<user>`) and the `AppData` /
-/// `AppData\Local` directories.** Writing an ACE to any of these makes the
-/// kernel's recursive DACL propagation walk the whole subtree — an operation
-/// that effectively hangs on these large trees (mirrors the ADR-0001 finding;
-/// see docs/superpowers/plans/2026-09-16-mxc-derived-hardening.md Task 3B).
-/// The AppContainer can already traverse these directories via inherited
-/// `Everyone: ReadAndExecute` ACEs, so explicit grants are unnecessary.
+/// `AppData\Local` directories.** Empirically, on this host, an ACL write to
+/// any of these directories does not return: under the integration harness's
+/// faked-`USERPROFILE` configuration the ACE is built but the kernel write
+/// never completes (observed via instrumentation; the pre-fix binary hung for
+/// more than 20 s in an A/B run, the post-fix binary exits in about 10 s). That
+/// is a measured property of these directories here, not a claim about why it
+/// happens. The AppContainer can already traverse these directories via
+/// inherited `Everyone: ReadAndExecute` ACEs, so explicit grants are
+/// unnecessary.
+///
+/// The stop set is derived from the OS profile root, never from
+/// `USERPROFILE` alone: a caller-controlled `USERPROFILE` (harness store
+/// isolation) used to move the stop points off their real targets, so the walk
+/// planned ACEs for the actual `%LOCALAPPDATA%` / `%APPDATA%` / profile root —
+/// the very directories whose ACL write does not complete — stalling the
+/// session before the child was ever spawned (ADR-0001 Task 4.5).
 fn collect_ancestors(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    // Build the set of directories at which to stop (without canonicalization
-    // — Rust's `canonicalize()` adds a `\\?\` prefix on Windows which would
-    // defeat the `eq` comparison below).
-    let mut stop_dirs: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(profile) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
-        stop_dirs.push(profile.clone());
-        stop_dirs.push(profile.join("AppData"));
-        stop_dirs.push(profile.join("AppData").join("Local"));
-    }
+    collect_ancestors_with_stops(path, &profile_stop_dirs(), out);
+}
+
+/// The core of [`collect_ancestors`] with the stop set passed in, so tests can
+/// pin the walk's truncation semantics without touching process state.
+fn collect_ancestors_with_stops(
+    path: &std::path::Path,
+    stop_dirs: &[std::path::PathBuf],
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    // The stop set is compared as-is (no canonicalization — Rust's
+    // `canonicalize()` adds a `\\?\` prefix on Windows which would defeat the
+    // `eq` comparison below).
     let mut cur = path.parent();
     while let Some(parent) = cur {
         // Stop at the drive root (e.g. `C:\`): it's handled by the
@@ -292,7 +400,8 @@ fn collect_ancestors(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) 
             break;
         }
         // Stop at (and do NOT include) any of the large profile directories
-        // where DACL writes hang (see the doc comment above).
+        // where the ACL write does not complete on this host (see the doc
+        // comment above).
         if stop_dirs.iter().any(|d| paths_eq_ci(parent, d)) {
             break;
         }
@@ -389,10 +498,12 @@ mod tests {
 
     #[test]
     fn collect_ancestors_stops_at_user_profile_root() {
+        let _env = crate::env_lock();
         let mut out: Vec<std::path::PathBuf> = Vec::new();
-        // Use a path under the real user profile so the stop-dir checks
-        // trigger. If USERPROFILE is unset, this test still passes because
-        // the stop-dir guard is a no-op.
+        // Use a path under the user profile so the stop-dir checks trigger.
+        // Since Task 4.5 the stop set comes from the OS known folder and
+        // `USERPROFILE` is only a hint, so holding `ENV_LOCK` is what keeps the
+        // path built here on the same profile tree the walk stops at.
         let profile = std::env::var_os("USERPROFILE")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("C:\\Users\\nonexistent"));
@@ -414,6 +525,164 @@ mod tests {
                 out
             );
         }
+    }
+
+    /// The OS profile root always contributes all three stop points, even when
+    /// `USERPROFILE` names an unrelated directory (Task 4.5).
+    #[test]
+    fn profile_stop_dirs_keeps_the_system_profile_when_the_env_disagrees() {
+        let system = std::path::PathBuf::from(r"C:\Users\alice");
+        let env = std::path::PathBuf::from(r"C:\staging\fake-home");
+        let stops = profile_stop_dirs_from(Some(system.clone()), Some(env));
+
+        for expected in [
+            system.clone(),
+            system.join("AppData"),
+            system.join("AppData").join("Local"),
+        ] {
+            assert!(
+                stops.iter().any(|s| paths_eq_ci(s, &expected)),
+                "stop {expected:?} missing from {stops:?}"
+            );
+        }
+    }
+
+    /// With no OS answer the env value is the only source: pre-Task-4.5
+    /// behavior, kept as the fallback path.
+    #[test]
+    fn profile_stop_dirs_falls_back_to_the_env_profile() {
+        let env = std::path::PathBuf::from(r"C:\Users\alice");
+        let stops = profile_stop_dirs_from(None, Some(env.clone()));
+        assert_eq!(stops.len(), 3, "{stops:?}");
+        assert!(paths_eq_ci(&stops[2], &env.join("AppData").join("Local")));
+    }
+
+    #[test]
+    fn profile_stop_dirs_dedupes_case_insensitively() {
+        let stops = profile_stop_dirs_from(
+            Some(std::path::PathBuf::from(r"C:\Users\Alice")),
+            Some(std::path::PathBuf::from(r"c:\users\alice")),
+        );
+        assert_eq!(stops.len(), 3, "{stops:?}");
+    }
+
+    /// Ruling 2: the env profile is a real stop point, not an inert extra — an
+    /// env profile that IS an ancestor of the granted path truncates the walk
+    /// there — while the OS stops stay in force for the real tree.
+    #[test]
+    fn env_stop_dir_truncates_the_walk_without_weakening_the_system_stops() {
+        let system = std::path::PathBuf::from(r"C:\Users\alice");
+        let env = std::path::PathBuf::from(r"C:\staging\fake-home");
+        let stops = profile_stop_dirs_from(Some(system.clone()), Some(env.clone()));
+
+        // Granted path below the hint: the walk truncates at the hint, so
+        // neither the hint nor anything above it is ever granted.
+        let granted = env.join("work").join("app").join(".cache");
+        let mut under_hint: Vec<std::path::PathBuf> = Vec::new();
+        collect_ancestors_with_stops(&granted, &stops, &mut under_hint);
+        assert!(
+            under_hint
+                .iter()
+                .any(|p| paths_eq_ci(p, &env.join("work").join("app"))),
+            "intermediate dirs below the hint must still be granted: {under_hint:?}"
+        );
+        for truncated in [env.clone(), env.parent().unwrap().to_path_buf()] {
+            assert!(
+                !under_hint.iter().any(|p| paths_eq_ci(p, &truncated)),
+                "{truncated:?} must not be granted; walk produced {under_hint:?}"
+            );
+        }
+
+        // The hint must not shadow the real tree: a path under the OS profile
+        // still truncates at the OS stop dirs.
+        let real = system
+            .join("AppData")
+            .join("Local")
+            .join("Temp")
+            .join("proj");
+        let mut under_system: Vec<std::path::PathBuf> = Vec::new();
+        collect_ancestors_with_stops(&real, &stops, &mut under_system);
+        assert!(
+            under_system
+                .iter()
+                .any(|p| paths_eq_ci(p, real.parent().unwrap())),
+            "the dir below the OS stop must still be granted: {under_system:?}"
+        );
+        for stop in [
+            system.clone(),
+            system.join("AppData"),
+            system.join("AppData").join("Local"),
+        ] {
+            assert!(
+                !under_system.iter().any(|p| paths_eq_ci(p, &stop)),
+                "OS stop {stop:?} must hold with an unrelated env hint; walk produced {under_system:?}"
+            );
+        }
+    }
+
+    /// The trusted source itself must resolve on a normal Windows host — the
+    /// stop set has no other guard against a faked `USERPROFILE`.
+    #[test]
+    fn system_profile_root_resolves() {
+        let root = system_profile_root().expect("known-folder Profile lookup failed");
+        assert!(root.is_absolute(), "{root:?}");
+        let local_appdata = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+        if let Some(local) = local_appdata {
+            assert!(
+                local.starts_with(&root),
+                "LOCALAPPDATA {local:?} must live under the profile root {root:?}"
+            );
+        }
+    }
+
+    /// A known-folder return may be verbatim (`\\?\`) or UNC-verbatim; both must
+    /// be normalized before the stop compare, or the OS profile root silently
+    /// stops matching the ancestors it is supposed to stop (Task 4.5).
+    #[test]
+    fn known_folder_paths_lose_their_verbatim_prefix() {
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().collect()
+        }
+
+        assert_eq!(
+            known_folder_path_from_wide(&wide(r"\\?\C:\Users\alice")),
+            std::path::PathBuf::from(r"C:\Users\alice")
+        );
+        assert_eq!(
+            known_folder_path_from_wide(&wide(r"\\?\UNC\server\share\alice")),
+            std::path::PathBuf::from(r"\\server\share\alice")
+        );
+        // The stripped form must still survive the `is_absolute()` filter.
+        assert!(known_folder_path_from_wide(&wide(r"\\?\C:\Users\alice")).is_absolute());
+
+        // Plain and non-verbatim device paths pass through untouched.
+        for unchanged in [r"C:\Users\alice", r"\\.\C:\Users\alice", r"\\server\share"] {
+            assert_eq!(
+                known_folder_path_from_wide(&wide(unchanged)),
+                std::path::PathBuf::from(unchanged),
+                "{unchanged} must not be rewritten"
+            );
+        }
+    }
+
+    /// An unpaired surrogate must not disable the guard: strict decoding used to
+    /// fail into `None`, which drops the OS profile root from the stop set
+    /// entirely instead of falling back to anything (Task 4.5).
+    #[test]
+    fn known_folder_paths_decode_lossily_instead_of_dropping_the_guard() {
+        let wide = [0xD800u16, u16::from(b'X')]; // lone high surrogate, then 'X'
+        assert!(
+            String::from_utf16(&wide).is_err(),
+            "precondition: the sample must be invalid UTF-16"
+        );
+
+        let path = known_folder_path_from_wide(&wide);
+        let text = path.to_string_lossy();
+        assert!(text.contains('\u{FFFD}'), "expected U+FFFD in {path:?}");
+        assert!(
+            text.ends_with('X'),
+            "expected the tail to survive: {path:?}"
+        );
     }
 
     #[test]
@@ -474,6 +743,93 @@ mod tests {
                 .any(|e| e.win32_path == pyshim && e.access == RWX),
             "pyshim dir must carry an RWX grant; got: {:?}",
             entries.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+    }
+
+    /// ADR-0001 Task 4.5: the ancestor-walk stop set must come from the OS, not
+    /// from `USERPROFILE`.
+    ///
+    /// The supervisor's environment is caller-controlled — the integration
+    /// harness points `USERPROFILE` at a throwaway dir so the learned store is
+    /// isolated — and an env-derived stop set silently stops matching the REAL
+    /// profile tree. The walk then plans traverse ACEs for `%USERPROFILE%`,
+    /// `%APPDATA%` and `%LOCALAPPDATA%`, and on this host an ACL write to those
+    /// directories does not return under that configuration: the session blocks
+    /// inside `grant_access` BEFORE the child is spawned (observed as a
+    /// "teardown hang" — no child, a lone conhost, `sandbox.exe` alive forever;
+    /// instrumented runs show the ACE built with no kernel-write completion,
+    /// the pre-fix binary hung >20 s and the post-fix binary exits in ~10 s).
+    #[test]
+    fn ancestor_grants_ignore_a_faked_userprofile() {
+        let _env = crate::env_lock();
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("USERPROFILE", v),
+                        None => std::env::remove_var("USERPROFILE"),
+                    }
+                }
+            }
+        }
+
+        let real_home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE must be set on this host"),
+        );
+        let pid = std::process::id();
+        // A scenario dir where the harness puts it: under %LOCALAPPDATA%\Temp.
+        let cwd = std::env::temp_dir().join(format!("sbx-ancestor-test-{pid}"));
+        let fake_home = std::env::temp_dir().join(format!("sbx-fake-home-{pid}"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // Non-vacuity: the walk only meets the profile stop dirs if the session
+        // dir actually sits inside the REAL profile tree. If the temp dir ever
+        // moved outside it, this test would pass no matter what the guard did.
+        assert!(
+            cwd.starts_with(&real_home),
+            "test cwd {cwd:?} must live under the real profile tree {real_home:?}"
+        );
+
+        let _guard = EnvGuard(std::env::var_os("USERPROFILE"));
+        unsafe { std::env::set_var("USERPROFILE", &fake_home) };
+
+        let fs = FilesystemSlice {
+            allow: vec![cwd.clone()],
+            ..Default::default()
+        };
+        let entries = build_allowlist("test-sid", &cwd, &fs).unwrap();
+
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&fake_home);
+
+        for hazardous in [
+            real_home.clone(),
+            real_home.join("AppData"),
+            real_home.join("AppData").join("Local"),
+        ] {
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| paths_eq_ci(&e.win32_path, &hazardous)),
+                "an ancestor grant on {hazardous:?} must never be planned — the ACL \
+                 write does not complete there on this host (Task 4.5). entries: {:?}",
+                entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
+            );
+        }
+        // The guard must not weaken into "no ancestors at all": %TEMP% is a
+        // normal ancestor of the session dir and still needs its grant.
+        // (`env::temp_dir()` may carry a trailing separator on Windows.)
+        let temp = std::path::PathBuf::from(
+            std::env::temp_dir()
+                .to_string_lossy()
+                .trim_end_matches('\\')
+                .to_string(),
+        );
+        assert!(
+            entries.iter().any(|e| paths_eq_ci(&e.win32_path, &temp)),
+            "%TEMP% ({temp:?}) must still get its traverse grant; entries: {:?}",
+            entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
         );
     }
 }
