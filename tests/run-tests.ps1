@@ -175,7 +175,20 @@ function Invoke-Sandbox {
     # child and hangs the harness (observed: S-83 with curl -v stalled >6min).
     $soTask = $proc.StandardOutput.ReadToEndAsync()
     $seTask = $proc.StandardError.ReadToEndAsync()
-    $proc.WaitForExit()
+    # BOUNDED wait: an unbounded WaitForExit turns any supervisor-teardown defect
+    # into an indefinite harness hang (observed 2026-10-18: sessions whose child
+    # talks to the proxy and ends abnormally — a TLS-abort RST, or a chained 502 —
+    # leave sandbox.exe alive; the whole suite stalled). A timed-out child is
+    # killed and reported as ExitCode -2 so the scenario fails LOUDLY and fast.
+    if (-not $proc.WaitForExit(120000)) {
+        try { $proc.Kill() } catch { }
+        Start-Sleep -Milliseconds 500
+        $so = @($soTask.GetAwaiter().GetResult() -split "`r?`n")
+        $se = @($seTask.GetAwaiter().GetResult() -split "`r?`n")
+        $se += 'INVOKE-SANDBOX: child did not exit within 120s; killed (supervisor teardown defect)'
+        $proc.Close()
+        return @{ Stdout=$so; Stderr=$se; ExitCode=-2 }
+    }
     $so = @($soTask.GetAwaiter().GetResult() -split "`r?`n")
     $se = @($seTask.GetAwaiter().GetResult() -split "`r?`n")
     $exit = $proc.ExitCode
@@ -2231,7 +2244,13 @@ function Invoke-Scenario-S81 {
     $parts = ((($direct.Stdout -join '')).Trim()) -split '_'
     $code = $parts[0]
     $connectCode = if ($parts.Count -gt 1) { $parts[1] } else { '' }
-    $bypassed = ($connectCode -eq '200') -and (Test-CurlReachedServer -ExitCode $direct.ExitCode -HttpCode $code)
+    # The bypass proof is the CONNECT status: http_connect=200 means the
+    # supervisor dialed DIRECT (a chained failure answers 502 instead). The
+    # final http_code is informational only — this host's schannel rejects
+    # api.anthropic.com's chain with CRYPT_E_REVOCATION_OFFLINE (curl exit 35,
+    # code 000) when the CRL server is unreachable, which says nothing about
+    # chaining. Deliberately NOT asserted: a CRL-outage host would red the suite.
+    $bypassed = ($connectCode -eq '200')
     # Negative control: same env, host NOT in NO_PROXY. Raw CONNECT so the 502
     # status line and the X-Sandbox header are both observable.
     $probe = Invoke-ConnectProbe -SandboxArgs $flags -TargetHost 'anthropic.com' -WorkingDirectory $d -Env $envOverrides
