@@ -373,3 +373,35 @@ audit trail, and CLI. This would make `sandbox` a true cross-platform nono
 equivalent. Very long-term; mentioned so the architecture does not lock in
 Windows-only assumptions (e.g. keep paths as a generic `OsPath` abstraction,
 not `\\`-hardcoded strings).
+
+### F-21. Elevation-free operation via install-time privilege (spike candidate)
+Today's ONLY admin dependency is the AppContainer loopback exemption that lets
+the child reach the supervisor's proxy listener (`0x80070005` unprivileged).
+Filesystem isolation already runs as the current user (per-session ACEs on
+owned dirs), so nothing else needs elevation. Three install-once designs:
+
+1. **Stable container SID + install-time exemption** — fix the AppContainer
+   profile name (today derived from the session id) so the SID is stable, then
+   register the exemption once from an elevated installer. No service, no
+   per-run admin. Trade-off: all sessions share one container identity, so
+   OS-level separation between CONCURRENT sessions weakens (granted paths and
+   audit stay per session). The exemption is per-SID and port-agnostic; only a
+   future firewall rule would need a fixed port policy.
+2. **Privileged broker service** — a service installed once registers
+   exemptions (and any future protected-resource grants) for product-created
+   containers over authenticated IPC, keeping per-session SIDs. Cost: a new
+   privileged attack surface; policy must accept only product containers,
+   verify the caller, and never honour arbitrary SIDs/paths, or the broker
+   becomes a local privilege-escalation primitive.
+3. **Packaged identity (MSIX) + `privateNetworkClientServer`** — verify FIRST
+   whether the capability actually unblocks host loopback (the loopback block
+   may be independent of capabilities and still require the exemption list);
+   otherwise it adds packaging friction without the benefit.
+
+Threat-model note (all variants): the exemption is per-SID, so it covers the
+whole product identity including a compromised agent inside it — that is the
+intended containment boundary (the agent is meant to reach the proxy), but it
+should be stated explicitly. MXC does not answer this either way: its backend
+network model is still open at the pinned mxc-sdk version. Recommend spiking
+(1) first (smallest change, matches the current architecture), then (2) if
+per-session SIDs must be preserved, then (3) only if packaging is on the table.
