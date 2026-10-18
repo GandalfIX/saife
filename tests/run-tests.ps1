@@ -32,8 +32,15 @@
   prompt+intent+learned wiring: deny_domain blocklist, hard-deny IP expansion,
   wildcard apex allow, loopback CONNECT refusal, --no-prompt, /sandbox/intent
   POST+GET, learned list/revoke, and the audit `source` filter. S-78 (learned
-  persistence) is a MANUAL scenario and skips; S-81 is reserved for the plan's
-  Phase 4 D-2 NO_PROXY scenario. Plan slots S-73/S-74 moved to S-82/S-83 (the
+  persistence) is a MANUAL scenario and skips. S-81, S-85, S-86 (ADR-0001
+  Task 4.3) cover D-2 upstream chaining: S-81 is the NO_PROXY bypass driven
+  from the host env (with its negative control), S-85 is upstream-unreachable
+  -> 502 + `X-Sandbox: upstream-error` plus the two-leaf audit a chained
+  failure produces, and S-86 is the host-env/profile detection warnings [G-42]
+  plus the unconditional parse-failure warning (they skip like the other
+  network scenarios when child->proxy loopback is blocked; only S-81 dials the
+  internet — S-85 and S-86 stay on the loopback with a dead upstream).
+  Plan slots S-73/S-74 moved to S-82/S-83 (the
   MXC journal scenarios took those numbers on this branch after the plan was
   written) — see the numbering note above the S-72 section.
 .PARAMETER SandboxExe
@@ -51,7 +58,9 @@
 .PARAMETER Strict
   Treat skips as failures.
 .PARAMETER Diag
-  Propagate SANDBOX_DIAG=1 to the child for verbose ACL diagnostics.
+  Propagate SANDBOX_DIAG=1 to the child for verbose ACL diagnostics, and
+  enable the supervisor-side [G-42] upstream-override notice (S-86 leg b
+  depends on it).
 .EXAMPLE
   pwsh -ExecutionPolicy Bypass -File tests/run-tests.ps1
 #>
@@ -120,7 +129,18 @@ function Test-Denied { param([string]$Text)
 }
 
 function Invoke-Sandbox {
-    param([Parameter(Mandatory)][string[]]$Args, [string]$WorkingDirectory = $script:Cwd)
+    param(
+        [Parameter(Mandatory)][string[]]$Args,
+        [string]$WorkingDirectory = $script:Cwd,
+        # Optional child-environment overrides (ADR-0001 Task 4.3). The D-2
+        # upstream scenarios must drive the SUPERVISOR's environment, because
+        # `select_upstream` reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY from this
+        # process — not from the sandboxed child, which always gets the
+        # loopback-only proxy vars. A $null value REMOVES the variable (used to
+        # drop an inherited SANDBOX_DIAG). Default $null leaves every pre-4.3
+        # scenario's environment untouched.
+        [hashtable]$Env = $null
+    )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $SandboxExe
     $argParts = foreach ($a in $Args) {
@@ -132,6 +152,21 @@ function Invoke-Sandbox {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
+    if ($null -ne $Env) {
+        foreach ($k in @($Env.Keys)) {
+            $name = [string]$k
+            # Windows env names are case-insensitive but the backing dictionary
+            # is not necessarily ordered that way: drop any inherited spelling
+            # (e.g. a lowercase `https_proxy`) first, or the child would carry
+            # two entries and GetEnvironmentVariableW could pick either.
+            foreach ($existing in @($psi.EnvironmentVariables.Keys)) {
+                if ([string]::Equals([string]$existing, $name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $null = $psi.EnvironmentVariables.Remove([string]$existing)
+                }
+            }
+            if ($null -ne $Env[$k]) { $psi.EnvironmentVariables[$name] = [string]$Env[$k] }
+        }
+    }
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     if (-not $proc.Start()) { return @{ Stdout=@(); Stderr=@('failed to start'); ExitCode=-1 } }
@@ -171,6 +206,87 @@ function Invoke-SandboxCliHome { param([string]$FakeHome, [string]$CliArgs)
     $rc = $proc.ExitCode
     $proc.Close()
     return @{ Stdout=$stdout; Stderr=$stderr; ExitCode=$rc }
+}
+
+# Flatten a captured stream into ONE line, trimmed to $Max characters. Detail
+# strings are written with Write-Host on a single line, so a multi-line stderr
+# dump (SANDBOX_DIAG runs are verbose) must be collapsed before it lands there.
+function Get-LineHead { param([string[]]$Lines, [int]$Max = 240)
+    $joined = ((@($Lines) | Where-Object { $_ -and $_.Trim() }) -join ' | ')
+    $joined = $joined -replace "`r?`n", ' | '
+    if ($joined.Length -gt $Max) { $joined = $joined.Substring(0, $Max) + '...' }
+    return $joined
+}
+
+# Inner script for the raw CONNECT probe below (ADR-0001 Task 4.3). It runs
+# INSIDE the sandbox (the S-75 wrapper-file precedent), so it needs no
+# arguments beyond the target host: the session token comes from the injected
+# HTTPS_PROXY userinfo and the proxy port from SANDBOX_PROXY_PORT.
+#
+# Why a raw socket rather than curl: the D-2 upstream-failure response is a
+# `502` plus a diagnostic BODY, and a client-side curl on a failed CONNECT
+# tunnel never shows that body (it prints "CONNECT tunnel failed, response
+# 502" and, under -v, only the headers). Speaking HTTP directly also keeps the
+# assertions independent of curl's verbose formatting. The whole response —
+# status line, headers, body — is emitted base64-encoded on one line so no
+# output framing can mangle it.
+$script:ConnectProbeScript = @'
+param([string]$TargetHost)
+$m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
+if (-not $m.Success) { Write-Output 'CONNECT_PROBE_NO_TOKEN'; exit 3 }
+$cred = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
+$port = [int]$env:SANDBOX_PROXY_PORT
+$c = New-Object System.Net.Sockets.TcpClient
+try { $c.Connect('127.0.0.1', $port) } catch { Write-Output 'CONNECT_PROBE_DIAL_FAILED'; exit 4 }
+$s = $c.GetStream()
+$s.ReadTimeout = 10000
+$req = "CONNECT ${TargetHost}:443 HTTP/1.1`r`nHost: ${TargetHost}:443`r`nProxy-Authorization: Basic $cred`r`n`r`n"
+$bytes = [Text.Encoding]::ASCII.GetBytes($req)
+$s.Write($bytes, 0, $bytes.Length)
+$s.Flush()
+$ms = New-Object System.IO.MemoryStream
+$buf = New-Object byte[] 8192
+while ($true) {
+    $n = 0
+    try { $n = $s.Read($buf, 0, $buf.Length) } catch { break }
+    if ($n -le 0) { break }
+    $ms.Write($buf, 0, $n)
+}
+$c.Close()
+Write-Output ('CONNECT_RAW_B64=' + [Convert]::ToBase64String($ms.ToArray()))
+exit 0
+'@
+
+# Run the CONNECT probe through the sandbox proxy and decode the response.
+# $SandboxArgs must NOT include the `--` separator: the probe invocation is
+# appended here. Returns @{ Ok; Raw; ExitCode; Stdout; Stderr }.
+function Invoke-ConnectProbe {
+    param(
+        [Parameter(Mandatory)][string[]]$SandboxArgs,
+        [Parameter(Mandatory)][string]$TargetHost,
+        [string]$WorkingDirectory = $script:Cwd,
+        [hashtable]$Env = $null
+    )
+    $probePath = Join-Path $WorkingDirectory 'connect-probe.ps1'
+    Set-Content -LiteralPath $probePath -Value $script:ConnectProbeScript -Encoding ASCII
+    $r = Invoke-Sandbox -Args ($SandboxArgs + @('--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','connect-probe.ps1','-TargetHost',$TargetHost)) -WorkingDirectory $WorkingDirectory -Env $Env
+    $raw = ''
+    $ok = $false
+    foreach ($line in @($r.Stdout)) {
+        if ($line -like 'CONNECT_RAW_B64=*') {
+            try {
+                $bytes = [Convert]::FromBase64String($line.Substring($line.IndexOf('=') + 1))
+                $raw = [Text.Encoding]::UTF8.GetString($bytes)
+                # A read timeout leaves an EMPTY buffer, and an empty buffer still
+                # base64-decodes cleanly — so a successful decode is NOT evidence
+                # that the proxy answered. Ok requires at least one byte; Raw
+                # keeps whatever was decoded either way.
+                $ok = ($bytes.Length -gt 0)
+            } catch { $ok = $false }
+        }
+    }
+    return @{ Ok = $ok; Raw = $raw; ExitCode = $r.ExitCode
+        Stdout = ($r.Stdout -join "`n"); Stderr = ($r.Stderr -join "`n") }
 }
 
 function Get-Python { $py = Get-Command python -ErrorAction SilentlyContinue; if (-not $py) { return $null }; return $py.Source }
@@ -1457,7 +1573,8 @@ function Invoke-Scenario-S63 {
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $profilesDir 'alpha.json') -Value '{"meta":{"name":"alpha","schema_version":1}}' -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $profilesDir 'beta.json') -Value '{"meta":{"name":"beta","schema_version":1}}' -Encoding UTF8
-    # Invoke-Sandbox doesn't expose env-var overrides, so invoke directly.
+    # Kept as a direct invocation (this scenario predates Invoke-Sandbox's -Env
+    # switch): the USERPROFILE override is the one Invoke-SandboxCliHome applies.
     # `$SandboxExe` is the script-scope param (see harness top-level param block).
     $pi = New-Object System.Diagnostics.ProcessStartInfo
     $pi.FileName = $SandboxExe
@@ -1639,10 +1756,20 @@ function Invoke-Scenario-S71 {
 # the two colliding plan slots moved to the next free numbers: plan S-73
 # (hard-deny expansion) -> S-82, plan S-74 (wildcard apex) -> S-83. S-72
 # keeps the plan's number (the earlier "reserved for LPAC/Task 2" note
-# described another branch's harness copy, not this one). S-81 stays
-# unregistered so the plan's own Phase 4 D-2 NO_PROXY scenario (plan S-81)
-# keeps its number; S-84 is the extra seeded `*.`-prefixed learned-revoke
-# coverage from the 3.7 review advisory.
+# described another branch's harness copy, not this one). S-84 is the extra
+# seeded `*.`-prefixed learned-revoke coverage from the 3.7 review advisory.
+#
+# ADR-0001 Task 4.3 numbering note (same collision, later plan slots): the plan
+# numbered its Phase 4 D-2 scenarios S-81/S-82/S-83 and S-82/S-83 were already
+# taken by the two 3.8 scenarios moved above, so the mapping is
+#   plan S-81 (NO_PROXY bypass)              -> S-81 (free, kept)
+#   plan S-82 (upstream unreachable -> 502)  -> S-85
+#   plan S-83 (host-env detection + G-42)    -> S-86 (extended with the
+#                                               unconditional parse-failure
+#                                               warning: an `https://` upstream
+#                                               is rejected by design)
+# S-85/S-86 keep their numbers free of the 3.8 block on purpose: inserting
+# between S-84 and a later phase would renumber again on the next merge.
 # ---------------------------------------------------------------------------
 
 # Count non-inherited session AppContainer ACEs on a path. Excludes
@@ -2060,6 +2187,186 @@ function Invoke-Scenario-S84 {
 }
 
 # ---------------------------------------------------------------------------
+# ADR-0001 Task 4.3 — D-2 upstream chaining (plan Phase 4 S-81/S-82/S-83,
+# renumbered per the note above). All three drive the SUPERVISOR's environment
+# through Invoke-Sandbox's -Env switch: `select_upstream` reads
+# HTTPS_PROXY/HTTP_PROXY/NO_PROXY from the supervisor, while the sandboxed
+# child always gets the loopback-only proxy vars (build_env_block), so a
+# host-env scenario must not expect the child to see them.
+# ---------------------------------------------------------------------------
+
+# S-81 (D-2; plan Phase 4 slot S-81, kept — see the numbering note above):
+# NO_PROXY bypass. The plan's `network.noProxy` does not exist (RawNetwork is
+# deny_unknown_fields; Task 3.1 added only `upstreamProxy`), so the bypass is
+# driven from the HOST env, which is where [G-11] reads it. ONE configuration
+# proves both halves of the assertion:
+#   (a) api.anthropic.com is in NO_PROXY while the upstream proxy is a dead
+#       port, so that host skips chaining and dials DIRECT — the request
+#       succeeds (real egress, the same dependency S-83 has);
+#   (b) anthropic.com is allow-listed but NOT in NO_PROXY, so the same dead
+#       upstream IS used -> 502 + `X-Sandbox: upstream-error`. The direct-dial
+#       502 carries neither that header nor a second audit leaf, so (b) proves
+#       chaining was attempted for the non-bypassed host (i.e. the bypass in
+#       (a) came from the NO_PROXY match, not from chaining being off).
+function Invoke-Scenario-S81 {
+    if (-not (Get-Curl)) { return @{ Num=81; Name='S-81 (D-2 NO_PROXY bypass)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=81; Name='S-81 (D-2 NO_PROXY bypass)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 81
+    # Isolate the learned store: USERPROFILE points at a fresh EMPTY directory
+    # (the Invoke-SandboxCliHome pattern), so a learned deny/allow for either
+    # host in the real %USERPROFILE%\.sandbox\learned store cannot flip the
+    # verdict on a machine that has already answered a prompt.
+    $fakeHome = Join-Path $d 'home'
+    New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
+    # Port 1 is the codebase's conventional dead port. NO_PROXY names only
+    # api.anthropic.com, so the same value is "the proxy we cannot reach" for
+    # anthropic.com and "the proxy we never try" for api.anthropic.com.
+    $envOverrides = @{ 'HTTPS_PROXY' = 'http://127.0.0.1:1'; 'NO_PROXY' = 'api.anthropic.com'; 'USERPROFILE' = $fakeHome }
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--allow-domain','anthropic.com','--no-prompt')
+    # `%{http_connect}` is the proxy's CONNECT status: 200 proves the tunnel was
+    # established (i.e. the direct dial happened), so a bare 5xx from the
+    # NO_PROXY path can never be mistaken for success the way an http_code-only
+    # check could.
+    $direct = Invoke-Sandbox -Args ($flags + @('--','cmd','/c','curl.exe -sS -m 25 -o NUL -w %{http_code}_%{http_connect} https://api.anthropic.com')) -WorkingDirectory $d -Env $envOverrides
+    $parts = ((($direct.Stdout -join '')).Trim()) -split '_'
+    $code = $parts[0]
+    $connectCode = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+    $bypassed = ($connectCode -eq '200') -and (Test-CurlReachedServer -ExitCode $direct.ExitCode -HttpCode $code)
+    # Negative control: same env, host NOT in NO_PROXY. Raw CONNECT so the 502
+    # status line and the X-Sandbox header are both observable.
+    $probe = Invoke-ConnectProbe -SandboxArgs $flags -TargetHost 'anthropic.com' -WorkingDirectory $d -Env $envOverrides
+    $raw = $probe.Raw
+    $got502 = ($raw -match 'HTTP/1\.1 502 Bad Gateway')
+    $gotHeader = ($raw -match 'X-Sandbox: upstream-error')
+    $chained = $probe.Ok -and $got502 -and $gotHeader
+    $passed = $bypassed -and $chained
+    return @{ Num=81; Name='S-81 (D-2 NO_PROXY bypass)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "NO_PROXY host dialed direct (connect=200 http_code=$code); non-matching allow-listed host chained to the dead upstream (502 + X-Sandbox: upstream-error)" }
+                 else { "bypass=$bypassed connect=$connectCode http_code=$code exit=$($direct.ExitCode) curlErr=$(Get-LineHead -Lines $direct.Stderr -Max 160) probeOk=$($probe.Ok) got502=$got502 header=$gotHeader probeErr=$(Get-LineHead -Lines @($probe.Stderr) -Max 160)" } }
+}
+
+# S-85 (D-2; plan slot S-82, renumbered — see the numbering note above):
+# upstream unreachable -> `502 Bad Gateway` + `X-Sandbox: upstream-error`
+# [G-30/G-42]. The upstream comes from the PROFILE (`network.upstreamProxy`,
+# camelCase exactly — a stray `noProxy` key would be a hard load error) and
+# points at the conventional dead port. Asserts the status line, the header, a
+# body that names the proxy as host:port without echoing its URL or leaking
+# credentials, and the TWO-leaf audit shape a chained failure produces: the
+# admission `allowlist` allow FIRST, then the `default`/`upstream_error` deny.
+# A count-based "one leaf" assertion would fail here (Task 4.2 review).
+function Invoke-Scenario-S85 {
+    if (-not (Get-Curl)) { return @{ Num=85; Name='S-85 (D-2 upstream unreachable)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=85; Name='S-85 (D-2 upstream unreachable)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 85
+    # Isolate the learned store (fresh EMPTY fake home, see S-81) and PIN
+    # NO_PROXY off: a host entry covering anthropic.com would let the child dial
+    # direct, the dead upstream would never be consulted, and this scenario
+    # would fail spuriously. A $null value REMOVES the variable (both
+    # spellings; the helper also scrubs any other case variant).
+    $fakeHome = Join-Path $d 'home'
+    New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
+    $envPinned = @{ 'NO_PROXY' = $null; 'USERPROFILE' = $fakeHome }
+    $profilePath = Join-Path $d 'upstream-dead.json'
+    Set-Content -LiteralPath $profilePath -Value '{"meta":{"name":"s85-upstream-dead","schema_version":1},"network":{"upstreamProxy":"http://127.0.0.1:1"}}' -Encoding ASCII
+    $flags = @('run','--allow-cwd','--profile',$profilePath,'--allow-domain','anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d -Env $envPinned
+    if ($psid.ExitCode -ne 0) { return @{ Num=85; Name='S-85 (D-2 upstream unreachable)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $probe = Invoke-ConnectProbe -SandboxArgs ($flags + @('--sid',$sid)) -TargetHost 'anthropic.com' -WorkingDirectory $d -Env $envPinned
+    $raw = $probe.Raw
+    $got502 = ($raw -match 'HTTP/1\.1 502 Bad Gateway')
+    $gotHeader = ($raw -match 'X-Sandbox: upstream-error')
+    # Body contract: names the endpoint as host:port, never the URL (G-30) and
+    # never a credential-shaped token.
+    $namesEndpoint = ($raw -match '127\.0\.0\.1:1')
+    $noUrl = -not ($raw -match 'http://127\.0\.0\.1')
+    $noCreds = -not ($raw -match '(?i)(proxy-authorization|basic )')
+    $bodyOk = $namesEndpoint -and $noUrl -and $noCreds
+    # Audit shape: admission allow (source=allowlist) THEN the transport deny.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $leaves = New-Object System.Collections.Generic.List[object]
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'anthropic.com') { $leaves.Add($o) }
+    }
+    $leafCount = $leaves.Count
+    $twoLeaves = ($leafCount -eq 2)
+    # -and short-circuits, so the indexers only run when both leaves exist.
+    $admission = $twoLeaves -and ($leaves[0].disposition -eq 'allow') -and ($leaves[0].source -eq 'allowlist')
+    $upstreamLeaf = $twoLeaves -and ($leaves[1].disposition -eq 'deny') -and ($leaves[1].source -eq 'default') -and ($leaves[1].reason -eq 'upstream_error')
+    $passed = $probe.Ok -and $got502 -and $gotHeader -and $bodyOk -and $admission -and $upstreamLeaf
+    return @{ Num=85; Name='S-85 (D-2 upstream unreachable)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'chained CONNECT failed: 502 + X-Sandbox: upstream-error, body names 127.0.0.1:1 (no URL/creds); audit = allowlist allow + default/upstream_error deny' }
+                 else { "probeOk=$($probe.Ok) got502=$got502 header=$gotHeader endpoint=$namesEndpoint noUrl=$noUrl noCreds=$noCreds leaves=$leafCount admission=$admission upstreamLeaf=$upstreamLeaf probeExit=$($probe.ExitCode) probeErr=$(Get-LineHead -Lines @($probe.Stderr) -Max 160) raw=$(Get-LineHead -Lines @($raw) -Max 200)" } }
+}
+
+# S-86 (D-2; plan slot S-83, renumbered — see the numbering note above):
+# upstream-source detection and both diagnostics [G-10/G-42/G-30], three legs:
+#   (a) host HTTPS_PROXY only, NO profile value, SANDBOX_DIAG=1 -> there is
+#       nothing to differ from, so NO "differs" line appears on stderr;
+#   (b) profile value AND a different host value, SANDBOX_DIAG=1 -> the [G-42]
+#       override notice appears, naming BOTH endpoints as host:port and saying
+#       the profile wins (never the URLs: a proxy URL may carry a password);
+#   (c) an `https://` upstream — rejected by design (no TLS-to-proxy) — is a
+#       security-relevant degradation, so its warning is NOT SANDBOX_DIAG-
+#       gated. Asserted WITHOUT SANDBOX_DIAG (the variable is removed, since
+#       any value including "0" satisfies var_os): the line names the source
+#       knob, redacts the URL to `(unparsable)`, never echoes the URL, and the
+#       run still succeeds on the direct fallback — and stderr carries no
+#       SANDBOX_DIAG marker at all, so a future diag-gating of that warning
+#       cannot let this leg pass silently.
+# Every leg keeps the network active (an allow-list entry + --no-prompt): with
+# an empty allow-list and the prompt off the config resolves to Blocked, no
+# proxy starts, and none of this code runs at all.
+function Invoke-Scenario-S86 {
+    # Every leg runs a real network session (`cmd /c echo` still starts the
+    # proxy), so the loopback guard IS required: non-elevated, the session
+    # hangs — with register_loopback failed the supervisor still spawns the
+    # child, and a lingering conhost holds the child's stdio pipes open, so the
+    # supervisor waits for stdout EOF forever (observed 2026-10-18: leg (a) hung
+    # >5 minutes with only conhost left under sandbox.exe; every network
+    # scenario must stay elevation-guarded until that pre-existing supervisor
+    # defect is fixed — candidate fix: CREATE_NO_WINDOW or explicit pipe
+    # ownership on the child). The warnings themselves are elevation-independent;
+    # it is the session lifecycle that is not.
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=86; Name='S-86 (D-2 host env detection)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    $d = New-ScenarioDir 86
+    # Fresh EMPTY fake home (see S-81): the real learned store must not reach
+    # any leg's verdict.
+    $fakeHome = Join-Path $d 'home'
+    New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
+    $base = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    # (a) host env only: no override notice.
+    $a = Invoke-Sandbox -Args ($base + @('--','cmd','/c','echo','host-env-only')) -WorkingDirectory $d -Env @{ 'HTTPS_PROXY' = 'http://127.0.0.1:1'; 'SANDBOX_DIAG' = '1'; 'USERPROFILE' = $fakeHome }
+    $aErr = ($a.Stderr -join "`n")
+    $aOk = ($a.ExitCode -eq 0) -and ((($a.Stdout -join "`n")) -match 'host-env-only') -and (-not ($aErr -match 'differs from host'))
+    # (b) profile value differs from host env: the G-42 notice.
+    $pB = Join-Path $d 'upstream-profile.json'
+    Set-Content -LiteralPath $pB -Value '{"meta":{"name":"s86-profile","schema_version":1},"network":{"upstreamProxy":"http://127.0.0.1:1"}}' -Encoding ASCII
+    $b = Invoke-Sandbox -Args (@('run','--allow-cwd','--profile',$pB,'--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','echo','profile-wins')) -WorkingDirectory $d -Env @{ 'HTTPS_PROXY' = 'http://127.0.0.1:2'; 'SANDBOX_DIAG' = '1'; 'USERPROFILE' = $fakeHome }
+    $bErr = ($b.Stderr -join "`n")
+    $bWarn = $bErr.Contains('SANDBOX_DIAG: profile network.upstreamProxy (127.0.0.1:1) differs from host HTTPS_PROXY/HTTP_PROXY (127.0.0.1:2); using the profile value')
+    $bOk = ($b.ExitCode -eq 0) -and ((($b.Stdout -join "`n")) -match 'profile-wins') -and $bWarn
+    # (c) unparsable (https) profile value: unconditional warning.
+    $pC = Join-Path $d 'upstream-https.json'
+    Set-Content -LiteralPath $pC -Value '{"meta":{"name":"s86-https","schema_version":1},"network":{"upstreamProxy":"https://proxy.example:8080"}}' -Encoding ASCII
+    $c = Invoke-Sandbox -Args (@('run','--allow-cwd','--profile',$pC,'--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','echo','direct-fallback')) -WorkingDirectory $d -Env @{ 'SANDBOX_DIAG' = $null; 'USERPROFILE' = $fakeHome }
+    $cErr = ($c.Stderr -join "`n")
+    $cWarn = $cErr.Contains('[sandbox] warning: the upstream proxy configured via profile network.upstreamProxy is unusable')
+    $cUnparsable = $cErr.Contains('(unparsable)')
+    $cNoEcho = -not $cErr.Contains('proxy.example')
+    # The marker must be absent ENTIRELY, not merely harmless: without this the
+    # leg passes identically whether SANDBOX_DIAG was removed or inherited, so a
+    # future diag-gating of the parse-failure warning would go unnoticed.
+    $cNoDiag = -not $cErr.Contains('SANDBOX_DIAG')
+    $cOk = ($c.ExitCode -eq 0) -and ((($c.Stdout -join "`n")) -match 'direct-fallback') -and $cWarn -and $cUnparsable -and $cNoEcho -and $cNoDiag
+    $passed = $aOk -and $bOk -and $cOk
+    return @{ Num=86; Name='S-86 (D-2 host env detection)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'host-only: no differs warning; differing values: G-42 notice names both endpoints; https upstream: unconditional (unparsable) warning, URL not echoed, no SANDBOX_DIAG marker' }
+                 else { "a=$aOk b=$bOk warnB=$bWarn c=$cOk warnC=$cWarn unparsable=$cUnparsable noEcho=$cNoEcho diagFree=$cNoDiag aErr=$(Get-LineHead -Lines @($aErr) -Max 140) bErr=$(Get-LineHead -Lines @($bErr) -Max 140) cErr=$(Get-LineHead -Lines @($cErr) -Max 140)" } }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -2092,7 +2399,7 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 84
+$script:MaxScenario = 86
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
     73 = { Invoke-Scenario-S73 }
@@ -2103,9 +2410,12 @@ $script:ScenarioFunctions = @{
     78 = { Invoke-Scenario-S78 }
     79 = { Invoke-Scenario-S79 }
     80 = { Invoke-Scenario-S80 }
+    81 = { Invoke-Scenario-S81 }
     82 = { Invoke-Scenario-S82 }
     83 = { Invoke-Scenario-S83 }
     84 = { Invoke-Scenario-S84 }
+    85 = { Invoke-Scenario-S85 }
+    86 = { Invoke-Scenario-S86 }
 }
 
 function Invoke-Scenario { param([int]$Number)
