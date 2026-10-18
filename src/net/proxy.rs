@@ -1858,6 +1858,22 @@ mod tests {
         assert_eq!(ev["reason"], "loopback_refused");
     }
 
+    #[test]
+    fn loopback_refused_even_when_allowlisted() {
+        // [G-44] the loopback refusal is a pre-stage of the hard-deny: an
+        // allow_domain entry for `localhost` must not reopen a tunnel to host
+        // services. Pins the loopback stage against the allow-list stage.
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("loopback-allow", &["localhost", "127.0.0.1"], &[], dialog);
+        let resp = exchange(t.port, &connect_req("localhost:8080"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("X-Sandbox: denied"), "got: {resp}");
+        assert!(calls.lock().unwrap().is_empty());
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["source"], "hard-deny");
+        assert_eq!(ev["reason"], "loopback_refused");
+    }
+
     // ---- (3): hard-deny beats blocklist, allowlist, learned and prompt -----
 
     #[test]
@@ -1915,6 +1931,30 @@ mod tests {
         assert_eq!(ev["persisted"], false);
     }
 
+    #[test]
+    fn hard_deny_beats_allowlist() {
+        // [G-18, G-33] step 1 outranks step 4: an operator who allow-lists a
+        // metadata name still cannot reach it, and the audit source names the
+        // stage that answered (`allowlist` here would be the bug).
+        let (dialog, calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup(
+            "hard-deny-allow",
+            &["metadata.google.internal", "*.google.internal"],
+            &[],
+            dialog,
+        );
+        let resp = exchange(t.port, &connect_req("metadata.google.internal:80"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("X-Sandbox: denied"), "got: {resp}");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "hard-deny must not prompt"
+        );
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["source"], "hard-deny");
+        assert_eq!(ev["reason"], "denied_dns");
+    }
+
     // ---- (4): learned-deny beats blocklist and allowlist -------------------
 
     #[test]
@@ -1956,6 +1996,30 @@ mod tests {
         );
         let resp = exchange(t.port, &connect_req("evil.example.com:443"));
         assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["source"], "blocklist");
+        assert_eq!(ev["reason"], "denied_domain");
+    }
+
+    #[test]
+    fn blocklist_beats_learned_allow() {
+        // [G-33] step 3 outranks step 4's learned-allow half: a deny_domain
+        // entry added after the user once allowed the host still wins. The
+        // mirror of `learned_deny_beats_blocklist_and_allowlist`, which pins
+        // the opposite direction (learned deny is step 2).
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("blocklist-learned-allow", &[], &["*.example.com"], dialog);
+        t.learned
+            .lock()
+            .unwrap()
+            .record("evil.example.com", "host", true)
+            .unwrap();
+        let resp = exchange(t.port, &connect_req("evil.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "blocklist must not prompt"
+        );
         let ev = last_connect_event(&t.sid);
         assert_eq!(ev["source"], "blocklist");
         assert_eq!(ev["reason"], "denied_domain");
@@ -2004,6 +2068,34 @@ mod tests {
         assert!(
             src == "learned" || src == "dns",
             "learned-allowed host may only fail at DNS, got {src}"
+        );
+    }
+
+    #[test]
+    fn learned_allow_admits_in_allowlist_mode() {
+        // [G-33] step 4 is "allow_domain OR learned allow", so a learned allow
+        // must still admit when the allow-list is non-empty and lacks the
+        // host — i.e. ahead of the step-5 allowlist-mode default, which would
+        // prompt here. `learned_allow_allows_without_prompt` covers the same
+        // stage with an EMPTY allow-list (pure blocklist mode), so it cannot
+        // pin this pair.
+        let (dialog, calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("learned-allow-mode", &["api.allowed.invalid"], &[], dialog);
+        t.learned
+            .lock()
+            .unwrap()
+            .record("nx-learned-mode.invalid", "host", true)
+            .unwrap();
+        exchange(t.port, &connect_req("nx-learned-mode.invalid:443"));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "learned allow must not prompt"
+        );
+        let evs = connect_events(&t.sid);
+        assert!(
+            evs.iter()
+                .any(|e| e["source"] == "learned" && e["disposition"] == "allow"),
+            "admission leaf must be a learned allow: {evs:?}"
         );
     }
 
