@@ -43,6 +43,16 @@
   Plan slots S-73/S-74 moved to S-82/S-83 (the
   MXC journal scenarios took those numbers on this branch after the plan was
   written) — see the numbering note above the S-72 section.
+  S-87..S-92 (ADR-0001 Task 5.3) close the D-1 pipeline coverage: S-87 (plan
+  S-84) deny_domain beats a wildcard allow, S-88 (plan S-85) learned-deny beats
+  deny_domain, S-89 (plan S-86) is a DOCUMENTED SKIP for DNS pinning (no
+  controlled resolver is available hermetically; the pinning property is pinned
+  by three proxy.rs unit tests), S-90 (plan S-87) loopback CONNECT refused even
+  when allow-listed, S-91 (plan S-88) a CONNECT with no Proxy-Authorization
+  gets the exact 407 + Proxy-Authenticate contract (S-36 covers it loosely),
+  and S-92 (plan S-89) prompt_overload is a MANUAL scenario. Plan slots
+  S-84..S-89 became S-87..S-92 because S-84..S-86 were already taken on this
+  branch - see the numbering note above the S-72 section.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -1783,6 +1793,19 @@ function Invoke-Scenario-S71 {
 #                                               is rejected by design)
 # S-85/S-86 keep their numbers free of the 3.8 block on purpose: inserting
 # between S-84 and a later phase would renumber again on the next merge.
+#
+# ADR-0001 Task 5.3 numbering note (same collision, one phase later): the plan
+# numbered this final batch S-84..S-89, but S-84/S-85/S-86 are taken by 3.8's
+# extra learned-revoke case and 4.3's upstream-unreachable + host-env
+# scenarios, so the mapping is
+#   plan S-84 (deny_domain over allow)          -> S-87
+#   plan S-85 (learned-deny over deny_domain)   -> S-88
+#   plan S-86 (DNS pinning, single resolution)  -> S-89 (documented skip)
+#   plan S-87 (loopback CONNECT refused)        -> S-90
+#   plan S-88 (missing Proxy-Authorization)     -> S-91
+#   plan S-89 (prompt_overload, 9 concurrent)   -> S-92 (manual)
+# Plan S-84's literal flags are satisfiable as written (unlike 3.8's S-72,
+# whose deny pattern could not match its target), so S-87 uses them verbatim.
 # ---------------------------------------------------------------------------
 
 # Count non-inherited session AppContainer ACEs on a path. Excludes
@@ -2386,6 +2409,323 @@ function Invoke-Scenario-S86 {
 }
 
 # ---------------------------------------------------------------------------
+# ADR-0001 Task 5.3 - final pipeline integration scenarios (plan S-84..S-89,
+# renumbered to S-87..S-92 per the note above the S-72 section).
+#
+# The prompt-enabled trio (S-87/S-88/S-90) runs with the PROMPT ENABLED (no
+# --no-prompt) on purpose: the claim under test is that the decision happens
+# BEFORE the prompt, so disabling the prompt would make the "no dialog" half of
+# every assertion vacuous. None of them can park a TaskDialog even under a
+# pipeline regression, because each host's ALTERNATIVE outcome is also pre-prompt:
+# S-87/S-90's hosts are allow-listed (a broken blocklist/loopback stage answers
+# 200 or 502, never a prompt) and S-88's host is blocklisted (a broken learned
+# stage still gets a blocklist deny). The learned store is isolated with a fake
+# USERPROFILE in every member (the 4.3 convention).
+# ---------------------------------------------------------------------------
+
+# Prompt note for the trio below (S-87/S-88/S-90): the prompt is enabled ON
+# PURPOSE - the claim is "decided before the prompt". The assertions are safe
+# against regressions in the stages under test, but an UNRELATED allow-matcher
+# regression would fall through to the dialog and stall up to promptTimeoutSecs
+# (60 s) before failing - bounded by Invoke-Sandbox's 120 s kill, so slow, never
+# a hang.
+
+# S-87 (D-1; plan S-84): pipeline order - the deny_domain blocklist beats the
+# allow-list. The plan's flags are satisfiable AS WRITTEN (`--allow-domain
+# *.anthropic.com --deny-domain api.anthropic.com`): the wildcard allow really
+# does cover api.anthropic.com ([G-55] wildcard = apex + subdomains), so a 403
+# can only come from the blocklist stage. Unlike 3.8's S-72 (whose plan
+# flags could not match their target under dot-bounded matching), this config
+# is exact. A raw CONNECT probe (not curl) makes the status line,
+# the `X-Sandbox: denied` header and the deny body's stage attribution readable
+# without parsing curl -v output, and PROVES the request reached the pipeline
+# (an unparseable/absent response would read as a silent failure).
+function Invoke-Scenario-S87 {
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=87; Name='S-87 (D-1 blocklist beats allow)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; these scenarios themselves speak CONNECT without it)' } }
+    $d = New-ScenarioDir 87
+    # Fresh EMPTY fake home: a learned entry for anthropic.com in the real store
+    # must not be able to decide this scenario.
+    $fakeHome = Join-Path $d 'home'
+    New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
+    $envOverrides = @{ 'USERPROFILE' = $fakeHome }
+    $flags = @('run','--allow-cwd','--allow-domain','*.anthropic.com','--deny-domain','api.anthropic.com')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d -Env $envOverrides
+    if ($psid.ExitCode -ne 0) { return @{ Num=87; Name='S-87 (D-1 blocklist beats allow)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $probe = Invoke-ConnectProbe -SandboxArgs ($flags + @('--sid',$sid)) -TargetHost 'api.anthropic.com' -WorkingDirectory $d -Env $envOverrides
+    $raw = $probe.Raw
+    $got403 = ($raw -match 'HTTP/1\.1 403 Forbidden')
+    $gotHeader = ($raw -match 'X-Sandbox: denied')
+    # The deny body names the stage that answered; deterministic, unlike timing.
+    $bodyStage = ($raw -match 'denied by the blocklist policy \(denied_domain\)')
+    # -Env is deliberately omitted: audit_log_path() resolves under %LOCALAPPDATA%,
+    # not the overridden USERPROFILE (fake home). If that ever changes, pass -Env.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $blocklistDeny = $false
+    $allowLeaf = $false
+    $promptLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -ne 'CONNECT') { continue }
+        # Absence of ANY prompt-path leaf is asserted globally: the pipeline must
+        # never have reached the dialog, not merely "not for this host".
+        if ($o.source -eq 'prompt' -or $o.source -eq 'prompt_overload' -or $o.source -eq 'unavailable') { $promptLeaf = $true }
+        if ($o.host -ne 'api.anthropic.com') { continue }
+        if ($o.disposition -eq 'deny' -and $o.source -eq 'blocklist' -and $o.reason -eq 'denied_domain') { $blocklistDeny = $true }
+        if ($o.disposition -eq 'allow') { $allowLeaf = $true }
+    }
+    $passed = $probe.Ok -and $got403 -and $gotHeader -and $bodyStage -and $blocklistDeny -and (-not $allowLeaf) -and (-not $promptLeaf)
+    return @{ Num=87; Name='S-87 (D-1 blocklist beats allow)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'deny_domain beat the wildcard allow: 403 + X-Sandbox: denied, body names the blocklist stage; audit blocklist/denied_domain, no allow and no prompt leaf' }
+                 else { "probeOk=$($probe.Ok) 403=$got403 header=$gotHeader bodyStage=$bodyStage blocklistAudit=$blocklistDeny allowLeaf=$allowLeaf promptLeaf=$promptLeaf probeExit=$($probe.ExitCode) raw=$(Get-LineHead -Lines @($raw) -Max 200)" } }
+}
+
+# S-88 (D-1; plan S-85): pipeline order - a LEARNED permanent deny outranks
+# deny_domain [G-33]. Both stages answer 403 for this host, so the status is NOT
+# the assertion: the audit `source` is ("learned", not "blocklist"), plus the
+# learned fields the decision carries (scope, persisted). The seeded file is the
+# byte-shape `LearnedStore::record(host, "host", allow=false)` writes - the
+# ascii-LOWERCASED key form, because load() lowercases on read and `learned
+# list` shows the stored key (3.7 advisory #1) - under a per-scenario fake
+# USERPROFILE, so the real %USERPROFILE%\.sandbox\learned store is never
+# touched (S-79's pattern).
+function Invoke-Scenario-S88 {
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=88; Name='S-88 (D-1 learned-deny beats blocklist)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; these scenarios themselves speak CONNECT without it)' } }
+    $d = New-ScenarioDir 88
+    $fakeHome = Join-Path $d 'home'
+    $learnedDir = Join-Path $fakeHome '.sandbox\learned'
+    New-Item -ItemType Directory -Path $learnedDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $learnedDir 'default.json') -Value '{"schema":1,"allow":[],"deny":[{"host":"evil.example.com","scope":"host"}]}' -Encoding ASCII
+    $envOverrides = @{ 'USERPROFILE' = $fakeHome }
+    # The host is on BOTH the learned deny and the blocklist; api.anthropic.com
+    # keeps the session in allow-list mode so a broken conflict resolution has
+    # somewhere to fall through to (still a deny, different source).
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--deny-domain','*.example.com')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d -Env $envOverrides
+    if ($psid.ExitCode -ne 0) { return @{ Num=88; Name='S-88 (D-1 learned-deny beats blocklist)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $probe = Invoke-ConnectProbe -SandboxArgs ($flags + @('--sid',$sid)) -TargetHost 'evil.example.com' -WorkingDirectory $d -Env $envOverrides
+    $raw = $probe.Raw
+    $got403 = ($raw -match 'HTTP/1\.1 403 Forbidden')
+    $gotHeader = ($raw -match 'X-Sandbox: denied')
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $learnedDeny = $false
+    $learnedScope = $false
+    $learnedPersisted = $false
+    $blocklistDeny = $false
+    $allowLeaf = $false
+    $promptLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -ne 'CONNECT') { continue }
+        if ($o.source -eq 'prompt' -or $o.source -eq 'prompt_overload' -or $o.source -eq 'unavailable') { $promptLeaf = $true }
+        if ($o.host -ne 'evil.example.com') { continue }
+        if ($o.disposition -eq 'deny' -and $o.source -eq 'learned' -and $o.reason -eq 'learned deny') {
+            $learnedDeny = $true
+            if ($o.scope -eq 'host') { $learnedScope = $true }
+            if ($o.persisted -eq $true) { $learnedPersisted = $true }
+        }
+        if ($o.disposition -eq 'deny' -and $o.source -eq 'blocklist') { $blocklistDeny = $true }
+        # Mirror S-87's negative: the winning LEARNED deny must not also leave an
+        # allow leaf for the same host (deny-then-admit would still answer 403).
+        if ($o.disposition -eq 'allow') { $allowLeaf = $true }
+    }
+    $passed = $probe.Ok -and $got403 -and $gotHeader -and $learnedDeny -and $learnedScope -and $learnedPersisted -and (-not $blocklistDeny) -and (-not $allowLeaf) -and (-not $promptLeaf)
+    return @{ Num=88; Name='S-88 (D-1 learned-deny beats blocklist)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'learned deny outranked deny_domain: 403, audit learned/"learned deny" scope=host persisted=true, no blocklist leaf, no allow leaf, no prompt leaf' }
+                 else { "probeOk=$($probe.Ok) 403=$got403 header=$gotHeader learned=$learnedDeny scope=$learnedScope persisted=$learnedPersisted blocklistLeaf=$blocklistDeny allowLeaf=$allowLeaf promptLeaf=$promptLeaf raw=$(Get-LineHead -Lines @($raw) -Max 200)" } }
+}
+
+# S-89 (D-1; plan S-86): DNS pinning end-to-end - "one resolution per CONNECT,
+# and the dial uses exactly the admission answer". DOCUMENTED SKIP, not a test.
+# Observing which IPs leave the supervisor needs a CONTROLLED resolver (a
+# multi-A answer whose addresses only the test knows); none is available
+# hermetically, and the only way to synthesize one on Windows is editing
+# %SystemRoot%\System32\drivers\etc\hosts - a system-wide mutation that is
+# neither isolated from the rest of the suite nor reliably reversible after a
+# crash, so this harness will not make it. The property is pinned at the
+# production seam instead, in src/net/proxy.rs:
+#   anti_rebinding_dials_exactly_the_admission_resolved_set  (resolver called
+#     once; the dialed set equals the admission set; the winner's peer is in it)
+#   dial_upstream_resolves_once_and_dials_only_that_answer
+#   dial_upstream_denies_a_hostname_that_resolves_to_link_local (the pinned set
+#     feeds the hard-deny leg)
+# The plan's suggested assertion - "single CONNECT event in the audit log" -
+# would NOT test pinning anyway: that leaf is emitted at admission, before the
+# dial, and is exactly 1 whether or not the dialer re-resolved. A vacuous green
+# here would be worse than an explicit skip.
+function Invoke-Scenario-S89 {
+    return @{ Num=89; Name='S-89 (D-1 DNS pinning)'; Passed=$true; Skipped=$true
+        Detail='DOCUMENTED SKIP - needs a controlled resolver. A hermetic END-TO-END variant is not merely hard but IMPOSSIBLE without a resolver-injection hook in the binary (a production change): a static hosts entry cannot simulate rebinding, and a hosts edit is machine-global and survives a crash. Pinning is unit-pinned in src/net/proxy.rs (anti_rebinding_dials_exactly_the_admission_resolved_set, dial_upstream_resolves_once_and_dials_only_that_answer, dial_upstream_denies_a_hostname_that_resolves_to_link_local)' }
+}
+
+# S-90 (D-1; plan S-87): a loopback CONNECT is refused with 403 +
+# `X-Sandbox: denied` even when the loopback host is EXPLICITLY allow-listed
+# [G-44] - the loopback stage is step (2) of decide(), ahead of the allow-list.
+# End-to-end counterpart of the unit test loopback_refused_even_when_allowlisted
+# (proxy.rs). Both name forms are probed in ONE session (127.0.0.1 and
+# localhost), each allow-listed, so a regression that admit-lists loopback fails
+# twice with distinct evidence. The probe's CONNECT port is its fixed 443 (the
+# plan's 8080 is immaterial: the refusal happens before the port is used), and
+# nothing asserts on the port. S-75 already exercises this refusal on a NON-443
+# port (127.0.0.1:5432), which is what makes probing 443 here lossless.
+function Invoke-Scenario-S90 {
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=90; Name='S-90 (D-1 loopback refused)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; these scenarios themselves speak CONNECT without it)' } }
+    $d = New-ScenarioDir 90
+    $fakeHome = Join-Path $d 'home'
+    New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
+    $envOverrides = @{ 'USERPROFILE' = $fakeHome }
+    $flags = @('run','--allow-cwd','--allow-domain','127.0.0.1','--allow-domain','localhost')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d -Env $envOverrides
+    if ($psid.ExitCode -ne 0) { return @{ Num=90; Name='S-90 (D-1 loopback refused)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $probeOk = $true
+    $statusOk = $true
+    $headerOk = $true
+    $probeDetail = ''
+    foreach ($h in @('127.0.0.1','localhost')) {
+        $probe = Invoke-ConnectProbe -SandboxArgs ($flags + @('--sid',$sid)) -TargetHost $h -WorkingDirectory $d -Env $envOverrides
+        $raw = $probe.Raw
+        $got403 = ($raw -match 'HTTP/1\.1 403 Forbidden')
+        $gotHeader = ($raw -match 'X-Sandbox: denied')
+        if (-not $probe.Ok) { $probeOk = $false }
+        if (-not $got403) { $statusOk = $false }
+        if (-not $gotHeader) { $headerOk = $false }
+        if ($probeDetail -eq '' -and -not ($probe.Ok -and $got403 -and $gotHeader)) { $probeDetail = "[$h] exit=$($probe.ExitCode) raw=$(Get-LineHead -Lines @($raw) -Max 120)" }
+    }
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $loopbackLeaves = @{}
+    $allowLeaf = $false
+    $promptLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -ne 'CONNECT') { continue }
+        if ($o.source -eq 'prompt' -or $o.source -eq 'prompt_overload' -or $o.source -eq 'unavailable') { $promptLeaf = $true }
+        if ($o.disposition -eq 'allow') { $allowLeaf = $true }
+        if ($o.disposition -eq 'deny' -and $o.source -eq 'hard-deny' -and $o.reason -eq 'loopback_refused') { $loopbackLeaves[$o.host] = $true }
+    }
+    $bothAudited = $loopbackLeaves.ContainsKey('127.0.0.1') -and $loopbackLeaves.ContainsKey('localhost')
+    $passed = $probeOk -and $statusOk -and $headerOk -and $bothAudited -and (-not $allowLeaf) -and (-not $promptLeaf)
+    return @{ Num=90; Name='S-90 (D-1 loopback refused)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'loopback CONNECT refused while allow-listed (127.0.0.1 + localhost): 403 + X-Sandbox: denied; audit hard-deny/loopback_refused for both, no allow and no prompt leaf' }
+                 else { "probeOk=$probeOk 403=$statusOk header=$headerOk audited127=$($loopbackLeaves.ContainsKey('127.0.0.1')) auditedLocalhost=$($loopbackLeaves.ContainsKey('localhost')) allowLeaf=$allowLeaf promptLeaf=$promptLeaf $probeDetail" } }
+}
+
+# S-91 (D-1; plan S-88): a CONNECT carrying NO Proxy-Authorization is rejected
+# by the supervisor's own token gate with `407` + `Proxy-Authenticate` [G-7,
+# G-27]. S-36 covers this loosely from curl's side (curl retries a 407 and can
+# disguise the first response); this scenario is the tight version. An inner
+# PowerShell body (ASCII-only, an explicit param for the target, the S-75/S-77
+# wrapper-file precedent) speaks the CONNECT itself over a raw TcpClient:
+# curl's behaviour around the header is exactly what is being controlled for,
+# so curl is removed from the path. The supervisor writes the 407 and CLOSES
+# (no dial, no admission), which is cross-checked in the audit: the token gate
+# emits disposition deny / reason "no_token" / source "default" / host
+# "<unknown>" / port 0, and NO CONNECT leaf for the requested host exists.
+# Byte-shape of that leaf is the proxy.rs token-gate code, not an assumption.
+function Invoke-Scenario-S91 {
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=91; Name='S-91 (D-1 missing Proxy-Authorization)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; these scenarios themselves speak CONNECT without it)' } }
+    $d = New-ScenarioDir 91
+    $inner = @'
+param([string]$TargetHost)
+# Deliberately NO Proxy-Authorization header: that absence is the test.
+if (-not $env:HTTP_PROXY) { Write-Output 'S91_NO_PROXY_ENV'; exit 5 }
+# Read the port as a STRING first: [int]$env:SANDBOX_PROXY_PORT throws a cast
+# error on an empty or absent value, which would surface as a raw PowerShell
+# error instead of the clean NO_PROXY_PORT marker. Parse, then range-check.
+$portRaw = $env:SANDBOX_PROXY_PORT
+$port = 0
+if (-not [int]::TryParse([string]$portRaw, [ref]$port)) { Write-Output 'S91_NO_PROXY_PORT'; exit 3 }
+$m = [regex]::Match($env:HTTP_PROXY, '://(?:[^@/]*@)?([^:/]+):')
+$dialHost = if ($m.Success) { $m.Groups[1].Value } else { '127.0.0.1' }
+if ($port -le 0) { Write-Output 'S91_NO_PROXY_PORT'; exit 3 }
+$c = New-Object System.Net.Sockets.TcpClient
+try { $c.Connect($dialHost, $port) } catch { Write-Output 'S91_DIAL_FAILED'; exit 4 }
+$s = $c.GetStream()
+$s.ReadTimeout = 10000
+$req = "CONNECT ${TargetHost}:443 HTTP/1.1`r`nHost: ${TargetHost}:443`r`n`r`n"
+$bytes = [Text.Encoding]::ASCII.GetBytes($req)
+$s.Write($bytes, 0, $bytes.Length)
+$s.Flush()
+$ms = New-Object System.IO.MemoryStream
+$buf = New-Object byte[] 8192
+while ($true) {
+    $n = 0
+    try { $n = $s.Read($buf, 0, $buf.Length) } catch { break }
+    if ($n -le 0) { break }
+    $ms.Write($buf, 0, $n)
+}
+$c.Close()
+$raw = [Text.Encoding]::ASCII.GetString($ms.ToArray())
+$lines = $raw -split "`r`n"
+$status = if ($lines.Count -gt 0) { $lines[0] } else { '' }
+$authHdr = 0
+foreach ($ln in $lines) { if ($ln -match '^(?i)Proxy-Authenticate:') { $authHdr = 1 } }
+Write-Output ('S91_STATUS=' + $status)
+Write-Output ('S91_AUTH_HEADER=' + $authHdr)
+# The gate's contract is a headers-only 407: assert the DECLARED length of the
+# header block, not a measured byte count (a client acts on the declaration).
+$clZero = 0
+foreach ($ln in $lines) {
+    if ($ln -eq '') { break }
+    if ($ln -match '^(?i)Content-Length:\s*0\s*$') { $clZero = 1 }
+}
+Write-Output ('S91_CL_ZERO=' + $clZero)
+exit 0
+'@
+    Set-Content -LiteralPath (Join-Path $d 's91-no-auth-connect.ps1') -Value $inner -Encoding ASCII
+    $fakeHome = Join-Path $d 'home'
+    New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
+    $envOverrides = @{ 'USERPROFILE' = $fakeHome }
+    # The target is deliberately NOT allow-listed: if the token gate ever let
+    # this through, the verdict would be a clean 403 instead of real egress.
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d -Env $envOverrides
+    if ($psid.ExitCode -ne 0) { return @{ Num=91; Name='S-91 (D-1 missing Proxy-Authorization)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    # Absolute path: the harness rule is absolute paths for anything the child
+    # opens. The relative form only worked because spawn.rs passes lpCurrentDirectory.
+    $innerScript = Join-Path $d 's91-no-auth-connect.ps1'
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',$innerScript,'-TargetHost','example.com')) -WorkingDirectory $d -Env $envOverrides
+    $out = ($r.Stdout -join "`n")
+    if ($out -match 'S91_NO_PROXY_PORT' -or $out -match 'S91_NO_PROXY_ENV' -or $out -match 'S91_DIAL_FAILED') {
+        return @{ Num=91; Name='S-91 (D-1 missing Proxy-Authorization)'; Passed=$false; Skipped=$false
+            Detail = "inner probe could not reach the proxy (exit=$($r.ExitCode)): $(Get-LineHead -Lines @($out) -Max 160)" }
+    }
+    # Exact status line, not a contains-'407' check: the challenge is the
+    # contract, and a numeric port or an unrelated header containing 407 must
+    # not satisfy it.
+    $got407 = ($out -match 'S91_STATUS=HTTP/1\.1 407 Proxy Authentication Required')
+    $gotChallenge = ($out -match 'S91_AUTH_HEADER=1')
+    # Headers-only 407: Content-Length: 0 is the token gate's body contract.
+    $gotNoBody = ($out -match 'S91_CL_ZERO=1')
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $tokenLeaf = $false
+    $admissionLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -ne 'CONNECT') { continue }
+        if ($o.disposition -eq 'deny' -and $o.reason -eq 'no_token' -and $o.source -eq 'default' -and $o.host -eq '<unknown>') { $tokenLeaf = $true }
+        if ($o.host -eq 'example.com') { $admissionLeaf = $true }
+    }
+    $passed = ($r.ExitCode -eq 0) -and $got407 -and $gotChallenge -and $gotNoBody -and $tokenLeaf -and (-not $admissionLeaf)
+    return @{ Num=91; Name='S-91 (D-1 missing Proxy-Authorization)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'CONNECT with no Proxy-Authorization: 407 Proxy Authentication Required + Proxy-Authenticate + Content-Length: 0 (headers only); audit default/no_token (<unknown>), no admission leaf for example.com' }
+                 else { "exit=$($r.ExitCode) got407=$got407 challenge=$gotChallenge noBody=$gotNoBody tokenLeaf=$tokenLeaf admissionLeaf=$admissionLeaf out=$(Get-LineHead -Lines @($out) -Max 200) err=$(Get-LineHead -Lines $r.Stderr -Max 160)" } }
+}
+
+# S-92 (D-3; plan S-89): prompt_overload - nine concurrent CONNECTs to nine
+# distinct unknown hosts must spawn exactly EIGHT dialogs and deny the ninth
+# immediately with audit source "prompt_overload" [G-28]. MANUAL APPROVAL
+# REQUIRED: the assertion is a human counting native TaskDialogs, and the
+# harness never simulates dialog clicks (the S-78 convention). The recipe below
+# is the one verified at plan Task 3.8 Checkpoint 3 item 7.
+function Invoke-Scenario-S92 {
+    return @{ Num=92; Name='S-92 (D-3 prompt_overload)'; Passed=$true; Skipped=$true
+        Detail='MANUAL APPROVAL required - 8 dialogs must be counted by eye (plan Task 3.8 Checkpoint 3 item 7). Recipe: ONE session with the prompt ENABLED (no --no-prompt) and --allow-domain api.anthropic.com; inside it run: curl --parallel --parallel-max 9 -s -m 40 -o NUL <nine https URLs, n1.example.com..n9.example.com> (repeat -o NUL once per URL). Expect exactly 8 dialogs and the 9th request denied; confirm with sandbox audit show <sid> --json -> one CONNECT leaf with source=prompt_overload, disposition=deny. The DENIED HOST IS WHICHEVER REQUEST LOSES THE RACE, not necessarily n9, so a different denied host is NOT a failure: the invariant is exactly 8 dialogs + exactly one prompt_overload leaf (source=prompt_overload)' }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -2418,7 +2758,7 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 86
+$script:MaxScenario = 92
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
     73 = { Invoke-Scenario-S73 }
@@ -2435,6 +2775,12 @@ $script:ScenarioFunctions = @{
     84 = { Invoke-Scenario-S84 }
     85 = { Invoke-Scenario-S85 }
     86 = { Invoke-Scenario-S86 }
+    87 = { Invoke-Scenario-S87 }
+    88 = { Invoke-Scenario-S88 }
+    89 = { Invoke-Scenario-S89 }
+    90 = { Invoke-Scenario-S90 }
+    91 = { Invoke-Scenario-S91 }
+    92 = { Invoke-Scenario-S92 }
 }
 
 function Invoke-Scenario { param([int]$Number)
