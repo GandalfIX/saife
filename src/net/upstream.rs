@@ -443,7 +443,17 @@ impl DirectDialer {
     }
 
     /// Dial the pinned addresses. An empty list fails closed.
+    ///
+    /// Defence in depth (Task 5.2 spec advisory 3): the pinned-link-local
+    /// hard-deny is enforced at `proxy::dial_upstream` today, so a future path
+    /// that reached this seam directly would skip it. The assert reuses the
+    /// proxy's own predicate (not a copy) and is DEBUG-ONLY: release behaviour
+    /// is unchanged, because production already denies before dialing.
     pub async fn dial(&self, pinned_addrs: &[SocketAddr]) -> Result<TcpStream, UpstreamError> {
+        debug_assert!(
+            !super::proxy::pinned_addrs_contain_hard_denied(pinned_addrs),
+            "DirectDialer::dial was handed a hard-denied pinned address: {pinned_addrs:?}"
+        );
         happy_eyeballs_dial(pinned_addrs.to_vec())
             .await
             .map_err(UpstreamError::Unreachable)

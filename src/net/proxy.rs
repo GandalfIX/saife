@@ -24,6 +24,7 @@
 //! Likewise `hyper`, `hyper-util`, `http`, `http-body-util`, and `bytes`
 //! are present as deps for that future work and are NOT imported here.
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -343,11 +344,66 @@ fn deny_source(reason: DenyReason) -> &'static str {
 /// `maxParallelDials`, RFC 8305 race).
 const MAX_PARALLEL_DIALS: usize = 8;
 
+/// RFC 8305 §4 address ordering: alternate the two families, so a MAXIMAL
+/// dual-stack answer (8+ addresses of each family) puts 4 IPv6 + 4 IPv4 in
+/// the first batch instead of draining every IPv4 answer before any IPv6
+/// dial starts. A single-family list keeps its resolver order.
+///
+/// There is deliberately no RFC 8305 §5 head start: every address in a batch
+/// is dialed CONCURRENTLY, so the ONLY effect of this function is batch
+/// composition and spawn order. It does not prefer a family at connect time.
+///
+/// Family is decided by `SocketAddr::is_ipv6()`, which counts an IPv4-mapped
+/// `::ffff:a.b.c.d` as IPv6 — such an address takes an IPv6 slot and can lead
+/// its batch. Harmless: `matcher::is_hard_denied_ip` unmaps before the
+/// hard-deny check, and the kernel dials the embedded v4 target regardless.
+fn interleave_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.into_iter().partition(SocketAddr::is_ipv6);
+    if v6.is_empty() || v4.is_empty() {
+        return v6.into_iter().chain(v4).collect();
+    }
+    let mut out = Vec::with_capacity(v6.len() + v4.len());
+    let mut six = v6.into_iter();
+    let mut four = v4.into_iter();
+    loop {
+        let a = six.next();
+        let b = four.next();
+        if a.is_none() && b.is_none() {
+            break;
+        }
+        out.extend(a);
+        out.extend(b);
+    }
+    out
+}
+
 /// Race the (DNS-pinned) address list in batches of [`MAX_PARALLEL_DIALS`]:
-/// the first successful connection wins, stragglers are aborted. A loser
+/// the first successful connection wins, stragglers are cancelled. A loser
 /// that already connected is closed when its task is dropped — half-open
 /// sockets are never spliced into a tunnel.
 pub(crate) async fn happy_eyeballs_dial(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
+    happy_eyeballs_dial_with(addrs, TcpStream::connect).await
+}
+
+/// [`happy_eyeballs_dial`] with the connect operation injected.
+///
+/// `connect` is the ONLY way an address is dialed, so a test can observe the
+/// two properties the race actually promises: (1) exactly which addresses are
+/// attempted — the anti-rebinding pin, nothing outside the caller's
+/// admission-resolved list can be dialed; and (2) that a losing attempt is
+/// genuinely CANCELLED, by holding a drop probe across its await. Production
+/// calls it with `TcpStream::connect`; there is no test-only parallel path.
+async fn happy_eyeballs_dial_with<F, Fut>(
+    addrs: Vec<SocketAddr>,
+    connect: F,
+) -> io::Result<TcpStream>
+where
+    F: Fn(SocketAddr) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = io::Result<TcpStream>> + Send + 'static,
+{
+    let addrs = interleave_families(addrs);
+    let connect = Arc::new(connect);
     let mut last_err = None;
     for start in (0..addrs.len()).step_by(MAX_PARALLEL_DIALS) {
         let end = (start + MAX_PARALLEL_DIALS).min(addrs.len());
@@ -356,8 +412,9 @@ pub(crate) async fn happy_eyeballs_dial(addrs: Vec<SocketAddr>) -> io::Result<Tc
         let mut spawned = Vec::with_capacity(batch.len());
         for &addr in batch {
             let tx = tx.clone();
+            let connect = Arc::clone(&connect);
             spawned.push(tokio::spawn(async move {
-                let _ = tx.send(TcpStream::connect(addr).await).await;
+                let _ = tx.send(connect(addr).await).await;
             }));
         }
         drop(tx);
@@ -372,8 +429,15 @@ pub(crate) async fn happy_eyeballs_dial(addrs: Vec<SocketAddr>) -> io::Result<Tc
                 None => break,
             }
         }
-        for h in spawned {
+        // Abort AND await. `abort` alone only *requests* cancellation, so a
+        // loser's dial future (and the socket it may have opened) could outlive
+        // this call; awaiting the aborted handle makes "cancelled" an
+        // observable fact by the time the race returns.
+        for h in &spawned {
             h.abort();
+        }
+        for h in spawned {
+            let _ = h.await;
         }
         if let Some(s) = winner {
             return Ok(s);
@@ -768,12 +832,40 @@ async fn respond_deny(sock: &mut TcpStream, host: &str, port: u16, d: &Decision)
 /// candidate address list; that exact list is what gets dialed, so a
 /// mid-session DNS poison cannot redirect an already-admitted host.
 /// Literal IPs never touch the resolver.
-async fn resolve_pinned(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+///
+/// `lookup` is the resolver ([`system_lookup`] in production). It is injected
+/// because the literal-IP short-circuit and the single-lookup shape live HERE,
+/// ahead of the seam: a test that passes a counting resolver pins the real
+/// production path, not a copy of it — a literal host must not call `lookup` at
+/// all, and a hostname must call it exactly once and keep its answer verbatim
+/// (brackets stripped; case and trailing dot untouched — the resolver owns
+/// name normalization).
+///
+/// `Fut: Send` is a documented CONTRACT, not incidental: production passes
+/// [`system_lookup`], whose future is `Send`, and `handle_conn` (the caller)
+/// is spawned. Without the bound a non-`Send` resolver would still reach a
+/// working monomorphization for synchronous tests and only explode at the
+/// spawn site, with an error naming tokio rather than this seam — so the
+/// bound is stated here.
+async fn resolve_pinned_with<F, Fut>(
+    host: &str,
+    port: u16,
+    lookup: F,
+) -> io::Result<Vec<SocketAddr>>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = io::Result<Vec<SocketAddr>>> + Send,
+{
     let h = strip_host_brackets(host.trim());
     if let Ok(ip) = h.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    tokio::net::lookup_host((h, port))
+    lookup(h.to_string(), port).await
+}
+
+/// The real resolver — the one DNS lookup per admitted hostname ([G-12]).
+async fn system_lookup(host: String, port: u16) -> io::Result<Vec<SocketAddr>> {
+    tokio::net::lookup_host((host, port))
         .await
         .map(|it| it.collect())
 }
@@ -789,6 +881,34 @@ fn strip_host_brackets(host: &str) -> &str {
 /// leg of the pipeline.
 fn parse_host_ip(host: &str) -> Option<IpAddr> {
     strip_host_brackets(host.trim()).parse().ok()
+}
+
+/// Fail-closed verdict for the pinned (admission-resolved) address set
+/// ([G-12, G-45]): if ANY resolved address lies in a hard-denied CIDR —
+/// link-local / metadata — the whole request is denied as `denied_cidr`
+/// before a single dial, so a hostname cannot serve as a bridge into a
+/// link-local range ([G-22] keeps this leg on the DIRECT path only; chained
+/// dials are hostname-only and never produce a pinned set).
+///
+/// Pure over `&[SocketAddr]`, so the leg is testable with any address list
+/// (no resolver seam needed) and the production dial path calls exactly this.
+fn pinned_addrs_hard_denied(addrs: &[SocketAddr]) -> Option<Decision> {
+    if pinned_addrs_contain_hard_denied(addrs) {
+        return Some(denied_by(DenyReason::DeniedCidr));
+    }
+    None
+}
+
+/// The bare predicate behind [`pinned_addrs_hard_denied`]: does ANY address in
+/// the pinned set lie in a hard-denied CIDR?
+///
+/// Split out as `pub(crate)` for exactly one caller — the debug-only
+/// defence-in-depth assert in `upstream::DirectDialer::dial` (Task 5.2 spec
+/// advisory 3), which must be able to reuse this check without the audit
+/// `Decision` type. Sharing the predicate (not a copy) keeps the proxy seam and
+/// the direct-dialer seam from drifting apart.
+pub(crate) fn pinned_addrs_contain_hard_denied(addrs: &[SocketAddr]) -> bool {
+    addrs.iter().any(|sa| matcher::is_hard_denied_ip(sa.ip()))
 }
 
 /// Offset just past the first `\r\n\r\n` in `buf`, if the head is complete.
@@ -826,7 +946,7 @@ enum DialFailure {
 /// Resolve (or deliberately not) and dial the admitted CONNECT target.
 ///
 /// Chained (`upstream.is_some() && chains_host(host)`): hostname-only
-/// admission — no [`resolve_pinned`], no DNS-failure denial, no pinned-IP
+/// admission — no [`resolve_pinned_with`], no DNS-failure denial, no pinned-IP
 /// hard-deny ([G-22]). The upstream proxy resolves the name itself, and a
 /// local answer could disagree with what it sees. The hostname-set and
 /// IP-literal hard-denies already ran in [`decide`] before admission and need
@@ -834,11 +954,26 @@ enum DialFailure {
 ///
 /// Direct: pin once ([G-12]), hard-deny the pinned set, then race the addresses
 /// with Happy Eyeballs ([G-49] keeps that path intact).
-async fn dial_upstream(
+///
+/// `lookup` is the resolver ([`system_lookup`] in production). Injecting it
+/// here — rather than only into [`resolve_pinned_with`] — is what makes the
+/// [G-12] promise observable at the REAL call site: one resolution per
+/// admitted host, and the dial sees nothing but that answer. Unused on the
+/// chained branch by design.
+///
+/// `Fut: Send` mirrors [`resolve_pinned_with`]: this future is awaited inside
+/// `handle_conn`, which is spawned, so a resolver whose future is not `Send`
+/// must be rejected here — by name — instead of at the spawn site.
+async fn dial_upstream<F, Fut>(
     upstream: Option<&UpstreamDialer>,
     host: &str,
     port: u16,
-) -> Result<TcpStream, DialFailure> {
+    lookup: F,
+) -> Result<TcpStream, DialFailure>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = io::Result<Vec<SocketAddr>>> + Send,
+{
     // One normalization, used by every branch below. `parse_connect_target`
     // keeps an IPv6 literal's brackets, but `chains_host`/`host_matches_no_proxy`
     // compare bare names and `host_port` re-brackets for the CONNECT line — so
@@ -860,7 +995,7 @@ async fn dial_upstream(
             });
     }
 
-    let addrs = match resolve_pinned(host, port).await {
+    let addrs = match resolve_pinned_with(host, port, lookup).await {
         Ok(a) if a.is_empty() => {
             return Err(DialFailure::Denied(Decision::dns_failure(
                 "DNS resolution returned no addresses",
@@ -876,8 +1011,8 @@ async fn dial_upstream(
     // The pinned IP set gets the hard-deny check too: a hostname that resolves
     // into a hard-denied range is refused before any dial (fail-closed
     // [G-12, G-45]).
-    if addrs.iter().any(|sa| matcher::is_hard_denied_ip(sa.ip())) {
-        return Err(DialFailure::Denied(denied_by(DenyReason::DeniedCidr)));
+    if let Some(d) = pinned_addrs_hard_denied(&addrs) {
+        return Err(DialFailure::Denied(d));
     }
 
     happy_eyeballs_dial(addrs)
@@ -1004,7 +1139,8 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
 
     // Admission done — dial (Step 2): chained through the upstream
     // proxy, or DNS-pinned + Happy Eyeballs on the direct path.
-    let mut upstream_stream = match dial_upstream(ctx.upstream.as_deref(), &host, port).await {
+    let dialed = dial_upstream(ctx.upstream.as_deref(), &host, port, system_lookup).await;
+    let mut upstream_stream = match dialed {
         Ok(s) => s,
         Err(DialFailure::Denied(d)) => {
             emit_decision(&ctx.writer, &host, port, &d);
@@ -1281,6 +1417,7 @@ async fn handle_non_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_head(auth: &str) -> String {
         format!("CONNECT api.example.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n")
@@ -1543,6 +1680,677 @@ mod tests {
             .await
             .expect("second batch must dial");
         assert_eq!(s.peer_addr().unwrap().port(), live.port());
+    }
+
+    // ---- Task 5.2: pinned (admission-time) resolution --------------------
+
+    /// The resolved-IP hard-deny leg is a pure predicate over the pinned set,
+    /// so it is testable with any address list and the production dial path
+    /// calls exactly this. RFC 3927 link-local, unrelated to the two named
+    /// metadata literals — this is the CIDR leg.
+    ///
+    /// Table-driven over the /16 edges (Task 5.2 spec advisory 6): the first
+    /// and last host in 169.254.0.0/16 must deny, the neighbours just outside
+    /// must not — an off-by-one in the prefix or a `<=`/`<` slip shows here.
+    #[test]
+    fn pinned_addrs_hard_denied_catches_link_local_v4() {
+        let public: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let cases = [
+            ("169.254.0.1:443", true),      // first host of the /16
+            ("169.254.31.7:443", true),     // interior
+            ("169.254.255.254:443", true),  // last host of the /16
+            ("169.255.0.1:443", false),     // one past the /16
+            ("169.253.255.254:443", false), // one before it
+        ];
+        for (addr, denied) in cases {
+            let addrs = [public, addr.parse::<SocketAddr>().unwrap()];
+            let verdict = super::pinned_addrs_hard_denied(&addrs);
+            assert_eq!(
+                verdict.is_some(),
+                denied,
+                "{addr} must {}be hard-denied",
+                if denied { "" } else { "NOT " }
+            );
+            if let Some(d) = verdict {
+                assert!(!d.allowed);
+                assert_eq!(d.source, "hard-deny");
+                assert_eq!(d.reason.as_deref(), Some("denied_cidr"));
+            }
+        }
+    }
+
+    /// fe80::/10 ([G-45]) — the v6 link-local CIDR. Same edge discipline: the
+    /// last address of the /10 (`febf:ffff:…:ffff`) denies and `fec0::1`, the
+    /// first address outside it, does not.
+    #[test]
+    fn pinned_addrs_hard_denied_catches_link_local_v6() {
+        let public: SocketAddr = "[2001:db8::9]:443".parse().unwrap();
+        let cases = [
+            ("[fe80::1]:443", true),            // first host of the /10
+            ("[fe80:abcd:1234::ff]:443", true), // interior
+            ("[febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:443", true), // last address of the /10
+            ("[fec0::1]:443", false),           // one past the /10
+            ("[fe70::1]:443", false),           // one before it
+        ];
+        for (addr, denied) in cases {
+            let addrs = [public, addr.parse::<SocketAddr>().unwrap()];
+            let verdict = super::pinned_addrs_hard_denied(&addrs);
+            assert_eq!(
+                verdict.is_some(),
+                denied,
+                "{addr} must {}be hard-denied",
+                if denied { "" } else { "NOT " }
+            );
+            if let Some(d) = verdict {
+                assert_eq!(d.reason.as_deref(), Some("denied_cidr"));
+            }
+        }
+    }
+
+    /// No false positives: a public pinned set (and the empty set, which the
+    /// DNS-failure path handles) is not a CIDR denial.
+    #[test]
+    fn pinned_addrs_hard_denied_allows_public_and_empty_sets() {
+        let addrs = [
+            "203.0.113.9:443".parse::<SocketAddr>().unwrap(),
+            "[2001:db8::9]:443".parse::<SocketAddr>().unwrap(),
+        ];
+        assert!(super::pinned_addrs_hard_denied(&addrs).is_none());
+        assert!(super::pinned_addrs_hard_denied(&[]).is_none());
+    }
+
+    /// The gap Task 5.1 recorded: the pinned-IP hard-deny leg had no test.
+    /// `dial_upstream` is the production call site — a literal keeps the test
+    /// DNS-free, and the leg sees the same `Vec<SocketAddr>` a hostname's
+    /// resolver answer produces, so this pins the leg a resolving hostname
+    /// would hit too.
+    ///
+    /// The 2s bound (Task 5.2 spec advisory 5) keeps the test FAST-RED: with
+    /// the hard-deny removed it reaches a real connect to 169.254.31.7:80 and
+    /// would otherwise fail only after the OS SYN timeout (~20s). The bound
+    /// does not weaken it — a dial attempt that is actually attempted cannot
+    /// be mistaken for a denial.
+    #[tokio::test]
+    async fn dial_upstream_denies_a_pinned_link_local_v4_literal() {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            super::dial_upstream(None, "169.254.31.7", 80, super::system_lookup),
+        )
+        .await
+        {
+            Ok(Err(super::DialFailure::Denied(d))) => {
+                assert_eq!(d.source, "hard-deny");
+                assert_eq!(d.reason.as_deref(), Some("denied_cidr"));
+            }
+            Ok(Err(_)) => panic!("expected a Denied dial failure, not a dial attempt"),
+            Ok(Ok(_)) => panic!("a link-local pinned address must never be dialed"),
+            Err(_) => panic!("the deny must be decided before any dial is awaited"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_upstream_denies_a_pinned_link_local_v6_literal() {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            super::dial_upstream(None, "[fe80::1]", 80, super::system_lookup),
+        )
+        .await
+        {
+            Ok(Err(super::DialFailure::Denied(d))) => {
+                assert_eq!(d.reason.as_deref(), Some("denied_cidr"));
+            }
+            Ok(Err(_)) => panic!("expected a Denied dial failure, not a dial attempt"),
+            Ok(Ok(_)) => panic!("a link-local pinned address must never be dialed"),
+            Err(_) => panic!("the deny must be decided before any dial is awaited"),
+        }
+    }
+
+    /// The gap Task 5.1 recorded, in its REAL shape: a hostname whose
+    /// admission-time answer is link-local. Same production leg as the literal
+    /// tests, but the address list arrives from the resolver exactly as a
+    /// poisoned DNS answer would.
+    #[tokio::test]
+    async fn dial_upstream_denies_a_hostname_that_resolves_to_link_local() {
+        let calls = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::dial_upstream(None, "metadata.evil.example", 80, |host, port| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!((host.as_str(), port), ("metadata.evil.example", 80));
+                async { Ok(vec!["169.254.31.7:80".parse::<SocketAddr>().unwrap()]) }
+            }),
+        )
+        .await
+        .expect("the deny must be decided before any dial is awaited");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        match result {
+            Err(super::DialFailure::Denied(d)) => {
+                assert_eq!(d.source, "hard-deny");
+                assert_eq!(d.reason.as_deref(), Some("denied_cidr"));
+            }
+            Err(_) => panic!("expected a Denied dial failure, not a dial attempt"),
+            Ok(_) => panic!("a hostname resolving into link-local must never be dialed"),
+        }
+    }
+
+    /// [G-12] at the real call site: ONE resolution per admitted host, and the
+    /// dial is seeded with exactly its answer (the winning peer proves which
+    /// address was dialed). A second resolution would either bump `calls` or
+    /// dial a different address.
+    #[tokio::test]
+    async fn dial_upstream_resolves_once_and_dials_only_that_answer() {
+        let (_l, live) = local_listener().await;
+        let calls = AtomicUsize::new(0);
+        let s = match super::dial_upstream(None, "pinned.example", live.port(), |host, port| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!((host.as_str(), port), ("pinned.example", live.port()));
+            async move { Ok(vec![live]) }
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => panic!("the pinned answer must be dialed"),
+        };
+        assert_eq!(s.peer_addr().unwrap(), live);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one resolution per admitted host"
+        );
+    }
+
+    /// Step 1 / requirement 4: a literal IP is its own answer — the resolver
+    /// seam is never consulted (counted, not merely "returns the same thing",
+    /// which `lookup_host` would also do for a literal).
+    #[tokio::test]
+    async fn resolve_pinned_literal_ip_never_calls_the_resolver() {
+        let calls = AtomicUsize::new(0);
+        let addrs = super::resolve_pinned_with("192.0.2.7", 8443, |_host, _port| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Vec::new()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(addrs, vec!["192.0.2.7:8443".parse::<SocketAddr>().unwrap()]);
+        let addrs = super::resolve_pinned_with("[2001:db8::9]", 443, |_host, _port| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Vec::new()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            addrs,
+            vec!["[2001:db8::9]:443".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a literal IP must not touch the resolver"
+        );
+    }
+
+    /// Step 1: exactly ONE resolution per admission, and its answer is used
+    /// verbatim (brackets stripped, trailing dot and case preserved — the
+    /// resolver owns normalization, this seam must not silently rewrite the
+    /// name it pins).
+    #[tokio::test]
+    async fn resolve_pinned_hostname_resolves_exactly_once() {
+        let expected = vec![
+            "203.0.113.9:443".parse::<SocketAddr>().unwrap(),
+            "203.0.113.10:443".parse::<SocketAddr>().unwrap(),
+        ];
+        let calls = AtomicUsize::new(0);
+        let got = super::resolve_pinned_with("Pinned.Example.", 443, |host, port| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!((host.as_str(), port), ("Pinned.Example.", 443));
+            let answer = expected.clone();
+            async move { Ok(answer) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one resolution per admission"
+        );
+    }
+
+    /// Step 3 / requirement 3 — anti-rebinding. The audit event carries no
+    /// `resolved_ips` field (the D-5 taxonomy has no such key), so the pin is
+    /// structural: the address list produced at admission is the ONLY list the
+    /// dial seam is handed, no second resolution happens, and the socket that
+    /// wins belongs to that set.
+    #[tokio::test]
+    async fn anti_rebinding_dials_exactly_the_admission_resolved_set() {
+        let (_l, live) = local_listener().await;
+        let dead = "203.0.113.1:443".parse::<SocketAddr>().unwrap();
+        let expected = vec![dead, live];
+        let answer = expected.clone();
+        let resolve_calls = AtomicUsize::new(0);
+
+        // (1) admission: one resolution, answer recorded.
+        let admitted = super::resolve_pinned_with("rebind.example", live.port(), |host, port| {
+            resolve_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!((host.as_str(), port), ("rebind.example", live.port()));
+            let answer = answer.clone();
+            async move { Ok(answer) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+
+        // (2) the dial: every attempted address is recorded. The barrier makes
+        // the recording complete before the winner can return.
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_seam = Arc::clone(&seen);
+        let barrier = Arc::new(tokio::sync::Barrier::new(admitted.len()));
+        // Timeout-bounded (Task 5.2 quality advisory 1): a regression to fewer
+        // concurrent dials would leave the barrier unfulfilled forever, and an
+        // unbounded barrier HANGS the suite instead of failing it.
+        let s = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::happy_eyeballs_dial_with(admitted.clone(), move |addr| {
+                seen_seam.lock().unwrap().push(addr);
+                let barrier = Arc::clone(&barrier);
+                let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                    Box::pin(async move {
+                        barrier.wait().await;
+                        if addr == live {
+                            TcpStream::connect(live).await
+                        } else {
+                            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                        }
+                    });
+                fut
+            }),
+        )
+        .await
+        .expect("every admitted address must be dialed concurrently")
+        .unwrap();
+        assert_eq!(s.peer_addr().unwrap(), live);
+        assert!(
+            expected.contains(&s.peer_addr().unwrap()),
+            "the winning socket must be one of the admission-resolved addresses"
+        );
+
+        let mut dialed = seen.lock().unwrap().clone();
+        let mut want = admitted.clone();
+        dialed.sort();
+        want.sort();
+        assert_eq!(
+            dialed, want,
+            "the dial set must equal the admission-resolved set"
+        );
+    }
+
+    // ---- Task 5.2: Happy Eyeballs race shape -----------------------------
+
+    /// Step 2: 8 dials in flight at once ([G-12] maxParallelDials). The
+    /// barrier of 8 only releases if all eight are awaited concurrently — a
+    /// sequential (or 4-wide) implementation times out here.
+    #[tokio::test]
+    async fn happy_eyeballs_races_eight_addresses_concurrently() {
+        assert_eq!(super::MAX_PARALLEL_DIALS, 8, "[G-12] maxParallelDials");
+        let (_l, live) = local_listener().await;
+        let mut addrs = vec![live];
+        for i in 0..7u8 {
+            addrs.push(format!("203.0.113.{}:443", i + 1).parse().unwrap());
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(super::MAX_PARALLEL_DIALS));
+        let s = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::happy_eyeballs_dial_with(addrs, move |addr| {
+                let barrier = Arc::clone(&barrier);
+                let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                    Box::pin(async move {
+                        barrier.wait().await;
+                        if addr == live {
+                            TcpStream::connect(live).await
+                        } else {
+                            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                        }
+                    });
+                fut
+            }),
+        )
+        .await
+        .expect("8 dials must run concurrently")
+        .expect("the live address must win");
+        assert_eq!(s.peer_addr().unwrap(), live);
+    }
+
+    /// The race is capped at 8 IN FLIGHT — not merely "8 per batch step". Every
+    /// dial bumps a high-water mark, yields once so its peers can start, then
+    /// fails; a 16-address list must still peak at exactly
+    /// [`MAX_PARALLEL_DIALS`]. A wider cap peaks at the batch length, a narrower
+    /// one below 8.
+    ///
+    /// `current_thread` is pinned deliberately (Task 5.2 quality advisory 2):
+    /// the exact-equality assert is sound only when `yield_now` hands control
+    /// to the other spawned dials before any of them decrements the counter.
+    /// On a multi-thread flavor the dials can run on separate workers and
+    /// finish before their peers start, giving a lower peak — a flake, not a
+    /// regression. Pinning the flavor makes the assumption part of the test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn happy_eyeballs_caps_concurrency_at_eight() {
+        let mut addrs = Vec::new();
+        for i in 0..16u8 {
+            addrs.push(format!("203.0.113.{}:443", i + 1).parse().unwrap());
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let out = super::happy_eyeballs_dial_with(addrs, {
+            let live = Arc::clone(&live);
+            let peak = Arc::clone(&peak);
+            move |_addr| {
+                let live = Arc::clone(&live);
+                let peak = Arc::clone(&peak);
+                let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                    Box::pin(async move {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                    });
+                fut
+            }
+        })
+        .await;
+        assert!(out.is_err(), "sixteen dead addresses must all fail");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            super::MAX_PARALLEL_DIALS,
+            "the race must peak at MAX_PARALLEL_DIALS in flight"
+        );
+    }
+
+    /// The interleave CALL SITE (not just the pure function): a resolver
+    /// answer with every IPv4 first must still put 4+4 into the first batch.
+    /// The first eight addresses to reach the barrier ARE that batch — batch
+    /// two is not even spawned until batch one has finished.
+    #[tokio::test]
+    async fn happy_eyeballs_first_batch_interleaves_both_families() {
+        let mut addrs: Vec<SocketAddr> = (1..=8)
+            .map(|i| format!("203.0.113.{i}:443").parse().unwrap())
+            .collect();
+        addrs.extend((1..=8).map(|i| {
+            format!("[2001:db8::{i}]:443")
+                .parse::<SocketAddr>()
+                .unwrap()
+        }));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_seam = Arc::clone(&seen);
+        let barrier = Arc::new(tokio::sync::Barrier::new(super::MAX_PARALLEL_DIALS));
+        // Timeout-bounded (Task 5.2 quality advisory 1): if the first batch
+        // ever stopped holding eight concurrent dials the barrier would never
+        // release and this would HANG the suite instead of failing it.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::happy_eyeballs_dial_with(addrs, move |addr| {
+                seen_seam.lock().unwrap().push(addr);
+                let barrier = Arc::clone(&barrier);
+                let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                    Box::pin(async move {
+                        barrier.wait().await;
+                        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                    });
+                fut
+            }),
+        )
+        .await
+        .expect("the first batch must hold 8 concurrent dials");
+        let first_batch: Vec<SocketAddr> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .take(super::MAX_PARALLEL_DIALS)
+            .cloned()
+            .collect();
+        assert_eq!(first_batch.len(), super::MAX_PARALLEL_DIALS);
+        assert_eq!(
+            first_batch.iter().filter(|a| a.is_ipv6()).count(),
+            4,
+            "the first batch must be 4 IPv6 + 4 IPv4: {first_batch:?}"
+        );
+    }
+
+    /// Step 2: the race is capped at 8 in flight — a 9th address is spawned
+    /// only after the first batch has finished. With a 16-wide cap the 9th
+    /// dial would start alongside the first eight and this goes red.
+    #[tokio::test]
+    async fn happy_eyeballs_ninth_dial_waits_for_the_first_batch() {
+        let (_l, live) = local_listener().await;
+        let mut addrs = Vec::new();
+        for i in 0..8u8 {
+            addrs.push(format!("203.0.113.{}:443", i + 1).parse().unwrap());
+        }
+        addrs.push(live); // 9th — second batch only
+        let order = Arc::new(addrs.clone());
+        let log = Arc::new(StdMutex::new(Vec::<(usize, &'static str)>::new()));
+        let log_seam = Arc::clone(&log);
+        let order_seam = Arc::clone(&order);
+        let s = super::happy_eyeballs_dial_with(addrs, move |addr| {
+            let idx = order_seam.iter().position(|a| *a == addr).unwrap();
+            log_seam.lock().unwrap().push((idx, "start"));
+            let log = Arc::clone(&log_seam);
+            let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                Box::pin(async move {
+                    if addr == live {
+                        TcpStream::connect(live).await
+                    } else {
+                        log.lock().unwrap().push((idx, "done"));
+                        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                    }
+                });
+            fut
+        })
+        .await
+        .expect("the second batch must dial");
+        assert_eq!(s.peer_addr().unwrap(), live);
+
+        let events = log.lock().unwrap().clone();
+        let ninth_start = events
+            .iter()
+            .position(|e| e.0 == 8 && e.1 == "start")
+            .expect("the 9th dial must have started");
+        let last_first_batch = events
+            .iter()
+            .rposition(|e| e.0 < 8)
+            .expect("the first batch must have run");
+        assert!(
+            last_first_batch < ninth_start,
+            "the 9th dial must not start before the first batch ends: {events:?}"
+        );
+        assert_eq!(events.iter().filter(|e| e.1 == "start").count(), 9);
+    }
+
+    /// Step 2: the losers are CANCELLED, not abandoned. Each loser's dial
+    /// future holds a drop probe and never resolves; after the winner returns,
+    /// both probes must have been dropped — the production path aborts each
+    /// loser task and awaits its handle, so cancellation has completed before
+    /// `happy_eyeballs_dial` returns.
+    #[tokio::test]
+    async fn happy_eyeballs_cancels_the_losing_dials() {
+        struct CancelProbe(Arc<AtomicUsize>);
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (_l, live) = local_listener().await;
+        let addrs = vec![
+            "203.0.113.1:443".parse::<SocketAddr>().unwrap(),
+            live,
+            "203.0.113.2:443".parse::<SocketAddr>().unwrap(),
+        ];
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(addrs.len()));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::happy_eyeballs_dial_with(addrs, {
+                let cancelled = Arc::clone(&cancelled);
+                let started = Arc::clone(&started);
+                let barrier = Arc::clone(&barrier);
+                move |addr| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let probe = if addr == live {
+                        None
+                    } else {
+                        Some(CancelProbe(Arc::clone(&cancelled)))
+                    };
+                    let barrier = Arc::clone(&barrier);
+                    let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                        Box::pin(async move {
+                            let _probe = probe;
+                            barrier.wait().await;
+                            if addr == live {
+                                TcpStream::connect(live).await
+                            } else {
+                                std::future::pending::<io::Result<TcpStream>>().await
+                            }
+                        });
+                    fut
+                }
+            }),
+        )
+        .await
+        .expect("the race must not hang");
+        let s = outcome.expect("the live address must win");
+        assert_eq!(s.peer_addr().unwrap(), live);
+        assert_eq!(started.load(Ordering::SeqCst), 3, "all three dials start");
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            2,
+            "both losers must be cancelled, not abandoned"
+        );
+    }
+
+    /// A loser that already CONNECTED is CLOSED, not leaked: the sockets this
+    /// race opens must never escape it. Two live local listeners, and a
+    /// barrier AFTER the connect, so both dials reach ESTABLISHED before
+    /// either can win — the loser in this race is guaranteed to be holding an
+    /// open socket. When the race returns, the winner's tunnel still carries
+    /// bytes and the loser's peer has seen EOF. Deterministic: no sleeps, and
+    /// no assumption about which listener wins.
+    #[tokio::test]
+    async fn happy_eyeballs_closes_a_loser_that_already_connected() {
+        let (la, a) = local_listener().await;
+        let (lb, b) = local_listener().await;
+        // Accept up front: each connection is witnessed as ESTABLISHED, so the
+        // loser's close is observed on a socket that really exists rather than
+        // on a half-open backlog entry.
+        let acc_a = tokio::spawn(async move { la.accept().await.map(|(s, _)| s) });
+        let acc_b = tokio::spawn(async move { lb.accept().await.map(|(s, _)| s) });
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut s = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::happy_eyeballs_dial_with(vec![a, b], move |addr| {
+                let barrier = Arc::clone(&barrier);
+                let fut: std::pin::Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> =
+                    Box::pin(async move {
+                        let s = TcpStream::connect(addr).await?;
+                        // Both dials have CONNECTED before either reports.
+                        barrier.wait().await;
+                        if addr == a {
+                            Ok(s)
+                        } else {
+                            // The loser holds its ESTABLISHED socket and never
+                            // reports: only cancellation (abort AND await, so
+                            // the drop has happened by the time the race
+                            // returns) can close it.
+                            std::future::pending::<()>().await;
+                            unreachable!("the pending dial cannot complete")
+                        }
+                    });
+                fut
+            }),
+        )
+        .await
+        .expect("the race must not hang")
+        .expect("one of two live listeners must win");
+
+        let winner = s.peer_addr().unwrap();
+        assert!(
+            winner == a || winner == b,
+            "the winner must be one of the dialed addresses"
+        );
+        let (mut winner_peer, mut loser_peer) = if winner == a {
+            (acc_a.await.unwrap().unwrap(), acc_b.await.unwrap().unwrap())
+        } else {
+            (acc_b.await.unwrap().unwrap(), acc_a.await.unwrap().unwrap())
+        };
+
+        // The winner's tunnel is alive in both directions ...
+        winner_peer.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        s.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+
+        // ... while the loser's socket is closed. `read` returning 0 is EOF,
+        // i.e. the client side dropped its TcpStream and sent a FIN. Had the
+        // loser been abandoned instead of aborted-and-awaited, its socket
+        // would still be open and this read would block until the timeout.
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), loser_peer.read(&mut buf))
+            .await
+            .expect("a connected loser must be closed when the race returns")
+            .expect("the close must be graceful, not a reset");
+        assert_eq!(n, 0, "the loser's peer must see EOF");
+    }
+
+    /// Step 2 as specced: 8 concurrent is 4 IPv6 + 4 IPv4, so the first batch
+    /// must alternate families instead of draining the resolver's IPv4 block
+    /// before any IPv6 dial starts (RFC 8305 §4 ordering, IPv6 first).
+    #[test]
+    fn interleave_families_alternates_v6_and_v4() {
+        let v6: Vec<SocketAddr> = (1..=4)
+            .map(|i| format!("[2001:db8::{i}]:443").parse().unwrap())
+            .collect();
+        let v4: Vec<SocketAddr> = (1..=4)
+            .map(|i| format!("203.0.113.{i}:443").parse().unwrap())
+            .collect();
+        let mut input = v4.clone();
+        input.extend(v6.clone()); // resolver order: every IPv4 first
+        let out = super::interleave_families(input);
+        assert_eq!(
+            out,
+            vec![v6[0], v4[0], v6[1], v4[1], v6[2], v4[2], v6[3], v4[3]]
+        );
+        let first_batch = &out[..super::MAX_PARALLEL_DIALS];
+        assert_eq!(
+            first_batch.iter().filter(|a| a.is_ipv6()).count(),
+            4,
+            "the first batch must carry 4 IPv6 + 4 IPv4"
+        );
+    }
+
+    #[test]
+    fn interleave_families_keeps_a_single_family_order() {
+        let v4: Vec<SocketAddr> = (1..=3)
+            .map(|i| format!("203.0.113.{i}:443").parse().unwrap())
+            .collect();
+        assert_eq!(super::interleave_families(v4.clone()), v4);
+        // Unequal counts: alternation first, then the remainder in place.
+        let mixed = vec![
+            v4[0],
+            "[2001:db8::1]:443".parse::<SocketAddr>().unwrap(),
+            v4[1],
+            v4[2],
+        ];
+        assert_eq!(
+            super::interleave_families(mixed),
+            vec![
+                "[2001:db8::1]:443".parse::<SocketAddr>().unwrap(),
+                v4[0],
+                v4[1],
+                v4[2]
+            ]
+        );
     }
 
     // ---- PromptOutcome → D-5 audit mapping (pure) -------------------------
@@ -2590,17 +3398,6 @@ mod tests {
         let t = t36_setup("sandbox-404", &[], &[], dialog);
         let resp = exchange(t.port, &get_req("/sandbox/other"));
         assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp}");
-    }
-
-    #[tokio::test]
-    async fn resolve_pinned_literal_ip_skips_the_resolver() {
-        let addrs = super::resolve_pinned("192.0.2.7", 8443).await.unwrap();
-        assert_eq!(addrs, vec!["192.0.2.7:8443".parse::<SocketAddr>().unwrap()]);
-        let addrs = super::resolve_pinned("[2001:db8::9]", 443).await.unwrap();
-        assert_eq!(
-            addrs,
-            vec!["[2001:db8::9]:443".parse::<SocketAddr>().unwrap()]
-        );
     }
 
     #[test]
