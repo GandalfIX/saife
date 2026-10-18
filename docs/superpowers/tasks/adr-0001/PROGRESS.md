@@ -91,6 +91,8 @@ Manual verification (elevated shell, loopback exemption registered):
 
 **CHECKPOINT 5** — STOP for user approval
 
+> 2026-10-18 (automated half GREEN): elevated `-Only @(87,88,90,91)` → **4/4 PASS** — S-87 (blocklist beats allow), S-88 (learned-deny beats blocklist), S-90 (loopback refused for both name forms), S-91 (missing Proxy-Authorization → 407). The wrapper returned to the prompt this run, so `Cleanup-Acls` did NOT hang here (unlike the earlier 3-scenario run). S-92 (prompt_overload, MANUAL) was already user-verified at Checkpoint 3 item 7 (8 dialogs + exactly one `prompt_overload` denial); a re-run is optional. Awaiting the user's go-ahead to close ADR-0001.
+
 ## Event Log
 
 - 2026-07-31: Worktree created at `.worktrees/adr-0001-network/sandbox`. Baseline verified: `cargo build --release` (0 warnings), `cargo test` (95 passed).
