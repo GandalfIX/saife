@@ -837,50 +837,117 @@ function Invoke-Scenario-S26 {
 
 # S-27: AC-3.3 — allow-domain permits the listed host.
 # The sandboxed child talks to the localhost proxy (auto-injected HTTP_PROXY),
-# which allows the CONNECT to the listed host. PASS if curl gets an HTTP
-# response code from the server (4xx/5xx = reached the server; auth failed is
-# expected). Skip if curl.exe is absent or loopback-to-proxy is blocked.
+# which ADMITS the CONNECT to the listed host. The assertion is that admission
+# as the proxy records it: an audit CONNECT leaf for api.anthropic.com with
+# disposition=allow and source=allowlist (the allow-list arm of decide(),
+# src/net/proxy.rs:654-663 via emit_connect). curl's exit code and
+# %{http_connect} are informational Detail only. Why the shift: the CONNECT
+# decision is the ADR-0001 D-1 property, while a TLS round trip to a live host
+# is ENVIRONMENTAL - with no route to the CRL/OCSP responder the handshake
+# fails behind a perfectly good admission (curl exit 35; the same request has
+# also been observed as exit 7). --no-prompt keeps an admission regression a
+# clean 403 instead of parking the suite on a dialog. Skip if curl.exe is
+# absent or loopback-to-proxy is blocked.
 function Invoke-Scenario-S27 {
     if (-not (Get-Curl)) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 27
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
-    $code = (($r.Stdout -join '') -replace '\s','')
-    $connected = Test-CurlReachedServer -ExitCode $r.ExitCode -HttpCode $code
-    $passed = $connected
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    # Exactly one %{...} curl variable: cmd.exe expands only DEFINED %VAR%
+    # names, so %{http_connect} reaches curl literally on the /c line (checked
+    # against curl 8.18 / cmd.exe) - no extra escaping is needed.
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://api.anthropic.com/v1/messages')) -WorkingDirectory $d
+    $info = (($r.Stdout -join '') -replace '\s','')
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $allowLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'api.anthropic.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $allowLeaf = $true }
+    }
+    $passed = $allowLeaf
     return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "connection succeeded (http_code=$code)" } else { "exit=$($r.ExitCode) http_code=$code" } }
+        Detail = if ($passed) { "proxy admitted api.anthropic.com (audit: disposition=allow source=allowlist); curl info: http_connect='$info' exit=$($r.ExitCode)" }
+                 else { "no disposition=allow/source=allowlist CONNECT leaf for api.anthropic.com (sid=$sid exit=$($r.ExitCode) http_connect='$info') audit=$(Get-LineHead -Lines $s.Stderr -Max 120)" } }
 }
 
 # S-28: AC-3.4 — allow-domain denies an unlisted host.
-# The proxy denies the CONNECT to evil.example.com (not in the allow-list).
-# PASS if curl fails to connect (non-zero exit, empty/error output).
+# PASS iff the PROXY is seen refusing evil.example.com: either curl's CONNECT
+# response is 403 (%{http_connect}) or the audit holds a CONNECT deny leaf for
+# that host. A bare "curl exited non-zero with http_code 000" is NOT accepted
+# any more: every transport failure satisfies it, which is the signature this
+# host produces when the network is unreachable (exit 7, and exit 35 behind an
+# admitted tunnel) - the old form passed without the proxy ever seeing the
+# request, a false pass by construction. --no-prompt pins the decision to the
+# policy's own deny [G-48] (source=default, reason "prompting disabled; host
+# not allow-listed") instead of a dialog-backend timeout, so the leaf is
+# deterministic. Detail separates "no proxy signal - request never reached the
+# proxy" from "denied". Why the shift: the CONNECT decision is the ADR-0001 D-1
+# property, while a TLS round trip to a live host is ENVIRONMENTAL - no route
+# to the CRL/OCSP responder (curl exit 35; the same request has also been
+# observed as exit 7). Skip if curl.exe is absent or loopback-to-proxy blocked.
 function Invoke-Scenario-S28 {
     if (-not (Get-Curl)) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 28
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://evil.example.com') -WorkingDirectory $d
-    $code = (($r.Stdout -join '') -replace '\s','')
-    # Denied: curl exit non-zero AND http_code is 000/empty (never reached a server).
-    $denied = ($r.ExitCode -ne 0) -and ($code -eq '000' -or $code -eq '')
-    $passed = $denied
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://evil.example.com')) -WorkingDirectory $d
+    $connect = (($r.Stdout -join '') -replace '\s','')
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $denyLeaf = $false
+    $leafSource = ''
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'evil.example.com' -and $o.disposition -eq 'deny') { $denyLeaf = $true; $leafSource = [string]$o.source }
+    }
+    # Two acceptable proxy signals: the 403 on the CONNECT response, or the
+    # admission-time deny leaf. Neither can exist if the request never arrived.
+    $got403 = ($connect -eq '403')
+    $passed = $got403 -or $denyLeaf
+    $noSignal = (-not $passed) -and ($connect -eq '' -or $connect -eq '000')
     return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "unlisted host denied (exit=$($r.ExitCode))" } else { "exit=$($r.ExitCode) http_code=$code (expected denial)" } }
+        Detail = if ($passed) { "proxy refused evil.example.com (http_connect='$connect', audit deny leaf=$denyLeaf source='$leafSource'); no transport-failure pass" }
+                 elseif ($noSignal) { "NO PROXY SIGNAL - request never reached the proxy (exit=$($r.ExitCode) http_connect='$connect', no deny leaf; sid=$sid) - this is exactly the old false pass" }
+                 else { "no denial from the proxy: exit=$($r.ExitCode) http_connect='$connect' denyLeaf=$denyLeaf (expected 403 or an audit deny leaf)" } }
 }
 
 # S-29: AC-3.5 — wildcard suffix matches, dot-bounded.
-# `*.anthropic.com` matches the subdomain `api.anthropic.com`. PASS if the
-# connection succeeds (http_code is 4xx/5xx = reached the server).
+# `*.anthropic.com` matches the subdomain api.anthropic.com. Same assertion
+# shape as S-27: the proxy's admission, read from the audit - a CONNECT leaf
+# for api.anthropic.com with disposition=allow and source=allowlist
+# (src/net/proxy.rs:654-663, matcher::check owns the [G-55] wildcard rule). The
+# wildcard is what the allow-list arm consumed; the leaf proves the pipeline
+# admitted the host the wildcard covered. curl exit / %{http_connect} are
+# informational only. Why the shift: the CONNECT decision is the ADR-0001 D-1
+# property, while a TLS round trip to a live host is ENVIRONMENTAL - no route
+# to the CRL/OCSP responder (curl exit 35; the same request has also been
+# observed as exit 7). --no-prompt keeps a wildcard regression a clean 403.
+# Skip if curl.exe is absent or loopback-to-proxy is blocked.
 function Invoke-Scenario-S29 {
     if (-not (Get-Curl)) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 29
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
-    $code = (($r.Stdout -join '') -replace '\s','')
-    $connected = Test-CurlReachedServer -ExitCode $r.ExitCode -HttpCode $code
-    $passed = $connected
+    $flags = @('run','--allow-cwd','--allow-domain','*.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://api.anthropic.com/v1/messages')) -WorkingDirectory $d
+    $info = (($r.Stdout -join '') -replace '\s','')
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $allowLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'api.anthropic.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $allowLeaf = $true }
+    }
+    $passed = $allowLeaf
     return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "wildcard subdomain matched (http_code=$code)" } else { "exit=$($r.ExitCode) http_code=$code" } }
+        Detail = if ($passed) { "wildcard *.anthropic.com admitted api.anthropic.com (audit: disposition=allow source=allowlist); curl info: http_connect='$info' exit=$($r.ExitCode)" }
+                 else { "no disposition=allow/source=allowlist CONNECT leaf for api.anthropic.com (sid=$sid exit=$($r.ExitCode) http_connect='$info') audit=$(Get-LineHead -Lines $s.Stderr -Max 120)" } }
 }
 
 # S-30: AC-3.6 — always-denied overrides explicit allow.
@@ -914,57 +981,152 @@ function Invoke-Scenario-S31 {
 }
 
 # S-32: AC-3.8 — minimal profile allows LLM APIs, denies github.
-# `--network-profile minimal` allows api.anthropic.com (and openai/google) but
-# not github.com. PASS if the first curl succeeds AND the second fails.
+# `--network-profile minimal` admits api.anthropic.com and does not admit
+# github.com. BOTH halves are asserted as the PROXY's decision, in two sessions
+# with stable sids. Allowed host: an audit CONNECT leaf disposition=allow
+# source=allowlist - a profile entry lands in the same list the CLI flag feeds
+# (src/net/mod.rs:97-98) and the allow-list arm is the only arm that emits
+# "allowlist" (src/net/proxy.rs:654-663), so that is the string the code
+# actually emits for a profile-granted host. Denied host: an observed refusal,
+# %{http_connect}=403 or an audit CONNECT deny leaf for github.com.
+# --no-prompt makes the deny the policy's own [G-48] deny (source=default,
+# reason "prompting disabled; host not allow-listed") instead of a
+# dialog-backend timeout. curl exit/http codes are informational only. Why the
+# shift: the CONNECT decision is the ADR-0001 D-1 property, while a TLS round
+# trip to a live host is ENVIRONMENTAL - no route to the CRL/OCSP responder
+# (curl exit 35; the same request has also been observed as exit 7). Skip if
+# curl.exe is absent or loopback-to-proxy is blocked.
 function Invoke-Scenario-S32 {
     if (-not (Get-Curl)) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 32
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
-    $code1 = (($r1.Stdout -join '') -replace '\s','')
-    $allowed = Test-CurlReachedServer -ExitCode $r1.ExitCode -HttpCode $code1
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://github.com') -WorkingDirectory $d
-    $code2 = (($r2.Stdout -join '') -replace '\s','')
-    $denied = ($r2.ExitCode -ne 0) -and ($code2 -eq '000' -or $code2 -eq '')
-    $passed = $allowed -and $denied
+    $flags = @('run','--allow-cwd','--network-profile','minimal','--no-prompt')
+    $psidA = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psidA.ExitCode -ne 0) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$false; Skipped=$false; Detail="print-sid (allow leg) failed exit=$($psidA.ExitCode)" } }
+    $sidA = ($psidA.Stdout -join '').Trim()
+    $rA = Invoke-Sandbox -Args ($flags + @('--sid',$sidA,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://api.anthropic.com/v1/messages')) -WorkingDirectory $d
+    $infoA = (($rA.Stdout -join '') -replace '\s','')
+    $sA = Invoke-Sandbox -Args @('audit','show',$sidA,'--json')
+    $allowLeaf = $false
+    foreach ($l in @($sA.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'api.anthropic.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $allowLeaf = $true }
+    }
+    $psidB = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psidB.ExitCode -ne 0) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$false; Skipped=$false; Detail="print-sid (deny leg) failed exit=$($psidB.ExitCode)" } }
+    $sidB = ($psidB.Stdout -join '').Trim()
+    $rB = Invoke-Sandbox -Args ($flags + @('--sid',$sidB,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://github.com')) -WorkingDirectory $d
+    $connectB = (($rB.Stdout -join '') -replace '\s','')
+    $sB = Invoke-Sandbox -Args @('audit','show',$sidB,'--json')
+    $denyLeaf = $false
+    $denySource = ''
+    $denyReason = ''
+    foreach ($l in @($sB.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'github.com' -and $o.disposition -eq 'deny') { $denyLeaf = $true; $denySource = [string]$o.source; $denyReason = [string]$o.reason }
+    }
+    $got403 = ($connectB -eq '403')
+    $deniedOk = $got403 -or $denyLeaf
+    $passed = $allowLeaf -and $deniedOk
     return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "minimal: anthropic allowed, github denied" } else { "allowed=$allowed (code=$code1) denied=$denied (code=$code2)" } }
+        Detail = if ($passed) { "minimal: api.anthropic.com admitted (allow/allowlist), github.com refused (http_connect='$connectB' denyLeaf=$denyLeaf source='$denySource' reason='$denyReason'); curl info exit=$($rA.ExitCode)/$($rB.ExitCode)" }
+                 else { "minimal: allowLeaf=$allowLeaf (http_connect='$infoA' exit=$($rA.ExitCode)) github403=$got403 denyLeaf=$denyLeaf (source='$denySource' reason='$denyReason' http_connect='$connectB' exit=$($rB.ExitCode)) sidA=$sidA sidB=$sidB" } }
 }
 
 # S-33: AC-3.9 — developer profile adds registries + github.
-# `--network-profile developer` allows api.anthropic.com AND github.com. PASS
-# if both curls succeed (reach the server).
+# `--network-profile developer` admits api.anthropic.com AND github.com (the
+# developer list is minimal plus the registries and github; see
+# builtin_profile in src/net/profile.rs). Both halves are asserted as the
+# PROXY's decision in two stable-sid sessions: an audit CONNECT leaf
+# disposition=allow source=allowlist for each host - profile entries feed the
+# same allow list the CLI flag does (src/net/mod.rs:97-98) and the allow-list
+# arm is the only arm that emits "allowlist" (src/net/proxy.rs:654-663). curl
+# exit / %{http_connect} are informational only. Why the shift: the
+# CONNECT decision is the ADR-0001 D-1 property, while a TLS round trip to a
+# live host is ENVIRONMENTAL - no route to the CRL/OCSP responder (curl exit
+# 35; the same request has also been observed as exit 7). --no-prompt keeps
+# a regression a clean 403 instead of a dialog. Skip if curl.exe is absent
+# or loopback-to-proxy is blocked.
 function Invoke-Scenario-S33 {
     if (-not (Get-Curl)) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 33
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','developer','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com') -WorkingDirectory $d
-    $code1 = (($r1.Stdout -join '') -replace '\s','')
-    $ok1 = Test-CurlReachedServer -ExitCode $r1.ExitCode -HttpCode $code1
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','developer','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://github.com') -WorkingDirectory $d
-    $code2 = (($r2.Stdout -join '') -replace '\s','')
-    $ok2 = Test-CurlReachedServer -ExitCode $r2.ExitCode -HttpCode $code2
-    $passed = $ok1 -and $ok2
+    $flags = @('run','--allow-cwd','--network-profile','developer','--no-prompt')
+    $psidA = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psidA.ExitCode -ne 0) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$false; Skipped=$false; Detail="print-sid (anthropic leg) failed exit=$($psidA.ExitCode)" } }
+    $sidA = ($psidA.Stdout -join '').Trim()
+    $rA = Invoke-Sandbox -Args ($flags + @('--sid',$sidA,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://api.anthropic.com')) -WorkingDirectory $d
+    $infoA = (($rA.Stdout -join '') -replace '\s','')
+    $sA = Invoke-Sandbox -Args @('audit','show',$sidA,'--json')
+    $leafA = $false
+    foreach ($l in @($sA.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'api.anthropic.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $leafA = $true }
+    }
+    $psidB = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psidB.ExitCode -ne 0) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$false; Skipped=$false; Detail="print-sid (github leg) failed exit=$($psidB.ExitCode)" } }
+    $sidB = ($psidB.Stdout -join '').Trim()
+    $rB = Invoke-Sandbox -Args ($flags + @('--sid',$sidB,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://github.com')) -WorkingDirectory $d
+    $infoB = (($rB.Stdout -join '') -replace '\s','')
+    $sB = Invoke-Sandbox -Args @('audit','show',$sidB,'--json')
+    $leafB = $false
+    foreach ($l in @($sB.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'github.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $leafB = $true }
+    }
+    $passed = $leafA -and $leafB
     return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "developer: anthropic + github allowed" } else { "anthropic=$ok1 (code=$code1) github=$ok2 (code=$code2)" } }
+        Detail = if ($passed) { "developer: audit allow/allowlist for api.anthropic.com AND github.com; curl info http_connect='$infoA'/'$infoB' exit=$($rA.ExitCode)/$($rB.ExitCode)" }
+                 else { "developer: anthropicLeaf=$leafA (http_connect='$infoA' exit=$($rA.ExitCode)) githubLeaf=$leafB (http_connect='$infoB' exit=$($rB.ExitCode)) sidA=$sidA sidB=$sidB" } }
 }
 
 # S-34: AC-3.10 — profile + CLI flags merge.
-# `--network-profile minimal --allow-domain github.com`: minimal allows
-# api.anthropic.com, CLI flag adds github.com. PASS if both succeed.
+# `--network-profile minimal --allow-domain github.com`: minimal admits
+# api.anthropic.com, the CLI flag adds github.com. The MERGE is the property,
+# so both hosts are asserted as the PROXY's decision in two stable-sid
+# sessions, each with the identical flag set: an audit CONNECT leaf
+# disposition=allow source=allowlist per host. Both leaves carry the same
+# "allowlist" source because the merge happens before matching - the profile
+# list and the CLI list are concatenated into one allow list
+# (src/net/mod.rs:97-98) consumed by the allow-list arm
+# (src/net/proxy.rs:654-663); a dropped profile half fails the anthropic leaf,
+# a dropped CLI half fails the github leaf. curl exit / %{http_connect} are
+# informational only. Why the shift: the CONNECT decision is the ADR-0001 D-1
+# property, while a TLS round trip to a live host is ENVIRONMENTAL - no route
+# to the CRL/OCSP responder (curl exit 35; the same request has also been
+# observed as exit 7). --no-prompt keeps a regression a clean 403. Skip if
+# curl.exe is absent or loopback-to-proxy is blocked.
 function Invoke-Scenario-S34 {
     if (-not (Get-Curl)) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 34
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--allow-domain','github.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://api.anthropic.com') -WorkingDirectory $d
-    $code1 = (($r1.Stdout -join '') -replace '\s','')
-    $ok1 = Test-CurlReachedServer -ExitCode $r1.ExitCode -HttpCode $code1
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--allow-domain','github.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://github.com') -WorkingDirectory $d
-    $code2 = (($r2.Stdout -join '') -replace '\s','')
-    $ok2 = Test-CurlReachedServer -ExitCode $r2.ExitCode -HttpCode $code2
-    $passed = $ok1 -and $ok2
+    $flags = @('run','--allow-cwd','--network-profile','minimal','--allow-domain','github.com','--no-prompt')
+    $psidA = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psidA.ExitCode -ne 0) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$false; Skipped=$false; Detail="print-sid (profile leg) failed exit=$($psidA.ExitCode)" } }
+    $sidA = ($psidA.Stdout -join '').Trim()
+    $rA = Invoke-Sandbox -Args ($flags + @('--sid',$sidA,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://api.anthropic.com')) -WorkingDirectory $d
+    $infoA = (($rA.Stdout -join '') -replace '\s','')
+    $sA = Invoke-Sandbox -Args @('audit','show',$sidA,'--json')
+    $leafA = $false
+    foreach ($l in @($sA.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'api.anthropic.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $leafA = $true }
+    }
+    $psidB = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psidB.ExitCode -ne 0) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$false; Skipped=$false; Detail="print-sid (CLI leg) failed exit=$($psidB.ExitCode)" } }
+    $sidB = ($psidB.Stdout -join '').Trim()
+    $rB = Invoke-Sandbox -Args ($flags + @('--sid',$sidB,'--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_connect} https://github.com')) -WorkingDirectory $d
+    $infoB = (($rB.Stdout -join '') -replace '\s','')
+    $sB = Invoke-Sandbox -Args @('audit','show',$sidB,'--json')
+    $leafB = $false
+    foreach ($l in @($sB.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'CONNECT' -and $o.host -eq 'github.com' -and $o.disposition -eq 'allow' -and $o.source -eq 'allowlist') { $leafB = $true }
+    }
+    $passed = $leafA -and $leafB
     return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "profile+CLI merged: anthropic + github allowed" } else { "anthropic=$ok1 (code=$code1) github=$ok2 (code=$code2)" } }
+        Detail = if ($passed) { "profile+CLI merged: audit allow/allowlist for api.anthropic.com (profile) AND github.com (CLI flag); curl info http_connect='$infoA'/'$infoB' exit=$($rA.ExitCode)/$($rB.ExitCode)" }
+                 else { "merge incomplete: profileLeaf(anthropic)=$leafA (http_connect='$infoA' exit=$($rA.ExitCode)) cliLeaf(github)=$leafB (http_connect='$infoB' exit=$($rB.ExitCode)) sidA=$sidA sidB=$sidB" } }
 }
 
 # S-35: AC-3.11 — two concurrent sessions get distinct sids (proxy ports differ).
@@ -988,26 +1150,52 @@ function Invoke-Scenario-S35 {
 }
 
 # S-36: AC-3.12 — no token → 407.
-# Run a single sandboxed curl that explicitly overrides the proxy URL via
-# curl's -x flag, pointing at the injected proxy port (SANDBOX_PROXY_PORT env
-# var, which the sandbox sets for the child) WITHOUT userinfo — so curl sends
-# no Proxy-Authorization header. The proxy must reject with 407. PASS if the
-# response contains 407 or curl exits with a proxy-auth error.
+# The child overrides the proxy URL with curl's -x, pointing at the injected
+# proxy port (SANDBOX_PROXY_PORT, set for the child) WITHOUT userinfo, so no
+# Proxy-Authorization header is sent. The assertion is the supervisor's own
+# token gate, in two independent places: (a) the client must see 407 on the
+# CONNECT - %{http_connect}, with curl exit 97 or "407" on stderr accepted as
+# equivalent evidence since curl retries a 407 and can disguise the first
+# response; (b) the audit must carry the gate's leaf - disposition=deny,
+# reason=no_token, source=default, host '<unknown>' - and NO admission leaf
+# for the probed host (src/net/proxy.rs:1102-1111; the gate writes before any
+# decide(), so an absent admission leaf proves nothing was admitted). A gate
+# that stops rejecting fails (a); a gate placed after admission fails (b).
+# %{http_connect} rather than %{http_code}: on a refused tunnel http_code stays
+# 000, which is indistinguishable from a transport failure. Why the shift: the
+# CONNECT decision is the ADR-0001 D-1 property, while a TLS round trip to a
+# live host is ENVIRONMENTAL (no route to the CRL/OCSP responder, curl exit 35;
+# the same request has also been observed as exit 7) - exit 000 alone proved
+# nothing. --no-prompt only keeps a regressed gate from parking on a dialog.
+# Skip if curl.exe is absent or loopback-to-proxy is blocked.
 function Invoke-Scenario-S36 {
     if (-not (Get-Curl)) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 36
-    # %SANDBOX_PROXY_PORT% is injected by the sandbox env block. curl -x takes
-    # precedence over HTTP_PROXY; a URL without userinfo sends no auth header.
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 10 -x http://127.0.0.1:%SANDBOX_PROXY_PORT% -o NUL -w %{http_code} https://api.anthropic.com/v1/messages') -WorkingDirectory $d
-    $code = (($r.Stdout -join '') -replace '\s','')
+    $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
+    $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
+    $sid = ($psid.Stdout -join '').Trim()
+    # %SANDBOX_PROXY_PORT% is a defined cmd variable and expands; cmd does NOT
+    # expand %{http_connect} (undefined name), so it reaches curl intact -
+    # verified with curl 8.18 + cmd.exe on the /c command line.
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 10 -x http://127.0.0.1:%SANDBOX_PROXY_PORT% -o NUL -w %{http_connect} https://api.anthropic.com/v1/messages')) -WorkingDirectory $d
+    $connect = (($r.Stdout -join '') -replace '\s','')
     $stderr = ($r.Stderr -join "`n")
-    # PASS if we see 407 anywhere (http_code, stderr) OR curl exits with a
-    # proxy-auth error (curl exit 97 = proxy auth required by RFC, 56 = recv).
-    $got407 = ($code -eq '407') -or ($stderr -match '407') -or ($r.ExitCode -eq 97)
-    $passed = $got407
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $tokenLeaf = $false
+    $admissionLeaf = $false
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -ne 'CONNECT') { continue }
+        if ($o.disposition -eq 'deny' -and $o.reason -eq 'no_token' -and $o.source -eq 'default' -and $o.host -eq '<unknown>') { $tokenLeaf = $true }
+        if ($o.host -eq 'api.anthropic.com') { $admissionLeaf = $true }
+    }
+    $client407 = ($connect -eq '407') -or ($r.ExitCode -eq 97) -or ($stderr -match '407')
+    $passed = $client407 -and $tokenLeaf -and (-not $admissionLeaf)
     return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "proxy returned 407 for unauthenticated CONNECT" } else { "exit=$($r.ExitCode) code=$code" } }
+        Detail = if ($passed) { "token gate refused the unauthenticated CONNECT (http_connect='$connect' exit=$($r.ExitCode)); audit default/no_token host=<unknown>, no admission leaf for api.anthropic.com" }
+                 else { "client407=$client407 (http_connect='$connect' exit=$($r.ExitCode)) tokenLeaf=$tokenLeaf admissionLeaf=$admissionLeaf sid=$sid" } }
 }
 
 # S-37: AC-3.13 — raw-socket app fails closed. DEFERRED with the US-3
@@ -1947,39 +2135,92 @@ function Invoke-Scenario-S72 {
 }
 
 # S-75 (D-1): a CONNECT to a loopback target is refused pre-prompt with
-# 403 + `X-Sandbox: denied` [G-44/G-52]. The inner script (S-21's
-# wrapper-file precedent, written into the scenario dir under --allow-cwd):
-# (a) clears the injected loopback NO_PROXY so curl actually sends the
-# CONNECT to the proxy instead of dialing the loopback target directly, and
-# (b) puts the session token — extracted from the injected HTTPS_PROXY
-# userinfo — into the -x proxy URL so curl authenticates past the 407 token
-# gate on its own. curl -v makes the 403 + header visible on stderr.
+# 403 + `X-Sandbox: denied` [G-44/G-52]. The inner script (S-21's wrapper-file
+# precedent, written into the scenario dir under --allow-cwd) speaks the
+# CONNECT itself over a raw TcpClient and authenticates with the session token
+# from the injected HTTPS_PROXY userinfo, so it clears the 407 token gate and
+# reaches the admission pipeline. No native command appears anywhere: curl's
+# own retry and proxy-bypass behaviour is exactly what this scenario controls
+# for, and 5.1 cannot invoke native commands inside the AppContainer anyway.
 function Invoke-Scenario-S75 {
-    if (-not (Get-Curl)) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; this scenario speaks CONNECT without it)' } }
     $d = New-ScenarioDir 75
     $inner = @'
 $m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
 if (-not $m.Success) { Write-Output 'S75_NO_TOKEN'; exit 3 }
-$tok = $m.Groups[1].Value
-# Loopback sits in NO_PROXY (so intent endpoints stay direct) - clear it or
-# curl bypasses the proxy for the 127.0.0.1 target and never issues CONNECT.
-$env:NO_PROXY = ''
-$env:no_proxy = ''
-& curl.exe -s -m 10 -v -x "http://sandbox:$tok@127.0.0.1:$($env:SANDBOX_PROXY_PORT)" -o NUL https://127.0.0.1:5432
-exit $LASTEXITCODE
+$port = 0
+if (-not [int]::TryParse([string]$env:SANDBOX_PROXY_PORT, [ref]$port) -or $port -le 0) { Write-Output 'S75_NO_PORT'; exit 3 }
+$creds = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
+# Exit 3 = the proxy was never reached (no connection, or no bytes back);
+# exit 4 = connected but nothing arrived inside the read timeout. The harness
+# distinguishes the two in the failure detail.
+$c = New-Object System.Net.Sockets.TcpClient
+try { $c.Connect('127.0.0.1', $port) } catch { Write-Output 'S75_DIAL_FAILED'; exit 3 }
+$s = $c.GetStream()
+$s.ReadTimeout = 10000
+$s.WriteTimeout = 10000
+$req = "CONNECT 127.0.0.1:5432 HTTP/1.1`r`nHost: 127.0.0.1:5432`r`nProxy-Authorization: Basic $creds`r`n`r`n"
+$bytes = [Text.Encoding]::ASCII.GetBytes($req)
+$s.Write($bytes, 0, $bytes.Length)
+$s.Flush()
+# Bounded HEAD read: stop at CRLF CRLF (the deny head precedes its body) or at
+# 64 KiB. No sleeps - the socket read timeout is the only clock in here.
+$ms = New-Object System.IO.MemoryStream
+$buf = New-Object byte[] 4096
+$total = 0
+$timedOut = $false
+while ($total -lt 65536) {
+    $n = 0
+    try { $n = $s.Read($buf, 0, $buf.Length) }
+    catch { if ($total -eq 0) { $timedOut = $true }; break }
+    if ($n -le 0) { break }
+    $ms.Write($buf, 0, $n)
+    $total += $n
+    if ([Text.Encoding]::ASCII.GetString($ms.ToArray()).Contains("`r`n`r`n")) { break }
+}
+$c.Close()
+if ($timedOut) { Write-Output 'S75_TIMEOUT'; exit 4 }
+if ($total -le 0) { Write-Output 'S75_NO_RESPONSE'; exit 3 }
+$raw = [Text.Encoding]::ASCII.GetString($ms.ToArray())
+$split = $raw.IndexOf("`r`n`r`n")
+if ($split -lt 0) { $headText = $raw; $bodyText = '' }
+else { $headText = $raw.Substring(0, $split); $bodyText = $raw.Substring($split + 4) }
+$lines = $headText -split "`r`n"
+$status = if ($lines.Count -gt 0) { $lines[0] } else { '' }
+$xs = 0
+foreach ($ln in $lines) { if ($ln -match '^(?i)X-Sandbox:\s*denied\s*$') { $xs = 1 } }
+$bodyFirst = ''
+foreach ($ln in @($bodyText -split "`r?`n")) { if ($ln.Trim()) { $bodyFirst = $ln.Trim(); break } }
+Write-Output ('S75_STATUS=' + $status)
+Write-Output ('S75_HEADER_XS=' + $xs)
+Write-Output ('S75_BODY=' + $bodyFirst)
+exit 0
 '@
     Set-Content -LiteralPath (Join-Path $d 's75-loopback-connect.ps1') -Value $inner -Encoding ASCII
     $flags = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
     $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','placeholder')) -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
     $sid = ($psid.Stdout -join '').Trim()
-    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','s75-loopback-connect.ps1')) -WorkingDirectory $d
+    # Interpreter: `powershell` (5.1), NOT pwsh. In-VM pwsh cannot be spawned as
+    # a sandboxed child at all (0x80070520 "A specified logon session does not
+    # exist" - the WindowsApps alias / AppContainer token problem), while 5.1
+    # runs fine but throws DriveNotFoundException
+    # (Microsoft.PowerShell.Core\FileSystem) on ANY native command invocation
+    # inside the AppContainer. Hence: 5.1, and the inner script is pure managed
+    # .NET (the S-91 precedent) so it never shells out. -File gets an absolute
+    # path - the harness rule for anything the child opens.
+    $innerScript = Join-Path $d 's75-loopback-connect.ps1'
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',$innerScript)) -WorkingDirectory $d
     $out = ($r.Stdout -join "`n")
     if ($out -match 'S75_NO_TOKEN') { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail='inner script could not extract the session token from HTTPS_PROXY' } }
-    $err = ($r.Stderr -join "`n")
-    $got403 = ($err -match '403')
-    $gotHeader = ($err -match 'X-Sandbox: denied')
+    if ($out -match 'S75_NO_PORT') { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail='SANDBOX_PROXY_PORT missing or unparsable in the child env' } }
+    # Assert on the markers the inner script prints, not on curl stderr: an
+    # exact status line (a stray numeric port or header containing "403" must
+    # not satisfy it) plus the header-presence flag.
+    $status = [regex]::Match($out, 'S75_STATUS=([^\r\n]*)').Groups[1].Value.Trim()
+    $bodyShown = [regex]::Match($out, 'S75_BODY=([^\r\n]*)').Groups[1].Value
+    $got403 = ($status -eq 'HTTP/1.1 403 Forbidden')
+    $gotHeader = ($out -match 'S75_HEADER_XS=1')
     # The audit must show the loopback branch (source hard-deny + the
     # dedicated loopback_refused reason), not a generic deny.
     $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
@@ -1989,10 +2230,13 @@ exit $LASTEXITCODE
         if ($o.op -eq 'CONNECT' -and $o.disposition -eq 'deny' -and $o.source -eq 'hard-deny' -and $o.reason -eq 'loopback_refused' -and $o.host -eq '127.0.0.1') { $loopbackAudit = $true }
     }
     $passed = $got403 -and $gotHeader -and $loopbackAudit
-    $errHead = ((($err -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 5 | ForEach-Object { $_ -replace 'Basic [A-Za-z0-9+/=]+', 'Basic [REDACTED]' }) -join ' | ')
+    # Distinguish the inner script's exit codes in the failure detail: 3 = the
+    # proxy was never reached, 4 = read timeout.
+    $exitHint = switch ($r.ExitCode) { 3 { 'exit 3 = proxy never reached / no response' } 4 { 'exit 4 = read timeout, no response head' } default { '' } }
+    $outHead = ((($out -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 4 | ForEach-Object { $_ -replace 'Basic [A-Za-z0-9+/=]+', 'Basic [REDACTED]' }) -join ' | ')
     return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'CONNECT 127.0.0.1:5432 refused: 403 + X-Sandbox: denied; audit loopback_refused' }
-                 else { "403=$got403 header=$gotHeader audit=$loopbackAudit exit=$($r.ExitCode) err=$errHead" } }
+        Detail = if ($passed) { 'CONNECT 127.0.0.1:5432 refused: 403 Forbidden + X-Sandbox: denied; audit loopback_refused' }
+                 else { "status='$status' header=$gotHeader audit=$loopbackAudit exit=$($r.ExitCode) $exitHint body='$bodyShown' out=$outHead err=$(Get-LineHead -Lines $r.Stderr -Max 160)" } }
 }
 
 # S-76 (D-3): --no-prompt — an unlisted host is denied with NO dialog and
@@ -2028,14 +2272,16 @@ function Invoke-Scenario-S76 {
 }
 
 # S-77 (D-4): the intent control-plane endpoints, exercised from INSIDE the
-# sandbox. NO_PROXY covers loopback so the request goes direct to the proxy
-# listener; the session token (from HTTPS_PROXY userinfo) rides an explicit
-# Proxy-Authorization header — the 3.6 review's child-side note. POST the
-# intent (204), then GET it back (200 + the declared reason + hint
-# "declared"). The JSON body is a file so no shell-quoting can mangle it.
+# sandbox. The inner script uses System.Net.Http.HttpClient with
+# UseProxy = $false, so it dials 127.0.0.1:<port> DIRECTLY instead of routing
+# through the injected proxy, and identifies itself with an explicit
+# Proxy-Authorization: Basic header carrying the session token from the
+# HTTPS_PROXY userinfo - the 3.6 review's child-side note. POST the intent
+# (204), then GET it back (200 + the declared reason + hint "declared"). The
+# JSON body is a file so no quoting can mangle it. Pure managed .NET, no
+# native command (see S-75's interpreter note).
 function Invoke-Scenario-S77 {
-    if (-not (Get-Curl)) { return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
-    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
+    if (-not (Test-LoopbackProxyReachable)) { return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; this scenario speaks HTTP without it)' } }
     $d = New-ScenarioDir 77
     $bodyPath = Join-Path $d 's77-intent-body.json'
     Set-Content -LiteralPath $bodyPath -Value '{"target":"api.example.com","reason":"s77-intent-roundtrip"}' -Encoding ASCII
@@ -2044,27 +2290,66 @@ param([string]$BodyPath)
 $m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
 if (-not $m.Success) { Write-Output 'POST_STATUS=NO_TOKEN'; exit 3 }
 $creds = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
-$port = $env:SANDBOX_PROXY_PORT
+$port = 0
+if (-not [int]::TryParse([string]$env:SANDBOX_PROXY_PORT, [ref]$port) -or $port -le 0) { Write-Output 'POST_STATUS=NO_PORT'; exit 3 }
 Write-Output "DIAG body=$BodyPath exists=$(Test-Path -LiteralPath $BodyPath)"
-$post = & curl.exe -s -m 8 -o NUL -w '%{http_code}' -H "Proxy-Authorization: Basic $creds" --data "@$BodyPath" "http://127.0.0.1:$port/sandbox/intent"
-Write-Output "POST_STATUS=$post"
-$get = & curl.exe -s -m 8 -w '%{http_code}' -H "Proxy-Authorization: Basic $creds" "http://127.0.0.1:$port/sandbox/intent?host=api.example.com"
-Write-Output "GET_BODY=$get"
+# HttpClient rather than a native client: UseProxy=$false keeps the loopback
+# dial direct (the endpoint is reachable by NO_PROXY semantics, never by
+# proxying), UseDefaultCredentials=$false stops .NET attaching host
+# credentials, and the token rides an explicit Proxy-Authorization header.
+Add-Type -AssemblyName System.Net.Http
+$h = [System.Net.Http.HttpClientHandler]::new()
+$h.UseProxy = $false
+$h.UseDefaultCredentials = $false
+$c = [System.Net.Http.HttpClient]::new($h)
+$c.Timeout = [TimeSpan]::FromSeconds(8)
+$auth = 'Basic ' + $creds
+$postStatus = 0
+try {
+    $post = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "http://127.0.0.1:$port/sandbox/intent")
+    [void]$post.Headers.TryAddWithoutValidation('Proxy-Authorization', $auth)
+    $bodyText = [IO.File]::ReadAllText($BodyPath)
+    $post.Content = [System.Net.Http.StringContent]::new($bodyText, [Text.Encoding]::UTF8, 'application/json')
+    $pres = $c.SendAsync($post).GetAwaiter().GetResult()
+    $postStatus = [int]$pres.StatusCode
+} catch { $postStatus = 0 }
+Write-Output ('POST_STATUS=' + $postStatus)
+$getStatus = 0
+$getBody = ''
+try {
+    $get = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, "http://127.0.0.1:$port/sandbox/intent?host=api.example.com")
+    [void]$get.Headers.TryAddWithoutValidation('Proxy-Authorization', $auth)
+    $gres = $c.SendAsync($get).GetAwaiter().GetResult()
+    $getStatus = [int]$gres.StatusCode
+    $getBody = $gres.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+} catch { $getStatus = 0 }
+$c.Dispose()
+Write-Output ('GET_STATUS=' + $getStatus)
+Write-Output ('GET_BODY=' + $getBody)
 exit 0
 '@
     Set-Content -LiteralPath (Join-Path $d 's77-intent.ps1') -Value $inner -Encoding ASCII
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt','--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','s77-intent.ps1','-BodyPath',$bodyPath) -WorkingDirectory $d
+    # powershell 5.1, not pwsh - see S-75's interpreter note. The inner script
+    # is pure managed code, so 5.1's native-command limitation never applies.
+    # $bodyPath is absolute (Join-Path over the resolved scenario dir), so
+    # -BodyPath keeps its unchanged contract.
+    $innerScript = Join-Path $d 's77-intent.ps1'
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt','--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',$innerScript,'-BodyPath',$bodyPath) -WorkingDirectory $d
     $out = ($r.Stdout -join "`n")
     $err = ($r.Stderr -join "`n")
+    $diagOk = ($out -match 'DIAG body=.+ exists=True')
     $post204 = ($out -match 'POST_STATUS=204')
-    $get200 = ($out -match 'GET_BODY=.*200\s*$')
+    # Status and body are separate markers now: GET_STATUS carries the code,
+    # GET_BODY the JSON the endpoint returned.
+    $get200 = ($out -match 'GET_STATUS=200')
     $getReason = ($out -match '"reason":"s77-intent-roundtrip"')
     $getHost = ($out -match '"host":"api.example.com"')
     $getHint = ($out -match '"hint":"declared"')
-    $passed = ($r.ExitCode -eq 0) -and $post204 -and $get200 -and $getReason -and $getHost -and $getHint
+    $passed = ($r.ExitCode -eq 0) -and $diagOk -and $post204 -and $get200 -and $getReason -and $getHost -and $getHint
+    $getBodyShown = [regex]::Match($out, 'GET_BODY=([^\r\n]*)').Groups[1].Value
     return @{ Num=77; Name='S-77 (D-4 intent endpoint)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'POST /sandbox/intent 204; GET returned the declared reason (hint=declared)' }
-                 else { "exit=$($r.ExitCode) post204=$post204 get200=$get200 reason=$getReason host=$getHost hint=$getHint out=$($out -replace "`r?`n", ' | ') err=$err" } }
+        Detail = if ($passed) { 'POST /sandbox/intent 204; GET 200 returned the declared reason (hint=declared)' }
+                 else { "exit=$($r.ExitCode) diag=$diagOk post204=$post204 get200=$get200 reason=$getReason host=$getHost hint=$getHint body='$getBodyShown' out=$($out -replace "`r?`n", ' | ') err=$err" } }
 }
 
 # S-78 (D-3): learned persistence across a sandbox restart — run with an
@@ -2186,18 +2471,33 @@ function Invoke-Scenario-S82 {
 # S-83 (D-1; plan slot S-74, renumbered — see the numbering note above):
 # wildcard apex — `*.anthropic.com` must allow the apex `anthropic.com`
 # itself ([G-55]: the wildcard covers the apex and subdomains, dot-bounded).
-# This makes a REAL connection to anthropic.com:443 through the tunnel
-# (plan-intended); PASS iff curl reaches the server (any 1xx-5xx code).
+# The contract is the PROXY's CONNECT status, not the origin's http_code:
+# this makes a real connection to anthropic.com:443 and PASSes iff the tunnel
+# is admitted (`%{http_connect}` == 200). See the assertion note below.
 function Invoke-Scenario-S83 {
     if (-not (Get-Curl)) { return @{ Num=83; Name='S-83 (D-1 wildcard apex)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=83; Name='S-83 (D-1 wildcard apex)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 83
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--no-prompt','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} https://anthropic.com') -WorkingDirectory $d
-    $code = (($r.Stdout -join '') -replace '\s','')
-    $connected = Test-CurlReachedServer -ExitCode $r.ExitCode -HttpCode $code
-    $passed = $connected
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--no-prompt','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code}_%{http_connect} https://anthropic.com') -WorkingDirectory $d
+    $parts = ((($r.Stdout -join '')).Trim()) -split '_'
+    $code = $parts[0]
+    $connectCode = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+    # ASSERTION CONTRACT: `%{http_connect}` (the proxy's CONNECT reply status).
+    # http_connect=200 means the allow-list ADMITTED the tunnel to
+    # anthropic.com:443, which is the only claim this scenario makes; a refused
+    # CONNECT answers 403 (or 502 for a chained failure) and still fails here.
+    # The origin `%{http_code}` is INFORMATIONAL (Detail only, never asserted):
+    # this host's schannel cannot validate anthropic.com's chain because the
+    # CRL/OCSP responder is unreachable (CRYPT_E_REVOCATION_OFFLINE), so curl
+    # exits 35 with http_code 000 BY CONSTRUCTION — a TLS-layer fact that says
+    # nothing about the allow-list. Do NOT "fix" this back to an http_code
+    # assertion: it would red the suite on every CRL-offline host while proving
+    # nothing new (S-81's precedent, and the same reason S-81 asserts
+    # http_connect).
+    $tunnel = ($connectCode -eq '200')
+    $passed = $tunnel
     return @{ Num=83; Name='S-83 (D-1 wildcard apex)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "wildcard allowed the apex (http_code=$code)" } else { "exit=$($r.ExitCode) http_code=$code err=$((($r.Stderr | Where-Object { $_.Trim() } | Select-Object -First 10) -join ' | '))" } }
+        Detail = if ($passed) { "wildcard admitted the apex (CONNECT=200; http_code=$code informational)" } else { "CONNECT not admitted (connect=$connectCode http_code=$code exit=$($r.ExitCode)) err=$((($r.Stderr | Where-Object { $_.Trim() } | Select-Object -First 10) -join ' | '))" } }
 }
 
 # S-84 (D-3, extra; 3.7 review advisory #2 — "no test currently revokes a
