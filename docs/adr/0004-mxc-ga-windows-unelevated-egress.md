@@ -34,7 +34,7 @@ against a real SPIKE built on the published crate:
 |---|---|
 | Elevation | `SPIKE: elevated=false` — no UAC prompt at any point |
 | Platform support | `isSupported:true`, `availableMethods:["processcontainer"]`, tier **`base-container`**, `needsDaclAugmentation:false`, `warnings:[]` |
-| Proxy injection | child env `HTTP_PROXY`/`HTTPS_PROXY` (+ lowercase) = `http://127.0.0.1:<port>`, `NO_PROXY` unset |
+| Proxy injection | child env `HTTP_PROXY`/`HTTPS_PROXY` (+ lowercase) = `http://127.0.0.1:<port>`, `NO_PROXY` unset. **1.0.1 strips HTTP(S)/ALL/NO_PROXY from the request env (any case) and re-injects only uppercase HTTP_PROXY/HTTPS_PROXY** (`appcontainer_runner.rs:86`, `:209-234`, `:260-272`) — so `NO_PROXY` cannot be delivered through `request.environment`; see plan §P1 D1. |
 | Proxy reachability | `proxy_connect=ok`, `HTTP/1.1 200 Connection Established` |
 | **Direct egress containment** | `1.1.1.1:443` and a resolved `104.20.23.154:443` both **denied, os error 10013 PermissionDenied** |
 | Filesystem policy | write + read back on the granted dir OK; read/write on a non-granted dir denied (error 5) |

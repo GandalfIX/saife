@@ -69,6 +69,51 @@ inbound while proxy mode is on.
 
 ---
 
+## P1 design decisions required before wiring (from the P0 reviews)
+
+**D1 — NO_PROXY cannot be delivered through `request.environment` (blocking for
+P1.2).** mxc-sdk 1.0.1 strips `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`/`ALL_PROXY`
+(case-insensitive) when a proxy is configured and re-injects only uppercase
+`HTTP_PROXY`/`HTTPS_PROXY` (`appcontainer_runner.rs:86`, `:209-234`,
+`:260-272`). The child therefore has no `NO_PROXY`, so a request to
+`http://127.0.0.1:<proxy>/sandbox/intent` would be proxied into a loop.
+
+Chosen approach (P1.2a): **wrapper launcher** — the container command becomes a
+small supervisor-owned exe that sets `NO_PROXY=localhost,127.0.0.1,::1` (and any
+other env we cannot deliver through the request), starts the real workload with
+inherited stdio, and propagates the exit code. Fallback if the wrapper proves
+too invasive: serve the intent endpoints on a **separate loopback port** and
+document that clients bypass the proxy for it. File an upstream ask either way
+(allow NO_PROXY through, or inject it alongside the proxy vars).
+
+**D2 — `inherit_default_environment`.** `Some(true)` layers our list over the
+user's PROFILE environment (not the caller's process env) and proxy names are
+stripped when a proxy is configured. P1 decides between `Some(false)` (strict
+allow-list) and `Some(true)` + explicit denials; the code comment must match the
+SDK's real semantics either way.
+
+**D3 — guardrail 1 has no offline branch.** `verify_proxy_proof` demands
+`tunnels >= 1` while a proxy-less request builds `egress=deny` +
+`host_loopback=deny`, so a no-network session can never pass. P1 must either
+exempt no-network sessions explicitly (and say so in the ADR) or require a proxy
+for every MXC launch.
+
+**D4 — epoch lifecycle and backend state.** `ProxyProofSource` has no `cancel`;
+a `v1::run` error abandons an open epoch. P1.1 makes epochs per-launch-object
+(or adds a cancel path), turns `MxcBackend` into a state-carrying struct, and
+adds `Send + Sync` if the trait is held across an await.
+
+**D5 — timeout budget.** `timeout_ms` is a passthrough; MXC's default is 30 000
+ms, which would kill a 60 s prompt. P2.1 owns the budget, but P1 must not ship a
+default that silently caps sessions.
+
+**D6 — housekeeping.** Remove `#![cfg_attr(not(test), allow(dead_code))]` from
+`src/net/mxc.rs` when main.rs routes through the backend, and set the
+`ProcessContainerConfig` UI fields explicitly instead of relying on today's
+defaults.
+
+---
+
 ## P0 — Backend skeleton behind a flag (default unchanged)
 
 **Files:** `Cargo.toml` (+ optional dep + feature `mxc-backend`),
