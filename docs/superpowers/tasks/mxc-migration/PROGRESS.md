@@ -16,8 +16,9 @@ Status legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
 | P1.1 Per-session proxy + networkProxy | [x] | impl | PASS | PASS | 52614f2 + wave 2 | Wave 1: launch wiring + epoch lifecycle. Wave 2: the REAL proof source is the listener's own `LaunchCounters` (`begin_epoch`/`counters`/`close_epoch`, poison-tolerant, `Send+Sync`), `ProxyHandle::counters()` is the source, `127.0.0.1:0` is the session port, and `launch_session` derives the guardrail leg from the port instead of trusting the caller. Counting: `accepted` = authenticated CONNECT or absolute-form consultation (NOT origin-form to our own intent endpoints, NOT a 407); `tunnels` = upstream established (CONNECT 200 after the dial **or** a plain-HTTP forward whose upstream dial came up). |
 | P1.2 Request mapping + NO_PROXY injection | [x] | impl | PASS | PASS | 52614f2 + wave 2 | D1 via the `mxc-launch` wrapper (proven again live). Wave 2: the request's `networkProxy` is the supervisor's own bound port **and carries the session token as userinfo** (plan D8) - without it every child request was a 407 and Required failed as `SessionNotAccepted`; the SDK copies that URL verbatim into HTTP(S)_PROXY, and `policy_identity` excludes userinfo from the hash. Also: absolute-form `http://` requests are now admitted through the full D-1 pipeline and forwarded (the previous blanket 400 made a plain-HTTP-only session unprovable). Tokens are restricted to URL-unreserved chars. |
 | P1.3 Filesystem mapping + workspace-only test | [x] | impl | PASS | PASS | wave 2 + 3 fixers | `filesystem_policy`: readwrite = [workspace], readonly = declared + the **launcher's directory (added before the deny list is filtered — the ordering defect that shipped a deny covering the launcher is fixed)**, denied = profile `.ssh/.aws/.azure/.gnupg` + configured denies (deduped, case-folded). **Fail-closed:** an operator deny that is equal to or an *ancestor of* any grant (workspace, declared readonly, launcher) is a hard `RequestError::DenyCoversGrant` naming both paths — the old silent drop left Documents/Downloads/AppData/browser profiles readable with no warning and no audit trace; denies that are *descendants* of a grant are kept. `path_key`/`covers` normalise case, separators, trailing dots/spaces, `.`/`..` and `\\?\`/`\\.\` prefixes with no filesystem calls, and `covers` has direct boundary tests. Recorded exposure: the launcher grant is its whole parent directory (`target\debug` for a repo-local build). Unit tests + a live leg: granted write OK, denied read/write refused, ungranted path refused, and `C:\Windows\win.ini` readable = the recorded additive-grants caveat (asserted as the caveat, so it cannot be "fixed" by denying System32). |
-| P1.4 Concurrency: per-run token (or proxy per run) | [ ] | | | | | mandatory test with 2 containers |
+| P1.4 Concurrency: per-run token (or proxy per run) | [x] | impl | PASS | PASS | P1.4 | `RunToken` (run-serial prefix + 224 CNG bits, redacted Debug, constant-time `matches`); the listener classifies `OwnRun`/`Absent`/`Foreign`, refuses a foreign credential with the SAME 407, counts it as nothing, and records exactly one `foreign_token` leaf - the reviews caught that the first cut left cross-run probing invisible in BOTH chains. `begin_epoch` refuses overlap (`MxcError::Concurrency`); the pruner evicts only CLOSED epochs (32 + at most 1 open). One listener per run was already true - pinned by a live **two-container** test: both proofs `{1,1}` (not `{2,2}`), cross-token 407 with counters frozen, closing B leaves A serving and still refusing B. |
 | P1.5 WinHTTP path measurement | [ ] | | | | | decides GUI workload support |
+| P1.6 Harden what P1.4's reviews left open | [ ] | | | | | pre-commit hardening, not blocking P1 | (a) **`no_token` leaf flood** - measured 400 credential-less CONNECTs -> 400 leaves / 129 KB, no cap: cap per epoch (first N, then one aggregate leaf with the suppressed count); (b) `RunToken: Clone` lets two `ProxyConfig`s share one credential (unreachable today; a process-global live-token set checked in `proxy::spawn` closes it); (c) `Absent` vs `Foreign` differ in TIMING (644 vs 355 us) because only the absent arm flushed a leaf before this change - not an oracle over the token, and the comment now says 'bytes' rather than 'byte-identically'; (d) the constant-time property is unpinned (swapping `ct_eq` for `==` leaves the suite green) - keep it inside `matches` so removal is a visible diff; (e) `ProxyEnv.token` is a bare `String` at the env edge with no charset check - make it `&RunToken` before P2; (f) live-test honesty: distinct nonce per Origin, assert B's port refuses connections after `drop`, add a launch barrier so 'concurrent' is observed. |
 | P2.1 Prompt budget vs timeout_ms | [ ] | | | | | 60 s dialog must survive |
 | P2.2 D-4 endpoints under MXC | [ ] | | | | | S-77 parity |
 | P2.3 session.start tier leaf + audit verify | [ ] | | | | | D-5 extension |
@@ -40,6 +41,40 @@ endpoints need the wrapper launcher).
 **CHECKPOINT D** (after P4) — STOP for user approval
 
 ## Event Log
+
+- 2026-10-21 (P1.4): **concurrency + per-run token attribution.** (A) **Per-run token**: `src/net/token.rs`
+  is now `RunToken` (was `gen_token() -> String`): the value is 8 lowercase hex chars of this process's
+  **run serial** followed by 224 bits of `BCryptGenRandom`, so uniqueness per run is *structural* rather
+  than an incidental property of the RNG; `RunToken` has a redacted `Debug`, a constant-time `matches`,
+  and is the only way to construct `ProxyConfig`/`ConnCtx` (`token: RunToken`), so a listener cannot exist
+  without its own run's credential. `main.rs` mints one per run and hands the same value to the listener
+  and to the child's proxy URL. (B) **Foreign-token refusal**: `check_proxy_auth` (bool) became
+  `classify_auth` (`OwnRun`/`Absent`/`Foreign`). A well-formed `Basic` credential that is not this run's
+  token is answered with the identical `407` as before but is *not* counted as a consultation and writes
+  **no audit leaf**; a request with no usable credential keeps its `no_token` leaf (the distinction is
+  ownership, so the silence cannot hide a dead audit writer - proven non-vacuously in the test). (C)
+  **Overlap refusal**: `LaunchCounters::begin_epoch` returns `Result<u64, EpochAlreadyOpen>` and refuses
+  when a window is already open; `ProxyProofSource::begin_launch` now returns that `Result`, `EpochGuard`
+  refuses before the body runs, and `MxcError::Concurrency` carries the named error. Nothing is spawned
+  and the open window is untouched, so there is no silent split (the previous behaviour moved `active`,
+  which sent the older launch's traffic to the newer window). (D) **Eviction**: an epoch entry carries
+  `closed`; `prune` evicts only closed, non-active entries, so a live launch's proof can no longer be
+  deleted at the bound. Memory bound documented: 32 closed counters (~24 B each) plus the one open
+  window (a second is refused). `RecordingSource`/`LiveProof` fakes enforce the same contract, and the
+  old `a_new_epoch_does_not_inherit...` test was restated because its manual `begin_launch` + launch
+  sequence is exactly the overlap now refused. RED EVIDENCE (each revert restored byte-identically,
+  `cmp` clean): treating `Foreign` as `Absent` fails
+  `a_listener_refuses_a_foreign_run_token_without_counting_or_auditing_it` (leaf count 2 != 1); dropping
+  the open-epoch check fails `begin_epoch_refuses_a_second_launch_while_one_is_open` (a second window
+  opened); pruning on `!= active` alone fails `an_open_epoch_is_never_evicted_by_pruning` (the oldest
+  *open* epoch was evicted); issuing an unsalted random token fails
+  `every_run_gets_its_own_token_and_its_own_serial`. LIVE (unelevated, `elevated=false`): two concurrent
+  containers, each on its own listener/port/token, A over CONNECT and B over absolute-form plain HTTP -
+  both exit 0, each proof exactly `{1,1}` (not `{2,2}`), each origin saw only its own path; A's token at
+  B's listener and B's at A's returned `HTTP/1.1 407` with counters `{0,0}` and no new audit leaf in
+  either chain; closing B left A's counters frozen, A still serving its own token and still refusing B's.
+  GATES: 439 tests (feature off) / 519 + 3 ignored (feature on), 0 clippy warnings in both states, the
+  three touched source files `rustfmt --check` clean and uniformly CRLF.
 
 - 2026-10-21: Plan created from the ADR-0004 prototype evidence (spike commits
   `a067461`, `be59a60`; ADR amendments `6933a89`). No implementation started.
@@ -212,3 +247,19 @@ legal. Filesystem: Unicode case folding (Ä/ä), absolute-path precondition, `..
 trim fixed; `RequestError::PathNotAbsolute` and `DenyCoversGrant` documented including the built-in
 credential-deny trap. Gates: 432 (feature off) / 511 + 2 ignored (feature on), 0 clippy both states,
 both files rustfmt-clean and uniformly CRLF, both live legs green unelevated.
+- 2026-10-21 (P1.4 reviews, both PASS): two advisories were worth acting on before the commit, and one was a
+regression the spec review caught. (1) **A foreign token left NO audit evidence.** Pre-P1.4 every bad credential
+wrote a `no_token` leaf; the first cut made `Foreign` silent in both chains, with only a `SANDBOX_DIAG`-gated
+eprintln - i.e. the one deliberate security event was the only one with no evidence, contradicting this repo's
+own rule that security-relevant degradation is not diag-gated. `Foreign` now writes exactly one leaf
+(`disposition: deny`, `reason: foreign_token`, `host: <unknown>`, `source: default`) and STILL counts as no
+consultation, so guardrail 1 is unaffected; the proxy unit test and all three live legs were updated to assert
+`+1` leaf with the reason (the positive control - `Absent` also adds one - keeps the assertion non-vacuous).
+(2) `MXC_CONCURRENCY_REFUSED` told the user 'per-run proxy attribution is not implemented yet', which P1.4 made
+false; it now says one session per supervisor process and names P1.4. (3) `RunToken::run()` became dead when the
+diag line went; it is now `#[cfg(test)]`-gated (the tests use it) rather than `allow(dead_code)`, which would
+hide a real dead path later. Recorded, not fixed: the `no_token` leaf flood, `RunToken: Clone` sharing, the
+absent/foreign timing delta, the unpinned constant-time property, the untyped env-edge token, and three
+live-test honesty gaps - all in row **P1.6**. Plan amended: D8's closing paragraph now records P1.4's answer;
+P1.4's token wording states the serial is process-local; P0.5 no longer claims attribution is unimplemented;
+P2 gains a requirement to pass `(port, token, counters)` from ONE object.

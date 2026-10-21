@@ -152,6 +152,8 @@ Open for P1.4/P1.5: the token is now in the *request*, so P1.4 is a *rejection*
 rule (a run must not accept another run's token) rather than a delivery problem,
 and P1.5 must measure whether the WinHTTP path is given the same userinfo URL.
 
+**Answered by P1.4:** the listener classifies a credential as `OwnRun` / `Absent` / `Foreign`. `Foreign` gets the identical 407, is **not** counted (so it cannot satisfy guardrail 1), and writes exactly one audit leaf (`reason: foreign_token`, `host: <unknown>`) so a cross-run attempt is evidence rather than silence; `Absent` keeps its `no_token` leaf. Two open epochs are impossible (`EpochAlreadyOpen` -> `MxcError::Concurrency`) and the pruner only evicts CLOSED epochs (32 closed + at most one open), so a live launch's window can be neither split nor evicted.
+
 **D9 — the listener forwards absolute-form plain HTTP (recorded 2026-10-21 after
 a FAILed review).** Carrying `tunnels` as "upstream established" is only
 meaningful if a plain-HTTP session can actually reach an origin, so the listener
@@ -200,7 +202,7 @@ CONNECT, now also carrying cleartext HTTP.
   request → `tier`, `tier_source`, `needs_dacl_augmentation`; persist into the
   session record (leaf wiring lands in P2.3).
 - [ ] **P0.5** CLI `--backend <appcontainer|mxc>` (default `appcontainer`);
-  `--backend mxc` refuses `--concurrency > 1` with a clear message until P1.4.
+  `--backend mxc` refuses `--concurrency > 1` with a clear message until the concurrency fan-out lands (P3): P1.4 gives every run its own listener, port and token, but the supervisor still runs one session per process, so the refusal must not claim attribution is unimplemented.
 
 **Acceptance:** `cargo test` green both feature states; an unelevated manual run
 prints the tier and passes the guardrail; the default path is byte-for-byte the
@@ -243,7 +245,7 @@ current behaviour (harness smoke on 5 scenarios).
   dedicated one-entry launcher directory is deferred. Test asserting the
   workspace-only posture (outside write and read denied, `C:\Windows` readable =
   documented caveat).
-- [ ] **P1.4** **Concurrency:** per-run token — the supervisor generates a token,
+- [ ] **P1.4** **Concurrency:** per-run token — the supervisor mints a `RunToken` (64 lowercase hex = 8 hex chars of a **process-global run serial** + 224 CNG random bits; the serial makes two runs distinct **within one supervisor process**, while across processes both start at `00000001` and uniqueness rests on the 224 random bits; the serial is diagnostic only), the child's `HTTP_PROXY` userinfo carries it, and the listener rejects any credential that is not this run's
   the child's `HTTP_PROXY` userinfo carries it, the proxy rejects CONNECTs whose
   token does not match the run; two concurrent containers must both pass their
   own guardrail and neither can satisfy the other's. Alternative (only if the
@@ -256,6 +258,9 @@ current behaviour (harness smoke on 5 scenarios).
 S-75..S-77, S-81..S-87, S-90, S-91) pass against `--backend mxc`; the guardrail
 negative test still fails the session; concurrency test passes with two
 containers.
+
+
+**P1.4 review requirement for P2 wiring:** `launch_session(source, proxy_port, proxy_token, launcher, input)` takes the credential as a free-standing argument next to the port and the counters, so a caller can pair listener A's proof source with run B's token and only a runtime 407 catches it. The wiring must take the run's `(port, token, counters)` from ONE object (expose the token on `ProxyHandle`) rather than three loose arguments.
 
 ## P2 — Prompt, intent, audit parity
 
