@@ -1,6 +1,10 @@
 # ADR-0002: MXC integration surface (WBD D-03 — stop-work gate)
 
 > **Status:** Proposed (2026-10-17) — evidence complete; supersedes nothing (first D-03 record)
+> **Amended 2026-10-21 by ADR-0004 (Option A):** the binding stop-work consequence below is RELAXED to
+> ADR-0003's bounded-adapter posture, on condition of two mandatory guardrails (post-launch proxy proof
+> as a hard gate; per-session tier logging). The attestation gap itself is UNCHANGED — still absent at
+> mxc-sdk 1.0.1 — so a degraded launch is detectable, not preventable.
 > **Scope:** WBD ticket D-03 (`input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` line 474, criteria lines 480-492). Consumes D-02 (`docs/wbd-d02-capability-matrix.md`). Binds ADR-0003 (D-04) and every product launch-path implementation ticket.
 > **Origin:** `docs/superpowers/specs/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.2; implementation plan `docs/superpowers/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
 > **Evidence rule:** every claim below cites a fetched artifact (under `tests/vm/results/<run-id>/`, SHA256-verified against that run's `capture-manifest.json`) or a `file:line` at the pinned tree. Unexposed capabilities are recorded blockers, never inferences.
@@ -144,7 +148,14 @@ dependency at the pinned tree.** It is the best-documented fit for a Rust produc
   an ABI boundary with zero capability gain.
 
 **Binding stop-work consequence (criterion 6):** created-not-running and pre-resume
-attestation are **unavailable on every surface** (§3 items 1-2). Therefore **no product
+attestation are **unavailable on every surface** (§3 items 1-2), and remain so at mxc-sdk
+**1.0.1** (ADR-0004 re-verified crate-wide: no `pre_resume`/`created_not_running`/`require_tier`
+symbol, and no provision→start split for ProcessContainer). **AMENDED 2026-10-21 (ADR-0004,
+Option A):** the absolute prohibition is replaced by ADR-0003's bounded posture — a product
+launch path MAY be implemented against `processcontainer` provided the residual exposure is
+documented and the two ADR-0004 guardrails are mandatory (proxy proof after launch; tier
+recorded per session). The prohibition below stands whenever either guardrail is absent.
+Historically, the rule was: **no product
 launch path may be implemented** until an upstream mechanism exists (the minimal upstream
 change: make the suspended-spawn/resume pair, or a created-not-running handle, public on
 the `SandboxBackend` trait / `v1` surface). Contracts and test infrastructure are not

@@ -1,6 +1,7 @@
 # ADR-0004: MXC `processcontainer` on GA Windows — unelevated proxy-only egress
 
-- **Status:** Proposed (decision pending: option A vs B below)
+- **Status:** **Accepted 2026-10-21 — Option A with guardrails** (decided by the product owner).
+  ADR-0002's stop-work consequence and ADR-0003's posture are amended accordingly.
 - **Date:** 2026-10-21
 - **Supersedes:** nothing. Amends the premise of ADR-0002 §"platform" (MXC
   required an Insider build) and leaves ADR-0003's enforcement posture intact.
@@ -94,9 +95,31 @@ Therefore **ADR-0002's stop-work gate stands unchanged.**
 
 ## Decision
 
-Two options; this ADR stays **Proposed** until one is chosen.
+**Option A was chosen, with guardrails.** The two guardrails are normative
+requirements of this ADR — not advice — and any launch path that does not
+implement both is non-conformant and must fall back to the un-amended
+ADR-0002 prohibition.
 
-### Option A — bounded adapter now (UAC removed from network sessions)
+### Guardrail 1 — post-launch proxy proof (hard gate)
+
+`warnings: []` is **not** evidence that the network works: the spike observed a
+run that exited 0 with no warnings while its proxy connect timed out. Therefore
+a session MUST NOT be reported as successful unless the supervisor can prove the
+child actually reached the proxy — e.g. a connection count on our own listener,
+or an in-container probe that reports back. Failure => fail the session, do not
+warn-and-continue.
+
+### Guardrail 2 — per-session tier recording
+
+The tier actually selected at dispatch (`base-container` vs
+`appcontainer-dacl`) MUST be recorded per session (a session-start audit leaf,
+not per-request — the D-5 taxonomy already carries `source`), together with the
+request's containment posture. A degraded tier must be visible after the fact
+even though it cannot be prevented before execution.
+
+### Options considered (unchanged in substance)
+
+### Option A — CHOSEN: bounded adapter now (UAC removed from network sessions)
 
 Adopt `mxc-sdk 1.0.1`'s `processcontainer` as the enforcement backend for
 **network and filesystem containment**, keeping this project's D-1..D-5 logic
@@ -111,7 +134,7 @@ misconfiguration must be caught by our own post-launch proxy probe.
 - Cost: an explicit, documented security downgrade vs. an attested launch;
   a compatibility-tier proxy; inbound private-network exposure.
 
-### Option B — keep the gate, use MXC only for test/CI
+### Option B — rejected (retained for the record)
 
 Stay on the AppContainer supervisor for the product; use MXC in the VM/CI lane
 to cross-check containment, and drop `sbx-base-b` as the "MXC needs Insider"
