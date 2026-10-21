@@ -4776,6 +4776,49 @@ mod tests {
         format!("CONNECT {target} HTTP/1.1{c}Proxy-Authorization: Basic {creds}{c}{c}")
     }
 
+    /// P1.8: managed clients do **not** send `Proxy-Authorization` pre-emptively.
+    ///
+    /// Measured inside a real container: .NET 8 (`SocketsHttpHandler`) and pwsh 7
+    /// read the credential out of the `HTTP_PROXY` userinfo, try once WITHOUT it,
+    /// and authenticate only after a `407` carrying a `Proxy-Authenticate: Basic`
+    /// challenge (the first attempt is a deliberate, uncounted refusal, so the run
+    /// still reports `accepted: 1`). If this listener ever answered 407 without a
+    /// challenge, every managed workload would silently lose egress - so the
+    /// header, not just the status, is pinned here.
+    #[test]
+    fn an_unauthenticated_consultation_gets_the_basic_challenge_managed_clients_need() {
+        let token = RunToken::issue().expect("mint a token");
+        let (dialog, _keep) = recording_dialog(Ok(allow_once()));
+        let cfg = t36_setup_token_cfg(
+            "p18-challenge",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        );
+        let c = crlf();
+        let unauth = format!("CONNECT 127.0.0.1:9 HTTP/1.1{c}Host: 127.0.0.1:9{c}{c}");
+        let resp = exchange(cfg.port, &unauth);
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        assert!(
+            resp.contains("Proxy-Authenticate: Basic"),
+            "no challenge means every managed client loses egress: {resp}"
+        );
+        assert!(resp.contains("realm=\"sandbox\""), "{resp}");
+
+        // The retry the client performs after that challenge is accepted, which
+        // proves the challenge is actionable rather than decorative.
+        let resp = exchange(cfg.port, &connect_req_with("127.0.0.1:9", token.value()));
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "an admitted request is loopback-refused, not challenged: {resp}"
+        );
+    }
+
     /// P1.4: a listener accepts exactly one credential - its own run's token.
     ///
     /// Two live listeners, each with its own token and port. Each refuses the
