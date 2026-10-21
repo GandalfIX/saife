@@ -53,6 +53,14 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] 
 sha2 = "0.10"
 subtle = "2"
 base64 = "0.22"
+# ADR-0004 Option A: the ProcessContainer containment backend. Optional and
+# exact-pinned; the published crate is preferred over a git SHA, and every bump
+# must re-run tests/vm/spikes/mxc-ga-spike.
+mxc-sdk = { version = "=1.0.1", optional = true }
+
+[features]
+# Default OFF: the AppContainer supervisor is the shipped default until P3.
+mxc-backend = ["dep:mxc-sdk"]
 
 [profile.release]
 opt-level = 2

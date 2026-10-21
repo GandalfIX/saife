@@ -1,5 +1,111 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// Containment backend for `sandbox run`.
+///
+/// The default is the in-repo AppContainer supervisor: P0 adds the MXC backend
+/// behind a flag without changing any existing behaviour (P3 flips the default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Backend {
+    /// In-repo AppContainer supervisor (network sessions need elevation).
+    #[default]
+    #[value(name = "appcontainer")]
+    AppContainer,
+    /// `mxc-sdk` ProcessContainer (ADR-0004 Option A). Requires a binary built
+    /// with `--features mxc-backend`.
+    #[value(name = "mxc")]
+    Mxc,
+}
+
+/// Refusal when `--backend mxc` is selected in a binary without the feature.
+pub const MXC_FEATURE_MISSING: &str = "`--backend mxc` requires a binary built with the \
+`mxc-backend` feature: rebuild with `cargo build --release --features mxc-backend`";
+
+/// Refusal when more than one MXC run is requested concurrently: ADR-0004
+/// guardrail 1 cannot yet attribute proxy traffic to a single run.
+pub const MXC_CONCURRENCY_REFUSED: &str = "`--backend mxc` refuses more than one concurrent run: \
+run one session at a time; per-run proxy attribution is not implemented yet";
+
+/// Refusal when `--backend mxc` is requested but the session path does not route
+/// through the MXC backend yet. Refusing beats a silent fallback to
+/// `appcontainer`, which would misreport the containment the child got.
+pub const MXC_NOT_WIRED: &str = "`--backend mxc` is not wired into the session path yet (plan P1); \
+refusing rather than falling back to `appcontainer`";
+
+/// Decide whether a run may use the selected backend, or explain the refusal.
+///
+/// Pure on purpose: `feature_enabled` is a parameter rather than a `cfg!` read,
+/// so the refusal is testable in both feature states.
+///
+/// `concurrency` is the requested number of concurrent runs. There is **no**
+/// `--concurrency` flag yet (P0.5 found none), so callers pass `None` and the
+/// MXC concurrency refusal is currently unreachable; it exists so P1.4 only has
+/// to thread the value through once the flag lands.
+pub fn resolve_backend(
+    backend: Backend,
+    concurrency: Option<usize>,
+    feature_enabled: bool,
+) -> Result<Backend, String> {
+    match backend {
+        // The shipped path: never gated, so P0 changes no existing behaviour.
+        Backend::AppContainer => Ok(Backend::AppContainer),
+        Backend::Mxc => {
+            if !feature_enabled {
+                return Err(MXC_FEATURE_MISSING.to_string());
+            }
+            if concurrency.is_some_and(|n| n > 1) {
+                return Err(MXC_CONCURRENCY_REFUSED.to_string());
+            }
+            Ok(Backend::Mxc)
+        }
+    }
+}
+
+/// Why a run may not use the selected backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendRefusal {
+    /// The binary was built without the `mxc-backend` feature.
+    FeatureMissing,
+    /// The feature is present, but the session path does not route through it.
+    NotWiredYet,
+}
+
+impl BackendRefusal {
+    /// The user-facing text for this refusal. The enum carries the decision; the
+    /// wording lives here, at the CLI boundary.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::FeatureMissing => MXC_FEATURE_MISSING,
+            Self::NotWiredYet => MXC_NOT_WIRED,
+        }
+    }
+}
+
+/// Route a `sandbox run` to a backend, or refuse it — fail-closed, before
+/// anything is spawned or created.
+///
+/// Pure and table-testable: `feature_enabled` and `wired` are parameters rather
+/// than `cfg!`/runtime reads, so every cell of the matrix is exercised in both
+/// feature states. `appcontainer` is never gated, so P0 changes no existing
+/// behaviour.
+///
+/// Order is the contract. Without the feature, `mxc` cannot route at all; with
+/// the feature it still refuses until the session path is wired, because
+/// ADR-0004 guardrail 1 makes an unproven launch non-conformant.
+pub fn route_backend(
+    backend: Backend,
+    feature_enabled: bool,
+    wired: bool,
+) -> Result<Backend, BackendRefusal> {
+    // The feature gate is expressed once, in `resolve_backend`; with no
+    // concurrency hint its only possible refusal is the missing feature.
+    match resolve_backend(backend, None, feature_enabled) {
+        Err(_) => Err(BackendRefusal::FeatureMissing),
+        Ok(Backend::AppContainer) => Ok(Backend::AppContainer),
+        Ok(Backend::Mxc) if wired => Ok(Backend::Mxc),
+        Ok(Backend::Mxc) => Err(BackendRefusal::NotWiredYet),
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +168,13 @@ pub enum Cmd {
         /// best-effort (a mid-stream write failure does not kill active connections).
         #[arg(long)]
         audit_strict: bool,
+
+        /// Containment backend. `appcontainer` (default) is the in-repo
+        /// supervisor. `mxc` requires a binary built with `--features
+        /// mxc-backend`, and each run must be a single session: proxy traffic
+        /// cannot be attributed per run yet.
+        #[arg(long, value_enum, default_value_t = Backend::AppContainer)]
+        backend: Backend,
 
         /// Print only the session id and exit 0 without spawning.
         #[arg(long, hide = true)]
@@ -323,5 +436,170 @@ mod tests {
     #[test]
     fn parse_learned_profile_after_subcommand_rejected() {
         assert!(Cli::try_parse_from(["sandbox", "learned", "list", "--profile", "dev"]).is_err());
+    }
+
+    fn run_backend(args: &[&str]) -> Backend {
+        let mut argv = vec!["sandbox", "run"];
+        argv.extend_from_slice(args);
+        argv.extend(["--", "cmd", "/c", "exit", "0"]);
+        let cli = Cli::parse_from(argv);
+        let Cmd::Run { backend, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        backend
+    }
+
+    /// P0.5: the default must stay `appcontainer` — P0 changes no behaviour.
+    #[test]
+    fn run_defaults_to_the_appcontainer_backend() {
+        assert_eq!(run_backend(&[]), Backend::AppContainer);
+    }
+
+    #[test]
+    fn run_accepts_backend_mxc() {
+        assert_eq!(run_backend(&["--backend", "mxc"]), Backend::Mxc);
+    }
+
+    #[test]
+    fn run_accepts_backend_appcontainer_explicitly() {
+        assert_eq!(
+            run_backend(&["--backend", "appcontainer"]),
+            Backend::AppContainer
+        );
+    }
+
+    /// An unknown value must fail as an invalid *value* (naming the valid ones),
+    /// not as some other parse error that would also satisfy `is_err()`.
+    #[test]
+    fn run_rejects_an_unknown_backend() {
+        let argv = ["sandbox", "run", "--backend", "sandboxie", "--", "cmd"];
+        let err = match Cli::try_parse_from(argv) {
+            Ok(_) => panic!("an unknown backend must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("appcontainer") && rendered.contains("mxc"),
+            "the error must name the valid backends: {rendered}"
+        );
+    }
+
+    #[test]
+    fn appcontainer_is_allowed_in_every_feature_state() {
+        for feature_enabled in [false, true] {
+            for concurrency in [None, Some(1), Some(8)] {
+                assert_eq!(
+                    resolve_backend(Backend::AppContainer, concurrency, feature_enabled),
+                    Ok(Backend::AppContainer)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mxc_without_the_feature_names_the_feature_in_the_error() {
+        let err = resolve_backend(Backend::Mxc, None, false)
+            .expect_err("mxc must be refused without the feature");
+        assert!(
+            err.contains("--features mxc-backend"),
+            "the message must name the feature flag: {err}"
+        );
+        assert_eq!(err, MXC_FEATURE_MISSING);
+    }
+
+    #[test]
+    fn mxc_refuses_concurrency_above_one() {
+        let err = resolve_backend(Backend::Mxc, Some(2), true)
+            .expect_err("concurrency > 1 must be refused");
+        assert!(
+            err.contains("run one session at a time"),
+            "the message must say what to do instead: {err}"
+        );
+        assert!(
+            !err.contains("plan P1"),
+            "user-facing text must not cite an internal plan: {err}"
+        );
+        assert_eq!(err, MXC_CONCURRENCY_REFUSED);
+    }
+
+    /// The routing decision, exhaustively: 2 backends x 2 feature states x 2
+    /// wiring states. The cells that must never soften are feature-off + `mxc`
+    /// (refuse) and feature-on + `mxc` + not wired (still refuse, never a silent
+    /// fallback to `appcontainer`).
+    #[test]
+    fn route_backend_matrix_is_fail_closed() {
+        for (backend, feature_enabled, wired, expected) in [
+            (
+                Backend::AppContainer,
+                false,
+                false,
+                Ok(Backend::AppContainer),
+            ),
+            (
+                Backend::AppContainer,
+                false,
+                true,
+                Ok(Backend::AppContainer),
+            ),
+            (
+                Backend::AppContainer,
+                true,
+                false,
+                Ok(Backend::AppContainer),
+            ),
+            (Backend::AppContainer, true, true, Ok(Backend::AppContainer)),
+            (
+                Backend::Mxc,
+                false,
+                false,
+                Err(BackendRefusal::FeatureMissing),
+            ),
+            (
+                Backend::Mxc,
+                false,
+                true,
+                Err(BackendRefusal::FeatureMissing),
+            ),
+            (Backend::Mxc, true, false, Err(BackendRefusal::NotWiredYet)),
+            (Backend::Mxc, true, true, Ok(Backend::Mxc)),
+        ] {
+            assert_eq!(
+                route_backend(backend, feature_enabled, wired),
+                expected,
+                "backend={backend:?} feature_enabled={feature_enabled} wired={wired}"
+            );
+        }
+    }
+
+    /// Each refusal keeps its existing user-facing text, so moving the decision
+    /// into an enum cannot silently reword what the CLI prints.
+    #[test]
+    fn refusal_text_is_the_existing_message() {
+        assert_eq!(
+            BackendRefusal::FeatureMissing.message(),
+            MXC_FEATURE_MISSING
+        );
+        assert_eq!(BackendRefusal::NotWiredYet.message(), MXC_NOT_WIRED);
+        assert!(
+            MXC_FEATURE_MISSING.contains("--features mxc-backend"),
+            "the feature refusal must name the flag: {MXC_FEATURE_MISSING}"
+        );
+        assert!(
+            !MXC_CONCURRENCY_REFUSED.contains("plan P"),
+            "the concurrency refusal must not cite an internal plan: {MXC_CONCURRENCY_REFUSED}"
+        );
+    }
+
+    /// The refusal is vacuous today (no `--concurrency` flag exists), so a
+    /// serial run must pass — and `Some(1)` must behave like `None`.
+    #[test]
+    fn mxc_allows_serial_runs() {
+        for concurrency in [None, Some(1)] {
+            assert_eq!(
+                resolve_backend(Backend::Mxc, concurrency, true),
+                Ok(Backend::Mxc)
+            );
+        }
     }
 }

@@ -13,6 +13,11 @@ use clap::Parser;
 use cli::Cli;
 use cli::Cmd;
 
+/// Whether the MXC backend is wired into the session path. P0 lands the seam
+/// only; until the launch path routes through it, `--backend mxc` is refused
+/// rather than falling back to `appcontainer` (`cli::route_backend`).
+const MXC_SESSION_WIRED: bool = false;
+
 /// Serializes the tests that read or mutate process-wide environment variables
 /// (`USERPROFILE` in particular). Those tests share one global process state, so
 /// an unlocked reader can observe a mutator's temporary value and fail for a
@@ -41,10 +46,12 @@ fn main() {
             no_prompt,
             network_profile,
             audit_strict,
+            backend,
             print_sid,
             sid,
             cmd,
         } => run_cmd(
+            backend,
             profile,
             allow_cwd,
             allow,
@@ -409,6 +416,7 @@ fn upstream_parse_failure_warning(
 
 #[allow(clippy::too_many_arguments)]
 fn run_cmd(
+    backend: cli::Backend,
     profile: Option<String>,
     allow_cwd: bool,
     allow: Vec<String>,
@@ -423,6 +431,25 @@ fn run_cmd(
     sid: Option<String>,
     cmd: Vec<String>,
 ) -> i32 {
+    // Backend selection is refused before anything is spawned or created. The
+    // decision itself is `cli::route_backend` (pure, table-tested); this is only
+    // the boundary that maps a refusal to its user-facing text and an exit code.
+    let backend =
+        match cli::route_backend(backend, cfg!(feature = "mxc-backend"), MXC_SESSION_WIRED) {
+            Ok(backend) => backend,
+            Err(refusal) => {
+                eprintln!("[sandbox] {}", refusal.message());
+                return 2;
+            }
+        };
+    if backend == cli::Backend::Mxc {
+        // Only reachable once `MXC_SESSION_WIRED` flips: this function has no MXC
+        // session path, so refuse instead of running an AppContainer session
+        // under a backend name that promised otherwise.
+        eprintln!("[sandbox] {}", cli::MXC_NOT_WIRED);
+        return 2;
+    }
+
     if let Err(e) = setup::check_runtime() {
         eprintln!("[sandbox] {e:#}");
         return 1;

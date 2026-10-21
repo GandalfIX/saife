@@ -2,6 +2,11 @@ pub mod intent;
 pub mod learned;
 pub mod loopback;
 pub mod matcher;
+/// MXC `processcontainer` containment backend (ADR-0004 Option A). Compiled
+/// only with the `mxc-backend` feature; the AppContainer supervisor stays the
+/// default backend (P3 flips it).
+#[cfg(feature = "mxc-backend")]
+pub mod mxc;
 pub mod profile;
 pub mod prompt;
 pub mod proxy;
