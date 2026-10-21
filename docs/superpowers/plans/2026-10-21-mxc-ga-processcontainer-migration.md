@@ -181,6 +181,32 @@ now runs absolute-form `http://` through the same D-1 pipeline as CONNECT
 This is a NEW egress surface whose only gate is D-1 — the same trust boundary as
 CONNECT, now also carrying cleartext HTTP.
 
+**D10 — the child may enter Win32k, deliberately (recorded 2026-10-21).**
+
+`build_request` now sets `ui.disable = false` explicitly. The SDK's default is the
+opposite (`UiPolicy::default().disable = true`, mxc-sdk-1.0.1
+`core/mxc_common/models.rs:583`), and that default becomes
+`PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE` in the PSEC path
+(`base_container_helpers.rs:57`). Measured consequence of leaving it on:
+`powershell.exe` exits `0xC0000142`, `dotnet` fails with `coreclr.dll` HRESULT
+`0x8007045A` - every managed process dies at load, because `coreclr.dll`
+statically imports USER32 and ole32 and their DllMain cannot run. With
+`ui.disable = false` both print (`FXOK`, `HELLO-OK`).
+
+**What we give up:** the kernel's user-mode attack surface (Win32k syscalls) is
+reachable from the child again. There is no middle setting - the dependency is a
+static import, not a call we can gate. **What stays:** the ten
+`JOB_OBJECT_UILIMIT_*` restrictions, clipboard `None` (verified: `OpenClipboard`
+-> `ACCESS_DENIED`), input injection off, filesystem policy, proxy-only egress and
+the AppContainer-shaped low-integrity token.
+
+**Why not fall back:** the SDK's AppContainer tier applies the SAME mitigation
+(`appcontainer_runner.rs:858`, `:917`), so a fallback to it would not have
+rescued managed workloads either.
+
+**Process lesson:** a suite that never runs a managed process would have called
+this a green launch. P3's gate therefore needs an explicit managed-workload leg.
+
 ---
 
 ## P0 — Backend skeleton behind a flag (default unchanged)

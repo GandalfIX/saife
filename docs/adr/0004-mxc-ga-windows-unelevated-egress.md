@@ -194,3 +194,24 @@ attestation (created-not-running or an atomic require-tier field).
   launch — `warnings=[]` is not evidence.
 - Re-pin policy: prefer the published crate (`mxc-sdk = "1.0.1"`) over a git
   SHA; pin exact versions and re-run this spike on every bump.
+
+## Posture change 2026-10-21: Win32k is reachable from the child
+
+The `processcontainer` request previously left `ui` unset, and the SDK defaults
+`UiPolicy::disable` to `true` (mxc-sdk-1.0.1 `core/mxc_common/models.rs:583`),
+which the PSEC path maps to
+`PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE`
+(`base_container_helpers.rs:57`). That ban is incompatible with every managed
+runtime on Windows: `coreclr.dll` statically imports USER32 and ole32, so their
+DllMain fails (`ERROR_DLL_INIT_FAILED`), and the loader dies before the CLR
+exists. Measured: `powershell.exe` -> `0xC0000142`, `dotnet` -> `coreclr.dll`
+HRESULT `0x8007045A`; with `ui.disable = false` both run (`FXOK`, `HELLO-OK`).
+
+The migration therefore **accepts Win32k reachability** as a deliberate trade:
+without it, MXC cannot run the product's own workloads at all. The mitigations
+this ADR relies on are unchanged (proxy-only egress, filesystem policy, low-
+integrity AppContainer-shaped token, UI restrictions and no clipboard/injection);
+what is lost is kernel attack-surface reduction, which this ADR previously got
+for free from the default. The SDK's AppContainer tier applies the same
+mitigation, so it is not an alternative posture - and no doc, audit leaf or CLI
+text may claim Win32k containment from here on.

@@ -114,10 +114,16 @@ grants to `C:\ProgramData`, `%LOCALAPPDATA%`, `C:\Windows\Temp` (RW) changed not
 so this is **not** a filesystem-grant or code-integrity gap. The same
 `powershell.exe -Command "Write-Output FXOK"` runs fine under the **AppContainer
 backend** of this repo, so it is specific to the ProcessContainer configuration the
-migration maps. Root cause not determined here; consequence: no managed (.NET) GUI or
-console workload can run at all, and the .NET/SocketsHttpHandler legs of this
-measurement are therefore **not runnable** (they would also be the only stacks whose
-env handling is documented to work).
+migration maps. Consequence: no managed (.NET) GUI or console workload can run at all, and
+the .NET/SocketsHttpHandler legs of this measurement are therefore **not runnable** (they
+would also be the only stacks whose env handling is documented to work).
+
+> **Resolved in P1.7** (`clr-startup-failure.md`): this is not the CLR and not the
+> containment primitive. The container runs every child with the kernel mitigation
+> "disallow Win32k system calls", which `mxc-sdk` derives from `ui.disable` and which
+> defaults to `true` when `ContainerRequest::ui` is unset. Setting
+> `request.ui = Some(UiPolicy{ disable: false, .. })` makes `powershell` print `FXOK` and
+> `dotnet` run, so the .NET legs above are runnable after that one field is set.
 
 ## Consequence for GUI workloads
 
