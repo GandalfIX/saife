@@ -25,6 +25,7 @@
 //! are present as deps for that future work and are NOT imported here.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -33,7 +34,6 @@ use std::sync::Mutex as StdMutex;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
@@ -47,6 +47,7 @@ use crate::net::matcher::{self, DenyReason, Verdict};
 use crate::net::prompt::{
     PromptConfig, PromptCoordinator, PromptOutcome, PromptPolicy, PromptResult, is_loopback_host,
 };
+use crate::net::token::RunToken;
 use crate::net::upstream::{UpstreamDialer, UpstreamError};
 
 /// The complete set of valid `source` values for a CONNECT audit event
@@ -69,7 +70,10 @@ pub const SOURCES: &[&str] = &[
 
 pub struct ProxyConfig {
     pub session_id: String,
-    pub token: String,
+    /// This run's own credential (P1.4). The listener accepts **only** this
+    /// value: a token minted for another run gets a `407` that is neither
+    /// counted nor audited here. See [`RunToken`].
+    pub token: RunToken,
     pub allow_domain: Vec<String>,
     /// Domains always denied, checked after hard-deny and before the
     /// allow-list ([G-32, G-33]). Wired in D-3.2; the full prompt/learned-deny
@@ -112,7 +116,9 @@ pub struct PromptGate {
 
 /// Per-listener shared state, immutable after `spawn`.
 struct ConnCtx {
-    token: String,
+    /// This listener's own run token. Every request is checked against it
+    /// before anything else happens (P1.4).
+    token: RunToken,
     deny: Vec<String>,
     allow: Vec<String>,
     writer: Arc<AuditWriter>,
@@ -169,10 +175,27 @@ pub struct LaunchProofCounters {
     pub upstream_established: u64,
 }
 
-/// Closed epochs kept for after-the-fact reading. One proxy serves one launch
-/// until P1.4 (per-run token), so this only bounds a long-lived supervisor that
-/// re-uses a listener; the epoch being opened is never the one evicted.
+/// Closed epochs kept for after-the-fact reading.
+///
+/// One listener serves one run (P1.4: its own token is the only credential it
+/// accepts), so this only bounds a listener that serves many sequential
+/// launches. The *rule* is the part that matters: **only closed epochs are
+/// evictable**. A launch reads its proof before it closes (read-then-close), so
+/// an open entry is live by definition, and evicting it would turn a working
+/// launch's proof into zeros — a false `SessionNotAccepted` on a session that
+/// did everything right. The memory bound is therefore this many closed counters
+/// (two `u64`s plus a flag each) plus the open ones, and [`LaunchCounters::begin_epoch`]
+/// refuses a second open epoch, so a listener holds at most one open counter.
 const MAX_REMEMBERED_EPOCHS: usize = 32;
+
+/// One epoch's attribution window.
+#[derive(Debug, Clone, Copy, Default)]
+struct EpochEntry {
+    counters: LaunchProofCounters,
+    /// Set by [`LaunchCounters::close_epoch`]: the window is over, so the entry
+    /// is frozen and may be evicted. An open entry never is.
+    closed: bool,
+}
 
 #[derive(Debug, Default)]
 struct CounterState {
@@ -180,16 +203,42 @@ struct CounterState {
     /// The epoch traffic is attributed to. `None` outside a launch: traffic
     /// then counts nowhere rather than against a stale launch.
     active: Option<u64>,
-    epochs: HashMap<u64, LaunchProofCounters>,
+    epochs: HashMap<u64, EpochEntry>,
 }
+
+/// Refusal for a launch that would overlap one already in flight (P1.4).
+///
+/// One listener serves one run, whose token is the only credential it accepts,
+/// so two open epochs mean two launches sharing one attribution window: the
+/// older launch's traffic would land in the newer epoch, and either launch could
+/// satisfy its guardrail with the other's consultation. Refused by name, before
+/// any child is spawned — never merged silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochAlreadyOpen {
+    /// The epoch that is still open.
+    pub active: u64,
+}
+
+impl fmt::Display for EpochAlreadyOpen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "launch epoch {} is still open on this proxy: a second concurrent launch would split \
+             proxy attribution between two runs, so it is refused",
+            self.active
+        )
+    }
+}
+
+impl std::error::Error for EpochAlreadyOpen {}
 
 /// Per-launch attribution counters for this listener (ADR-0004 guardrail 1).
 ///
 /// The proxy's handler tasks write; the launch path opens an epoch before the
 /// child starts, reads the counters for that epoch, and closes it. Attribution
 /// is by *the epoch active when the connection was classified as a proxy
-/// consultation*, which is exact while one proxy serves one launch (invariant
-/// 6) and is the assumption P1.4's per-run token removes.
+/// consultation*. Exact because one listener serves exactly one run's token
+/// (P1.4), and because a second epoch cannot be opened while one is open.
 ///
 /// `Send + Sync` and **poison-tolerant**: a handler that panicked while holding
 /// the lock must not make the launch path panic (a poisoned `Mutex` would turn
@@ -218,32 +267,58 @@ impl LaunchCounters {
 
     /// Open an epoch and make it the attribution target.
     ///
-    /// Any epoch still open is left open on purpose: closing it here would
-    /// silently merge two launches' traffic. The launch path owns closing.
-    pub fn begin_epoch(&self) -> u64 {
+    /// Refuses with [`EpochAlreadyOpen`] when an epoch is already open: closing
+    /// the previous one here would attribute two launches' traffic to one
+    /// window, and leaving both open would split attribution silently. The
+    /// launch path owns closing, so refusal is the only safe answer (P1.4).
+    pub fn begin_epoch(&self) -> std::result::Result<u64, EpochAlreadyOpen> {
         let mut state = self.lock();
+        if let Some(active) = state.active {
+            return Err(EpochAlreadyOpen { active });
+        }
         state.next_epoch += 1;
         let epoch = state.next_epoch;
-        state.epochs.insert(epoch, LaunchProofCounters::default());
+        state.epochs.insert(epoch, EpochEntry::default());
         state.active = Some(epoch);
         state.prune();
-        epoch
+        Ok(epoch)
     }
 
-    /// Close `epoch`'s window. Traffic arriving afterwards is attributed
-    /// nowhere. Returns whether `epoch` was the active one.
+    /// Close `epoch`'s window: it is frozen and becomes evictable. Traffic
+    /// arriving afterwards is attributed nowhere. Returns whether `epoch` was
+    /// the active one.
     pub fn close_epoch(&self, epoch: u64) -> bool {
         let mut state = self.lock();
         let was_active = state.active == Some(epoch);
         if was_active {
             state.active = None;
         }
+        if let Some(entry) = state.epochs.get_mut(&epoch) {
+            entry.closed = true;
+        }
         was_active
     }
 
     /// The counters recorded for `epoch`, if the epoch was ever opened.
     pub fn counters(&self, epoch: u64) -> Option<LaunchProofCounters> {
-        self.lock().epochs.get(&epoch).copied()
+        self.lock().epochs.get(&epoch).map(|entry| entry.counters)
+    }
+
+    /// The epoch a consultation would currently be attributed to.
+    ///
+    /// Test-only: no production caller needs to observe the window, and a
+    /// reader that branched on it could only re-derive what `begin_epoch`
+    /// already decided.
+    #[cfg(test)]
+    pub fn active_epoch(&self) -> Option<u64> {
+        self.lock().active
+    }
+
+    /// How many epochs are remembered. Test-only: the bound is what the tests
+    /// assert, and no production caller may depend on the map's size.
+    #[cfg(test)]
+    pub fn remembered_epochs(&self) -> usize {
+        self.lock().epochs.len()
     }
 
     /// Count one proxy consultation (a CONNECT or an absolute-form request that
@@ -263,24 +338,28 @@ impl LaunchCounters {
     fn bump(&self, f: impl FnOnce(&mut LaunchProofCounters)) {
         let mut state = self.lock();
         if let Some(epoch) = state.active
-            && let Some(counters) = state.epochs.get_mut(&epoch)
+            && let Some(entry) = state.epochs.get_mut(&epoch)
         {
-            f(counters);
+            f(&mut entry.counters);
         }
     }
 }
 
 impl CounterState {
-    /// Keep the map bounded. The highest epoch (the one just opened) is never
-    /// evicted, so a caller that opens and then reads its own epoch always sees
-    /// its counters.
+    /// Keep the map bounded **without ever dropping an epoch a live launch could
+    /// still be proving against**: only closed epochs are evictable (P1.4).
+    ///
+    /// An open entry is live by definition (its launch has not read its proof
+    /// yet), so it is kept even when the map is over the bound. In practice there
+    /// is at most one open entry — `begin_epoch` refuses overlap — so the map
+    /// holds `MAX_REMEMBERED_EPOCHS` closed entries plus that one.
     fn prune(&mut self) {
         while self.epochs.len() > MAX_REMEMBERED_EPOCHS {
             let Some(oldest) = self
                 .epochs
-                .keys()
-                .copied()
-                .filter(|e| Some(*e) != self.active)
+                .iter()
+                .filter(|(epoch, entry)| entry.closed && Some(**epoch) != self.active)
+                .map(|(epoch, _)| *epoch)
                 .min()
             else {
                 return;
@@ -438,10 +517,32 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
     })
 }
 
-/// Check `Proxy-Authorization: Basic <base64(sandbox:token)>` against the
-/// session token. Constant-time comparison via `subtle::ConstantTimeEq`.
-/// Returns false if the header is missing, malformed, or the token doesn't match.
-fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
+/// What this listener made of a client's `Proxy-Authorization` credential.
+///
+/// Three outcomes rather than two, because the *audit* consequences differ
+/// (P1.4): a credential this run does not own must not write into this run's
+/// audit chain, while a request that carried no credential at all is worth a
+/// leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthVerdict {
+    /// This run's own token: serve the request.
+    OwnRun,
+    /// No usable credential: the field is missing, the scheme is not `Basic`,
+    /// the payload is not base64, or there is no `user:password` shape.
+    Absent,
+    /// A well-formed `Basic` credential carrying a password that is **not** this
+    /// run's token. Another run's token and a guess are indistinguishable here,
+    /// and neither is evidence about *this* run, so it is refused without a
+    /// consultation count and without an audit leaf.
+    Foreign,
+}
+
+/// The one `407` body both refusal arms send, so they answer byte-identically.
+const AUTH_REQUIRED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"sandbox\"\r\nContent-Length: 0\r\n\r\n";
+
+/// Classify `Proxy-Authorization: Basic base64("sandbox:<token>")` against this
+/// listener's own run token ([`RunToken::matches`], which is constant-time).
+fn classify_auth(head: &str, expected: &RunToken) -> AuthVerdict {
     // Find the Proxy-Authorization header (case-insensitive).
     let auth_value = head.lines().skip(1).find_map(|l| {
         // Match the header name case-insensitively, but slice the *original*
@@ -454,7 +555,7 @@ fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
     });
 
     let Some(auth_value) = auth_value else {
-        return false;
+        return AuthVerdict::Absent;
     };
 
     // Expect "Basic <base64>" — accept any whitespace (RFC 7230 allows 1*SP).
@@ -462,24 +563,27 @@ fn check_proxy_auth(head: &str, expected_token: &str) -> bool {
     let scheme = parts.next().unwrap_or("");
     let b64 = parts.next().unwrap_or("");
     if !scheme.eq_ignore_ascii_case("Basic") || b64.is_empty() {
-        return false;
+        return AuthVerdict::Absent;
     }
 
     // Decode base64 -> "sandbox:<token>".
-    let decoded = match base64::engine::general_purpose::STANDARD.decode(b64) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return AuthVerdict::Absent;
     };
-    let decoded_str = match std::str::from_utf8(&decoded) {
-        Ok(s) => s,
-        Err(_) => return false,
+    let Ok(decoded_str) = std::str::from_utf8(&decoded) else {
+        return AuthVerdict::Absent;
     };
-    let (_, password) = decoded_str.split_once(':').unwrap_or(("", ""));
+    // No `user:password` shape is not a credential at all, so it is "absent"
+    // rather than "foreign": there is nothing here that could even name a run.
+    let Some((_, password)) = decoded_str.split_once(':') else {
+        return AuthVerdict::Absent;
+    };
 
-    // Constant-time compare.
-    // NOTE: ct_eq leaks length on unequal-length slices; acceptable for a
-    // localhost proxy with a fixed-length session token.
-    password.as_bytes().ct_eq(expected_token.as_bytes()).into()
+    if expected.matches(password) {
+        AuthVerdict::OwnRun
+    } else {
+        AuthVerdict::Foreign
+    }
 }
 
 /// Map a deny reason to the `source` field of the D-5 audit taxonomy.
@@ -1253,24 +1357,44 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     let target = parts.next().unwrap_or("");
 
     // Token gate: the same session token guards CONNECT and every
-    // /sandbox/* endpoint ([G-7, G-38]).
-    if !check_proxy_auth(head, &ctx.token) {
-        let _ = sock
-            .write_all(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"sandbox\"\r\nContent-Length: 0\r\n\r\n",
-            )
-            .await;
-        let _ = emit_connect(
-            &ctx.writer,
-            "<unknown>",
-            0,
-            "deny",
-            Some("no_token"),
-            "default",
-            None,
-            false,
-        );
-        return Ok(());
+    // /sandbox/* endpoint ([G-7, G-38]). This listener accepts exactly one
+    // credential — its own run's (P1.4).
+    match classify_auth(head, &ctx.token) {
+        AuthVerdict::OwnRun => {}
+        AuthVerdict::Absent => {
+            let _ = sock.write_all(AUTH_REQUIRED).await;
+            let _ = emit_connect(
+                &ctx.writer,
+                "<unknown>",
+                0,
+                "deny",
+                Some("no_token"),
+                "default",
+                None,
+                false,
+            );
+            return Ok(());
+        }
+        AuthVerdict::Foreign => {
+            // Refused and uncounted, but RECORDED (P1.4 review): a credential
+            // that is not this run's is lateral movement, and leaving it
+            // invisible in BOTH chains made the one deliberate security event
+            // the only one with no evidence. The leaf names no host and never
+            // the credential, and because it is not a consultation it can
+            // neither satisfy guardrail 1 nor reach `decide()`.
+            let _ = sock.write_all(AUTH_REQUIRED).await;
+            let _ = emit_connect(
+                &ctx.writer,
+                "<unknown>",
+                0,
+                "deny",
+                Some("foreign_token"),
+                "default",
+                None,
+                false,
+            );
+            return Ok(());
+        }
     }
 
     if method != "CONNECT" {
@@ -2504,40 +2628,69 @@ mod tests {
         format!("CONNECT api.example.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n")
     }
 
-    #[test]
-    fn valid_basic_auth() {
-        let token = "abc123";
+    fn basic(token: &str) -> String {
         let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
-        let head = make_head(&format!("Basic {creds}"));
-        assert!(check_proxy_auth(&head, token));
+        format!("Basic {creds}")
+    }
+
+    fn own_run() -> RunToken {
+        RunToken::for_tests("abc123")
     }
 
     #[test]
-    fn missing_auth_header() {
+    fn valid_basic_auth_is_the_own_run() {
+        assert_eq!(
+            classify_auth(&make_head(&basic("abc123")), &own_run()),
+            AuthVerdict::OwnRun
+        );
+    }
+
+    #[test]
+    fn missing_auth_header_is_absent() {
         let head = "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-        assert!(!check_proxy_auth(head, "abc123"));
+        assert_eq!(classify_auth(head, &own_run()), AuthVerdict::Absent);
+    }
+
+    /// The distinction P1.4 turns on: another run's token is not "no
+    /// credential", it is a credential this listener does not own.
+    #[test]
+    fn another_runs_token_is_foreign_not_absent() {
+        assert_eq!(
+            classify_auth(&make_head(&basic("another-runs-token")), &own_run()),
+            AuthVerdict::Foreign
+        );
     }
 
     #[test]
-    fn wrong_token() {
-        let creds = base64::engine::general_purpose::STANDARD.encode("sandbox:wrong");
-        let head = make_head(&format!("Basic {creds}"));
-        assert!(!check_proxy_auth(&head, "abc123"));
-    }
-
-    #[test]
-    fn wrong_scheme() {
+    fn wrong_scheme_is_absent() {
         let creds = base64::engine::general_purpose::STANDARD.encode("sandbox:abc123");
         let head = make_head(&format!("Bearer {creds}"));
-        assert!(!check_proxy_auth(&head, "abc123"));
+        assert_eq!(classify_auth(&head, &own_run()), AuthVerdict::Absent);
     }
 
     #[test]
-    fn case_insensitive_header_name() {
-        let token = "abc123";
-        let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+    fn case_insensitive_header_name_is_the_own_run() {
+        let creds = base64::engine::general_purpose::STANDARD.encode("sandbox:abc123");
         let head = format!("CONNECT x:443 HTTP/1.1\r\nproxy-AUTHORIZATION: Basic {creds}\r\n\r\n");
-        assert!(check_proxy_auth(&head, token));
+        assert_eq!(classify_auth(&head, &own_run()), AuthVerdict::OwnRun);
+    }
+
+    #[test]
+    fn undecodable_and_colonless_credentials_are_absent() {
+        let colonless =
+            base64::engine::general_purpose::STANDARD.encode("sandbox-token-without-a-colon");
+        for raw in [
+            "Basic".to_string(),
+            "Basic ".to_string(),
+            "Basic !!!not-base64!!!".to_string(),
+            format!("Basic {colonless}"),
+        ] {
+            assert_eq!(
+                classify_auth(&make_head(&raw), &own_run()),
+                AuthVerdict::Absent,
+                "{raw} is not a credential"
+            );
+        }
     }
 
     fn temp_sid(label: &str) -> String {
@@ -3612,6 +3765,33 @@ mod tests {
         policy: PromptPolicy,
         upstream: Option<Arc<UpstreamDialer>>,
     ) -> T36 {
+        t36_setup_token_cfg(
+            label,
+            allow,
+            deny,
+            dialog,
+            enabled,
+            timeout,
+            policy,
+            upstream,
+            RunToken::for_tests(TEST_TOKEN),
+        )
+    }
+
+    /// The same listener, with a run token of its own: what P1.4's two-run tests
+    /// need to show that a listener refuses every credential but its own.
+    #[allow(clippy::too_many_arguments)]
+    fn t36_setup_token_cfg(
+        label: &str,
+        allow: &[&str],
+        deny: &[&str],
+        dialog: DialogFn,
+        enabled: bool,
+        timeout: Duration,
+        policy: PromptPolicy,
+        upstream: Option<Arc<UpstreamDialer>>,
+        token: RunToken,
+    ) -> T36 {
         let learned_base = std::env::temp_dir().join(format!(
             "sandbox-t36-{label}-{}-{}",
             std::process::id(),
@@ -3639,7 +3819,7 @@ mod tests {
         let writer = Arc::new(crate::audit::AuditWriter::open(&sid, false).unwrap());
         let handle = super::spawn(super::ProxyConfig {
             session_id: sid.clone(),
-            token: TEST_TOKEN.to_string(),
+            token,
             allow_domain: allow.iter().map(|s| s.to_string()).collect(),
             deny_domain: deny.iter().map(|s| s.to_string()).collect(),
             upstream,
@@ -4488,7 +4668,7 @@ mod tests {
         let (dialog, _c) = recording_dialog(Ok(deny_once_result()));
         let t = t36_setup("counters", &[], &[], dialog);
         let counters = t.handle.counters();
-        let epoch = counters.begin_epoch();
+        let epoch = counters.begin_epoch().expect("the first launch's window");
 
         // Origin-form to our own endpoint: served, but NOT a proxy consultation.
         let resp = exchange(t.port, &get_req("/sandbox/intent?host=x.invalid"));
@@ -4520,7 +4700,7 @@ mod tests {
 
         // A new epoch starts empty; the closed one keeps its numbers.
         assert!(counters.close_epoch(epoch));
-        let next = counters.begin_epoch();
+        let next = counters.begin_epoch().expect("a window after the close");
         assert_eq!(
             counters.counters(next),
             Some(LaunchProofCounters::default())
@@ -4558,7 +4738,7 @@ mod tests {
     #[test]
     fn counters_survive_a_poisoned_lock() {
         let counters = LaunchCounters::new();
-        let epoch = counters.begin_epoch();
+        let epoch = counters.begin_epoch().expect("the first launch's window");
         let poisoner = Arc::clone(&counters);
         let poisoned = std::thread::spawn(move || {
             let _guard = poisoner.state.lock().expect("first lock");
@@ -4580,7 +4760,302 @@ mod tests {
             })
         );
         assert!(counters.close_epoch(epoch));
-        assert_eq!(counters.begin_epoch(), epoch + 1);
+        assert_eq!(
+            counters.begin_epoch().expect("a window after the close"),
+            epoch + 1
+        );
+    }
+
+    // ---- P1.4: concurrency and per-run token attribution ------------------
+
+    /// One CONNECT carrying a chosen credential (the tests below need to present
+    /// a token that is *not* this listener's).
+    fn connect_req_with(target: &str, token: &str) -> String {
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+        let c = crlf();
+        format!("CONNECT {target} HTTP/1.1{c}Proxy-Authorization: Basic {creds}{c}{c}")
+    }
+
+    /// P1.4: a listener accepts exactly one credential - its own run's token.
+    ///
+    /// Two live listeners, each with its own token and port. Each refuses the
+    /// other's token with a `407` that is **not** a consultation and leaves **no**
+    /// audit leaf, while still serving its own token. Before the P1.4 rule the
+    /// foreign token took the same `no_token` path as a missing credential: it
+    /// wrote a leaf into an audit chain it does not belong to.
+    #[test]
+    fn a_listener_refuses_a_foreign_run_token_without_counting_it_and_records_it_once() {
+        let (dialog_a, _keep_a) = recording_dialog(Ok(allow_once()));
+        let (dialog_b, _keep_b) = recording_dialog(Ok(allow_once()));
+        let token_a = RunToken::issue().expect("mint run A's token");
+        let token_b = RunToken::issue().expect("mint run B's token");
+        assert_ne!(token_a.value(), token_b.value());
+
+        let a = t36_setup_token_cfg(
+            "p14-run-a",
+            &["*"],
+            &[],
+            dialog_a,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token_a.clone(),
+        );
+        let b = t36_setup_token_cfg(
+            "p14-run-b",
+            &["*"],
+            &[],
+            dialog_b,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token_b.clone(),
+        );
+        assert_ne!(
+            a.port, b.port,
+            "one listener per run means one port per run"
+        );
+
+        let epoch_a = a.handle.counters().begin_epoch().expect("A's window");
+        let epoch_b = b.handle.counters().begin_epoch().expect("B's window");
+        let one_consultation = Some(LaunchProofCounters {
+            consultations: 1,
+            upstream_established: 0,
+        });
+
+        // (i) A's own token at A's listener is served and counted.
+        let resp = exchange(a.port, &connect_req_with("127.0.0.1:9", token_a.value()));
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "A must accept its own token: {resp}"
+        );
+        assert_eq!(a.handle.counters().counters(epoch_a), one_consultation);
+
+        // (ii) B's token at A's listener: refused, uncounted, recorded once
+        // as `foreign_token`.
+        let leaves_before = connect_events(&a.sid).len();
+        let resp = exchange(a.port, &connect_req_with("127.0.0.1:9", token_b.value()));
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "A must refuse B's token: {resp}"
+        );
+        assert_eq!(
+            a.handle.counters().counters(epoch_a),
+            one_consultation,
+            "a foreign token is not a consultation"
+        );
+        assert_eq!(
+            connect_events(&a.sid).len(),
+            leaves_before + 1,
+            "a foreign token must leave exactly one leaf in A's chain"
+        );
+        assert_eq!(
+            last_connect_event(&a.sid)["reason"],
+            "foreign_token",
+            "the leaf must name the event, and never the credential"
+        );
+        assert_eq!(
+            last_connect_event(&a.sid)["host"],
+            "<unknown>",
+            "a foreign attempt names no host, because none was admitted"
+        );
+
+        // (iii) the other direction: A's token at B's listener.
+        let leaves_before = connect_events(&b.sid).len();
+        let resp = exchange(b.port, &connect_req_with("127.0.0.1:9", token_a.value()));
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "B must refuse A's token: {resp}"
+        );
+        assert_eq!(
+            b.handle.counters().counters(epoch_b),
+            Some(LaunchProofCounters::default()),
+            "a foreign token must not count at B either"
+        );
+        assert_eq!(
+            connect_events(&b.sid).len(),
+            leaves_before + 1,
+            "a foreign token must leave exactly one leaf in B's chain"
+        );
+        assert_eq!(last_connect_event(&b.sid)["reason"], "foreign_token");
+
+        // B still serves its own token, so the refusal is about ownership and
+        // not a broken listener.
+        let resp = exchange(b.port, &connect_req_with("127.0.0.1:9", token_b.value()));
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+        assert_eq!(b.handle.counters().counters(epoch_b), one_consultation);
+
+        // (iv) non-vacuity: a request with NO credential still gets its leaf, so
+        // the silence above is the foreign-token rule and not a dead writer.
+        let leaves_before = connect_events(&a.sid).len();
+        let resp = exchange(a.port, &connect_req_no_auth("127.0.0.1:9"));
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        assert_eq!(
+            connect_events(&a.sid).len(),
+            leaves_before + 1,
+            "a missing credential is worth a leaf; a foreign one is not"
+        );
+    }
+
+    /// P1.4: an epoch that is still open refuses a second launch by name.
+    ///
+    /// Before the rule, the second `begin_epoch` simply moved `active`: both
+    /// launches' traffic landed in the newer window and the older launch's proof
+    /// silently went to zero - a split attribution with no error anywhere.
+    #[test]
+    fn begin_epoch_refuses_a_second_launch_while_one_is_open() {
+        let counters = LaunchCounters::new();
+        let first = counters.begin_epoch().expect("the first launch's window");
+        counters.note_consultation();
+
+        let err = counters
+            .begin_epoch()
+            .expect_err("a second concurrent launch must be refused");
+        assert_eq!(
+            err,
+            EpochAlreadyOpen { active: first },
+            "the refusal must name the open epoch"
+        );
+        assert_eq!(
+            counters.active_epoch(),
+            Some(first),
+            "a refused launch must not move the attribution window"
+        );
+        assert_eq!(
+            counters.counters(first),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            }),
+            "a refused launch must not steal or reset the open window"
+        );
+        assert!(
+            err.to_string().contains("still open"),
+            "the error must say what is wrong: {err}"
+        );
+
+        // Non-vacuity: once the window is closed, the next launch is allowed and
+        // starts empty, while the closed window keeps its numbers.
+        assert!(counters.close_epoch(first));
+        let second = counters.begin_epoch().expect("a window after the close");
+        assert_eq!(second, first + 1);
+        assert_eq!(
+            counters.counters(second),
+            Some(LaunchProofCounters::default())
+        );
+        assert_eq!(
+            counters.counters(first),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            })
+        );
+    }
+
+    /// P1.4: the pruner evicts **only closed** epochs, so the window a live
+    /// launch is about to read can never be dropped.
+    ///
+    /// Before the rule, `prune` skipped the active epoch alone; once the map hit
+    /// `MAX_REMEMBERED_EPOCHS` it evicted the oldest entry regardless of whether
+    /// a launch was still proving against it, and that launch then read zeros and
+    /// failed `SessionNotAccepted` after doing real work.
+    #[test]
+    fn an_open_epoch_is_never_evicted_by_pruning() {
+        let counters = LaunchCounters::new();
+        let live = counters.begin_epoch().expect("the launch in flight");
+        counters.note_consultation();
+
+        {
+            let mut state = counters.lock();
+            // The open epochs get the LOWEST ids on purpose: a pruner that
+            // evicts oldest-first without looking at `closed` removes exactly
+            // these first, which is the defect this test exists for.
+            for id in 100..110 {
+                state.epochs.insert(
+                    id,
+                    EpochEntry {
+                        counters: LaunchProofCounters::default(),
+                        closed: false,
+                    },
+                );
+            }
+            for id in 900..(900 + MAX_REMEMBERED_EPOCHS as u64 + 8) {
+                state.epochs.insert(
+                    id,
+                    EpochEntry {
+                        counters: LaunchProofCounters::default(),
+                        closed: true,
+                    },
+                );
+            }
+            state.prune();
+
+            assert!(
+                state.epochs.contains_key(&live),
+                "the live launch's window must survive pruning"
+            );
+            for id in 100..110 {
+                assert!(
+                    state.epochs.contains_key(&id),
+                    "open epoch {id} must survive pruning even though it is the oldest: only \
+                     closed epochs are evictable"
+                );
+            }
+            assert_eq!(
+                state.epochs.len(),
+                MAX_REMEMBERED_EPOCHS,
+                "closed epochs are still trimmed to the bound"
+            );
+            assert_eq!(
+                state.epochs.values().filter(|entry| entry.closed).count(),
+                MAX_REMEMBERED_EPOCHS - 11,
+                "the eleven open epochs are kept on top of the closed bound, and every                  over-bound entry removed was a closed one"
+            );
+        }
+
+        assert_eq!(
+            counters.counters(live),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            }),
+            "the surviving window still holds the live launch's traffic"
+        );
+    }
+
+    /// The bound holds through ordinary open/close cycles: closed epochs are
+    /// pruned oldest-first, so a long-lived listener cannot grow without limit.
+    #[test]
+    fn the_epoch_registry_stays_bounded_as_launches_close() {
+        let counters = LaunchCounters::new();
+        let mut last = 0;
+        for _ in 0..(MAX_REMEMBERED_EPOCHS * 3) {
+            last = counters
+                .begin_epoch()
+                .expect("sequential launches never overlap");
+            counters.note_consultation();
+            assert!(counters.close_epoch(last));
+        }
+        assert_eq!(
+            counters.remembered_epochs(),
+            MAX_REMEMBERED_EPOCHS,
+            "the map must not grow with the number of launches"
+        );
+        assert_eq!(
+            counters.counters(last),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            }),
+            "the newest window is still readable"
+        );
+        assert_eq!(
+            counters.counters(1),
+            None,
+            "the oldest closed window was evicted"
+        );
     }
 
     // ---- P1 wave 2: absolute-form parsing and head rewriting --------------
@@ -6222,7 +6697,7 @@ mod tests {
         let sid = temp_sid(label);
         let writer = Arc::new(crate::audit::AuditWriter::open(&sid, false).unwrap());
         let ctx = Arc::new(ConnCtx {
-            token: TEST_TOKEN.to_string(),
+            token: RunToken::for_tests(TEST_TOKEN),
             deny: Vec::new(),
             allow: vec!["api.example.com".to_string()],
             writer,

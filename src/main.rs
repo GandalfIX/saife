@@ -615,7 +615,10 @@ fn run_inner(
             profile_name,
             ..
         } => {
-            let token = net::token::gen_token().context("generate session token")?;
+            // One credential per run (P1.4): the token this run's listener
+            // accepts, and the only one its child is given. Minting it here is
+            // what makes two concurrent sessions attributable to themselves.
+            let token = net::token::RunToken::issue().context("generate session token")?;
             // Task 3.6 Step 5: load the learned policy BEFORE starting the
             // proxy. A corrupt learned file is a hard error by design — the
             // user notices immediately and can fix or revoke it ([G-5]).
@@ -702,7 +705,9 @@ fn run_inner(
             .context("start localhost proxy")?;
             proxy_env = Some(net::ProxyEnv {
                 port: handle.port,
-                token,
+                // The child's copy of this run's credential; the listener holds
+                // the same value and refuses every other.
+                token: token.value().to_string(),
             });
             Some(handle)
         }

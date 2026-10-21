@@ -42,8 +42,12 @@
 //!   silent drop — dropping it would leave the rest of the denied tree readable.
 //!
 //! Not here, by design: the session-start audit leaf (P2.3), the prompt/timeout
-//! budget arithmetic (P2.1), the per-run token that would make more than one
-//! launch per proxy safe (P1.4), and the WinHTTP measurement (P1.5).
+//! budget arithmetic (P2.1) and the WinHTTP measurement (P1.5). The per-run token
+//! that makes concurrent sessions safe landed in P1.4 and lives where it is
+//! enforced: `net::token::RunToken` mints one credential per run and the listener
+//! accepts only its own (`net::proxy::classify_auth`). What this module owns is
+//! the other half — an overlapping launch epoch is refused with
+//! [`MxcError::Concurrency`] rather than splitting one window between two runs.
 //! [`build_request`] passes the caller's `timeout_ms` through unchanged —
 //! `None` means *no deadline*, because the SDK turns a zero timeout into
 //! `INFINITE` (`mxc_common::script_runner::get_timeout_milliseconds`) — and
@@ -74,6 +78,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+use crate::net::proxy::EpochAlreadyOpen;
 
 use mxc_sdk::v1;
 use mxc_sdk::v1::configs::{
@@ -885,15 +891,25 @@ pub fn verify_proxy_proof(
 /// is the real implementation: the supervisor's own listener, counting what it
 /// served.
 ///
-/// One proxy per launch until P1.4 lands the per-run token (ADR-0004
-/// "concurrency caveat").
+/// One listener per run, one token per run (P1.4): the run's own
+/// [`RunToken`](crate::net::token::RunToken) is the only credential its listener
+/// accepts, and the epoch it opens while the child runs is the only window its
+/// traffic can be counted in. A second launch on the same listener is refused by
+/// [`begin_launch`](ProxyProofSource::begin_launch), never merged into the first.
 ///
 /// [`begin_launch`]: ProxyProofSource::begin_launch
 /// [`proof`]: ProxyProofSource::proof
 /// [`close_launch`]: ProxyProofSource::close_launch
 pub trait ProxyProofSource: Send + Sync {
     /// Open an attribution epoch and return its id.
-    fn begin_launch(&self) -> u64;
+    ///
+    /// Refuses with [`EpochAlreadyOpen`] when an epoch is already open. One
+    /// listener serves one run's token (P1.4), so a second open window means two
+    /// launches sharing one attribution epoch: the older launch's traffic would
+    /// land in the newer window and either launch could satisfy its guardrail
+    /// with the other's consultation. An implementation must refuse — not merge,
+    /// not reset, not silently move `active`.
+    fn begin_launch(&self) -> Result<u64, EpochAlreadyOpen>;
     /// Counters for the sessions accepted in `epoch`.
     fn proof(&self, epoch: u64) -> ProxyProof;
     /// Close `epoch`'s attribution window. Called exactly once per
@@ -909,7 +925,7 @@ pub trait ProxyProofSource: Send + Sync {
 /// (`runtimeConfig.networkProxy`) — never by a lookalike listener or a second
 /// count ("two sources of truth" is how a guardrail starts lying).
 impl ProxyProofSource for crate::net::proxy::LaunchCounters {
-    fn begin_launch(&self) -> u64 {
+    fn begin_launch(&self) -> Result<u64, EpochAlreadyOpen> {
         self.begin_epoch()
     }
 
@@ -945,12 +961,16 @@ struct EpochGuard<'a> {
 }
 
 impl<'a> EpochGuard<'a> {
-    fn open(source: &'a dyn ProxyProofSource) -> Self {
-        Self {
+    /// Open this launch's epoch, or refuse the launch.
+    ///
+    /// The refusal happens before the body runs, so an overlapping launch never
+    /// spawns a container and never touches the open window.
+    fn open(source: &'a dyn ProxyProofSource) -> Result<Self, EpochAlreadyOpen> {
+        Ok(Self {
             source,
-            epoch: source.begin_launch(),
+            epoch: source.begin_launch()?,
             closed: false,
-        }
+        })
     }
 
     /// Read the epoch's counters and close the window. The counters are frozen
@@ -989,7 +1009,7 @@ fn run_in_epoch<T>(
     source: &dyn ProxyProofSource,
     body: impl FnOnce() -> Result<T, MxcError>,
 ) -> Result<(T, ProxyProof), MxcError> {
-    let mut guard = EpochGuard::open(source);
+    let mut guard = EpochGuard::open(source).map_err(MxcError::Concurrency)?;
     // No `?` here: the epoch must be closed and its proof read before the error
     // is propagated.
     let result = body();
@@ -1178,6 +1198,10 @@ pub enum MxcError {
     Request(RequestError),
     /// The SDK refused the request or the wait failed.
     Sdk(v1::Error),
+    /// A launch was refused because the listener already had an open epoch:
+    /// two launches would share one attribution window (P1.4). Nothing was
+    /// spawned and the open window was not touched.
+    Concurrency(EpochAlreadyOpen),
 }
 
 impl fmt::Display for MxcError {
@@ -1186,6 +1210,7 @@ impl fmt::Display for MxcError {
             Self::Guard(e) => write!(f, "{e}"),
             Self::Request(e) => write!(f, "{e}"),
             Self::Sdk(e) => write!(f, "mxc-sdk: {e}"),
+            Self::Concurrency(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1196,6 +1221,7 @@ impl std::error::Error for MxcError {
             Self::Guard(e) => Some(e),
             Self::Request(e) => Some(e),
             Self::Sdk(e) => Some(e),
+            Self::Concurrency(e) => Some(e),
         }
     }
 }
@@ -2305,6 +2331,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingSource {
         next: AtomicU64,
+        /// The window that is open, if any: this fake enforces the same
+        /// no-overlap contract the real `LaunchCounters` does (P1.4).
+        active: Mutex<Option<u64>>,
         epochs: Mutex<Vec<u64>>,
         /// `(epoch, proof reads at close time)` — the read-then-close order is
         /// part of the contract, so it is recorded rather than assumed.
@@ -2328,10 +2357,15 @@ mod tests {
     }
 
     impl ProxyProofSource for RecordingSource {
-        fn begin_launch(&self) -> u64 {
+        fn begin_launch(&self) -> Result<u64, EpochAlreadyOpen> {
+            let mut active = self.active.lock().unwrap();
+            if let Some(open) = *active {
+                return Err(EpochAlreadyOpen { active: open });
+            }
             let epoch = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+            *active = Some(epoch);
             self.epochs.lock().unwrap().push(epoch);
-            epoch
+            Ok(epoch)
         }
 
         fn proof(&self, epoch: u64) -> ProxyProof {
@@ -2345,7 +2379,13 @@ mod tests {
         }
 
         fn close_launch(&self, epoch: u64) {
+            // Read-then-close ordering is part of the contract, so the read
+            // count is captured before the window is released.
             let reads = self.reads.load(Ordering::SeqCst);
+            let mut active = self.active.lock().unwrap();
+            if *active == Some(epoch) {
+                *active = None;
+            }
             self.closes.lock().unwrap().push((epoch, reads));
         }
     }
@@ -2420,8 +2460,8 @@ mod tests {
         struct PanickyClose;
 
         impl ProxyProofSource for PanickyClose {
-            fn begin_launch(&self) -> u64 {
-                1
+            fn begin_launch(&self) -> Result<u64, EpochAlreadyOpen> {
+                Ok(1)
             }
 
             fn proof(&self, _epoch: u64) -> ProxyProof {
@@ -2443,16 +2483,60 @@ mod tests {
         );
     }
 
+    /// Each launch opens its own epoch, and a new epoch starts empty: the fake's
+    /// proof for epoch 1 must not leak into the launch that opens epoch 2.
+    ///
+    /// The old form of this test opened an epoch by hand and then ran a launch:
+    /// that sequence is exactly the overlap P1.4 now refuses, so the property is
+    /// restated against the ids the fake assigns instead.
     #[test]
     fn a_new_epoch_does_not_inherit_an_earlier_launch_traffic() {
         let source = RecordingSource::default();
-        let first = source.begin_launch();
-        source.set_proof(first, proven());
-        let (_, proof) = run_in_epoch(&source, || Ok::<_, MxcError>(())).expect("body ran");
+        source.set_proof(1, proven());
+        let (_, first) = run_in_epoch(&source, || Ok::<_, MxcError>(())).expect("body ran");
+        assert_eq!(first, proven(), "epoch 1 is the seeded one");
+        let (_, second) = run_in_epoch(&source, || Ok::<_, MxcError>(())).expect("body ran");
         assert_eq!(
-            proof,
+            second,
             untouched(),
             "epoch 2 starts empty even though epoch 1 saw a tunnel"
+        );
+        assert_eq!(source.epochs(), vec![1, 2]);
+    }
+
+    /// P1.4: a launch that would overlap an open epoch is refused by name,
+    /// before the body runs, and leaves the open window alone.
+    ///
+    /// Without the refusal the second launch opened epoch 2 and the first
+    /// launch's traffic was split silently between two windows.
+    #[test]
+    fn an_overlapping_launch_is_refused_and_leaves_the_open_window_alone() {
+        let source = RecordingSource::default();
+        let open = source.begin_launch().expect("the launch in flight");
+        let err = run_in_epoch(&source, || Ok::<_, MxcError>(1))
+            .expect_err("a second concurrent launch must be refused");
+        match err {
+            MxcError::Concurrency(e) => assert_eq!(
+                e,
+                EpochAlreadyOpen { active: open },
+                "the refusal must name the open epoch"
+            ),
+            other => panic!("expected the named concurrency error, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("still open"),
+            "the message must name the condition: {err}"
+        );
+        assert_eq!(
+            source.epochs(),
+            vec![open],
+            "no epoch was opened for the refusal"
+        );
+        assert!(source.closes().is_empty(), "the open window was not closed");
+        assert_eq!(
+            source.active.lock().unwrap().as_ref(),
+            Some(&open),
+            "the launch in flight still owns the window"
         );
     }
 
@@ -3330,7 +3414,7 @@ mod tests {
     fn listener_counters_map_to_the_proof_and_never_leak_between_epochs() {
         let counters = crate::net::proxy::LaunchCounters::new();
 
-        let first = counters.begin_launch();
+        let first = counters.begin_launch().expect("the first launch's window");
         counters.note_consultation();
         counters.note_upstream_established();
         assert_eq!(
@@ -3344,7 +3428,7 @@ mod tests {
 
         // A second launch starts from zero, even though the first one saw
         // traffic — this is the whole point of the epoch.
-        let second = counters.begin_launch();
+        let second = counters.begin_launch().expect("a window after the close");
         assert_eq!(counters.proof(second), untouched());
         // A plain-HTTP forward: consulted and upstream established, with no
         // CONNECT anywhere. `tunnels >= 1` must hold or `Required` would fail a
@@ -3423,11 +3507,17 @@ mod live {
     use crate::net::prompt::{
         DialogFn, DialogUnavailable, PromptConfig, PromptCoordinator, PromptPolicy,
     };
+    use crate::net::proxy::LaunchProofCounters;
+    use crate::net::token::RunToken;
+    use base64::Engine as _;
 
     /// What the fake endpoint and the proof source share.
     #[derive(Default)]
     struct Shared {
         epoch: AtomicU64,
+        /// The window that is open, if any: the fake proof source enforces the
+        /// same no-overlap contract the real counters do (P1.4).
+        active: Mutex<Option<u64>>,
         counters: Mutex<HashMap<u64, ProxyProof>>,
         closes: Mutex<Vec<u64>>,
         /// `(epoch, request line)` for origin-form requests: a client dialled the
@@ -3449,14 +3539,19 @@ mod live {
     }
 
     impl ProxyProofSource for LiveProof {
-        fn begin_launch(&self) -> u64 {
+        fn begin_launch(&self) -> Result<u64, EpochAlreadyOpen> {
+            let mut active = self.shared.active.lock().unwrap();
+            if let Some(open) = *active {
+                return Err(EpochAlreadyOpen { active: open });
+            }
             let epoch = self.shared.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            *active = Some(epoch);
             self.shared
                 .counters
                 .lock()
                 .unwrap()
                 .insert(epoch, ProxyProof::default());
-            epoch
+            Ok(epoch)
         }
 
         fn proof(&self, epoch: u64) -> ProxyProof {
@@ -3470,6 +3565,10 @@ mod live {
         }
 
         fn close_launch(&self, epoch: u64) {
+            let mut active = self.shared.active.lock().unwrap();
+            if *active == Some(epoch) {
+                *active = None;
+            }
             self.shared.closes.lock().unwrap().push(epoch);
         }
     }
@@ -3905,11 +4004,19 @@ mod live {
     struct LiveProxy {
         handle: crate::net::proxy::ProxyHandle,
         sid: String,
+        /// This listener's own run token: the only credential it accepts.
+        token: RunToken,
         learned_base: PathBuf,
     }
 
     impl LiveProxy {
         fn start(allow: &[&str]) -> Self {
+            Self::start_with_token(allow, RunToken::for_tests(LIVE_TOKEN))
+        }
+
+        /// The same listener with a run token of its own (P1.4's two-run test
+        /// needs two sessions that must not be able to speak for each other).
+        fn start_with_token(allow: &[&str], token: RunToken) -> Self {
             let learned_base = std::env::temp_dir().join(format!(
                 "sandbox-mxc-live-learned-{}-{}",
                 std::process::id(),
@@ -3939,7 +4046,7 @@ mod live {
                 Arc::new(crate::audit::AuditWriter::open(&sid, false).expect("audit writer"));
             let handle = crate::net::proxy::spawn(crate::net::proxy::ProxyConfig {
                 session_id: sid.clone(),
-                token: LIVE_TOKEN.to_string(),
+                token: token.clone(),
                 allow_domain: allow.iter().map(|s| s.to_string()).collect(),
                 deny_domain: Vec::new(),
                 upstream: None,
@@ -3950,12 +4057,19 @@ mod live {
             Self {
                 handle,
                 sid,
+                token,
                 learned_base,
             }
         }
 
         fn port(&self) -> u16 {
             self.handle.port
+        }
+
+        /// This listener's credential, for the child's proxy URL and for the
+        /// cross-run refusal legs below.
+        fn token(&self) -> &RunToken {
+            &self.token
         }
 
         fn counters(&self) -> Arc<crate::net::proxy::LaunchCounters> {
@@ -4675,6 +4789,302 @@ mod live {
         println!(
             "EVIDENCE done: proxied CONNECT, plain-HTTP forward, blocked and filesystem legs all \
              proven unelevated against the supervisor's own listener"
+        );
+    }
+
+    // =====================================================================
+    // P1.4: two concurrent sessions, two listeners, two run tokens
+    // =====================================================================
+
+    /// One `CONNECT` carrying a credential the test chose, blocking.
+    ///
+    /// A container can only present its own run's token (it rides its proxy
+    /// URL), so the cross-run legs use a raw socket: presenting *another* run's
+    /// token is exactly what must be refused.
+    fn cx(port: u16, token: &str, target: &str) -> String {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect the listener");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+        let req =
+            format!("CONNECT {target} HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n");
+        sock.write_all(req.as_bytes()).expect("write CONNECT");
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 256];
+        // Read until the status line is complete; a tunnel keeps the socket
+        // open afterwards, so this must never read to EOF.
+        while !out.windows(2).any(|w| w == b"\r\n") {
+            match sock.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// CONNECT leaves in a session's audit chain.
+    fn connect_leaves(sid: &str) -> usize {
+        std::fs::read_to_string(crate::audit::audit_log_path(sid))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("\"op\":\"CONNECT\""))
+            .count()
+    }
+
+    /// **P1.4 mandatory test: two containers, concurrently.**
+    ///
+    /// Each session gets its own listener, its own port and its own run token.
+    /// The assertions are the four the review asked for: both sessions prove
+    /// their own guardrail, each proof counts **only** its own traffic (`{1,1}`,
+    /// never the `{2,2}` a shared listener would produce), a token from the other
+    /// session is refused at the first listener with a `407` that is neither
+    /// counted nor audited, and closing one session leaves the other's counters
+    /// and service untouched.
+    ///
+    /// Run: `cargo test --features mxc-backend --bin sandbox -- --ignored --nocapture`
+    #[test]
+    #[ignore = "launches two real ProcessContainers; run: cargo test --features mxc-backend -- --ignored"]
+    fn two_concurrent_sessions_prove_only_their_own_traffic_and_refuse_each_others_tokens() {
+        let launcher = launcher_under_test();
+        let origin_a = Origin::start();
+        let origin_b = Origin::start();
+        // Two runs, two credentials, minted the way the supervisor mints them.
+        let token_a = RunToken::issue().expect("mint run A's token");
+        let token_b = RunToken::issue().expect("mint run B's token");
+        let a = LiveProxy::start_with_token(&[origin_a.host.as_str()], token_a.clone());
+        let b = LiveProxy::start_with_token(&[origin_b.host.as_str()], token_b.clone());
+
+        println!(
+            "EVIDENCE elevated={} (TokenElevation of the driving process)",
+            process_is_elevated()
+        );
+        println!(
+            "EVIDENCE run_a port={} token_run={} origin={}",
+            a.port(),
+            a.token().run(),
+            origin_a.authority()
+        );
+        println!(
+            "EVIDENCE run_b port={} token_run={} origin={}",
+            b.port(),
+            b.token().run(),
+            origin_b.authority()
+        );
+        assert_ne!(a.port(), b.port(), "each run gets its own listener");
+        assert_ne!(
+            token_a.value(),
+            token_b.value(),
+            "each run gets its own credential"
+        );
+
+        let scratch_a = Scratch::named("p14-run-a");
+        let scratch_b = Scratch::named("p14-run-b");
+        let dir_a = scratch_a.path().to_path_buf();
+        let dir_b = scratch_b.path().to_path_buf();
+        let no_denies: Vec<String> = Vec::new();
+
+        // A: a real CONNECT tunnel. B: a real absolute-form plain-HTTP forward.
+        // Different legs on purpose — each session proves itself with the leg it
+        // uses, and neither proof can be borrowed from the other.
+        let command_a = format!(
+            "{CURL} -sS -f --max-time 40 --proxytunnel {}",
+            origin_a.url("/run-a")
+        );
+        let command_b = format!("{CURL} -sS -f --max-time 40 {}", origin_b.url("/run-b"));
+        let input_a = session_input(&dir_a, &launcher, &no_denies, command_a, Some(a.port()));
+        let input_b = session_input(&dir_b, &launcher, &no_denies, command_b, Some(b.port()));
+
+        let counters_a = a.counters();
+        let counters_b = b.counters();
+
+        // Genuinely concurrent: both containers are in flight at once, each
+        // pointed at its own listener by its own proxy URL.
+        let (out_a, out_b) = std::thread::scope(|scope| {
+            let handle_a = scope.spawn(|| {
+                launch_session(
+                    counters_a.as_ref(),
+                    Some(a.port()),
+                    Some(a.token().value()),
+                    &launcher,
+                    &input_a,
+                )
+            });
+            let handle_b = scope.spawn(|| {
+                launch_session(
+                    counters_b.as_ref(),
+                    Some(b.port()),
+                    Some(b.token().value()),
+                    &launcher,
+                    &input_b,
+                )
+            });
+            (
+                handle_a.join().expect("run A's launch thread"),
+                handle_b.join().expect("run B's launch thread"),
+            )
+        });
+
+        let out_a = out_a.expect("run A must pass guardrail 1");
+        let out_b = out_b.expect("run B must pass guardrail 1");
+        println!(
+            "EVIDENCE run_a exit={:?} success={} proof={:?} stdout={:?} stderr={:?}",
+            out_a.exit_code,
+            out_a.success(),
+            out_a.proxy_proof,
+            stdout_of(&out_a).trim(),
+            stderr_of(&out_a).trim()
+        );
+        println!(
+            "EVIDENCE run_b exit={:?} success={} proof={:?} stdout={:?} stderr={:?}",
+            out_b.exit_code,
+            out_b.success(),
+            out_b.proxy_proof,
+            stdout_of(&out_b).trim(),
+            stderr_of(&out_b).trim()
+        );
+
+        // (i) both sessions succeed.
+        assert_eq!(out_a.exit_code, Some(0), "run A's curl failed: {out_a:?}");
+        assert_eq!(out_b.exit_code, Some(0), "run B's curl failed: {out_b:?}");
+        assert!(out_a.success() && out_b.success());
+
+        // (ii) each proof is exactly its own traffic. `{2,2}` here would mean one
+        // listener had served both sessions (the R3 masking failure).
+        assert_eq!(
+            out_a.proxy_proof,
+            ProxyProof {
+                accepted: 1,
+                tunnels: 1,
+            },
+            "run A's proof must count only run A's consultation"
+        );
+        assert_eq!(
+            out_b.proxy_proof,
+            ProxyProof {
+                accepted: 1,
+                tunnels: 1,
+            },
+            "run B's proof must count only run B's consultation"
+        );
+        assert!(
+            stdout_of(&out_a).contains(NONCE) && stdout_of(&out_b).contains(NONCE),
+            "each session's body must come from its own origin"
+        );
+        assert!(
+            origin_a.saw("/run-a") && !origin_a.saw("/run-b"),
+            "origin A served another session's request: {:?}",
+            origin_a.requests()
+        );
+        assert!(
+            origin_b.saw("/run-b") && !origin_b.saw("/run-a"),
+            "origin B served another session's request: {:?}",
+            origin_b.requests()
+        );
+
+        // (iii) a token from the other session is refused at the first: 407, not
+        // counted, and no leaf in that run's audit chain.
+        let epoch_a = counters_a.begin_epoch().expect("a fresh window for A");
+        let leaves_before = connect_leaves(&a.sid);
+        let resp = cx(a.port(), token_b.value(), &origin_a.authority());
+        println!(
+            "EVIDENCE foreign_token_at_run_a status={:?} counters={:?} leaves_before={} leaves_after={}",
+            resp.lines().next().unwrap_or(""),
+            counters_a.counters(epoch_a),
+            leaves_before,
+            connect_leaves(&a.sid)
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "run A must refuse run B's token: {resp:?}"
+        );
+        assert_eq!(
+            counters_a.counters(epoch_a),
+            Some(LaunchProofCounters::default()),
+            "a foreign token must not count as a consultation"
+        );
+        assert_eq!(
+            connect_leaves(&a.sid),
+            leaves_before + 1,
+            "a foreign token must be recorded once in run A's chain"
+        );
+
+        let epoch_b = counters_b.begin_epoch().expect("a fresh window for B");
+        let leaves_before = connect_leaves(&b.sid);
+        let resp = cx(b.port(), token_a.value(), &origin_b.authority());
+        println!(
+            "EVIDENCE foreign_token_at_run_b status={:?} counters={:?} leaves_before={} leaves_after={}",
+            resp.lines().next().unwrap_or(""),
+            counters_b.counters(epoch_b),
+            leaves_before,
+            connect_leaves(&b.sid)
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "run B must refuse run A's token: {resp:?}"
+        );
+        assert_eq!(
+            counters_b.counters(epoch_b),
+            Some(LaunchProofCounters::default()),
+            "a foreign token must not count at run B either"
+        );
+        assert_eq!(
+            connect_leaves(&b.sid),
+            leaves_before + 1,
+            "a foreign token must be recorded once in run B's chain"
+        );
+
+        // Each listener still serves its own token, so the refusals above are
+        // about ownership and not a broken listener.
+        let resp = cx(a.port(), token_a.value(), &origin_a.authority());
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "run A must accept its own token: {resp:?}"
+        );
+        let resp = cx(b.port(), token_b.value(), &origin_b.authority());
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "run B must accept its own token: {resp:?}"
+        );
+
+        // (iv) closing one session does not disturb the other's counters or its
+        // ability to serve.
+        let frozen_b = counters_b.counters(epoch_b);
+        drop(b);
+        println!(
+            "EVIDENCE after_closing_run_b run_a_counters={:?} run_b_counters_frozen={:?}",
+            counters_a.counters(epoch_a),
+            frozen_b
+        );
+        assert_eq!(
+            counters_b.counters(epoch_b),
+            frozen_b,
+            "closing run B must not change run B's frozen counters"
+        );
+        let resp = cx(a.port(), token_a.value(), &origin_a.authority());
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "run A must keep serving after run B closes: {resp:?}"
+        );
+        let leaves_before = connect_leaves(&a.sid);
+        let resp = cx(a.port(), token_b.value(), &origin_a.authority());
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "run A must still refuse B's token after B closed: {resp:?}"
+        );
+        assert_eq!(
+            connect_leaves(&a.sid),
+            leaves_before + 1,
+            "the refusal after B closed is recorded as one event in A's chain"
+        );
+        assert!(
+            counters_a.close_epoch(epoch_a),
+            "run A's window is still the open one"
+        );
+        assert!(counters_b.close_epoch(epoch_b));
+
+        println!(
+            "EVIDENCE done: two concurrent sessions, each proofed by its own listener and its \
+             own run token, with the cross-run token refused uncounted and unaudited"
         );
     }
 }

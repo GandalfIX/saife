@@ -24,7 +24,8 @@ pub const MXC_FEATURE_MISSING: &str = "`--backend mxc` requires a binary built w
 /// Refusal when more than one MXC run is requested concurrently: ADR-0004
 /// guardrail 1 cannot yet attribute proxy traffic to a single run.
 pub const MXC_CONCURRENCY_REFUSED: &str = "`--backend mxc` refuses more than one concurrent run: \
-run one session at a time; per-run proxy attribution is not implemented yet";
+run one session per supervisor process (per-run proxy attribution and one listener per run \
+landed in P1.4)";
 
 /// Refusal when `--backend mxc` is requested but the session path does not route
 /// through the MXC backend yet. Refusing beats a silent fallback to
@@ -513,7 +514,7 @@ mod tests {
         let err = resolve_backend(Backend::Mxc, Some(2), true)
             .expect_err("concurrency > 1 must be refused");
         assert!(
-            err.contains("run one session at a time"),
+            err.contains("run one session per supervisor process"),
             "the message must say what to do instead: {err}"
         );
         assert!(
