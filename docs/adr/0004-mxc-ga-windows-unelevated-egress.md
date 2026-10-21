@@ -117,6 +117,44 @@ not per-request — the D-5 taxonomy already carries `source`), together with th
 request's containment posture. A degraded tier must be visible after the fact
 even though it cannot be prevented before execution.
 
+### Prototype evidence for the guardrails (2026-10-21, same host, unelevated)
+
+- **Real HTTPS through a forwarding proxy: PASS.** Inside an unelevated
+  ProcessContainer: `CONNECT api.anthropic.com:443` → rustls TLS 1.3 (OS root
+  store) → `GET /` → **HTTP 404** (a bare `GET /` 404s on that host; any 1xx-5xx
+  was the acceptance rule), 3557 bytes down, 453 up, 211 ms. DNS and TCP to the
+  origin provably happened on the proxy side (`160.79.104.10:443`), while the
+  child saw only `127.0.0.1` and its own direct egress stayed blocked
+  (`WSAEACCES 10013`, raw IP and hostname). No schannel/CRL involvement at all —
+  the child used rustls, not schannel.
+- **Guardrail 1 implemented and DEMONSTRATED, including the negative case.**
+  Each launch takes an attribution epoch on the proxy; the gate requires
+  `accepted >= 1 AND tunnels_established >= 1` (a tunnel exists only if the
+  proxy's own origin dial succeeded), prints `guardrail_proxy_proof=FAIL` and
+  exits 3 on failure — there is no code path that prints success without it.
+  Positive: `accepted=1 tunnels=1` → PASS. **Negative (the silent-misconfig
+  case): the SDK reported `outcome=exited:0`, `warnings=[]`, the child's proxy
+  connect timed out, and the guardrail printed FAIL with `accepted=0` → exit 3.**
+  Two further branches show why `tunnels>=1` is required: an unresolvable target
+  (proxy 502) and a loopback target (proxy 403) both give `accepted=1,
+  tunnels=0` → FAIL.
+- **Guardrail 2 implemented.** The tier is taken from `v1::probe()` on the exact
+  request being launched (not a lookalike, not the backend ceiling), recorded as
+  `tier=base-container`, `tier_source=probe`, `tier_needs_dacl_augmentation=false`,
+  and persisted per run to `runs/<utc>-<label>.json`. Product placement: a
+  **session-start** audit leaf; a wrong tier is a refused session with no CONNECT
+  leaves.
+
+**Concurrency caveat (must be designed before shipping):** guardrail 1 attributes
+connections by launch epoch on one proxy instance, so it assumes one launch per
+proxy. Concurrent containers require one proxy per run or a per-run token inside
+the CONNECT request — MXC provides neither — otherwise one container's success
+can mask another's failure.
+
+**Interaction with D-3:** MXC's `timeout_ms` bounds the entire workload, so the
+60 s interactive prompt must fit inside the supervisor-owned run budget or the
+container is killed mid-dialog. The budget must be explicit, not inherited.
+
 ### Options considered (unchanged in substance)
 
 ### Option A — CHOSEN: bounded adapter now (UAC removed from network sessions)
