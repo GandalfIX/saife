@@ -87,8 +87,9 @@ use mxc_sdk::v1::configs::{
     ProcessContainerUiIsolation,
 };
 use mxc_sdk::v1::{
-    ContainerRequest, Containment, FilesystemPolicy, NetworkAction, NetworkEgressPolicy,
-    NetworkIngressPolicy, NetworkPolicy, NetworkRuntimeConfig, RunOptions, WaitResult,
+    ClipboardPolicy, ContainerRequest, Containment, FilesystemPolicy, NetworkAction,
+    NetworkEgressPolicy, NetworkIngressPolicy, NetworkPolicy, NetworkRuntimeConfig, RunOptions,
+    UiPolicy, WaitResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1340,11 @@ fn process_container_config() -> ProcessContainerConfig {
 ///   (ADR-0004 risk 2) — the one that actually works unelevated.
 /// * `environment` is always an explicit, filtered allow-list — never `None`
 ///   (which would mean "backend default").
+/// * `ui` is stated explicitly with `disable: false`, because an **absent** UI
+///   policy is not neutral: the SDK resolves it to `UiPolicy::default()`, which
+///   bans Win32k system calls, and every child that loads `user32`/`gdi32`/
+///   `ole32` then dies at load (`0xC0000142`). The assignment carries the
+///   mechanism, the measured codes and the containment that is given up.
 /// * The command is the **wrapper launcher**, not the workload (D1).
 ///
 /// Fails with [`RequestError`] for a workload command that cannot be launched.
@@ -1447,6 +1453,49 @@ pub fn build_request(
         clear_policy_on_exit: Some(true),
     });
     request.network = Some(network);
+    // P3 — the Win32k ban is *this* field, and its default is the trap.
+    //
+    // `ContainerRequest::ui` is not `processContainer.ui` above: that one is the
+    // job-object UI-restriction knob (`isolation`, `desktopSystemControl`,
+    // `systemSettings`, `ime`).  This one is the cross-cutting `UiPolicy` whose
+    // `disable` flag the backend copies into the process-security-environment
+    // spec as `disallow_win32k_system_calls` (mxc-sdk 1.0.1,
+    // `backends/process_container/common/base_container_helpers.rs:57`), which
+    // the OS applies as `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE`
+    // before the child runs any user-mode code.
+    //
+    // Leaving the field unset is NOT "no opinion": absence resolves to
+    // `UiPolicy::default()`, and that default is `disable: true`
+    // (`mxc_common/models.rs:583` for the internal twin, `policy.rs:564` for the
+    // public type, and the wire default agrees —
+    // `mxc_common/config_parser.rs:1597` `disable: raw_ui.disable.unwrap_or(true)`).
+    // So every launch so far shipped the harshest posture, and with Win32k
+    // syscalls banned `user32.dll`, `gdi32.dll` and `ole32.dll` fail their
+    // `DllMain` with `ERROR_DLL_INIT_FAILED` (1114) and the loader kills the
+    // process before `main`. Measured A/B on this exact request, one field
+    // different: `powershell.exe -Command "Write-Output FXOK"` exits
+    // `0xC0000142` with the default and `0` with `disable: false`, and
+    // `dotnet hello.dll` fails to load `coreclr.dll` with `HRESULT 0x8007045A`
+    // (0xC0000409) versus printing `HELLO-OK`. `coreclr.dll` statically imports
+    // USER32 *and* ole32, so there is no middle setting — it is Win32k syscalls
+    // or no CLR, never both.
+    //
+    // The cost, accepted deliberately and not hidden: the child may now enter
+    // Win32k at all — create windows and reach that large kernel attack surface
+    // — which is precisely what the mitigation existed to remove. Everything
+    // else stays closed: clipboard and input injection are pinned default-deny
+    // right here, and the ten `JOB_OBJECT_UILIMIT_*` restrictions
+    // `resolve_ui_restrictions` derives from `processContainer.ui` are still
+    // emitted. Do not "tidy" this back to the default; the canary test
+    // `sdk_ui_policy_default_is_still_the_win32k_ban_we_explicitly_escape` is
+    // what tells us if a bump ever moves the default out from under it.
+    // Evidence: `docs/backends/process-container/clr-startup-failure.md`.
+    request.ui = Some(UiPolicy {
+        disable: false,
+        // Default-deny: the child keeps no clipboard and cannot inject input.
+        clipboard: ClipboardPolicy::None,
+        allow_input_injection: false,
+    });
     request.timeout_ms = input.timeout_ms;
     // Identity-less deployment: `allowedProxyPeer` is left unset because an
     // unpackaged caller-owned proxy has no package family name, and the
@@ -2059,6 +2108,54 @@ mod tests {
         assert_eq!(pinned.ui, sdk.ui);
         assert_eq!(pinned.capabilities, sdk.capabilities);
         assert_eq!(pinned.capture_denials, sdk.capture_denials);
+    }
+
+    // ---- P3: the Win32k ban is a UI field, and its default is the trap -----
+
+    /// The `processContainer.ui` block pinned above is the **job-object** knob
+    /// (`isolation`, `desktopSystemControl`, `systemSettings`, `ime`). The
+    /// Win32k ban is a different field — the cross-cutting `ContainerRequest::ui`
+    /// — and leaving it unset is not "no opinion": the SDK resolves absence to
+    /// `UiPolicy::default()`, which is `disable: true`, and the PSEC path turns
+    /// that into `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE`.
+    /// A request that states nothing therefore ships the harshest posture.
+    #[test]
+    fn build_request_permits_win32k_but_keeps_clipboard_and_injection_closed() {
+        let request = build(&input());
+        let ui = request
+            .ui
+            .expect("the UI policy is stated on the request, not inherited");
+        assert!(
+            !ui.disable,
+            "a Win32k ban makes every child that loads user32/gdi32/ole32 die at load"
+        );
+        assert_eq!(
+            ui.clipboard,
+            ClipboardPolicy::None,
+            "clipboard stays default-deny"
+        );
+        assert!(
+            !ui.allow_input_injection,
+            "input injection stays default-deny"
+        );
+    }
+
+    /// Canary on the SDK default the explicit set above exists to escape.
+    ///
+    /// If this ever fails, `mxc-sdk` changed the trap: `UiPolicy::default()`
+    /// stopped meaning "ban Win32k". Delete this canary and the explicit
+    /// `request.ui` assignment in [`build_request`], then re-read the comment
+    /// there and `docs/backends/process-container/clr-startup-failure.md` — the
+    /// explicit set would then be pinning a posture the default already gives,
+    /// and the "lost containment" note would be describing a default, not a
+    /// choice.
+    #[test]
+    fn sdk_ui_policy_default_is_still_the_win32k_ban_we_explicitly_escape() {
+        assert!(
+            UiPolicy::default().disable,
+            "mxc-sdk changed UiPolicy::default() to disable = false: delete this canary and the \
+             explicit request.ui in build_request"
+        );
     }
 
     // ---- P0.3 / D3: guardrail 1, both legs -------------------------------
@@ -5085,6 +5182,103 @@ mod live {
         println!(
             "EVIDENCE done: two concurrent sessions, each proofed by its own listener and its \
              own run token, with the cross-run token refused uncounted and unaudited"
+        );
+    }
+
+    /// PowerShell 5.1 lives here (System32), and the container's policy grants
+    /// `C:\Windows` read-only.
+    const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+    /// **The managed-workload leg (P3).**
+    ///
+    /// Every other leg in this module runs a native executable (`curl.exe`,
+    /// `cmd.exe`), and a native child starts even when the container bans Win32k
+    /// system calls — so this suite could have been fully green while **every**
+    /// managed workload died at load. It was: with `ContainerRequest::ui` unset,
+    /// the SDK's `UiPolicy::default()` (`disable: true`) becomes
+    /// `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE`, `user32`,
+    /// `gdi32` and `ole32` then fail `DllMain` with `ERROR_DLL_INIT_FAILED`
+    /// (1114), and `powershell.exe` exits `0xC0000142`
+    /// (`STATUS_DLL_INIT_FAILED`) with empty output.
+    ///
+    /// So this leg asserts only that a CLR-hosted workload *starts* inside the
+    /// container, through the same wrapper, the same filesystem policy and the
+    /// same proxy-only network posture as the other legs. The command is pure
+    /// PowerShell on purpose: 5.1 cannot invoke native commands as an
+    /// AppContainer child (`DriveNotFoundException:
+    /// Microsoft.PowerShell.Core\FileSystem`), and `Write-Output` needs no
+    /// subprocess. `FXOK` is the proof the child reached managed code — an exit
+    /// code alone would also pass a silently swallowed error.
+    ///
+    /// Red without the fix: remove the `request.ui` assignment in
+    /// [`build_request`] and this leg reports `exit=Some(-1073741502)`
+    /// (`0xC0000142`) with empty stdout.
+    #[test]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend -- --ignored"]
+    fn managed_powershell_workload_starts_and_prints_fxok_inside_the_container() {
+        let launcher = launcher_under_test();
+        // No allowed origin: this workload makes no network request, and an
+        // empty allow-list keeps that honest if it ever tried to.
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let scratch = Scratch::named("managed");
+        let dir = scratch.path().to_path_buf();
+        let no_denies: Vec<String> = Vec::new();
+
+        let command =
+            format!(r#"{POWERSHELL} -NoProfile -NonInteractive -Command "Write-Output FXOK""#);
+        let input = session_input(
+            &dir,
+            &launcher,
+            &no_denies,
+            command.clone(),
+            Some(proxy.port()),
+        );
+        println!(
+            "EVIDENCE elevated={} managed_command={:?} launcher={} proxy_port={}",
+            process_is_elevated(),
+            command,
+            launcher.display(),
+            proxy.port()
+        );
+
+        // The normal launch path, with the proof expectation stated rather than
+        // derived: `launch_session` demands `Required` whenever the request
+        // carries a proxy port, and this command cannot consult a proxy.
+        let backend = MxcBackend::new(counters.as_ref(), Some(proxy.port()), &launcher)
+            .with_proxy_token(proxy.token().value())
+            .with_budget(Some(120_000));
+        let outcome = backend
+            .launch(&input, ProofExpectation::MustBeAbsent)
+            .expect("a workload with no network use must leave the proxy unconsulted");
+        let out = stdout_of(&outcome);
+        println!(
+            "EVIDENCE managed_workload exit={:?} timed_out={} success={} proof={:?} tier={:?}",
+            outcome.exit_code,
+            outcome.timed_out,
+            outcome.success(),
+            outcome.proxy_proof,
+            outcome.tier.tier
+        );
+        println!(
+            "EVIDENCE managed_workload_stdout={:?} stderr={:?} readonly_grants={:?}",
+            out.trim(),
+            stderr_of(&outcome).trim(),
+            input.filesystem.readonly_paths
+        );
+
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "a CLR workload must start inside the container; exit -1073741502 (0xC0000142) is \
+             STATUS_DLL_INIT_FAILED, i.e. the Win32k ban is back: {outcome:?}"
+        );
+        assert!(
+            out.contains("FXOK"),
+            "the managed child must have reached managed code and printed FXOK: {out:?}"
+        );
+        println!(
+            "EVIDENCE done: powershell started inside the container and printed FXOK (ui.disable = false)"
         );
     }
 }
