@@ -27,11 +27,24 @@
 //!   closed on the success *and* the error path ([`EpochGuard`]).
 //! * Guardrail 2 ([`probe_tier`]) records the tier of the *exact* request about
 //!   to be launched. The audit leaf that persists it lands in P2.3.
+//! * The **real** proof source is this listener's own counters:
+//!   [`LaunchCounters`](crate::net::proxy::LaunchCounters) in `src/net/proxy.rs`
+//!   implements [`ProxyProofSource`] (see the impl below), and [`launch_session`]
+//!   is the seam that binds one to the other — the port the supervisor bound is
+//!   the port the request configures, and the same port decides which guardrail
+//!   leg applies.
+//! * P1.3's filesystem policy is [`filesystem_policy`]: the workspace is the only
+//!   writable grant, the launcher's directory is added automatically
+//!   ([`ensure_launcher_grant`]) **before** the deny list is filtered against the
+//!   grant set, and the profile's four credential directories plus the configured
+//!   deny list become `denied_paths`. A deny that contains a grant (equal to it,
+//!   or an ancestor of it) is a hard [`RequestError::DenyCoversGrant`], never a
+//!   silent drop — dropping it would leave the rest of the denied tree readable.
 //!
-//! Not here, by design: the real `ProxyProofSource` over `src/net/proxy.rs` and
-//! the per-session proxy bind (P1.4/P2.2), filesystem denied-path policy (P1.3),
-//! the session-start audit leaf (P2.3), and the prompt/timeout budget arithmetic
-//! (P2.1). [`build_request`] passes the caller's `timeout_ms` through unchanged —
+//! Not here, by design: the session-start audit leaf (P2.3), the prompt/timeout
+//! budget arithmetic (P2.1), the per-run token that would make more than one
+//! launch per proxy safe (P1.4), and the WinHTTP measurement (P1.5).
+//! [`build_request`] passes the caller's `timeout_ms` through unchanged —
 //! `None` means *no deadline*, because the SDK turns a zero timeout into
 //! `INFINITE` (`mxc_common::script_runner::get_timeout_milliseconds`) — and
 //! [`MxcBackend`] overrides it only when a budget was set explicitly with
@@ -49,7 +62,8 @@
 // `cargo test`. Removing it requires a real call site in `main.rs` (the P2/P3
 // session wiring), not merely this seam. Unreachable set: the whole public
 // surface — `BLOCKED_ENV_KEYS`, `is_blocked_env_key`, `LAUNCHER_EXE_NAME`,
-// `launcher_grant`, `launcher_command`,
+// `launcher_grant`, `launcher_command`, `ensure_launcher_grant`,
+// `PROFILE_SECRET_DIRS`, `filesystem_policy`, `launch_session`,
 // `MxcFilesystemInput`, `MxcNetworkInput`, `MxcSessionInput`, `ProxyProof`,
 // `ProofExpectation`, `verify_proxy_proof`, `GuardError`, `ProxyProofSource`,
 // `TierRecord`, `ProbeView`, `tier_record`, `probe_tier`, `TIER_SOURCE_PROBE`,
@@ -108,16 +122,260 @@ pub fn is_blocked_env_key(key: &str) -> bool {
 /// executable (`src/bin/mxc-launch.rs`).
 pub const LAUNCHER_EXE_NAME: &str = "mxc-launch.exe";
 
-/// The directory a caller **must** add to `readonly_paths`.
+/// The directory the container must be granted to execute the launcher.
 ///
 /// Filesystem policy in MXC is additive grants, so the container cannot execute
 /// the launcher unless its directory is granted; without this the launch fails
-/// with a policy denial that names nothing.
+/// with a policy denial that names nothing. Callers therefore never supply it:
+/// [`build_request`] inserts it through [`ensure_launcher_grant`]. The function
+/// stays public so the grant can be named in diagnostics and reused by the
+/// launch-path tooling without duplicating the parent-directory rule.
 pub fn launcher_grant(launcher: &Path) -> Option<String> {
     let dir = launcher.parent()?.display().to_string();
     // A bare file name has no directory to grant; returning `Some("")` would
     // turn into an empty filesystem path in the request.
     (!dir.is_empty()).then_some(dir)
+}
+
+/// Insert the launcher's directory into the request's read-only grants.
+///
+/// A missing launcher grant fails with an opaque policy denial at launch, so
+/// the mapping adds it rather than trusting every caller to remember (plan P1.3).
+/// Returns whether the grant was added — a caller that already declared it keeps
+/// its declared order and is not duplicated.
+///
+/// **Exposure, recorded not hidden:** MXC grants *directories*, not files, so
+/// this is the launcher's whole **parent** directory — not just
+/// `mxc-launch.exe`. The launcher is deployed beside the supervisor
+/// (`target\debug\mxc-launch.exe` in this repo), which means every container
+/// gets a read-only view of the directory the binary was built into: the build
+/// directory, and for this repository that is `<repo>\target\debug` plus every
+/// sibling of the executable. When the supervisor itself is installed under
+/// `C:\Program Files\<app>\`, the granted directory is that installation
+/// directory instead. The narrowing options — copying the launcher into a
+/// directory of its own, or granting a dedicated one-entry directory beside it —
+/// are deferred; the plan's P1.3 row records both this exposure and why it was
+/// accepted (nothing writable is added, and the alternative is a launcher the
+/// container cannot execute).
+///
+/// This grant is also a grant for deny-coverage purposes: see
+/// [`filesystem_policy`], which adds it **before** filtering the deny list for
+/// exactly that reason.
+pub fn ensure_launcher_grant(filesystem: &mut MxcFilesystemInput, launcher: &Path) -> bool {
+    let Some(grant) = launcher_grant(launcher) else {
+        return false;
+    };
+    if filesystem
+        .readonly_paths
+        .iter()
+        .any(|declared| path_key(declared) == path_key(&grant))
+    {
+        return false;
+    }
+    filesystem.readonly_paths.push(grant);
+    true
+}
+
+/// Normalized comparison key for a Windows path.
+///
+/// Two spellings that name the same object must compare equal, and none of these
+/// paths has to exist — a deny list is configuration, not a directory scan — so
+/// nothing here touches the filesystem:
+///
+/// * separators become `\` and runs of them collapse;
+/// * a verbatim/device prefix is dropped: `\\?\C:\x` and `\\.\C:\x` are
+///   `C:\x`, and `\\?\UNC\server\share` is `\\server\share`;
+/// * each component loses its **trailing** dots and spaces, which Win32 ignores,
+///   **before** the `.`/`..` tests — so `.. ` (trailing space) is still the
+///   parent directory rather than a segment that trims to nothing;
+/// * `.` segments are dropped and `..` segments collapse against their parent,
+///   clamping at the root as Windows does;
+/// * the UNC root's server and share components lose their trailing dots and
+///   spaces too, like every other component: `\\srv\share.\x` is
+///   `\\srv\share\x`;
+/// * a trailing separator is dropped (a drive root keeps the bare `c:` form, so
+///   that it still prefixes its own children) and the whole key is case-folded
+///   by [`fold_case`].
+///
+/// **Spellings this deliberately does *not* unify.** Each of these still compares
+/// *different*, so a deny spelled one way does not cover a grant spelled the
+/// other — recorded here so the gap is a known caveat rather than a surprise:
+///
+/// * **8.3 short names**: `C:\PROGRA~1` and `C:\Program Files` are distinct keys
+///   (expanding them needs the filesystem);
+/// * **junctions and symlinks**: an alias and its target are distinct keys, for
+///   the same reason — nothing here touches the disk;
+/// * **drive-relative (`C:work`) and root-relative (`\Windows`) spellings**: they
+///   resolve against a per-drive or per-process current directory this function
+///   cannot know, so they are distinct from the absolute forms. That is why
+///   [`filesystem_policy`] and [`build_request`] make their cwd and launcher
+///   absolute first ([`absolute_path`]) instead of trusting the caller's
+///   spelling;
+/// * **alternate data streams**: `C:\x\file:stream` keeps its `:stream` suffix,
+///   which is not stripped, so it never matches the base file.
+fn path_key(path: &str) -> String {
+    let unified = unify_path_prefix(path);
+    let (root, rest) = split_path_root(&unified);
+
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('\\') {
+        // Trailing spaces first, then the `.`/`..` tests, then the dots: Windows
+        // ignores a component's trailing dots and spaces *before* deciding what
+        // the component means, so `.. ` is the parent directory. Doing it in any
+        // other order dropped `.. ` (it trimmed to nothing), keying
+        // `C:\work\sub\.. \x` as `c:\work\sub\x`. Dots cannot be trimmed before
+        // the `..` test for the same reason in reverse: `..` would lose its own
+        // dots.
+        let segment = segment.trim_end_matches(' ');
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            segments.pop();
+            continue;
+        }
+        let segment = trim_component(segment);
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
+    }
+
+    let mut key = fold_case(&root);
+    for segment in segments {
+        if !key.is_empty() && !key.ends_with('\\') {
+            key.push('\\');
+        }
+        key.push_str(&fold_case(segment));
+    }
+    key
+}
+
+/// One path component as Win32 compares it: trailing dots and spaces are not part
+/// of the name.
+fn trim_component(component: &str) -> &str {
+    component.trim_end_matches(['.', ' '])
+}
+
+/// Win32's case fold, as closely as `std` approximates it: Unicode **uppercase**
+/// (`str::to_uppercase`).
+///
+/// Windows' ordinal case-insensitive compare (`CompareStringOrdinal` with
+/// `bIgnoreCase`) uppercases each character from its invariant table, so folding
+/// both sides with Unicode uppercase agrees with it across the scripts a Windows
+/// path practically contains (ASCII, Latin-1, Greek, Cyrillic) where the previous
+/// `to_ascii_lowercase` did not: `C:\Users\Ä` and `C:\Users\ä` name one directory
+/// and now produce one key, so a deny of either covers a grant under the other.
+/// Folding to uppercase rather than lowercase matters for the same reason:
+/// uppercase is what Windows compares.
+///
+/// **Approximation, recorded not hidden:** `std` performs *full* case mapping,
+/// which may expand one character into several (`ß` → `SS`), while Windows maps
+/// character for character. Where the two disagree the difference is an
+/// *over*-match — two spellings compare equal here that Windows would distinguish
+/// — which fails closed: the over-covering deny is refused
+/// ([`RequestError::DenyCoversGrant`]) rather than shipped or dropped. It is not
+/// an under-match that would let a covering deny through.
+fn fold_case(text: &str) -> String {
+    text.to_uppercase()
+}
+
+/// Separator unification plus verbatim/device-prefix removal, so
+/// [`path_key`]'s segment pass sees one spelling per path.
+fn unify_path_prefix(path: &str) -> String {
+    let raw = path.trim().replace('/', "\\");
+    let bytes = raw.as_bytes();
+    if bytes.len() < 4
+        || !(bytes[..4].eq_ignore_ascii_case(br"\\?\") || bytes[..4].eq_ignore_ascii_case(br"\\.\"))
+    {
+        return raw;
+    }
+    // Byte 4 is a char boundary: the prefix that matched is ASCII.
+    let rest = &raw[4..];
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes.len() >= 4 && rest_bytes[..4].eq_ignore_ascii_case(br"UNC\") {
+        // `\\?\UNC\server\share` is the plain UNC path `\\server\share`.
+        return format!("\\\\{}", &rest[4..]);
+    }
+    rest.to_string()
+}
+
+/// Split a unified path into its root (`C:`, `\\server\share`, `\`, or `""`)
+/// and the part below it.
+///
+/// A drive root is returned **without** its separator so the joined key still
+/// prefixes its children (`c:` covers `c:\work`); the join in [`path_key`]
+/// re-adds exactly one separator. The UNC root's server and share components are
+/// trimmed like every other component ([`trim_component`]), which is why the root
+/// is owned: `\\srv\share.` and `\\srv\share` must be one root.
+fn split_path_root(path: &str) -> (String, &str) {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        // UNC root: `\\server\share`; everything after it is segments.
+        let mut parts = path[2..].splitn(3, '\\');
+        let server = parts.next().unwrap_or_default();
+        let share = parts.next().unwrap_or_default();
+        let end = 2 + server.len() + usize::from(!share.is_empty()) + share.len();
+        let root = if share.is_empty() {
+            format!("\\\\{}", trim_component(server))
+        } else {
+            format!("\\\\{}\\{}", trim_component(server), trim_component(share))
+        };
+        return (root, &path[end..]);
+    }
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return (path[..2].to_string(), &path[2..]);
+    }
+    if bytes.first() == Some(&b'\\') {
+        return ("\\".to_string(), &path[1..]);
+    }
+    (String::new(), path)
+}
+
+/// Is `parent` the same path as `child`, or an ancestor of it?
+///
+/// Segment-aware, so `C:\work2` is *not* covered by `C:\work`, and comparison
+/// happens on [`path_key`], so case, separator style, `.`/`..` segments, a
+/// verbatim prefix and a trailing dot all compare equal. An empty `parent`
+/// covers nothing: an empty deny is a mistake, not a wildcard.
+fn covers(parent: &str, child: &str) -> bool {
+    let (parent, child) = (path_key(parent), path_key(child));
+    !parent.is_empty()
+        && (child == parent
+            || child
+                .strip_prefix(&parent)
+                .is_some_and(|rest| rest.starts_with('\\')))
+}
+
+/// Resolve a caller-supplied path that takes part in the deny-vs-grant
+/// comparison, naming the input it was.
+///
+/// The comparison is between [`path_key`]s, and a relative spelling keys as
+/// itself (`tools\sandbox`, or empty for `.`) — which never matches an absolute
+/// deny, so the guard would pass a deny that covers the real directory and the
+/// container would then be denied its own workspace or launcher. Every path in
+/// that comparison is therefore made absolute at the boundary:
+/// `std::path::absolute` joins a relative path onto the current directory (and a
+/// drive-relative `C:work` onto that drive's current directory) without touching
+/// the filesystem, while an already-absolute path — a verbatim `\\?\C:\x`
+/// included — is returned unchanged.
+///
+/// A spelling that cannot be resolved (empty, or rejected by the OS) is
+/// [`RequestError::PathNotAbsolute`]: guessing what it meant is how the guard gets
+/// voided, and the operator can name a real path.
+fn absolute_path(what: &'static str, path: &Path) -> Result<PathBuf, RequestError> {
+    if path.as_os_str().is_empty() {
+        return Err(RequestError::PathNotAbsolute {
+            what,
+            path: String::new(),
+        });
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::path::absolute(path).map_err(|_| RequestError::PathNotAbsolute {
+        what,
+        path: path.display().to_string(),
+    })
 }
 
 /// Quote one argv element so that a `CommandLineToArgvW`-compatible parser
@@ -173,6 +431,28 @@ fn quote_windows_arg(arg: &str) -> String {
     out
 }
 
+/// The proxy URL the child is given, with the session token as `userinfo` when
+/// there is one.
+///
+/// No token → the credential-less form (a proxy that authenticates nobody).
+///
+/// Refuses a token containing anything outside the RFC 3986 *unreserved* set: in
+/// `userinfo`, `@` ends the userinfo early and `/` ends the authority, so either
+/// could point the child at a different host or port than the one the supervisor
+/// bound and proves.
+fn proxy_url(port: u16, token: Option<&str>) -> Result<String, RequestError> {
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        return Ok(format!("http://127.0.0.1:{port}"));
+    };
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+    {
+        return Err(RequestError::UnsafeProxyToken);
+    }
+    Ok(format!("http://sandbox:{token}@127.0.0.1:{port}"))
+}
+
 /// The container command: the wrapper launcher, with the real workload command
 /// line as its single argument.
 ///
@@ -203,7 +483,7 @@ pub struct MxcFilesystemInput {
 }
 
 /// Network posture for the launch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct MxcNetworkInput {
     /// Loopback port the supervisor's proxy listens on (P1.4 binds it). `None`
     /// means no proxy: the request stays egress-denied and host loopback stays
@@ -212,11 +492,46 @@ pub struct MxcNetworkInput {
     /// [`MxcBackend`] overrides this with its own port; the field stays so the
     /// pure mapping can be exercised on its own.
     pub proxy_port: Option<u16>,
+    /// The session token the proxy's `Proxy-Authorization` gate expects.
+    ///
+    /// It is embedded in the proxy URL's `userinfo`
+    /// (`http://sandbox:<token>@127.0.0.1:<port>`) because that URL is the
+    /// **only** channel that reaches the child's `HTTP_PROXY`/`HTTPS_PROXY`:
+    /// mxc-sdk 1.0.1 strips every proxy variable from `request.environment` and
+    /// re-injects the URL from `runtimeConfig.networkProxy` verbatim
+    /// (`ProxyAddress::original_url` → `to_url`). Without it every child request
+    /// is a `407` and guardrail 1 could never pass — the ADR-0004 spike's
+    /// listener had no auth, so the gap only appears against the real proxy.
+    ///
+    /// Only URL-unreserved characters are accepted
+    /// ([`RequestError::UnsafeProxyToken`]): anything else would change which
+    /// host or port the child is told to use.
+    pub proxy_token: Option<String>,
+}
+
+/// What `{:?}` prints in place of the token.
+///
+/// [`MxcNetworkInput::proxy_token`] is a credential — the session token the
+/// proxy's `Proxy-Authorization` gate expects — so a derived `Debug` would print
+/// it into every log line, panic message and error chain that formats an input,
+/// which is exactly the leak audit logging exists to prevent.
+pub const REDACTED_TOKEN: &str = "<redacted>";
+
+impl fmt::Debug for MxcNetworkInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MxcNetworkInput")
+            .field("proxy_port", &self.proxy_port)
+            .field(
+                "proxy_token",
+                &self.proxy_token.as_ref().map(|_| REDACTED_TOKEN),
+            )
+            .finish()
+    }
 }
 
 /// One session, as the supervisor resolved it. Plain data — deliberately free
 /// of SDK types so the mapping can be tested without the runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct MxcSessionInput {
     /// The workload's command line, verbatim. [`build_request`] does not hand it
     /// to the container directly: it becomes the argument of the wrapper
@@ -236,6 +551,165 @@ pub struct MxcSessionInput {
     /// unchanged, and [`MxcBackend`] overrides it only when it carries an
     /// explicit budget ([`with_budget`](MxcBackend::with_budget)).
     pub timeout_ms: Option<u32>,
+}
+
+impl fmt::Debug for MxcSessionInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Hand-written for the same reason as [`MxcNetworkInput`]'s: whoever
+        // formats a session input must see `<redacted>` where the proxy token
+        // would be, and that guarantee should not rest on a derived impl
+        // delegating to the field's.
+        f.debug_struct("MxcSessionInput")
+            .field("command", &self.command)
+            .field("working_directory", &self.working_directory)
+            .field("environment", &self.environment)
+            .field("filesystem", &self.filesystem)
+            .field("network", &self.network)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1.3: filesystem policy (workspace-only posture)
+// ---------------------------------------------------------------------------
+
+/// Profile subdirectories that hold credentials, denied for every MXC launch.
+///
+/// `.ssh` (keys and known_hosts), `.aws`/`.azure` (credential files) and
+/// `.gnupg` (secret keyrings) are the four a compromised workload would read
+/// first. They are denied as a path list; the rest of the profile stays
+/// readable, because a workload that cannot read `%APPDATA%` at all is not a
+/// workload anyone can run.
+pub const PROFILE_SECRET_DIRS: [&str; 4] = [".ssh", ".aws", ".azure", ".gnupg"];
+
+/// Build the launch's filesystem grants from policy (plan P1.3).
+///
+/// * `readwrite_paths` is exactly the session's working directory — the
+///   workspace, and nothing else. Extra writable grants are not derived from
+///   the profile: the workspace-only posture is the point of the mapping.
+/// * `cwd` and `launcher` are made absolute first ([`absolute_path`]). A relative
+///   spelling keys as itself (`tools\sandbox`, or empty for `.`), which no
+///   absolute deny can cover, so resolving here is what keeps the guard below
+///   meaningful; a spelling that cannot be resolved is
+///   [`RequestError::PathNotAbsolute`], not a guess.
+/// * `readonly_paths` is the caller's declared read-only grants, as declared,
+///   **plus** the launcher's directory ([`ensure_launcher_grant`]). It is added
+///   here and not only in [`build_request`] because the deny filter below needs
+///   the complete grant set: a deny that covers the launcher's directory is as
+///   self-contradictory as one that covers the workspace, and in practice the
+///   launcher lives under the user profile — so an operator deny of
+///   `%USERPROFILE%` or `C:\Users\<user>\tools` hits it.
+/// * `denied_paths` is [`PROFILE_SECRET_DIRS`] under `profile_dir` plus the
+///   configured deny list, deduplicated case-insensitively.
+///
+/// **A deny that contains a grant fails the launch.** MXC filesystem policy is
+/// additive grants, so a deny that is an ancestor of a grant (or the same path)
+/// cannot be honoured: shipping it produces a launch that denies its own
+/// workspace or launcher, and *dropping* it — the previous behaviour — silently
+/// un-denied everything else under it. Denying `%USERPROFILE%` with the
+/// workspace at `%USERPROFILE%\work` discarded the whole profile deny, leaving
+/// `Documents`, `Downloads`, `AppData` and every browser profile readable inside
+/// the container with no warning, no error and no audit trace. This returns
+/// [`RequestError::DenyCoversGrant`] naming **both** paths and telling the
+/// operator to deny the specific subdirectories instead — no silent narrowing,
+/// no drop.
+///
+/// A deny that is a *descendant* of a grant (workspace `%USERPROFILE%` with
+/// `%USERPROFILE%\.ssh` denied) is the intended, expressible case and is kept.
+///
+/// **The one deny no configuration can remove:** the four
+/// [`PROFILE_SECRET_DIRS`] are added for every launch and are *not* the
+/// operator's configuration. A workspace that lives inside one of them
+/// (`%USERPROFILE%\.ssh\work`, say) is therefore unlaunchable with no
+/// override at all, and the refusal names `.ssh` — a path the operator never
+/// wrote. It is not their configuration to fix: the workspace has to live
+/// elsewhere.
+///
+/// **Known caveat, recorded rather than "fixed":** MXC filesystem policy is
+/// *additive grants*, so system directories stay readable (`C:\Windows\win.ini`
+/// was readable inside the container in the ADR-0004 spike). Denying them would
+/// break every workload that needs System32, so the caveat is documented and
+/// measured (see the live filesystem leg) instead of being papered over with a
+/// deny list that cannot work.
+pub fn filesystem_policy(
+    cwd: &Path,
+    readonly: &[String],
+    configured_denies: &[String],
+    profile_dir: Option<&Path>,
+    launcher: &Path,
+) -> Result<MxcFilesystemInput, RequestError> {
+    // Both paths enter the deny-versus-grant comparison, and a relative spelling
+    // (`tools\sandbox`, or empty for `.`) has no key an absolute deny could
+    // cover: resolve them here, at the boundary, before anything is compared.
+    let cwd = absolute_path("workspace directory", cwd)?;
+    let launcher = absolute_path("launcher", launcher)?;
+    let mut filesystem = MxcFilesystemInput {
+        readwrite_paths: vec![cwd.display().to_string()],
+        readonly_paths: readonly.to_vec(),
+        denied_paths: Vec::new(),
+    };
+    // Before any deny is filtered, never after: the launcher grant is a grant
+    // like any other, and `build_request` would otherwise insert it into a
+    // request whose deny list was filtered against a grant set missing it.
+    ensure_launcher_grant(&mut filesystem, &launcher);
+
+    let grants = granted_paths(&filesystem);
+    if let Some(profile) = profile_dir {
+        for dir in PROFILE_SECRET_DIRS {
+            push_deny(
+                &mut filesystem.denied_paths,
+                &profile.join(dir).display().to_string(),
+                &grants,
+            )?;
+        }
+    }
+    for candidate in configured_denies {
+        push_deny(&mut filesystem.denied_paths, candidate, &grants)?;
+    }
+    Ok(filesystem)
+}
+
+/// Every path the request grants, writable grants first.
+fn granted_paths(filesystem: &MxcFilesystemInput) -> Vec<String> {
+    let mut grants = filesystem.readwrite_paths.clone();
+    grants.extend(filesystem.readonly_paths.iter().cloned());
+    grants
+}
+
+/// The first grant that `deny` is equal to, or an ancestor of.
+fn grant_contained_by_deny<'a>(deny: &str, grants: &'a [String]) -> Option<&'a String> {
+    grants.iter().find(|grant| covers(deny, grant))
+}
+
+/// Append one denied path, refusing one that contains a grant.
+///
+/// Empty entries and case-folded duplicates are ignored. A deny that is an
+/// ancestor of (or equal to) a grant is [`RequestError::DenyCoversGrant`] — a
+/// named refusal, never the silent drop that used to un-deny a whole tree.
+fn push_deny(
+    denied: &mut Vec<String>,
+    candidate: &str,
+    grants: &[String],
+) -> Result<(), RequestError> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return Ok(());
+    }
+    if let Some(grant) = grant_contained_by_deny(candidate, grants) {
+        return Err(RequestError::DenyCoversGrant {
+            deny: candidate.to_string(),
+            grant: grant.clone(),
+        });
+    }
+    if denied
+        .iter()
+        .any(|kept| path_key(kept) == path_key(candidate))
+    {
+        return Ok(());
+    }
+    denied.push(candidate.to_string());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +857,34 @@ pub fn verify_proxy_proof(
 /// are written from the proxy's I/O threads, and the supervisor's proxy runtime
 /// will hold this across `await` points.
 ///
+/// # Counting rules (normative — guardrail 1 is only as honest as these)
+///
+/// `accepted` counts **proxy consultations** only: a `CONNECT` whose target
+/// parsed, or an absolute-form request naming another origin, that reached this
+/// listener *and authenticated with the session token*. Not counted: a 407 or a
+/// malformed request line (no proof the session's proxy path works), and — the
+/// case that matters — an **origin-form** request to one of our own loopback
+/// endpoints (the D-4 intent API). Serving an endpoint is not a proxy
+/// consultation, and counting it would make [`ProofExpectation::MustBeAbsent`]
+/// unsatisfiable for exactly the sessions it exists for.
+///
+/// `tunnels` means **upstream established**, never "a 200 was written": the
+/// `200 Connection Established` is sent only after the upstream dial succeeded,
+/// and a **plain-HTTP forward** counts as soon as its own upstream connection
+/// comes up. This is why the definition is not "CONNECT answered 200": a session
+/// that only ever makes plain-HTTP requests would otherwise report
+/// `accepted >= 1, tunnels == 0` and fail [`ProofExpectation::Required`]
+/// spuriously, i.e. the gate would reject a working session — the worst possible
+/// false negative for a hard gate.
+///
+/// Both counters are per epoch, so a launch cannot borrow another launch's
+/// traffic; attribution is by the epoch that was active when the connection was
+/// classified.
+///
+/// [`LaunchCounters`](crate::net::proxy::LaunchCounters) in `src/net/proxy.rs`
+/// is the real implementation: the supervisor's own listener, counting what it
+/// served.
+///
 /// One proxy per launch until P1.4 lands the per-run token (ADR-0004
 /// "concurrency caveat").
 ///
@@ -397,6 +899,37 @@ pub trait ProxyProofSource: Send + Sync {
     /// Close `epoch`'s attribution window. Called exactly once per
     /// [`begin_launch`](ProxyProofSource::begin_launch).
     fn close_launch(&self, epoch: u64);
+}
+
+/// The real proof source: the supervisor's proxy listener, in
+/// `src/net/proxy.rs`.
+///
+/// The counters are the listener's own, shared with its handler tasks, so a
+/// launch is proofed by the very socket the child was told to use
+/// (`runtimeConfig.networkProxy`) — never by a lookalike listener or a second
+/// count ("two sources of truth" is how a guardrail starts lying).
+impl ProxyProofSource for crate::net::proxy::LaunchCounters {
+    fn begin_launch(&self) -> u64 {
+        self.begin_epoch()
+    }
+
+    fn proof(&self, epoch: u64) -> ProxyProof {
+        match self.counters(epoch) {
+            Some(counters) => ProxyProof {
+                accepted: counters.consultations,
+                tunnels: counters.upstream_established,
+            },
+            // An unknown epoch has no counters. Zeros make the gate fail closed
+            // instead of reporting traffic that belongs to someone else.
+            None => ProxyProof::default(),
+        }
+    }
+
+    fn close_launch(&self, epoch: u64) {
+        // A close for an epoch that is not the active one is a no-op: the
+        // listener must not stop counting for a launch that is still running.
+        let _ = self.close_epoch(epoch);
+    }
 }
 
 /// Owns one epoch's lifetime: whichever way the launch leaves, the epoch is
@@ -540,32 +1073,96 @@ pub fn probe_tier(request: &ContainerRequest) -> Result<TierRecord, MxcError> {
 
 /// A request the mapping refuses to build.
 ///
-/// Both cases are checked **before** anything is spawned, because both only
-/// surface later and misleadingly: an empty command reaches the container as a
+/// Every case is checked **before** anything is spawned, because each only
+/// surfaces later and misleadingly: an empty command reaches the container as a
 /// wrapper launch with nothing to start (a bare `126` that looks like a usage
-/// error), and a command line containing NUL is truncated by `CreateProcessW`
-/// at the NUL — the child would run a different command from the one the
-/// request is recorded as launching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// error), a command line containing NUL is truncated by `CreateProcessW` at the
+/// NUL — the child would run a different command from the one the request is
+/// recorded as launching — and a deny that contains a grant cannot be honoured
+/// by an additive-grant policy at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     /// The workload command line is empty (or only whitespace).
     EmptyCommand,
     /// The command line contains a NUL, which the OS treats as its end.
     NulInCommand,
+    /// A path that takes part in the deny-versus-grant comparison is empty, or
+    /// cannot be made absolute, so it has no key an absolute deny could cover —
+    /// the guard would compare nothing and a deny covering the real directory
+    /// would ship. Refused rather than guessed: a relative or empty spelling is
+    /// exactly how that guard gets voided.
+    PathNotAbsolute {
+        /// Which input it was: `"workspace directory"` or `"launcher"`.
+        what: &'static str,
+        /// The spelling that could not be resolved (empty when it was empty).
+        path: String,
+    },
+    /// The session token contains a character that is not URL-safe, so it cannot
+    /// be embedded in the proxy URL's `userinfo` without changing which host or
+    /// port the child is told to use.
+    UnsafeProxyToken,
+    /// A `denied_paths` entry is the same path as a grant, or an ancestor of one.
+    ///
+    /// Filesystem policy is additive grants, so such a deny cannot be expressed:
+    /// shipping it denies the request its own workspace or launcher, and
+    /// quietly dropping it leaves everything else under the deny readable. The
+    /// launch is refused instead, naming both paths.
+    ///
+    /// **A workspace inside a built-in credential deny cannot be saved by
+    /// configuration.** [`filesystem_policy`] also denies the four
+    /// [`PROFILE_SECRET_DIRS`] for every launch, and those denies are built in:
+    /// no setting removes them. If `deny` is one of them
+    /// (`%USERPROFILE%\\.ssh`, `.aws`, `.azure`, `.gnupg`), there is no
+    /// override to grant and nothing the operator misconfigured — the workspace
+    /// has to live outside it.
+    DenyCoversGrant {
+        /// The operator-supplied denied path.
+        deny: String,
+        /// The grant it contains: the workspace, a declared read-only grant, or
+        /// the launcher's directory.
+        grant: String,
+    },
 }
 
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self {
-            Self::EmptyCommand => {
-                "the workload command line is empty: there is nothing to start in the container"
-            }
-            Self::NulInCommand => {
+        match self {
+            Self::EmptyCommand => f.write_str(
+                "the workload command line is empty: there is nothing to start in the container",
+            ),
+            Self::NulInCommand => f.write_str(
                 "the workload command line contains a NUL, which would truncate it at the OS \
-                 boundary — the child would run something other than the command named here"
-            }
-        };
-        f.write_str(msg)
+                 boundary — the child would run something other than the command named here",
+            ),
+            Self::UnsafeProxyToken => f.write_str(
+                "the session token contains a character outside the URL-unreserved set \
+                 (A-Z a-z 0-9 - . _ ~): in the proxy URL's userinfo any other character would \
+                 change which host or port the child is told to use",
+            ),
+            Self::PathNotAbsolute { what, path } if path.is_empty() => write!(
+                f,
+                "the {what} path is empty: the deny-versus-grant check compares absolute paths, \
+                 and an empty spelling matches nothing — any deny that covers the real path \
+                 would ship, so name the path explicitly"
+            ),
+            Self::PathNotAbsolute { what, path } => write!(
+                f,
+                "the {what} path `{path}` could not be made absolute: the deny-versus-grant \
+                 check compares absolute paths, and a relative spelling matches nothing — a \
+                 deny that covers the real path would ship, so name an absolute path"
+            ),
+            Self::DenyCoversGrant { deny, grant } => write!(
+                f,
+                "denied path `{deny}` contains the granted path `{grant}`: filesystem policy is \
+                 additive grants, so this deny cannot be honoured — the container would either \
+                 be denied its own grant or, if the deny were dropped, keep everything else \
+                 under `{deny}` readable. Deny the specific subdirectory instead of a tree that \
+                 contains a grant (for example `{deny}\\Documents` rather than `{deny}`). \
+                 If `{deny}` is one of the built-in profile credential denies (`.ssh`, `.aws`, \
+                 `.azure`, `.gnupg` under the user profile), no configuration can remove it — \
+                 move the workspace outside it"
+            ),
+        }
     }
 }
 
@@ -719,8 +1316,18 @@ fn process_container_config() -> ProcessContainerConfig {
 /// * The command is the **wrapper launcher**, not the workload (D1).
 ///
 /// Fails with [`RequestError`] for a workload command that cannot be launched.
-/// Both refusals happen here, at map time, rather than once the container
+/// Those refusals happen here, at map time, rather than once the container
 /// exists: an empty command and an embedded NUL only show up as a failed spawn.
+///
+/// Also fails with [`RequestError::DenyCoversGrant`] when a `denied_paths` entry
+/// contains a grant **after** the launcher grant is inserted. That check is
+/// repeated here, not only in [`filesystem_policy`], because a caller may build
+/// an [`MxcFilesystemInput`] by hand: the launcher grant is added below, and a
+/// deny list filtered before it existed can still ship a deny that covers it.
+///
+/// Also fails with [`RequestError::PathNotAbsolute`] for a launcher that is empty
+/// or cannot be made absolute: both the grant derived here and the check above
+/// compare absolute keys, so a relative launcher would defeat them.
 pub fn build_request(
     input: &MxcSessionInput,
     launcher: &Path,
@@ -732,6 +1339,33 @@ pub fn build_request(
     // child sees would stop there — silently, and not what was recorded here.
     if input.command.contains('\0') {
         return Err(RequestError::NulInCommand);
+    }
+
+    // The launcher takes part in the deny comparison below, so a relative
+    // spelling would key as itself and no absolute deny could cover it: resolve
+    // it at this boundary, before the grant is derived from it. The command line
+    // below names the resolved path as well, so the container executes exactly
+    // the binary the policy granted.
+    let launcher = absolute_path("launcher", launcher)?;
+    // P1.3: the launcher's directory is a grant the request cannot do without,
+    // so the mapping adds it here instead of relying on the caller.
+    let mut filesystem = input.filesystem.clone();
+    ensure_launcher_grant(&mut filesystem, &launcher);
+    // ...and then re-check the deny list against the grant set that now
+    // includes it (BLOCKING 1: the filter must never run before this grant).
+    // Fail closed: a deny that contains any grant is a refusal, not a drop.
+    let grants = granted_paths(&filesystem);
+    for deny in &filesystem.denied_paths {
+        let deny = deny.trim();
+        if deny.is_empty() {
+            continue;
+        }
+        if let Some(grant) = grant_contained_by_deny(deny, &grants) {
+            return Err(RequestError::DenyCoversGrant {
+                deny: deny.to_string(),
+                grant: grant.clone(),
+            });
+        }
     }
 
     // Invariant 5: the host's proxy configuration never crosses. Always an
@@ -758,7 +1392,10 @@ pub fn build_request(
                 host_loopback: Some(NetworkAction::Allow),
             }),
             runtime_config: Some(NetworkRuntimeConfig {
-                network_proxy: Some(format!("http://127.0.0.1:{port}")),
+                // With the session token as userinfo: the SDK copies this URL
+                // verbatim into the child's HTTP_PROXY/HTTPS_PROXY, and our
+                // proxy's token gate ([G-7]) is what it has to satisfy.
+                network_proxy: Some(proxy_url(port, input.network.proxy_token.as_deref())?),
             }),
         },
         // No proxy: no network at all, and no host loopback.
@@ -776,11 +1413,11 @@ pub fn build_request(
         },
     };
 
-    let mut request = ContainerRequest::new(launcher_command(launcher, &input.command));
+    let mut request = ContainerRequest::new(launcher_command(&launcher, &input.command));
     request.filesystem = Some(FilesystemPolicy {
-        readwrite_paths: input.filesystem.readwrite_paths.clone(),
-        readonly_paths: input.filesystem.readonly_paths.clone(),
-        denied_paths: input.filesystem.denied_paths.clone(),
+        readwrite_paths: filesystem.readwrite_paths,
+        readonly_paths: filesystem.readonly_paths,
+        denied_paths: filesystem.denied_paths,
         clear_policy_on_exit: Some(true),
     });
     request.network = Some(network);
@@ -825,6 +1462,11 @@ pub fn build_request(
 pub struct MxcBackend<'a> {
     proof: Option<&'a dyn ProxyProofSource>,
     proxy_port: Option<u16>,
+    /// The token the backend's own listener expects, if that listener
+    /// authenticates. Always overrides whatever the caller's input carried: only
+    /// this backend's token can satisfy this backend's proxy, so a caller value
+    /// is a lookalike by definition.
+    proxy_token: Option<String>,
     /// `None` when this backend has no budget of its own, so the caller's
     /// [`MxcSessionInput::timeout_ms`] ships untouched. `Some(budget)` is an
     /// explicit decision — including `Some(None)`, which means "no deadline" —
@@ -843,6 +1485,7 @@ impl<'a> MxcBackend<'a> {
         Self {
             proof: Some(proof),
             proxy_port,
+            proxy_token: None,
             budget: None,
             launcher: launcher.into(),
         }
@@ -855,6 +1498,7 @@ impl<'a> MxcBackend<'a> {
         Self {
             proof: None,
             proxy_port,
+            proxy_token: None,
             budget: None,
             launcher: launcher.into(),
         }
@@ -866,6 +1510,13 @@ impl<'a> MxcBackend<'a> {
     /// either way the budget wins over the caller's
     /// [`MxcSessionInput::timeout_ms`]. A backend that never calls this leaves
     /// the caller's deadline in force. P2.1 owns the real arithmetic.
+    /// The session token the backend's proxy expects, embedded in the proxy URL
+    /// the child receives (see [`MxcNetworkInput::proxy_token`]).
+    pub fn with_proxy_token(mut self, token: impl Into<String>) -> Self {
+        self.proxy_token = Some(token.into());
+        self
+    }
+
     pub fn with_budget(mut self, timeout_ms: Option<u32>) -> Self {
         self.budget = Some(timeout_ms);
         self
@@ -898,6 +1549,10 @@ impl<'a> MxcBackend<'a> {
     pub fn request_for(&self, input: &MxcSessionInput) -> Result<ContainerRequest, MxcError> {
         let mut effective = input.clone();
         effective.network.proxy_port = self.proxy_port;
+        // Overriding unconditionally (not `unwrap_or`): a caller-supplied token
+        // cannot authenticate against this backend's listener, and shipping it
+        // would produce a 407 that reads like a broken proxy.
+        effective.network.proxy_token = self.proxy_token.clone();
         if let Some(budget) = self.budget {
             effective.timeout_ms = budget;
         }
@@ -955,6 +1610,36 @@ impl<'a> MxcBackend<'a> {
             expectation,
         )
     }
+}
+
+/// Launch one session against the listener that owns `proxy_port`.
+///
+/// This is the seam the supervisor calls, and it is deliberately the only place
+/// the two halves meet:
+///
+/// * the **port** the proxy bound (`127.0.0.1:0`, so the session's own random
+///   port) becomes `runtimeConfig.networkProxy`, with `proxy_token` as its
+///   `userinfo` so the child can satisfy the proxy's token gate, and
+/// * the **same port** decides the guardrail leg — `Required` when a proxy
+///   exists, `MustBeAbsent` when it does not ([`ProofExpectation::for_network`]).
+///
+/// Deriving the leg here rather than taking it from the caller is the point: a
+/// hand-picked leg can only make a blocked session prove nothing or a networked
+/// session fail a test it could never pass. The proof source is the listener
+/// itself — `proxy_handle.counters()` — so the proof cannot come from a
+/// different socket than the child was pointed at.
+pub fn launch_session(
+    source: &dyn ProxyProofSource,
+    proxy_port: Option<u16>,
+    proxy_token: Option<&str>,
+    launcher: &Path,
+    input: &MxcSessionInput,
+) -> Result<SessionOutcome, MxcError> {
+    let mut backend = MxcBackend::new(source, proxy_port, launcher);
+    if let Some(token) = proxy_token {
+        backend = backend.with_proxy_token(token);
+    }
+    backend.launch(input, ProofExpectation::for_network(proxy_port))
 }
 
 /// Apply guardrail 1 to a finished child and map it into a [`SessionOutcome`].
@@ -1018,6 +1703,7 @@ mod tests {
             },
             network: MxcNetworkInput {
                 proxy_port: Some(54_321),
+                proxy_token: None,
             },
             timeout_ms: Some(60_000),
         }
@@ -1307,11 +1993,15 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_grants_pass_through_unchanged() {
+    fn declared_grants_are_carried_and_the_launcher_is_granted_automatically() {
         let req = build(&input());
         let fs = req.filesystem.as_ref().expect("filesystem policy");
         assert_eq!(fs.readwrite_paths, vec![r"C:\work".to_string()]);
-        assert_eq!(fs.readonly_paths, vec![r"C:\ref".to_string()]);
+        assert_eq!(
+            fs.readonly_paths,
+            vec![r"C:\ref".to_string(), r"C:\tools\sandbox".to_string()],
+            "the caller's grants keep their order; the launcher's directory is appended"
+        );
         assert_eq!(fs.denied_paths, vec![r"C:\Users\marku\.ssh".to_string()]);
     }
 
@@ -1904,6 +2594,783 @@ mod tests {
         assert_eq!(record.needs_dacl_augmentation, None);
     }
 
+    // ---- P1 wave 2 B: the launcher grant is never the caller's job -------
+
+    #[test]
+    fn a_caller_that_omits_the_launcher_grant_still_gets_a_launchable_request() {
+        let source = RecordingSource::default();
+        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let mut i = input();
+        i.filesystem.readonly_paths.clear();
+
+        let req = backend.request_for(&i).expect("launchable request");
+        let fs = req.filesystem.as_ref().expect("filesystem policy");
+        assert_eq!(
+            fs.readonly_paths,
+            vec![r"C:\tools\sandbox".to_string()],
+            "without this grant the container cannot execute the launcher and the launch fails \
+             with an opaque policy denial"
+        );
+    }
+
+    #[test]
+    fn a_declared_launcher_grant_is_not_duplicated() {
+        let mut fs = MxcFilesystemInput {
+            readonly_paths: vec![r"c:/TOOLS/sandbox/".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !ensure_launcher_grant(&mut fs, Path::new(TEST_LAUNCHER)),
+            "case and separator variants are the same grant"
+        );
+        assert_eq!(fs.readonly_paths.len(), 1);
+    }
+
+    #[test]
+    fn a_bare_launcher_file_name_adds_no_grant() {
+        let mut fs = MxcFilesystemInput::default();
+        assert!(!ensure_launcher_grant(&mut fs, Path::new("mxc-launch.exe")));
+        assert!(
+            fs.readonly_paths.is_empty(),
+            "there is no directory to grant, and an empty path in the request would be worse"
+        );
+    }
+
+    // ---- P1 wave 2 C: filesystem policy (workspace-only posture) ---------
+
+    const TEST_WORKSPACE: &str = r"C:\work";
+    const PROFILE: &str = r"C:\Users\marku";
+    /// What [`ensure_launcher_grant`] derives from `TEST_LAUNCHER`.
+    const TEST_LAUNCHER_DIR: &str = r"C:\tools\sandbox";
+
+    fn policy() -> MxcFilesystemInput {
+        filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[r"C:\ref".to_string()],
+            &[r"C:\secrets".to_string()],
+            Some(Path::new(PROFILE)),
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("no deny in this policy contains a grant")
+    }
+
+    #[test]
+    fn the_workspace_is_the_only_writable_grant_and_declared_reads_are_kept() {
+        let fs = policy();
+        assert_eq!(fs.readwrite_paths, vec![TEST_WORKSPACE.to_string()]);
+        assert_eq!(
+            fs.readonly_paths,
+            vec![r"C:\ref".to_string(), TEST_LAUNCHER_DIR.to_string()],
+            "declared read-only grants are carried as declared, and the launcher's directory is \
+             a grant from policy time on — the deny filter below runs against it"
+        );
+    }
+
+    #[test]
+    fn profile_credential_directories_are_denied() {
+        let denied = policy().denied_paths;
+        for dir in PROFILE_SECRET_DIRS {
+            let expected = format!(r"C:\Users\marku\{dir}");
+            assert!(
+                denied.contains(&expected),
+                "{dir} holds credentials and must be denied: {denied:?}"
+            );
+        }
+        assert!(
+            denied.contains(&r"C:\secrets".to_string()),
+            "the configured deny list is not optional: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn configured_denies_are_deduplicated_case_insensitively() {
+        let fs = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[],
+            &[
+                r"C:\secrets".to_string(),
+                r"c:\SECRETS\".to_string(),
+                r"\\?\C:\secrets.".to_string(),
+            ],
+            None,
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("a deny that contains no grant is kept");
+        assert_eq!(
+            fs.denied_paths,
+            vec![r"C:\secrets".to_string()],
+            "case, a trailing separator, a verbatim prefix and a trailing dot are one deny"
+        );
+        assert!(
+            !fs.denied_paths.iter().any(|d| d.contains(".ssh")),
+            "no profile means no profile denies: {:?}",
+            fs.denied_paths
+        );
+    }
+
+    /// A deny that *is* a grant sits on the boundary of "contains a grant": it can
+    /// be neither honoured nor dropped, so it is refused by name.
+    #[test]
+    fn a_deny_equal_to_a_grant_is_refused() {
+        let err = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[],
+            &[r"c:/WORK/".to_string()],
+            None,
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect_err("`C:\\work` denies the workspace it grants");
+        assert_eq!(
+            err,
+            RequestError::DenyCoversGrant {
+                deny: r"c:/WORK/".to_string(),
+                grant: TEST_WORKSPACE.to_string(),
+            }
+        );
+    }
+
+    /// BLOCKING 2, the reported case: `%USERPROFILE%` denied with the workspace
+    /// inside it. This used to be dropped silently, which left `Documents`,
+    /// `Downloads`, `AppData` and every browser profile readable.
+    #[test]
+    fn a_deny_that_is_an_ancestor_of_a_grant_is_refused_and_names_both_paths() {
+        let workspace = format!(r"{PROFILE}\work");
+        let err = filesystem_policy(
+            Path::new(&workspace),
+            &[],
+            &[PROFILE.to_string()],
+            Some(Path::new(PROFILE)),
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect_err("a profile deny with the workspace inside it cannot be honoured");
+        assert_eq!(
+            err,
+            RequestError::DenyCoversGrant {
+                deny: PROFILE.to_string(),
+                grant: workspace.clone(),
+            },
+            "the refusal must name the granted path the deny contains"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(PROFILE) && message.contains(&workspace),
+            "both paths must be in the message: {message}"
+        );
+        assert!(
+            message.contains("Deny the specific subdirectory"),
+            "the operator needs the fix, not just the failure: {message}"
+        );
+    }
+
+    /// The intended, expressible case — and the one that must keep working.
+    #[test]
+    fn a_deny_that_is_a_descendant_of_a_grant_is_kept() {
+        let fs = filesystem_policy(
+            Path::new(PROFILE),
+            &[],
+            &[format!(r"{PROFILE}\.ssh"), format!(r"{PROFILE}\Documents")],
+            Some(Path::new(PROFILE)),
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("denies below the granted workspace are exactly what a deny list is for");
+        assert!(fs.denied_paths.contains(&format!(r"{PROFILE}\.ssh")));
+        assert!(fs.denied_paths.contains(&format!(r"{PROFILE}\Documents")));
+        assert_eq!(
+            fs.denied_paths
+                .iter()
+                .filter(|deny| deny.eq_ignore_ascii_case(&format!(r"{PROFILE}\.ssh")))
+                .count(),
+            1,
+            "the built-in `.ssh` deny and the configured one are the same path: {:?}",
+            fs.denied_paths
+        );
+    }
+
+    #[test]
+    fn a_deny_unrelated_to_every_grant_is_kept() {
+        let fs = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[],
+            &[r"D:\secrets".to_string(), r"C:\work2".to_string()],
+            None,
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("neither deny contains a grant");
+        assert_eq!(
+            fs.denied_paths,
+            vec![r"D:\secrets".to_string(), r"C:\work2".to_string()],
+            "`C:\\work2` shares a prefix with the grant but is a sibling: the check stays \
+             segment-aware"
+        );
+    }
+
+    /// BLOCKING 1, the ordering defect: the launcher lives under the user profile
+    /// in practice, so an operator deny of the profile root contains the launcher
+    /// grant. It must be refused at policy time — the grant is inserted there, so
+    /// the deny set is filtered against it instead of against a grant set that is
+    /// completed later in `build_request`.
+    #[test]
+    fn a_profile_deny_that_contains_the_launcher_grant_is_refused() {
+        let launcher = format!(r"{PROFILE}\tools\sandbox\{LAUNCHER_EXE_NAME}");
+        let err = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[],
+            &[PROFILE.to_string()],
+            Some(Path::new(PROFILE)),
+            Path::new(&launcher),
+        )
+        .expect_err("the launcher's directory is under the denied profile");
+        assert_eq!(
+            err,
+            RequestError::DenyCoversGrant {
+                deny: PROFILE.to_string(),
+                grant: format!(r"{PROFILE}\tools\sandbox"),
+            },
+            "the refusal must name the launcher directory — the grant the deny contains"
+        );
+    }
+
+    /// The control for the test above: with no such deny, the profile credential
+    /// denies survive alongside a launcher grant that sits under the profile. The
+    /// grant must not swallow them, and their presence proves the deny list was
+    /// filtered against a grant set that already contained the launcher.
+    #[test]
+    fn a_launcher_under_the_profile_keeps_the_profile_credential_denies() {
+        let launcher = format!(r"{PROFILE}\tools\sandbox\{LAUNCHER_EXE_NAME}");
+        let fs = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[],
+            &[],
+            Some(Path::new(PROFILE)),
+            Path::new(&launcher),
+        )
+        .expect("no deny contains a grant");
+        assert!(
+            fs.readonly_paths
+                .contains(&format!(r"{PROFILE}\tools\sandbox")),
+            "the launcher grant is part of the policy: {:?}",
+            fs.readonly_paths
+        );
+        assert_eq!(
+            fs.denied_paths.len(),
+            PROFILE_SECRET_DIRS.len(),
+            "all four credential denies must survive: {:?}",
+            fs.denied_paths
+        );
+    }
+
+    /// (b) The launcher used to defeat the guard: a relative spelling keys as
+    /// `tools\sandbox`, which never matches an absolute deny, so a deny covering
+    /// the real directory shipped and the container was then denied the launcher
+    /// it needed. It is resolved before the comparison now.
+    #[test]
+    fn a_relative_launcher_is_resolved_before_the_deny_comparison() {
+        let here = std::env::current_dir().expect("current directory");
+        let launcher_dir = std::path::absolute(Path::new(r"tools\sandbox"))
+            .expect("the relative launcher directory resolves")
+            .display()
+            .to_string();
+        let err = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[],
+            &[here.display().to_string()],
+            None,
+            Path::new(r"tools\sandbox\mxc-launch.exe"),
+        )
+        .expect_err("the current directory is an ancestor of the resolved launcher directory");
+        assert_eq!(
+            err,
+            RequestError::DenyCoversGrant {
+                deny: here.display().to_string(),
+                grant: launcher_dir,
+            },
+            "the grant must be the resolved directory, not the relative spelling"
+        );
+    }
+
+    /// (b) The other input: a relative `cwd` keyed as `.` (empty), so a deny of the
+    /// real directory matched nothing and shipped. `.` now behaves like its
+    /// absolute form — same grant, same refusal.
+    #[test]
+    fn a_relative_cwd_behaves_like_its_absolute_form() {
+        let here = std::env::current_dir().expect("current directory");
+        let relative = filesystem_policy(Path::new("."), &[], &[], None, Path::new(TEST_LAUNCHER))
+            .expect("`.` resolves to the current directory");
+        assert_eq!(
+            relative.readwrite_paths,
+            vec![here.display().to_string()],
+            "the grant must be the resolved directory, not `.`"
+        );
+        let absolute = filesystem_policy(&here, &[], &[], None, Path::new(TEST_LAUNCHER))
+            .expect("the absolute spelling of the same workspace");
+        assert_eq!(
+            relative.readwrite_paths, absolute.readwrite_paths,
+            "`.` and the absolute form must produce the same policy"
+        );
+
+        let err = filesystem_policy(
+            Path::new("."),
+            &[],
+            &[here.display().to_string()],
+            None,
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect_err("the current directory is the workspace it would grant");
+        assert_eq!(
+            err,
+            RequestError::DenyCoversGrant {
+                deny: here.display().to_string(),
+                grant: here.display().to_string(),
+            }
+        );
+    }
+
+    /// A path the boundary cannot make absolute has no comparison key, so it is a
+    /// named refusal rather than a guess that voids the guard.
+    #[test]
+    fn a_path_that_cannot_be_made_absolute_is_a_named_refusal() {
+        let err = filesystem_policy(Path::new(""), &[], &[], None, Path::new(TEST_LAUNCHER))
+            .expect_err("an empty cwd has no key to compare");
+        assert_eq!(
+            err,
+            RequestError::PathNotAbsolute {
+                what: "workspace directory",
+                path: String::new(),
+            }
+        );
+        assert!(
+            err.to_string().contains("is empty"),
+            "the message must say what is wrong: {err}"
+        );
+
+        let err = build_request(&input(), Path::new("")).expect_err("an empty launcher has no key");
+        assert_eq!(
+            err,
+            RequestError::PathNotAbsolute {
+                what: "launcher",
+                path: String::new(),
+            }
+        );
+        assert!(
+            err.to_string().contains("launcher"),
+            "the message must name the input: {err}"
+        );
+    }
+
+    /// (b) The command line names the resolved launcher too, so the container
+    /// executes exactly the binary the policy granted.
+    #[test]
+    fn build_request_resolves_a_relative_launcher_in_the_command_line() {
+        let here = std::env::current_dir().expect("current directory");
+        let request = build_request(&input(), Path::new(r"bin\mxc-launch.exe"))
+            .expect("a relative launcher resolves");
+        let resolved_dir = here.join("bin").display().to_string();
+        assert!(
+            request.command.contains(&resolved_dir),
+            "the command line must name the absolute launcher directory: {:?}",
+            request.command
+        );
+        let fs = request.filesystem.as_ref().expect("filesystem policy");
+        assert!(
+            fs.readonly_paths
+                .iter()
+                .any(|g| path_key(g) == path_key(&resolved_dir)),
+            "the grant must be the resolved directory: {:?}",
+            fs.readonly_paths
+        );
+    }
+
+    /// (f) The built-in credential denies are not configuration: a workspace inside
+    /// one is unlaunchable with no override, and the operator has to be told that
+    /// rather than left hunting for a setting they never wrote.
+    #[test]
+    fn a_workspace_inside_a_built_in_credential_deny_names_the_trap() {
+        for dir in PROFILE_SECRET_DIRS {
+            let workspace = format!(r"{PROFILE}\{dir}\work");
+            let err = filesystem_policy(
+                Path::new(&workspace),
+                &[],
+                &[],
+                Some(Path::new(PROFILE)),
+                Path::new(TEST_LAUNCHER),
+            )
+            .expect_err("the built-in credential deny contains the workspace");
+            assert_eq!(
+                err,
+                RequestError::DenyCoversGrant {
+                    deny: format!(r"{PROFILE}\{dir}"),
+                    grant: workspace,
+                },
+                "{dir}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("built-in") && message.contains("move the workspace"),
+                "the operator must be told this is not their configuration: {message}"
+            );
+        }
+    }
+
+    /// A caller may hand-build an [`MxcFilesystemInput`], so `build_request` runs
+    /// the same coverage check again **after** inserting the launcher grant.
+    #[test]
+    fn build_request_refuses_a_hand_built_policy_that_denies_the_launcher_directory() {
+        let source = RecordingSource::default();
+        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let mut i = input();
+        i.filesystem.denied_paths = vec![TEST_LAUNCHER_DIR.to_string()];
+
+        match backend.request_for(&i) {
+            Err(MxcError::Request(RequestError::DenyCoversGrant { deny, grant })) => {
+                assert_eq!(deny, TEST_LAUNCHER_DIR);
+                assert_eq!(grant, TEST_LAUNCHER_DIR);
+            }
+            other => panic!(
+                "a deny of the launcher's own directory must refuse the request, got {other:?}"
+            ),
+        }
+    }
+
+    /// (e) The *ancestor* branch of the second filter — a deny that covers the
+    /// launcher's directory without naming it. The `deny == grant` test above
+    /// reaches only the equality arm, so without this the ancestor arm of
+    /// `covers` would be untested on the post-insertion re-check.
+    #[test]
+    fn build_request_refuses_a_hand_built_policy_whose_deny_is_an_ancestor_of_the_launcher() {
+        let source = RecordingSource::default();
+        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let mut i = input();
+        i.filesystem.readonly_paths.clear();
+        i.filesystem.denied_paths = vec![r"C:\tools".to_string()];
+
+        match backend.request_for(&i) {
+            Err(MxcError::Request(RequestError::DenyCoversGrant { deny, grant })) => {
+                assert_eq!(deny, r"C:\tools");
+                assert_eq!(
+                    grant, TEST_LAUNCHER_DIR,
+                    "the grant is the launcher directory build_request itself inserted"
+                );
+            }
+            other => panic!(
+                "a deny that is an ancestor of the launcher's directory must refuse the \
+                 request, got {other:?}"
+            ),
+        }
+    }
+
+    /// `covers` is the whole deny/grant decision, so its boundary cases are
+    /// asserted directly rather than only through `filesystem_policy`.
+    #[test]
+    fn covers_is_segment_aware_and_prefix_safe() {
+        // Siblings that share a prefix are not covered; children are.
+        assert!(!covers(r"C:\work", r"C:\work2"));
+        assert!(covers(r"C:\work", r"C:\work\sub"));
+        assert!(!covers(r"C:\work", r"C:\work2\sub"));
+        assert!(covers(r"C:\work", r"C:\work"));
+        // Separator style and a trailing separator are not identity.
+        assert!(covers(r"C:\work\", r"C:/work/sub"));
+
+        // Win32 ignores a component's trailing dots and spaces.
+        assert!(covers(r"C:\Users\x\.ssh.", r"C:\Users\x\.ssh"));
+        assert!(covers(r"C:\Users\x\.ssh", r"C:\Users\x\.ssh."));
+        assert!(covers(r"C:\work ", r"C:\work\sub"));
+
+        // `.`/`..` collapse before comparison.
+        assert!(covers(r"C:\work\.\sub\..", r"C:\work"));
+        assert!(covers(r"C:\work\sub\..\sub", r"C:\work\sub"));
+
+        // The verbatim/device prefix and its UNC spelling name the same tree.
+        assert!(covers(r"\\?\C:\work", r"C:\work\sub"));
+        assert!(covers(r"C:\work", r"\\?\C:\work\sub"));
+        assert!(covers(r"\\.\C:\work", r"C:\work"));
+        assert!(covers(r"\\?\UNC\server\share", r"\\server\share\sub"));
+        assert!(covers(r"\\server\share", r"\\?\UNC\server\share\sub"));
+        assert!(!covers(r"\\server\share", r"\\server\share2"));
+
+        // An empty path covers nothing — an empty deny is a mistake, not a
+        // wildcard — and nothing covers a drive root.
+        assert!(!covers("", r"C:\work"));
+        assert!(!covers("", ""));
+        assert!(!covers(r"C:\work", ""));
+
+        // A drive root covers its whole drive, and is covered by nothing else.
+        assert!(covers(r"C:\", r"C:\work"));
+        assert!(covers(r"C:\", r"C:\Windows\win.ini"));
+        assert!(!covers(r"C:\work", r"C:\"));
+    }
+
+    /// Windows compares path components case-insensitively over the whole
+    /// Unicode range; `to_ascii_lowercase` only folded ASCII, so `C:\Users\Ä` and
+    /// `C:\Users\ä` were different keys and a covering deny escaped the guard.
+    /// Both directions, because a fold that only worked one way would still let
+    /// one operator's spelling through.
+    #[test]
+    fn unicode_case_folds_to_one_key_in_both_directions() {
+        assert_eq!(path_key(r"C:\Users\Ä"), path_key(r"C:\Users\ä"));
+        assert_eq!(path_key(r"C:\Users\ä"), path_key(r"C:\Users\Ä"));
+        assert!(covers(r"C:\Users\Ä\work", r"C:\Users\ä\work\sub"));
+        assert!(covers(r"C:\Users\ä\work", r"C:\Users\Ä\work\.ssh"));
+        // Not Latin-1 only: the fold is Unicode, as Windows' ordinal compare is.
+        assert_eq!(path_key(r"C:\Δ\Σ"), path_key(r"C:\δ\σ"));
+        assert_eq!(path_key(r"C:\ДОМ"), path_key(r"C:\дом"));
+        // ...and it stays case-*insensitive*, not case-blind: different letters
+        // still differ, so the guard does not start refusing everything.
+        assert_ne!(path_key(r"C:\Users\Ä"), path_key(r"C:\Users\Ö"));
+    }
+
+    /// The fold is only worth having if it reaches the guard: a Unicode-cased deny
+    /// that covers the workspace must refuse the launch, in both directions.
+    #[test]
+    fn a_unicode_cased_deny_that_covers_the_workspace_is_refused() {
+        for (deny, workspace) in [
+            (r"C:\Users\Ä", r"C:\Users\ä\work"),
+            (r"C:\Users\ä", r"C:\Users\Ä\work"),
+        ] {
+            let err = filesystem_policy(
+                Path::new(workspace),
+                &[],
+                &[deny.to_string()],
+                None,
+                Path::new(TEST_LAUNCHER),
+            )
+            .expect_err("these are one directory to Windows, so the deny covers the grant");
+            assert_eq!(
+                err,
+                RequestError::DenyCoversGrant {
+                    deny: deny.to_string(),
+                    grant: workspace.to_string(),
+                },
+                "{deny} vs {workspace}"
+            );
+        }
+    }
+
+    /// (c) `..` is tested *after* the trailing-dot/space trim: `.. ` trimmed to
+    /// nothing and was dropped, so `C:\work\sub\.. \x` keyed as
+    /// `c:\work\sub\x` instead of collapsing to `c:\work\x`.
+    #[test]
+    fn a_dotdot_with_a_trailing_space_still_collapses_to_the_parent() {
+        assert_eq!(path_key(r"C:\work\sub\.. \x"), path_key(r"C:\work\x"));
+        assert_eq!(path_key(r"C:\work\sub\..  \x"), path_key(r"C:\work\x"));
+        assert_eq!(path_key(r"C:\work\sub\..\x"), path_key(r"C:\work\x"));
+        assert_eq!(path_key(r"C:\work\sub\.. "), path_key(r"C:\work"));
+        assert!(covers(r"C:\work\sub\.. .", r"C:\work\sub"));
+        // A dot-only segment with padding is still just `.`, dropped.
+        assert_eq!(path_key(r"C:\work\. \x"), path_key(r"C:\work\x"));
+        // `..` still clamps at the root.
+        assert_eq!(path_key(r"C:\..\work"), path_key(r"C:\work"));
+    }
+
+    /// (d) The docblock promises *every* component loses its trailing dots and
+    /// spaces; the UNC root's server and share were exempt, so `\\srv\share.\x`
+    /// and `\\srv\share\x` were different keys.
+    #[test]
+    fn unc_root_components_lose_their_trailing_dots_and_spaces() {
+        assert_eq!(path_key(r"\\srv\share.\x"), path_key(r"\\srv\share\x"));
+        assert_eq!(path_key(r"\\srv\share \x"), path_key(r"\\srv\share\x"));
+        assert_eq!(path_key(r"\\srv.\share\x"), path_key(r"\\srv\share\x"));
+        assert!(covers(r"\\srv\share.", r"\\srv\share\sub"));
+        assert!(covers(r"\\srv\share", r"\\srv\share.\sub"));
+        // The trimmed root still prefixes its own children, and no sibling.
+        assert!(!covers(r"\\srv\share.", r"\\srv\share2"));
+        assert!(!covers(r"\\srv\share.", r"\\srv2\share"));
+    }
+
+    /// The normalisation `covers` relies on, asserted where it is observable: every
+    /// spelling of one directory must reach one key, without touching the disk.
+    #[test]
+    fn equivalent_spellings_reach_the_same_path_key() {
+        let expected = path_key(r"C:\Users\x\.ssh");
+        for spelling in [
+            r"C:\Users\x\.ssh.",
+            r"C:\Users\x\.ssh   ",
+            r"C:/Users/x/.ssh",
+            r"\\?\C:\Users\x\.ssh",
+            r"\\.\C:\Users\x\.ssh",
+            r"C:\Users\.\x\ssh\..\.ssh",
+            r"C:\Users\x\.ssh\",
+        ] {
+            assert_eq!(path_key(spelling), expected, "{spelling}");
+        }
+        assert_eq!(path_key(r"\\?\UNC\srv\share\x"), path_key(r"\\srv\share\x"));
+    }
+
+    /// The documented caveat, asserted as a caveat: MXC filesystem policy is
+    /// additive grants, so system directories stay readable even when every
+    /// secret we can name is denied. This test exists so nobody "fixes" the
+    /// caveat by denying `C:\Windows` — that would break every workload that
+    /// needs System32 while the policy still cannot express "nothing else".
+    #[test]
+    fn system_directories_are_not_denied_the_additive_caveat_is_recorded() {
+        let fs = policy();
+        assert!(
+            !fs.denied_paths
+                .iter()
+                .any(|denied| covers(denied, r"C:\Windows")),
+            "`C:\\Windows` readable inside the container is the known caveat: {:?}",
+            fs.denied_paths
+        );
+        assert!(
+            !fs.denied_paths
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(r"C:\Windows")),
+            "denying C:\\Windows would break every System32-resident workload"
+        );
+    }
+
+    // ---- P1 wave 2 D8: the token rides the proxy URL ---------------------
+
+    fn network_proxy(request: &ContainerRequest) -> Option<String> {
+        request
+            .network
+            .as_ref()?
+            .runtime_config
+            .as_ref()?
+            .network_proxy
+            .clone()
+    }
+
+    #[test]
+    fn the_request_hands_the_child_a_proxy_url_with_the_session_token() {
+        let source = RecordingSource::default();
+        let backend =
+            MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_proxy_token("abc-123");
+        let request = backend.request_for(&input()).expect("launchable request");
+        assert_eq!(
+            network_proxy(&request).as_deref(),
+            Some("http://sandbox:abc-123@127.0.0.1:49152"),
+            "the SDK copies this URL verbatim into HTTP_PROXY/HTTPS_PROXY, and the proxy's \
+             token gate is what it has to satisfy"
+        );
+    }
+
+    #[test]
+    fn a_callers_token_cannot_stand_in_for_the_backends() {
+        let source = RecordingSource::default();
+        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let mut i = input();
+        i.network.proxy_token = Some("caller-lookalike".to_string());
+
+        let request = backend.request_for(&i).expect("launchable request");
+        assert_eq!(
+            network_proxy(&request).as_deref(),
+            Some("http://127.0.0.1:49152"),
+            "a token this backend's listener cannot honour must not ship: it would produce a \
+             407 that reads like a broken proxy"
+        );
+    }
+
+    /// The token is a credential: `{:?}` on either input must not print it, or
+    /// every log line, panic message and error chain that formats an input hands
+    /// out the session token the proxy's gate expects.
+    #[test]
+    fn debug_output_redacts_the_proxy_token() {
+        const TOKEN: &str = "tok-must-not-appear-4821";
+        let mut i = input();
+        i.network.proxy_port = Some(49_152);
+        i.network.proxy_token = Some(TOKEN.to_string());
+
+        let network = format!("{:?}", i.network);
+        assert!(
+            network.contains(REDACTED_TOKEN),
+            "the redaction must be visible: {network}"
+        );
+        assert!(
+            !network.contains(TOKEN),
+            "`MxcNetworkInput`'s Debug leaked the token: {network}"
+        );
+
+        let session = format!("{i:?}");
+        assert!(
+            session.contains(REDACTED_TOKEN),
+            "the redaction must be visible: {session}"
+        );
+        assert!(
+            !session.contains(TOKEN),
+            "`MxcSessionInput`'s Debug leaked the token: {session}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_token_is_refused_before_a_request_exists() {
+        for bad in ["a@b", "a/b", "a b", "a?b", "a#b"] {
+            let mut i = input();
+            i.network.proxy_token = Some(bad.to_string());
+            assert_eq!(
+                build_request(&i, Path::new(TEST_LAUNCHER)).expect_err("unsafe token"),
+                RequestError::UnsafeProxyToken,
+                "{bad:?} would move the URL's authority"
+            );
+        }
+        assert_eq!(
+            proxy_url(8080, Some("Hex-0123._~")).expect("unreserved characters are fine"),
+            "http://sandbox:Hex-0123._~@127.0.0.1:8080"
+        );
+        assert_eq!(
+            proxy_url(8080, None).expect("no token"),
+            "http://127.0.0.1:8080",
+            "no token means the credential-less form, unchanged"
+        );
+        assert_eq!(
+            proxy_url(8080, Some("")).expect("an empty token is no token"),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    // ---- P1 wave 2 A: the real proof source is the listener ---------------
+
+    #[test]
+    fn the_proxy_counters_are_a_proxy_proof_source() {
+        let counters = crate::net::proxy::LaunchCounters::new();
+        let source: &dyn ProxyProofSource = counters.as_ref();
+        assert_eq!(source.proof(1), untouched());
+    }
+
+    #[test]
+    fn listener_counters_map_to_the_proof_and_never_leak_between_epochs() {
+        let counters = crate::net::proxy::LaunchCounters::new();
+
+        let first = counters.begin_launch();
+        counters.note_consultation();
+        counters.note_upstream_established();
+        assert_eq!(
+            counters.proof(first),
+            ProxyProof {
+                accepted: 1,
+                tunnels: 1,
+            }
+        );
+        counters.close_launch(first);
+
+        // A second launch starts from zero, even though the first one saw
+        // traffic — this is the whole point of the epoch.
+        let second = counters.begin_launch();
+        assert_eq!(counters.proof(second), untouched());
+        // A plain-HTTP forward: consulted and upstream established, with no
+        // CONNECT anywhere. `tunnels >= 1` must hold or `Required` would fail a
+        // working session.
+        counters.note_consultation();
+        counters.note_upstream_established();
+        assert_eq!(
+            counters.proof(second),
+            ProxyProof {
+                accepted: 1,
+                tunnels: 1,
+            },
+            "a plain-HTTP-only session must satisfy Required"
+        );
+        // The closed epoch keeps its frozen numbers.
+        assert_eq!(
+            counters.proof(first),
+            ProxyProof {
+                accepted: 1,
+                tunnels: 1,
+            }
+        );
+        // An epoch nobody opened proves nothing.
+        assert_eq!(counters.proof(4_242), untouched());
+    }
+
     // ---- environment filter ---------------------------------------------
 
     #[test]
@@ -1950,6 +3417,12 @@ mod live {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    use crate::net::intent::{DEFAULT_TTL, IntentRegistry};
+    use crate::net::learned::LearnedStore;
+    use crate::net::prompt::{
+        DialogFn, DialogUnavailable, PromptConfig, PromptCoordinator, PromptPolicy,
+    };
 
     /// What the fake endpoint and the proof source share.
     #[derive(Default)]
@@ -2171,14 +3644,22 @@ mod live {
     struct Scratch(PathBuf);
 
     impl Scratch {
-        fn new() -> Self {
+        fn named(label: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "sandbox-mxc-intent-{}-{:?}",
+                "sandbox-mxc-{label}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
+            // A previous run of the same test in the same process would collide
+            // only on the thread id, which is stable per test thread — so start
+            // from an empty directory.
+            let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("create scratch dir");
             Self(dir)
+        }
+
+        fn new() -> Self {
+            Self::named("intent")
         }
 
         fn path(&self) -> &Path {
@@ -2208,6 +3689,7 @@ mod live {
             },
             network: MxcNetworkInput {
                 proxy_port: Some(port),
+                proxy_token: None,
             },
             timeout_ms: None,
         }
@@ -2261,6 +3743,273 @@ mod live {
             .collect()
     }
 
+    // =====================================================================
+    // P1 wave 2: proxied / plain-HTTP / blocked / filesystem legs
+    // =====================================================================
+
+    /// The body both legs look for, so a 200 from anything else cannot pass.
+    const NONCE: &str = "nonce-p1-wave-2";
+
+    /// The session token the live proxies require. URL-unreserved, the shape the
+    /// real generator produces (hex).
+    const LIVE_TOKEN: &str = "live-session-token-0123456789abcdef";
+
+    fn stamp() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// The host's own LAN address — local, but **not** loopback.
+    ///
+    /// Invariant 4 forbids the proxy forwarding to a loopback target, and the
+    /// live intent test relies on that refusal. A *proxied* round trip therefore
+    /// needs an address that is local without being loopback: the container is
+    /// told only `127.0.0.1:<proxy>`, the proxy dials this address, and the
+    /// listener below is where the request provably arrives.
+    fn non_loopback_ipv4() -> std::net::Ipv4Addr {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("route probe socket");
+        // No packet leaves: a connected UDP socket only fixes the route.
+        probe.connect("1.1.1.1:80").expect("route probe");
+        match probe.local_addr().expect("route probe address").ip() {
+            std::net::IpAddr::V4(v4) if !v4.is_loopback() => v4,
+            other => panic!(
+                "this host has no non-loopback IPv4 (probe address {other}): a proxied round \
+                 trip cannot be proven against a loopback target, because the proxy refuses those \
+                 by design"
+            ),
+        }
+    }
+
+    /// A local origin server that records the request line it was asked for.
+    struct Origin {
+        host: String,
+        port: u16,
+        seen: Arc<Mutex<Vec<String>>>,
+        heads: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Origin {
+        fn start() -> Self {
+            let ip = non_loopback_ipv4();
+            let listener =
+                TcpListener::bind((ip, 0)).expect("bind origin on the host's LAN address");
+            let port = listener.local_addr().expect("origin address").port();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let seen_thread = Arc::clone(&seen);
+            let heads_thread = Arc::clone(&heads);
+            let stop_thread = Arc::clone(&stop);
+            let join = std::thread::spawn(move || {
+                for accepted in listener.incoming() {
+                    if stop_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(stream) = accepted else { continue };
+                    let seen = Arc::clone(&seen_thread);
+                    let heads = Arc::clone(&heads_thread);
+                    std::thread::spawn(move || serve_origin(stream, &seen, &heads));
+                }
+            });
+            Self {
+                host: ip.to_string(),
+                port,
+                seen,
+                heads,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn authority(&self) -> String {
+            format!("{}:{}", self.host, self.port)
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.authority())
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+
+        /// Did the origin receive exactly this origin-form GET?
+        fn saw(&self, path: &str) -> bool {
+            let want = format!("GET {path} HTTP/1.1");
+            self.requests().iter().any(|line| line == &want)
+        }
+
+        /// The full head the origin received for `path`, verbatim — the evidence
+        /// for what the forward path rewrote (target form, `Host`, hop fields).
+        fn head_for(&self, path: &str) -> Option<String> {
+            let want = format!("GET {path} HTTP/1.1");
+            self.heads
+                .lock()
+                .ok()?
+                .iter()
+                .find(|head| head.lines().next().map(str::trim) == Some(want.as_str()))
+                .cloned()
+        }
+    }
+
+    impl Drop for Origin {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect((self.host.as_str(), self.port));
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    /// Answer one request with the nonce and close. Records the request line and
+    /// the whole head verbatim, which is the evidence that the forwarded request
+    /// was rewritten to origin-form with the admitted authority as `Host`.
+    fn serve_origin(mut stream: TcpStream, seen: &Mutex<Vec<String>>, heads: &Mutex<Vec<String>>) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if buf.len() > 16 * 1024 {
+                return;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf).to_string();
+        let line = head.lines().next().unwrap_or("").trim().to_string();
+        if let Ok(mut seen) = seen.lock() {
+            seen.push(line);
+        }
+        if let Ok(mut heads) = heads.lock() {
+            heads.push(head.clone());
+        }
+        let body = NONCE;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// A real session proxy (`127.0.0.1:0`, this process's own listener) plus the
+    /// audit/learned scaffolding it needs.
+    struct LiveProxy {
+        handle: crate::net::proxy::ProxyHandle,
+        sid: String,
+        learned_base: PathBuf,
+    }
+
+    impl LiveProxy {
+        fn start(allow: &[&str]) -> Self {
+            let learned_base = std::env::temp_dir().join(format!(
+                "sandbox-mxc-live-learned-{}-{}",
+                std::process::id(),
+                stamp()
+            ));
+            std::fs::create_dir_all(&learned_base).expect("learned base");
+            let learned = Arc::new(Mutex::new(
+                LearnedStore::load_in(&learned_base, Some("live")).expect("learned store"),
+            ));
+            let intent = Arc::new(IntentRegistry::new(DEFAULT_TTL));
+            // Never called: the origin is allow-listed, so the pipeline answers
+            // from the allow-list. A dialog that reports itself unavailable makes
+            // an accidental prompt a denial rather than a hang.
+            let dialog: DialogFn = Arc::new(|_request| Err(DialogUnavailable));
+            let prompt = crate::net::proxy::PromptGate {
+                enabled: false,
+                config: PromptConfig {
+                    timeout: Duration::from_secs(1),
+                    on_unavailable: PromptPolicy::Deny,
+                },
+                coordinator: Arc::new(PromptCoordinator::with_dialog(dialog)),
+                intent,
+                learned,
+            };
+            let sid = format!("test-mxc-live-{}-{}", std::process::id(), stamp());
+            let writer =
+                Arc::new(crate::audit::AuditWriter::open(&sid, false).expect("audit writer"));
+            let handle = crate::net::proxy::spawn(crate::net::proxy::ProxyConfig {
+                session_id: sid.clone(),
+                token: LIVE_TOKEN.to_string(),
+                allow_domain: allow.iter().map(|s| s.to_string()).collect(),
+                deny_domain: Vec::new(),
+                upstream: None,
+                writer,
+                prompt,
+            })
+            .expect("spawn the session proxy");
+            Self {
+                handle,
+                sid,
+                learned_base,
+            }
+        }
+
+        fn port(&self) -> u16 {
+            self.handle.port
+        }
+
+        fn counters(&self) -> Arc<crate::net::proxy::LaunchCounters> {
+            self.handle.counters()
+        }
+    }
+
+    impl Drop for LiveProxy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(crate::audit::audit_log_path(&self.sid));
+            let _ = std::fs::remove_dir_all(&self.learned_base);
+        }
+    }
+
+    /// A session input built through the **production** policy: workspace-only
+    /// readwrite, `denied_paths` from [`filesystem_policy`], and the launcher's
+    /// directory as a read-only grant — the policy adds it before filtering the
+    /// deny list, so the grant set the request ships is the one the filter saw.
+    fn session_input(
+        scratch: &Path,
+        launcher: &Path,
+        denies: &[String],
+        command: String,
+        proxy_port: Option<u16>,
+    ) -> MxcSessionInput {
+        let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let filesystem = filesystem_policy(
+            scratch,
+            // System32-resident workloads (cmd/curl) need the system directory.
+            &[r"C:\Windows".to_string()],
+            denies,
+            profile.as_deref(),
+            launcher,
+        )
+        .expect("no deny in this session's configuration contains a grant");
+        MxcSessionInput {
+            command,
+            working_directory: Some(scratch.display().to_string()),
+            environment: Vec::new(),
+            filesystem,
+            network: MxcNetworkInput {
+                proxy_port,
+                proxy_token: None,
+            },
+            // An explicit budget: `None` means no deadline at all (D5), which is
+            // wrong for a test that could otherwise hang.
+            timeout_ms: Some(180_000),
+        }
+    }
+
+    fn trace_of(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
     #[test]
     #[ignore = "launches real ProcessContainers; run: cargo test --features mxc-backend -- --ignored"]
     fn intent_endpoint_is_reachable_from_a_container_and_no_proxy_arrives() {
@@ -2286,8 +4035,9 @@ mod live {
             endpoint.port
         );
 
-        let backend =
-            MxcBackend::new(&proof, Some(endpoint.port), &launcher).with_budget(Some(120_000));
+        let backend = MxcBackend::new(&proof, Some(endpoint.port), &launcher)
+            .with_proxy_token(LIVE_TOKEN)
+            .with_budget(Some(120_000));
 
         // ---- 1. the child sees NO_PROXY and the SDK's own proxy variables ----
         let outcome = backend
@@ -2321,9 +4071,14 @@ mod live {
             proxy_lines(&env_dump)
         );
         assert!(
-            proxy_lines(&env_dump).iter().any(|line| line
-                .eq_ignore_ascii_case(&format!("HTTP_PROXY=http://127.0.0.1:{}", endpoint.port))),
-            "the SDK's proxy variable must be present, otherwise NO_PROXY proves nothing: {:?}",
+            proxy_lines(&env_dump)
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case(&format!(
+                    "HTTP_PROXY=http://sandbox:{LIVE_TOKEN}@127.0.0.1:{}",
+                    endpoint.port
+                ))),
+            "the SDK's proxy variable must be present WITH the session token (our proxy \
+             authenticates every consultation), otherwise NO_PROXY proves nothing: {:?}",
             proxy_lines(&env_dump)
         );
 
@@ -2486,6 +4241,440 @@ mod live {
 
         println!(
             "EVIDENCE done: intent endpoint reachable unelevated through the launcher, NO_PROXY delivered"
+        );
+    }
+    /// The four wave-2 legs, unelevated, against the **real** supervisor proxy
+    /// (a real `127.0.0.1:0` listener with its own counters) and a real local
+    /// origin:
+    ///
+    /// 1. a CONNECT session reaches the origin and proves a tunnel;
+    /// 2. a plain-HTTP (absolute-form, **no CONNECT**) session reaches the origin
+    ///    and *also* proves upstream establishment — the counting fix in A;
+    /// 3. a proxy-less session passes `MustBeAbsent` and cannot reach the origin;
+    /// 4. the filesystem policy: the granted workspace is writable, a denied path
+    ///    and an ungranted path are not, and `C:\Windows` stays readable (the
+    ///    recorded additive-grants caveat).
+    #[test]
+    #[ignore = "launches real ProcessContainers and a real proxy; run: cargo test --features mxc-backend -- --ignored"]
+    fn proxied_plain_http_blocked_and_filesystem_legs_are_proven() {
+        let launcher = launcher_under_test();
+        let origin = Origin::start();
+        let proxy = LiveProxy::start(&[origin.host.as_str()]);
+        let counters = proxy.counters();
+        let scratch = Scratch::named("legs");
+        let secret = Scratch::named("legs-secret");
+        let scratch_dir = scratch.path().to_path_buf();
+        let secret_dir = secret.path().to_path_buf();
+
+        std::fs::write(secret_dir.join("secret.txt"), "top-secret").expect("write the secret");
+        let denies = vec![secret_dir.display().to_string()];
+
+        println!(
+            "EVIDENCE elevated={} launcher={} proxy_port={} origin={}",
+            process_is_elevated(),
+            launcher.display(),
+            proxy.port(),
+            origin.authority()
+        );
+        println!(
+            "EVIDENCE launcher_grant={:?} (filesystem_policy inserts it before filtering denies)",
+            launcher_grant(&launcher)
+        );
+        let policy = filesystem_policy(
+            &scratch_dir,
+            &[r"C:\Windows".to_string()],
+            &denies,
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .as_deref(),
+            &launcher,
+        )
+        .expect("no deny in this session's configuration contains a grant");
+        println!("EVIDENCE filesystem_policy={policy:?}");
+        // Asserted, not merely printed: the grant without which the container
+        // cannot execute the launcher, and the four built-in credential denies
+        // (item (f): an operator whose workspace sits inside one of them gets a
+        // refusal naming a path they never configured).
+        let grant = launcher_grant(&launcher).expect("the launcher has a directory");
+        assert!(
+            policy
+                .readonly_paths
+                .iter()
+                .any(|kept| path_key(kept) == path_key(&grant)),
+            "the launcher grant must ship in the policy: {:?}",
+            policy.readonly_paths
+        );
+        match std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            Some(profile) => {
+                for dir in PROFILE_SECRET_DIRS {
+                    let expected = profile.join(dir).display().to_string();
+                    assert!(
+                        policy
+                            .denied_paths
+                            .iter()
+                            .any(|denied| path_key(denied) == path_key(&expected)),
+                        "the built-in {dir} deny must survive the grant filter: {:?}",
+                        policy.denied_paths
+                    );
+                }
+            }
+            None => println!("EVIDENCE credential_denies skipped: no USERPROFILE"),
+        }
+
+        // ---- leg 1: CONNECT through the proxy to the local origin ----------
+        let trace = scratch_dir.join("leg-connect.trace");
+        let command = format!(
+            "{CURL} -sS -f --max-time 25 --proxytunnel --trace-ascii \"{}\" {}",
+            trace.display(),
+            origin.url("/proxied")
+        );
+        let outcome = launch_session(
+            counters.as_ref(),
+            Some(proxy.port()),
+            Some(LIVE_TOKEN),
+            &launcher,
+            &session_input(
+                &scratch_dir,
+                &launcher,
+                &denies,
+                command,
+                Some(proxy.port()),
+            ),
+        )
+        .expect("the CONNECT leg must pass guardrail 1");
+        println!(
+            "EVIDENCE connect_leg exit={:?} success={} proof={:?} expectation={:?} tier={:?} \
+             stdout={:?} stderr={:?}",
+            outcome.exit_code,
+            outcome.success(),
+            outcome.proxy_proof,
+            outcome.expectation,
+            outcome.tier.tier,
+            stdout_of(&outcome).trim(),
+            stderr_of(&outcome).trim()
+        );
+        assert_eq!(outcome.exit_code, Some(0), "curl failed: {outcome:?}");
+        assert!(
+            stdout_of(&outcome).contains(NONCE),
+            "the body must come from the origin: {:?}",
+            stdout_of(&outcome)
+        );
+        assert!(
+            origin.saw("/proxied"),
+            "the origin must have served the tunnelled request: {:?}",
+            origin.requests()
+        );
+        assert!(
+            outcome.proxy_proof.accepted >= 1,
+            "the proxy must have been consulted: {:?}",
+            outcome.proxy_proof
+        );
+        assert!(
+            outcome.proxy_proof.tunnels >= 1,
+            "a live CONNECT must establish an upstream tunnel: {:?}",
+            outcome.proxy_proof
+        );
+        assert_eq!(outcome.expectation, ProofExpectation::Required);
+        assert!(outcome.success(), "a proven launch must report success");
+        let connect_trace = trace_of(&trace);
+        assert!(
+            connect_trace.contains(&format!("CONNECT {}", origin.authority())),
+            "the child's own bytes must show a CONNECT to the proxy: {connect_trace:?}"
+        );
+        println!(
+            "EVIDENCE connect_leg_child_bytes={:?}",
+            connect_trace
+                .lines()
+                .find(|line| line.contains("CONNECT "))
+                .unwrap_or("")
+                .trim()
+        );
+
+        // ---- leg 2: plain HTTP, absolute-form, NO CONNECT -------------------
+        let trace = scratch_dir.join("leg-plain.trace");
+        let command = format!(
+            "{CURL} -sS -f --max-time 25 --trace-ascii \"{}\" {}",
+            trace.display(),
+            origin.url("/plain")
+        );
+        let outcome = launch_session(
+            counters.as_ref(),
+            Some(proxy.port()),
+            Some(LIVE_TOKEN),
+            &launcher,
+            &session_input(
+                &scratch_dir,
+                &launcher,
+                &denies,
+                command,
+                Some(proxy.port()),
+            ),
+        )
+        .expect("the plain-HTTP leg must pass guardrail 1");
+        println!(
+            "EVIDENCE plain_http_leg exit={:?} success={} proof={:?} expectation={:?} \
+             stdout={:?} stderr={:?}",
+            outcome.exit_code,
+            outcome.success(),
+            outcome.proxy_proof,
+            outcome.expectation,
+            stdout_of(&outcome).trim(),
+            stderr_of(&outcome).trim()
+        );
+        assert_eq!(outcome.exit_code, Some(0), "curl failed: {outcome:?}");
+        assert!(stdout_of(&outcome).contains(NONCE));
+        assert!(
+            origin.saw("/plain"),
+            "the origin must have served the forwarded request: {:?}",
+            origin.requests()
+        );
+        // Origin-side evidence for the rewrite: what the *origin* saw, not what
+        // the client sent. The Host must be the admitted authority and our proxy
+        // credential must be absent.
+        let plain_head = origin
+            .head_for("/plain")
+            .expect("the origin must record the head it was sent");
+        println!("EVIDENCE plain_http_leg_origin_head={plain_head:?}");
+        let want_host = format!("Host: {}", origin.authority());
+        assert!(
+            plain_head
+                .lines()
+                .any(|line| line.trim_end() == want_host.as_str()),
+            "the origin must see the admitted authority as Host: {plain_head:?}"
+        );
+        assert!(
+            !plain_head
+                .to_ascii_lowercase()
+                .contains("proxy-authorization"),
+            "our proxy credential must never reach an origin: {plain_head:?}"
+        );
+        assert!(
+            outcome.proxy_proof.accepted >= 1,
+            "a plain-HTTP forward is a proxy consultation: {:?}",
+            outcome.proxy_proof
+        );
+        assert!(
+            outcome.proxy_proof.tunnels >= 1,
+            "`tunnels` means 'upstream established': a completed plain-HTTP forward must satisfy \
+             it, otherwise Required fails a working session: {:?}",
+            outcome.proxy_proof
+        );
+        assert!(outcome.success());
+        let plain_trace = trace_of(&trace);
+        assert!(
+            plain_trace.contains(&format!("GET {}", origin.url("/plain"))),
+            "the child must have sent an ABSOLUTE-form request to the proxy: {plain_trace:?}"
+        );
+        println!(
+            "EVIDENCE plain_http_leg_child_bytes={:?} contains_connect={}",
+            plain_trace
+                .lines()
+                .find(|line| line.contains("GET "))
+                .unwrap_or("")
+                .trim(),
+            plain_trace.contains("CONNECT ")
+        );
+        assert!(
+            !plain_trace.contains("CONNECT "),
+            "this leg must not involve CONNECT at all: {plain_trace:?}"
+        );
+
+        // ---- leg 3: blocked session (no proxy) -----------------------------
+        let command = format!(
+            "{CURL} -sS -f --max-time 8 --connect-timeout 5 {}",
+            origin.url("/blocked")
+        );
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            &session_input(&scratch_dir, &launcher, &denies, command, None),
+        )
+        .expect("a blocked session that stayed offline passes MustBeAbsent");
+        println!(
+            "EVIDENCE blocked_leg exit={:?} proof={:?} expectation={:?} stderr={:?}",
+            outcome.exit_code,
+            outcome.proxy_proof,
+            outcome.expectation,
+            stderr_of(&outcome).trim()
+        );
+        assert_eq!(outcome.expectation, ProofExpectation::MustBeAbsent);
+        assert_eq!(
+            outcome.proxy_proof,
+            ProxyProof::default(),
+            "a blocked session must never consult the proxy"
+        );
+        assert_ne!(
+            outcome.exit_code,
+            Some(0),
+            "without a proxy the workload cannot reach the origin: {outcome:?}"
+        );
+        assert!(
+            !origin.saw("/blocked"),
+            "the blocked workload reached the origin: {:?}",
+            origin.requests()
+        );
+        assert!(
+            !outcome.success(),
+            "the guardrail leg passed, but a workload that failed is not a successful session"
+        );
+
+        // ---- leg 4: filesystem policy --------------------------------------
+        // (a) the granted workspace is writable and readable.
+        let probe = scratch_dir.join("probe.txt");
+        let command = format!(
+            "cmd /c echo granted>\"{}\" & type \"{}\"",
+            probe.display(),
+            probe.display()
+        );
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            &session_input(&scratch_dir, &launcher, &denies, command, None),
+        )
+        .expect("the workspace write leg must launch");
+        println!(
+            "EVIDENCE fs_granted exit={:?} stdout={:?} stderr={:?}",
+            outcome.exit_code,
+            stdout_of(&outcome).trim(),
+            stderr_of(&outcome).trim()
+        );
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "the granted workspace must be writable: {outcome:?}"
+        );
+        assert!(stdout_of(&outcome).to_ascii_lowercase().contains("granted"));
+        assert_eq!(
+            std::fs::read_to_string(&probe).unwrap_or_default().trim(),
+            "granted",
+            "the write must have landed in the granted directory"
+        );
+
+        // (b) a denied path is not readable.
+        let secret_file = secret_dir.join("secret.txt");
+        let command = format!("cmd /c type \"{}\"", secret_file.display());
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            &session_input(&scratch_dir, &launcher, &denies, command, None),
+        )
+        .expect("the denied-read leg must launch");
+        println!(
+            "EVIDENCE fs_denied_read exit={:?} stdout={:?} stderr={:?}",
+            outcome.exit_code,
+            stdout_of(&outcome).trim(),
+            stderr_of(&outcome).trim()
+        );
+        assert!(
+            secret_file.is_file(),
+            "the file must exist outside the container, or 'unreadable' proves nothing"
+        );
+        assert_ne!(
+            outcome.exit_code,
+            Some(0),
+            "a denied path must not be readable: {outcome:?}"
+        );
+        assert!(
+            !stdout_of(&outcome).contains("top-secret"),
+            "the secret's content must never reach the child: {:?}",
+            stdout_of(&outcome)
+        );
+
+        // (c) a denied path is not writable.
+        let planted = secret_dir.join("planted.txt");
+        let command = format!("cmd /c echo leaked>\"{}\"", planted.display());
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            &session_input(&scratch_dir, &launcher, &denies, command, None),
+        )
+        .expect("the denied-write leg must launch");
+        println!(
+            "EVIDENCE fs_denied_write exit={:?} stderr={:?}",
+            outcome.exit_code,
+            stderr_of(&outcome).trim()
+        );
+        assert_ne!(
+            outcome.exit_code,
+            Some(0),
+            "a denied path must not be writable: {outcome:?}"
+        );
+        assert!(
+            !planted.exists(),
+            "the child wrote into a denied path: {}",
+            planted.display()
+        );
+
+        // (d) an ungranted path (outside the workspace, not on the deny list) is
+        //     not writable either: containment is grants, not only denies.
+        let outside = std::env::temp_dir().join(format!("mxc-outside-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let command = format!("cmd /c echo escaped>\"{}\"", outside.display());
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            &session_input(&scratch_dir, &launcher, &denies, command, None),
+        )
+        .expect("the ungranted-write leg must launch");
+        println!(
+            "EVIDENCE fs_ungranted_write exit={:?} stderr={:?}",
+            outcome.exit_code,
+            stderr_of(&outcome).trim()
+        );
+        assert_ne!(
+            outcome.exit_code,
+            Some(0),
+            "an ungranted path must not be writable: {outcome:?}"
+        );
+        assert!(
+            !outside.exists(),
+            "the child escaped the workspace: {}",
+            outside.display()
+        );
+
+        // (e) the recorded caveat: system directories stay readable, because the
+        //     policy is additive grants (ADR-0004). Asserted as the caveat it is,
+        //     so nobody "fixes" it by denying C:\Windows.
+        let win_ini = Path::new(r"C:\Windows\win.ini");
+        if win_ini.is_file() {
+            let command = format!("cmd /c type \"{}\"", win_ini.display());
+            let outcome = launch_session(
+                counters.as_ref(),
+                None,
+                None,
+                &launcher,
+                &session_input(&scratch_dir, &launcher, &denies, command, None),
+            )
+            .expect("the system-dir caveat leg must launch");
+            let first = stdout_of(&outcome).chars().take(48).collect::<String>();
+            println!(
+                "EVIDENCE caveat_system_dir_readable exit={:?} first_48={first:?}",
+                outcome.exit_code
+            );
+            assert_eq!(
+                outcome.exit_code,
+                Some(0),
+                "RECORDED CAVEAT: MXC filesystem policy is additive grants, so C:\\Windows stays \
+                 readable inside the container (ADR-0004); this leg records that, it does not \
+                 claim otherwise"
+            );
+        } else {
+            println!("EVIDENCE caveat_system_dir_readable skipped: no C:\\Windows\\win.ini");
+        }
+
+        println!(
+            "EVIDENCE done: proxied CONNECT, plain-HTTP forward, blocked and filesystem legs all \
+             proven unelevated against the supervisor's own listener"
         );
     }
 }

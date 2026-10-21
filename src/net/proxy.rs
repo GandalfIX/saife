@@ -24,6 +24,7 @@
 //! Likewise `hyper`, `hyper-util`, `http`, `http-body-util`, and `bytes`
 //! are present as deps for that future work and are NOT imported here.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -33,7 +34,7 @@ use std::sync::Mutex as StdMutex;
 use anyhow::{Context, Result};
 use base64::Engine;
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
@@ -117,6 +118,9 @@ struct ConnCtx {
     writer: Arc<AuditWriter>,
     upstream: Option<Arc<UpstreamDialer>>,
     prompt: PromptGate,
+    /// Per-launch attribution counters (ADR-0004 guardrail 1). Shared with the
+    /// handle, so the launch path reads exactly what this listener counted.
+    counters: Arc<LaunchCounters>,
 }
 
 /// Emit a CONNECT audit leaf directly through the threaded `AuditWriter`
@@ -151,14 +155,168 @@ fn emit_connect(
     Ok(())
 }
 
+/// What one launch epoch's traffic looked like from the proxy's side.
+///
+/// `consultations` counts connections the proxy handled **as a proxy**:
+/// an authenticated `CONNECT`, or an authenticated absolute-form request that
+/// named another origin. `upstream_established` counts those whose own dial to
+/// the origin succeeded — a `200 Connection Established` after the dial, or a
+/// plain-HTTP forward whose upstream connection came up. Serving an
+/// origin-form request for one of our own endpoints is **not** a consultation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchProofCounters {
+    pub consultations: u64,
+    pub upstream_established: u64,
+}
+
+/// Closed epochs kept for after-the-fact reading. One proxy serves one launch
+/// until P1.4 (per-run token), so this only bounds a long-lived supervisor that
+/// re-uses a listener; the epoch being opened is never the one evicted.
+const MAX_REMEMBERED_EPOCHS: usize = 32;
+
+#[derive(Debug, Default)]
+struct CounterState {
+    next_epoch: u64,
+    /// The epoch traffic is attributed to. `None` outside a launch: traffic
+    /// then counts nowhere rather than against a stale launch.
+    active: Option<u64>,
+    epochs: HashMap<u64, LaunchProofCounters>,
+}
+
+/// Per-launch attribution counters for this listener (ADR-0004 guardrail 1).
+///
+/// The proxy's handler tasks write; the launch path opens an epoch before the
+/// child starts, reads the counters for that epoch, and closes it. Attribution
+/// is by *the epoch active when the connection was classified as a proxy
+/// consultation*, which is exact while one proxy serves one launch (invariant
+/// 6) and is the assumption P1.4's per-run token removes.
+///
+/// `Send + Sync` and **poison-tolerant**: a handler that panicked while holding
+/// the lock must not make the launch path panic (a poisoned `Mutex` would turn
+/// one broken connection into a process-wide abort of the proof gate).
+#[derive(Debug, Default)]
+pub struct LaunchCounters {
+    state: StdMutex<CounterState>,
+}
+
+// With `mxc-backend` off nothing reads the epochs (no launch path is wired), so
+// the epoch accessors are only reachable from tests. Scoping the allow to that
+// state keeps genuine rot visible in the feature-on build.
+#[cfg_attr(not(any(test, feature = "mxc-backend")), allow(dead_code))]
+impl LaunchCounters {
+    /// A fresh registry, ready for its first epoch.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The lock, recovered from poisoning instead of panicking.
+    fn lock(&self) -> std::sync::MutexGuard<'_, CounterState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Open an epoch and make it the attribution target.
+    ///
+    /// Any epoch still open is left open on purpose: closing it here would
+    /// silently merge two launches' traffic. The launch path owns closing.
+    pub fn begin_epoch(&self) -> u64 {
+        let mut state = self.lock();
+        state.next_epoch += 1;
+        let epoch = state.next_epoch;
+        state.epochs.insert(epoch, LaunchProofCounters::default());
+        state.active = Some(epoch);
+        state.prune();
+        epoch
+    }
+
+    /// Close `epoch`'s window. Traffic arriving afterwards is attributed
+    /// nowhere. Returns whether `epoch` was the active one.
+    pub fn close_epoch(&self, epoch: u64) -> bool {
+        let mut state = self.lock();
+        let was_active = state.active == Some(epoch);
+        if was_active {
+            state.active = None;
+        }
+        was_active
+    }
+
+    /// The counters recorded for `epoch`, if the epoch was ever opened.
+    pub fn counters(&self, epoch: u64) -> Option<LaunchProofCounters> {
+        self.lock().epochs.get(&epoch).copied()
+    }
+
+    /// Count one proxy consultation (a CONNECT or an absolute-form request that
+    /// reached this listener as a proxy).
+    pub fn note_consultation(&self) {
+        self.bump(|counters| counters.consultations += 1);
+    }
+
+    /// Count one consultation whose **own upstream connection came up**. For
+    /// CONNECT this is the dial behind `200 Connection Established`; for a
+    /// plain-HTTP forward it is the forward's upstream dial. Never inferred
+    /// from a status code.
+    pub fn note_upstream_established(&self) {
+        self.bump(|counters| counters.upstream_established += 1);
+    }
+
+    fn bump(&self, f: impl FnOnce(&mut LaunchProofCounters)) {
+        let mut state = self.lock();
+        if let Some(epoch) = state.active
+            && let Some(counters) = state.epochs.get_mut(&epoch)
+        {
+            f(counters);
+        }
+    }
+}
+
+impl CounterState {
+    /// Keep the map bounded. The highest epoch (the one just opened) is never
+    /// evicted, so a caller that opens and then reads its own epoch always sees
+    /// its counters.
+    fn prune(&mut self) {
+        while self.epochs.len() > MAX_REMEMBERED_EPOCHS {
+            let Some(oldest) = self
+                .epochs
+                .keys()
+                .copied()
+                .filter(|e| Some(*e) != self.active)
+                .min()
+            else {
+                return;
+            };
+            self.epochs.remove(&oldest);
+        }
+    }
+}
+
 pub struct ProxyHandle {
     pub port: u16,
+    /// This listener's per-launch attribution counters. The MXC launch path
+    /// takes its proxy proof from exactly this instance (`mxc-backend`).
+    ///
+    /// Nothing reads it in a non-test build yet: the supervisor still refuses
+    /// `--backend mxc` (`MXC_SESSION_WIRED = false`), so the first real caller is
+    /// the P2 session wiring. The allow is scoped to non-test builds so rot in
+    /// the live tests still surfaces.
+    #[cfg_attr(not(test), allow(dead_code))]
+    counters: Arc<LaunchCounters>,
     cancel: CancellationToken,
     rt: Option<Runtime>,
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProxyHandle {
+    /// The proof source for this listener (ADR-0004 guardrail 1), for
+    /// [`mxc::launch_session`](crate::net::mxc::launch_session).
+    ///
+    /// Non-test builds have no caller until the P2 session wiring lands; see the
+    /// field's note.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn counters(&self) -> Arc<LaunchCounters> {
+        Arc::clone(&self.counters)
+    }
+
     /// Synchronously cancel the accept loop. The runtime is shut down
     /// cleanly in `Drop` (which calls `Runtime::shutdown_background` so
     /// the accept-loop task is reaped and the listening socket is
@@ -212,6 +370,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         upstream,
         prompt,
     } = cfg;
+    let counters = LaunchCounters::new();
     let ctx = Arc::new(ConnCtx {
         token,
         deny: deny_domain,
@@ -219,6 +378,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         writer,
         upstream,
         prompt,
+        counters: Arc::clone(&counters),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -271,6 +431,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
 
     Ok(ProxyHandle {
         port,
+        counters,
         cancel,
         rt: Some(rt),
         join: Some(join),
@@ -1125,6 +1286,14 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
         return Ok(());
     }
 
+    // This connection reached us *as a proxy* and is attributable to the
+    // launch: count it before the decision, so a denial (403) or a failed
+    // upstream dial (502) still shows up as `consultations=1,
+    // upstream_established=0` — the shape the spike proved must fail
+    // guardrail 1 (ADR-0004). A 407 or a malformed target above is not counted:
+    // neither is proof that this launch's proxy path works.
+    ctx.counters.note_consultation();
+
     // (2)-(7) The decision pipeline.
     let decision = decide(&ctx, &host, port).await;
     if !decision.allowed {
@@ -1170,6 +1339,9 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             return Ok(());
         }
     };
+    // The upstream dial succeeded and the 200 is about to go out: this is the
+    // "upstream established" the guardrail means (not the status code).
+    ctx.counters.note_upstream_established();
     let _ = sock
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await;
@@ -1364,11 +1536,914 @@ async fn intent_lookup(sock: &mut TcpStream, ctx: &ConnCtx, query: &str) -> Resu
     Ok(())
 }
 
-/// Route an authenticated non-CONNECT request through the /sandbox/*
-/// control plane (D-4). The listener never forwards plain HTTP: a
-/// forwarded request would bypass the admission pipeline entirely, so
-/// absolute- or origin-form requests outside /sandbox/ get a 400
-/// ([G-7, G-38]).
+/// One absolute-form `http://` target, split into what the dial needs and what
+/// the upstream origin must see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardTarget {
+    /// Bare host, no brackets and no port — what the admission pipeline decides
+    /// on.
+    host: String,
+    port: u16,
+    /// Path + optional query, as the upstream origin sees it.
+    origin_form: String,
+}
+
+/// What an absolute-form request target means to this listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AbsoluteTarget {
+    /// Plain HTTP for another origin: forwardable after admission.
+    Forward(ForwardTarget),
+    /// `https://` in absolute form. Only a CONNECT can carry TLS, and forwarding
+    /// this as cleartext would send a request the client believed was encrypted.
+    HttpsNeedsConnect,
+    Malformed,
+}
+
+/// `s` without `prefix`, matched ASCII-case-insensitively, or `None` when `s`
+/// does not start with it.
+///
+/// Byte-offset slicing a `&str` panics whenever the cut lands inside a
+/// multi-byte character, and this target is chosen by the sandboxed child, so
+/// the prefix compare must be UTF-8-safe: `get(..)` yields `None` at a
+/// non-boundary index instead of panicking.
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    s.get(prefix.len()..)
+}
+
+/// Parse an absolute-form request target (`http://host[:port]/path?q`).
+fn parse_absolute_target(target: &str) -> AbsoluteTarget {
+    const HTTP: &str = "http://";
+    const HTTPS: &str = "https://";
+    if strip_prefix_ignore_ascii_case(target, HTTPS).is_some() {
+        return AbsoluteTarget::HttpsNeedsConnect;
+    }
+    let Some(rest) = strip_prefix_ignore_ascii_case(target, HTTP) else {
+        return AbsoluteTarget::Malformed;
+    };
+    // The authority ends at the first `/` or `?`; the remainder is the
+    // origin-form target the upstream origin expects.
+    let (authority, tail) = match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // Client-supplied userinfo is dropped, never forwarded: it is a credential
+    // this listener never authorized and the origin never asked it for.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let Some((host, port)) = split_authority(authority) else {
+        return AbsoluteTarget::Malformed;
+    };
+    let origin_form = match tail {
+        "" => "/".to_string(),
+        t if t.starts_with('/') => t.to_string(),
+        t => format!("/{t}"),
+    };
+    AbsoluteTarget::Forward(ForwardTarget {
+        host,
+        port,
+        origin_form,
+    })
+}
+
+/// `host[:port]` (bracketed IPv6 allowed, default port 80) split into its parts.
+///
+/// `None` for anything that is not a well-formed authority, including an
+/// unbracketed IPv6 literal: RFC 3986 requires the brackets, and accepting the
+/// bare form would let `::1` reach the pipeline as a host named `:` — the
+/// loopback refusal would miss it.
+fn split_authority(authority: &str) -> Option<(String, u16)> {
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().ok()?,
+            None if after.is_empty() => 80,
+            None => return None,
+        };
+        (inside.to_string(), port)
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()?),
+            None => (authority, 80),
+        };
+        // An unbracketed IPv6 literal is not a valid authority: RFC 3986 requires
+        // the brackets, and accepting the bare form would hand the pipeline a
+        // host named `:` — the loopback refusal would miss `::1` entirely.
+        if host.contains(':') {
+            return None;
+        }
+        (host.to_string(), port)
+    };
+    if host.trim().is_empty() || port == 0 {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// Headers that describe the client's connection to *us*, plus our own proxy
+/// credential. None of them may reach the upstream origin.
+///
+/// `transfer-encoding` and `trailer` are hop-by-hop by definition (RFC 9110
+/// 7.6.1), and `te` names the transfer codings the client would accept from
+/// *us*. A forwarded request has exactly one framing signal — a
+/// `Content-Length` — so all three are dropped; a `Transfer-Encoding` in the
+/// head is refused with a 400 before any rewrite (see [`BodyReject`]).
+/// `proxy-authenticate` is a *response* field that no client should send, and
+/// passing it on would invite the origin to answer `407` — which this listener
+/// rewrites to `502` for the same reason: a proxy challenge must never reach a
+/// client that would replay our credential to an origin.
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "proxy-connection",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "keep-alive",
+    "upgrade",
+    "transfer-encoding",
+    "te",
+    "trailer",
+];
+
+/// The `Host` value the upstream origin must see: the **validated** authority
+/// from the request line, normalised the way RFC 9110 7.2 wants it — IPv6
+/// literals bracketed, the default port omitted, any other port included.
+///
+/// The client's own `Host` is never trusted, or even read. Admission decides on
+/// the authority in the request-target, so copying the received `Host` would let
+/// `GET http://allowlisted/ HTTP/1.1` plus `Host: victim.internal` be audited as
+/// allowlisted while the origin is told to serve `victim.internal`: the audit
+/// would name a host the request never went to.
+fn upstream_host_value(fwd: &ForwardTarget) -> String {
+    match (fwd.host.contains(':'), fwd.port) {
+        (true, 80) => format!("[{}]", fwd.host),
+        (true, port) => format!("[{}]:{port}", fwd.host),
+        (false, 80) => fwd.host.clone(),
+        (false, port) => format!("{}:{port}", fwd.host),
+    }
+}
+
+/// The field names the client's own `Connection:` list marks as
+/// connection-scoped (RFC 9110 7.6.1). Whatever it names must not be forwarded:
+/// otherwise a client could keep, say, `Upgrade` alive across the hop just by
+/// listing it, which is precisely what the fixed hop-by-hop list prevents.
+fn connection_listed_fields(head: &str) -> Vec<String> {
+    head.split("\r\n")
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("connection")
+                .then(|| value.to_ascii_lowercase())
+        })
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(|token| token.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// The `Connection:`-listed names that also decide framing — the fields whose
+/// loss changes what the bytes on the wire mean.
+///
+/// [`rewrite_head_for_upstream`] drops whatever the client's `Connection:` list
+/// names, which is right for `X-Secret-Hop` and catastrophic for
+/// `Content-Length`: the relay still writes that many body bytes, so the origin
+/// reads them as a second, unadmitted request — with a `Host` the client chose,
+/// because the first request's framing vanished. A request that names any of
+/// these is therefore refused before admission (see
+/// [`connection_listed_framing_field`]); none of them is ever stripped.
+const FRAMING_FIELDS: [&str; 4] = ["content-length", "transfer-encoding", "host", "connection"];
+
+/// The first framing-critical name the client's `Connection:` list names, if
+/// any. Such a head is a 400 before admission: it asks this listener to strip
+/// the field that frames the body it is about to relay.
+fn connection_listed_framing_field(head: &str) -> Option<&'static str> {
+    let listed = connection_listed_fields(head);
+    FRAMING_FIELDS
+        .iter()
+        .copied()
+        .find(|field| listed.iter().any(|token| token == field))
+}
+
+/// Why a header line is not RFC 9110 field syntax, or `None` when it is.
+///
+/// `field-name = token` (RFC 9110 5.1) and a token contains no whitespace. The
+/// rest of this module trims names before comparing them, so
+/// `Content-Length : 5` reads as a framing signal to us and forwards *verbatim* —
+/// leaving the origin to decide whether `Content-Length ` (with the space) is the
+/// framing field it knows. One head must mean one thing on both ends of the hop,
+/// so a name carrying whitespace is refused rather than re-interpreted. An empty
+/// name (`: v`) and a header line with no colon at all are refused for the same
+/// reason: neither is a field the origin is guaranteed to read the way we did.
+fn head_field_syntax_error(head: &str) -> Option<&'static str> {
+    for line in head.split("\r\n").skip(1).filter(|line| !line.is_empty()) {
+        let Some((name, _)) = line.split_once(':') else {
+            return Some("header line without a field name");
+        };
+        if name.is_empty() {
+            return Some("empty field name in the request head");
+        }
+        if name.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Some("whitespace in a field name");
+        }
+    }
+    None
+}
+
+/// Whether the request carries an `Expect` field, whatever its value.
+///
+/// `Expect: 100-continue` asks the *receiver* to send `100 Continue` before the
+/// body; this listener never sends an interim response and reads exactly one
+/// head, so forwarding it would leave the client waiting for a go-ahead that
+/// never comes while the origin waits for a body the client is withholding — a
+/// deadlock only curl's timer papers over. The behaviour chosen here is the
+/// strict one: **refuse the request before admission** (400 +
+/// `X-Sandbox: expect-unsupported`) rather than strip the field and answer
+/// `100 Continue` ourselves. That needs no new state on the relay and cannot
+/// admit a body the origin is not expecting.
+///
+/// Measured cost (curl 8.21): the field is sent automatically only for bodies
+/// above 1 MiB, so ordinary uploads forward untouched, and a larger one fails
+/// immediately and visibly (400 + `X-Sandbox: expect-unsupported`) instead of
+/// hanging. A client that needs a multi-megabyte plain-HTTP upload can send the
+/// field empty (curl: `-H 'Expect:'`) and the request forwards whole; if that
+/// ever becomes a real workload, answering `100 Continue` here and dropping the
+/// field is the cheap upgrade.
+fn has_expect_field(head: &str) -> bool {
+    head.split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, _)| name.eq_ignore_ascii_case("expect"))
+}
+
+/// Rewrite a proxy-form request head into an origin-form one for the upstream:
+/// the request line carries `origin_form`, the `Host` is rebuilt from the
+/// admitted authority (`host_value`), and every connection-scoped field — the
+/// fixed list above, whatever the client's `Connection:` names, the received
+/// `Host`, and our own `Proxy-Authorization` — is dropped. `Connection: close`
+/// is forced so the upstream ends the exchange (this listener relays bytes and
+/// does no keep-alive bookkeeping of its own).
+///
+/// Two names are never droppable by the client's list: `content-length` and
+/// `transfer-encoding` (see [`FRAMING_FIELDS`]). `handle_forward` refuses a head
+/// whose `Connection:` names one of them before admission, and the list is
+/// filtered here as well so the framing signal cannot be lost even if a caller
+/// ever skips that check.
+///
+/// The head is split on CRLF only, and that is the single framing rule: a head
+/// containing a bare LF or CR never reaches here ([`head_framing_error`] answers
+/// it with a 400), so this splitter and the LF-aware `str::lines` used by the
+/// auth gate and the request-line parse cannot disagree about where a field
+/// ends.
+fn rewrite_head_for_upstream(head: &str, origin_form: &str, host_value: &str) -> String {
+    let mut lines = head.split("\r\n").filter(|line| !line.is_empty());
+    let mut request = lines.next().unwrap_or("").split_whitespace();
+    let method = request.next().unwrap_or("GET");
+    let _target = request.next();
+    let version = request.next().unwrap_or("HTTP/1.1");
+    debug_assert!(
+        connection_listed_framing_field(head).is_none(),
+        "a Connection-listed framing field must be refused before the rewrite"
+    );
+    let listed: Vec<String> = connection_listed_fields(head)
+        .into_iter()
+        .filter(|token| !FRAMING_FIELDS.contains(&token.as_str()))
+        .collect();
+
+    let mut out = String::with_capacity(head.len() + origin_form.len() + host_value.len());
+    out.push_str(method);
+    out.push(' ');
+    out.push_str(origin_form);
+    out.push(' ');
+    out.push_str(version);
+    out.push_str("\r\nHost: ");
+    out.push_str(host_value);
+    out.push_str("\r\n");
+    for line in lines {
+        let name = line
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        // `host` goes with the rest: the authority in the request line is the
+        // admitted one, and it is the only Host the origin may see.
+        let drop = name.is_empty()
+            || name == "host"
+            || HOP_BY_HOP_HEADERS.iter().any(|hop| *hop == name)
+            || listed.contains(&name);
+        if drop {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    out
+}
+
+/// Why this head cannot be framed for forwarding, or `None` when it can.
+///
+/// One rule for the whole head. The rewriter splits on CRLF — what the wire
+/// says — while the auth gate and the request-line parse use `str::lines`, which
+/// also splits on a bare LF. A head containing either therefore has two
+/// different sets of field boundaries depending on who reads it: `X: y` + bare
+/// LF + `Connection: upgrade` is *one* field to the rewriter (name `X`, so it
+/// survives the hop-by-hop filter) and *three* to the gate. Strict HTTP/1.1
+/// forbids a bare LF or CR as a line terminator, so such a head is refused with
+/// a 400 rather than re-interpreted. An obs-fold continuation line is refused
+/// for the same reason: it is a second way to hide a field inside another one.
+fn head_framing_error(head: &str) -> Option<&'static str> {
+    if !head.ends_with("\r\n\r\n") {
+        return Some("request head is not CRLF-terminated");
+    }
+    let bytes = head.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => i += 2,
+            b'\r' => return Some("bare CR in the request head"),
+            b'\n' => return Some("bare LF in the request head"),
+            _ => i += 1,
+        }
+    }
+    head.split("\r\n")
+        .skip(1)
+        .find(|line| line.starts_with(' ') || line.starts_with('\t'))
+        .map(|_| "obs-fold line in the request head")
+}
+
+/// How many body bytes follow the head: exactly one framing signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardBody {
+    /// No body. A body can only be declared by `Content-Length` here.
+    None,
+    /// Exactly this many bytes, after which the request is over.
+    Length(usize),
+}
+
+/// Why a head cannot be framed as exactly one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyReject {
+    /// `Transfer-Encoding` is present. Re-framing chunked into a
+    /// `Content-Length` is not something a byte relay can do safely, and
+    /// passing it through would let the client pick the origin's framing — the
+    /// classic request-smuggling primitive. Refused, whatever it names.
+    TransferEncoding,
+    /// A `Content-Length` value that is not a plain decimal number.
+    BadContentLength,
+    /// Repeated `Content-Length` values that disagree.
+    ConflictingContentLength,
+}
+
+impl BodyReject {
+    fn reason(self) -> &'static str {
+        match self {
+            BodyReject::TransferEncoding => "Transfer-Encoding is not accepted on this path",
+            BodyReject::BadContentLength => "Content-Length is not a decimal number",
+            BodyReject::ConflictingContentLength => "conflicting Content-Length values",
+        }
+    }
+}
+
+/// Exactly one request per connection, part 1: the body length comes from at
+/// most one framing signal.
+///
+/// Repeated `Content-Length` fields are accepted only when every value is the
+/// same number (RFC 9110 8.6 allows exactly that, and refusing it would break
+/// clients that re-emit the field); any disagreement is a 400, because the
+/// receiver must not pick a favourite between two different body lengths.
+fn forward_body_framing(head: &str) -> Result<ForwardBody, BodyReject> {
+    let mut lengths: Vec<usize> = Vec::new();
+    for line in head.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(BodyReject::TransferEncoding);
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            for field in value.split(',') {
+                let field = field.trim();
+                // Only `[0-9]+` frames the body. Rust's `usize` parser also
+                // accepts a leading `+` (and the field is forwarded verbatim),
+                // so `Content-Length: +5` would be five bytes to us and a
+                // rejected or absent field to the origin -- the same
+                // two-readings-of-one-head gap the whitespace rule closes.
+                if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(BodyReject::BadContentLength);
+                }
+                let Ok(len) = field.parse::<usize>() else {
+                    return Err(BodyReject::BadContentLength);
+                };
+                lengths.push(len);
+            }
+        }
+    }
+    match lengths.split_first() {
+        None => Ok(ForwardBody::None),
+        Some((first, rest)) if rest.iter().all(|len| len == first) => {
+            Ok(ForwardBody::Length(*first))
+        }
+        Some(_) => Err(BodyReject::ConflictingContentLength),
+    }
+}
+
+/// Why the framed body could not be forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyRelayError {
+    /// The client sent bytes past the framed body: a second request, which this
+    /// listener never admitted and never audits. Refused, never relayed.
+    Trailing,
+    /// The client read or the upstream write failed.
+    Io,
+}
+
+/// Exactly one request per connection, part 2: forward exactly `want` body
+/// bytes from (`leftover`, `client`) to `upstream`, and not one byte more.
+///
+/// Nothing past the framed body is ever written upstream, whatever the client
+/// appends — that is the difference between a relay and a second, unadmitted
+/// request.
+async fn relay_framed_body<R, W>(
+    client: &mut R,
+    upstream: &mut W,
+    leftover: &[u8],
+    want: usize,
+) -> Result<(), BodyRelayError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    const CHUNK: usize = 8192;
+    if leftover.len() > want {
+        return Err(BodyRelayError::Trailing);
+    }
+    if !leftover.is_empty() {
+        upstream
+            .write_all(leftover)
+            .await
+            .map_err(|_| BodyRelayError::Io)?;
+    }
+    let mut remaining = want - leftover.len();
+    let mut buf = [0u8; CHUNK];
+    while remaining > 0 {
+        let take = remaining.min(CHUNK);
+        let read = client
+            .read(&mut buf[..take])
+            .await
+            .map_err(|_| BodyRelayError::Io)?;
+        if read == 0 {
+            // The client closed mid-body: the origin must not be left waiting
+            // for bytes that will never arrive.
+            return Err(BodyRelayError::Io);
+        }
+        upstream
+            .write_all(&buf[..read])
+            .await
+            .map_err(|_| BodyRelayError::Io)?;
+        remaining -= read;
+    }
+    Ok(())
+}
+
+/// What the upstream's **first** head says, judged strictly.
+///
+/// Only a final `HTTP/1.x` response is ever relayed. Everything else is named
+/// and withheld, because this listener reads exactly one head: an interim
+/// (`1xx`) head is a promise of a later answer it cannot keep, and a head it
+/// cannot parse has no status it may compare.
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamHead {
+    /// A final response (`status >= 200`): every byte read so far — the head and
+    /// any body that arrived with it — plus its status.
+    Final { bytes: Vec<u8>, status: u16 },
+    /// The first head was interim (`1xx`). Refused; nothing relayed.
+    Interim,
+    /// The first head does not begin with `HTTP/1.`, or its status line is not
+    /// `HTTP/1.x SP 3DIGIT` as read. Refused; nothing relayed. A leading CRLF
+    /// lands here — its first line is empty — which is exactly how a challenge
+    /// could otherwise be relayed past a status check that read `0`.
+    StatusUnparsable,
+}
+
+/// Read the upstream response head (up to 8 KiB, terminated by CRLF CRLF) so the
+/// status line can be inspected before a byte of it reaches the client. `None`
+/// when the upstream closed without answering at all.
+async fn read_upstream_head<R>(upstream: &mut R) -> Option<UpstreamHead>
+where
+    R: AsyncRead + Unpin,
+{
+    const HEAD_CAP: usize = 8192;
+    let mut bytes = Vec::with_capacity(512);
+    let mut chunk = [0u8; 1024];
+    while find_head_end(&bytes).is_none() && bytes.len() < HEAD_CAP {
+        match upstream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+        }
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+    // An incomplete first head (peer closed, or the cap was hit) is not a head
+    // this listener can vouch for.
+    let Some(head_end) = find_head_end(&bytes) else {
+        return Some(UpstreamHead::StatusUnparsable);
+    };
+    // Only the first line is parsed, and only against the strict grammar: the
+    // rest of the head never influences the verdict, and a second head behind
+    // this one is never read.
+    let head = &bytes[..head_end];
+    let line_end = head
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(head.len());
+    let status_line = String::from_utf8_lossy(&head[..line_end]);
+    let Some(status) = parse_upstream_status_line(&status_line) else {
+        return Some(UpstreamHead::StatusUnparsable);
+    };
+    match status {
+        100..=199 => Some(UpstreamHead::Interim),
+        200..=599 => Some(UpstreamHead::Final { bytes, status }),
+        // Three digits, but not a status HTTP defines (RFC 9110 15): `000`-`099`
+        // and `600`+ are refused rather than guessed at.
+        _ => Some(UpstreamHead::StatusUnparsable),
+    }
+}
+
+/// The status code of a strict `HTTP/1.x SP 3DIGIT [SP reason-phrase]` line.
+///
+/// `None` for every other shape: another protocol (`HTTP/2 200`), a lowercase
+/// version, two spaces, a two- or four-digit code, no separator at all. There is
+/// no `0` sentinel — a head whose status cannot be read is refused before any
+/// comparison, never treated as some status.
+fn parse_upstream_status_line(line: &str) -> Option<u16> {
+    let rest = line.strip_prefix("HTTP/1.")?;
+    let mut chars = rest.chars();
+    if !chars.next()?.is_ascii_digit() {
+        return None;
+    }
+    if chars.next()? != ' ' {
+        return None;
+    }
+    let mut code = 0u16;
+    for _ in 0..3 {
+        code = code * 10 + chars.next()?.to_digit(10)? as u16;
+    }
+    match chars.next() {
+        None | Some(' ') => Some(code),
+        Some(_) => None,
+    }
+}
+
+/// The exact bytes the client receives for a final upstream response: the
+/// origin's head relayed verbatim — this is a byte relay, not a re-framer, so
+/// `Content-Length`/`Transfer-Encoding` and every byte after the head are
+/// untouched — except for `Connection`.
+///
+/// Every `Connection` field the origin sent is dropped (a `keep-alive` would
+/// invite a client to reuse a socket this listener closes after every forward)
+/// and exactly one `Connection: close` is emitted in its place, so the head the
+/// client sees never carries two of them.
+fn relayed_response_head(bytes: &[u8]) -> Vec<u8> {
+    let head_end = find_head_end(bytes).unwrap_or(bytes.len());
+    let (head, rest) = bytes.split_at(head_end);
+    let mut out = Vec::with_capacity(head.len() + 19 + rest.len());
+    for (index, line) in head_lines(head).into_iter().enumerate() {
+        // Index 0 is the status line, which is always relayed as it arrived.
+        if index > 0 && (line.is_empty() || response_field_named(line, b"connection")) {
+            continue;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(rest);
+    out
+}
+
+/// The lines of a CRLF-framed head, without their terminators.
+///
+/// Splits on CRLF only — the same framing rule the request side applies — so a
+/// line that merely looks terminated by a bare LF is never mistaken for a
+/// separate field.
+fn head_lines(head: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index + 1 < head.len() {
+        if head[index] == b'\r' && head[index + 1] == b'\n' {
+            lines.push(&head[start..index]);
+            index += 2;
+            start = index;
+        } else {
+            index += 1;
+        }
+    }
+    if start < head.len() {
+        lines.push(&head[start..]);
+    }
+    lines
+}
+
+/// Whether `line` is a field whose name is `name` (ASCII case-insensitive).
+///
+/// The name is the bytes before the first `:` and is compared without trimming:
+/// only a `Connection` this proxy can see exactly is rewritten, so a head whose
+/// names carry anything extra is relayed as it arrived rather than re-parsed.
+fn response_field_named(line: &[u8], name: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    line[..colon].eq_ignore_ascii_case(name)
+}
+
+/// A plain-HTTP proxy consultation: an absolute-form `http://` request for
+/// another origin.
+///
+/// This is the only path on which the listener forwards a request upstream, and
+/// it forwards **after** the whole D-1 admission pipeline — loopback refusal,
+/// hard-deny, learned decisions, the deny/allow lists and the prompt — plus the
+/// same DNS-pinned dial the CONNECT path uses. It must not be a bypass: the
+/// admission decision is taken on the authority in the request line, which is
+/// exactly what a CONNECT carries.
+///
+/// The audit leaf is the same one `decide()` produces for a tunnel
+/// (`op: CONNECT`, with `source`/`scope`/`persisted`), so the D-5 taxonomy is
+/// untouched; whether a forward deserves its own `op` is P2.3's decision.
+async fn handle_forward(
+    mut sock: TcpStream,
+    ctx: Arc<ConnCtx>,
+    target: &str,
+    head: &str,
+    leftover: &[u8],
+) -> Result<()> {
+    let fwd = match parse_absolute_target(target) {
+        AbsoluteTarget::Forward(fwd) => fwd,
+        AbsoluteTarget::HttpsNeedsConnect => {
+            write_response(
+                &mut sock,
+                "400 Bad Request",
+                "Content-Type: text/plain\r\n",
+                "absolute-form https:// request: use CONNECT\n",
+            )
+            .await;
+            return Ok(());
+        }
+        AbsoluteTarget::Malformed => {
+            write_response(&mut sock, "400 Bad Request", "", "").await;
+            return Ok(());
+        }
+    };
+
+    // One framing rule for the head, then exactly one framing signal for the
+    // body. Both are decided *before* admission, so a request this listener
+    // refuses to frame is never counted as a consultation, never audited and
+    // never dialled: a refusal to frame is not a policy answer.
+    if let Some(why) = head_framing_error(head) {
+        write_response(
+            &mut sock,
+            "400 Bad Request",
+            "Content-Type: text/plain\r\n",
+            &format!("{why}\n"),
+        )
+        .await;
+        return Ok(());
+    }
+    // A field name must be a token (RFC 9110 5.1). The parsers below trim, so a
+    // head carrying `Content-Length : 5` would be framed as if the name were
+    // `Content-Length` and then forwarded verbatim — leaving the origin to decide
+    // whether the space is part of the name. One head must mean one thing on both
+    // ends of the hop, so such a head is refused before admission.
+    if let Some(why) = head_field_syntax_error(head) {
+        write_response(
+            &mut sock,
+            "400 Bad Request",
+            "Content-Type: text/plain\r\nConnection: close\r\n",
+            &format!("{why}\n"),
+        )
+        .await;
+        return Ok(());
+    }
+    // `Connection` may not name a framing field. The rewrite drops whatever the
+    // list names, and dropping `Content-Length` would relay the body unframed —
+    // the origin would read it as a second, unadmitted request with a `Host` the
+    // client chose. Refused here, before admission: nothing dialled, nothing
+    // audited, no consultation counted.
+    if let Some(field) = connection_listed_framing_field(head) {
+        write_response(
+            &mut sock,
+            "400 Bad Request",
+            "Content-Type: text/plain\r\nConnection: close\r\n",
+            &format!("Connection names the framing field `{field}`\n"),
+        )
+        .await;
+        return Ok(());
+    }
+    // `Expect` is refused rather than satisfied (the one behaviour chosen: a
+    // strict 400, no 100 Continue machinery). An `Expect: 100-continue` request
+    // that were forwarded would leave the client withholding the body until it
+    // saw a `100` this listener never sends, and the origin waiting for a body
+    // that never comes.
+    if has_expect_field(head) {
+        write_response(
+            &mut sock,
+            "400 Bad Request",
+            "Content-Type: text/plain\r\nX-Sandbox: expect-unsupported\r\nConnection: close\r\n",
+            "Expect is not supported: this proxy never sends 100 Continue\n",
+        )
+        .await;
+        return Ok(());
+    }
+    let body = match forward_body_framing(head) {
+        Ok(body) => body,
+        Err(reject) => {
+            write_response(
+                &mut sock,
+                "400 Bad Request",
+                "Content-Type: text/plain\r\n",
+                &format!("{}\n", reject.reason()),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let want = match body {
+        ForwardBody::None => 0,
+        ForwardBody::Length(len) => len,
+    };
+    // Exactly one request per connection, part 1: bytes buffered past the head
+    // are body bytes or nothing. Anything beyond the framed body is a second
+    // request this listener never admitted (and never audits); refusing it here
+    // keeps it off the wire entirely.
+    if leftover.len() > want {
+        write_response(
+            &mut sock,
+            "400 Bad Request",
+            "Content-Type: text/plain\r\n",
+            "bytes past the framed request body: one request per connection\n",
+        )
+        .await;
+        return Ok(());
+    }
+
+    // A consultation exactly like a CONNECT, and counted at the same point: a
+    // denial below must still read as `consultations=1,
+    // upstream_established=0`.
+    ctx.counters.note_consultation();
+
+    let decision = decide(&ctx, &fwd.host, fwd.port).await;
+    if !decision.allowed {
+        emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision);
+        respond_deny(&mut sock, &fwd.host, fwd.port, &decision).await?;
+        return Ok(());
+    }
+    emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision);
+
+    let mut upstream =
+        match dial_upstream(ctx.upstream.as_deref(), &fwd.host, fwd.port, system_lookup).await {
+            Ok(stream) => stream,
+            Err(DialFailure::Denied(d)) => {
+                emit_decision(&ctx.writer, &fwd.host, fwd.port, &d);
+                respond_deny(&mut sock, &fwd.host, fwd.port, &d).await?;
+                return Ok(());
+            }
+            Err(DialFailure::Direct(e)) => {
+                write_response(&mut sock, "502 Bad Gateway", "", "").await;
+                eprintln!(
+                    "[proxy] plain-HTTP forward to {}:{} failed: {e}",
+                    fwd.host, fwd.port
+                );
+                return Ok(());
+            }
+            Err(DialFailure::Upstream {
+                endpoint,
+                body,
+                error,
+            }) => {
+                eprintln!(
+                    "[proxy] upstream chaining to {}:{} via {endpoint} failed: {error}",
+                    fwd.host, fwd.port
+                );
+                emit_decision(&ctx.writer, &fwd.host, fwd.port, &upstream_error_decision());
+                respond_upstream_error(&mut sock, &body).await;
+                return Ok(());
+            }
+        };
+    // The origin connection is up. This is the forward leg's "upstream
+    // established" — the same fact the CONNECT path records before its 200.
+    ctx.counters.note_upstream_established();
+
+    // The head the origin sees is built from the admitted authority, never from
+    // the client's bytes: request line rewritten to origin-form, `Host`
+    // re-derived, connection-scoped fields (including the ones the client's own
+    // `Connection:` names) dropped.
+    let rewritten = rewrite_head_for_upstream(head, &fwd.origin_form, &upstream_host_value(&fwd));
+    if upstream.write_all(rewritten.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+    // Exactly one request per connection, part 2: forward exactly the framed
+    // body, then stop reading from the client for good. Only the *response* is
+    // relayed from here on, so a smuggled second request has no path upstream.
+    // `leftover.len() > want` was refused above, before the dial, so the relay
+    // cannot report trailing bytes here: it forwards exactly the framed body and
+    // stops. Only an I/O failure remains — a client that closed mid-body or a
+    // failed upstream write — and that ends the exchange, because the origin must
+    // not be left waiting for bytes that will never arrive.
+    debug_assert!(leftover.len() <= want);
+    if relay_framed_body(&mut sock, &mut upstream, leftover, want)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    // The response head is read before it is relayed, so the status line can be
+    // checked first: an origin must not be able to answer a *proxy* challenge,
+    // and an interim or unparsable head must never stand in for the answer.
+    let Some(response) = read_upstream_head(&mut upstream).await else {
+        return Ok(());
+    };
+    let (response_bytes, status) = match response {
+        UpstreamHead::Final { bytes, status } => (bytes, status),
+        UpstreamHead::Interim => {
+            // Exactly one head is read per exchange, so a `1xx` cannot be
+            // followed through to the real answer: the client gets a named 502
+            // and not one byte of the interim head. Relaying it would hand the
+            // client a header block whose fields (a `Link`, or a challenge from a
+            // 103-then-407 chain) stand in for a status it never received.
+            write_response(
+                &mut sock,
+                "502 Bad Gateway",
+                "X-Sandbox: interim-response-unsupported\r\nConnection: close\r\n",
+                "sandbox: the origin answered with an interim (1xx) response.\n",
+            )
+            .await;
+            return Ok(());
+        }
+        UpstreamHead::StatusUnparsable => {
+            // No readable status means no status to compare — so the head is
+            // withheld rather than guessed at. A response that opens with CRLF
+            // lands here (its first line is empty), which is exactly how a 407
+            // used to slip past the challenge check.
+            write_response(
+                &mut sock,
+                "502 Bad Gateway",
+                "X-Sandbox: origin-status-unparsable\r\nConnection: close\r\n",
+                "sandbox: the origin's status line could not be read.\n",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if status == 407 {
+        // An origin answering `407`/`Proxy-Authenticate` would make an honest
+        // client replay our session token to that origin. Rewritten to 502,
+        // with the origin's challenge and body discarded.
+        write_response(
+            &mut sock,
+            "502 Bad Gateway",
+            "X-Sandbox: origin-challenge\r\nConnection: close\r\n",
+            "sandbox: the origin answered with a proxy authentication challenge, \
+             which was withheld.\n",
+        )
+        .await;
+        return Ok(());
+    }
+    // The listener closes the client socket after every forward, so the head the
+    // client receives says `Connection: close` exactly once, whatever the
+    // origin's own head said: a client that honoured an origin `keep-alive` would
+    // reuse a connection that is already dead.
+    let relayed = relayed_response_head(&response_bytes);
+    if sock.write_all(&relayed).await.is_err() {
+        return Ok(());
+    }
+    let _ = tokio::io::copy(&mut upstream, &mut sock).await;
+    Ok(())
+}
+
+/// Route an authenticated non-CONNECT request.
+///
+/// Two shapes reach this listener, and they are treated differently:
+///
+/// * **Absolute-form** (`GET http://origin/path`): the client is using us
+///   as its proxy, so this is a plain-HTTP forward. It goes through the
+///   full D-1 admission pipeline in [`handle_forward`] — never straight
+///   upstream. `https://` in absolute form is refused: only a CONNECT can
+///   carry TLS.
+/// * **Origin-form** (`GET /sandbox/intent`): the client dialled us
+///   directly, so it is the D-4 control plane. Only `/sandbox/*` exists
+///   there; anything else is a 400 ([G-7, G-38]), because this listener is
+///   not a reverse proxy for anyone.
 async fn handle_non_connect(
     mut sock: TcpStream,
     ctx: Arc<ConnCtx>,
@@ -1377,6 +2452,12 @@ async fn handle_non_connect(
     head: &str,
     leftover: &[u8],
 ) -> Result<()> {
+    // Absolute-form is a proxy consultation: admit it, then forward. An
+    // origin-form target starts with `/` and can never contain `://`, so
+    // this cannot capture a control-plane request.
+    if !target.starts_with('/') && target.contains("://") {
+        return handle_forward(sock, ctx, target, head, leftover).await;
+    }
     if !target.starts_with("/sandbox/") {
         write_response(&mut sock, "400 Bad Request", "", "").await;
         return Ok(());
@@ -3380,16 +4461,1193 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 407"), "got: {resp}");
     }
 
+    /// Absolute-form is a **proxy consultation**: it runs the D-1 pipeline and is
+    /// refused when the pipeline denies (403) — never silently forwarded, and no
+    /// longer a 400. Origin-form outside `/sandbox/` stays a 400: this listener is
+    /// not a reverse proxy for anyone.
     #[test]
-    fn non_sandbox_non_connect_requests_get_400() {
+    fn absolute_form_is_admitted_and_origin_form_outside_sandbox_is_400() {
         let (dialog, _c) = recording_dialog(Ok(deny_once_result()));
         let t = t36_setup("plain-http-400", &[], &[], dialog);
-        // Absolute-form (forward-proxy style) request.
         let resp = exchange(t.port, &get_req("http://evil.example.com/"));
-        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("X-Sandbox: denied"), "got: {resp}");
+        // The deny went through the admission pipeline, so it is audited.
+        assert_eq!(last_connect_event(&t.sid)["host"], "evil.example.com");
         // Origin-form request to a non-/sandbox path.
         let resp = exchange(t.port, &get_req("/some/path"));
         assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+    }
+
+    /// Guardrail 1's counting rules on a real listener (plan P1 wave 2, item A):
+    /// a *denied* consultation is accepted-and-no-tunnel, a *refused* CONNECT is
+    /// the same shape, serving our own origin-form endpoint is not counted at
+    /// all, and every epoch starts empty.
+    #[test]
+    fn counters_record_consultations_and_upstream_establishment_per_epoch() {
+        let (dialog, _c) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("counters", &[], &[], dialog);
+        let counters = t.handle.counters();
+        let epoch = counters.begin_epoch();
+
+        // Origin-form to our own endpoint: served, but NOT a proxy consultation.
+        let resp = exchange(t.port, &get_req("/sandbox/intent?host=x.invalid"));
+        assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp}");
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters::default()),
+            "serving our own endpoint must never look like a proxy consultation"
+        );
+
+        // Absolute-form for another origin, denied by the pipeline.
+        let resp = exchange(t.port, &get_req("http://evil.example.com/x"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        // CONNECT to loopback, refused before any dial.
+        let resp = exchange(t.port, &connect_req("127.0.0.1:9"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters {
+                consultations: 2,
+                upstream_established: 0,
+            }),
+            "both reached us as a proxy; neither established anything upstream"
+        );
+
+        // A 407 is not proof of anything and is not counted.
+        let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 407"), "got: {resp}");
+
+        // A new epoch starts empty; the closed one keeps its numbers.
+        assert!(counters.close_epoch(epoch));
+        let next = counters.begin_epoch();
+        assert_eq!(
+            counters.counters(next),
+            Some(LaunchProofCounters::default())
+        );
+        exchange(t.port, &connect_req("127.0.0.1:9"));
+        assert_eq!(
+            counters.counters(next),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            }),
+            "the second epoch must not inherit the first one's traffic"
+        );
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters {
+                consultations: 2,
+                upstream_established: 0,
+            }),
+            "a closed epoch keeps its frozen counters"
+        );
+        assert_eq!(
+            counters.counters(9_999),
+            None,
+            "an unknown epoch has no proof"
+        );
+        assert!(
+            !counters.close_epoch(9_999),
+            "closing an unknown epoch is a no-op"
+        );
+    }
+
+    /// A handler that panicked while holding the counter lock must not make the
+    /// launch path panic: a poisoned mutex is recovered, not propagated.
+    #[test]
+    fn counters_survive_a_poisoned_lock() {
+        let counters = LaunchCounters::new();
+        let epoch = counters.begin_epoch();
+        let poisoner = Arc::clone(&counters);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().expect("first lock");
+            panic!("handler blew up mid-count");
+        });
+        assert!(poisoned.join().is_err(), "the handler thread panicked");
+
+        // Every accessor must still work on the same registry.
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters::default())
+        );
+        counters.note_consultation();
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            })
+        );
+        assert!(counters.close_epoch(epoch));
+        assert_eq!(counters.begin_epoch(), epoch + 1);
+    }
+
+    // ---- P1 wave 2: absolute-form parsing and head rewriting --------------
+
+    #[test]
+    fn absolute_targets_split_into_host_port_and_origin_form() {
+        let http = |target: &str| match parse_absolute_target(target) {
+            AbsoluteTarget::Forward(f) => f,
+            other => panic!("{target} should forward, got {other:?}"),
+        };
+        assert_eq!(
+            http("http://origin.example/a?b=1"),
+            ForwardTarget {
+                host: "origin.example".into(),
+                port: 80,
+                origin_form: "/a?b=1".into(),
+            }
+        );
+        assert_eq!(
+            http("HTTP://Origin.Example:8080"),
+            ForwardTarget {
+                host: "Origin.Example".into(),
+                port: 8080,
+                origin_form: "/".into(),
+            },
+            "no path means /, and the scheme is case-insensitive"
+        );
+        assert_eq!(
+            http("http://[::1]:9000/x").origin_form,
+            "/x",
+            "a bracketed IPv6 authority is split without its brackets"
+        );
+        assert_eq!(
+            http("http://user:secret@origin.example:81/p"),
+            ForwardTarget {
+                host: "origin.example".into(),
+                port: 81,
+                origin_form: "/p".into(),
+            },
+            "userinfo is dropped, never forwarded"
+        );
+        assert_eq!(http("http://origin.example?q=1").origin_form, "/?q=1");
+
+        assert_eq!(
+            parse_absolute_target("https://origin.example/"),
+            AbsoluteTarget::HttpsNeedsConnect,
+            "absolute-form https needs CONNECT and must be refused, not downgraded"
+        );
+        for bad in [
+            "ftp://origin.example/",
+            "http://",
+            "http://:80/",
+            "http://origin.example:0/",
+            "http://origin.example:notaport/",
+            "http://[::1/",
+            "http://::1/",
+            "/origin-form",
+        ] {
+            assert_eq!(
+                parse_absolute_target(bad),
+                AbsoluteTarget::Malformed,
+                "{bad} must not be forwardable"
+            );
+        }
+    }
+
+    /// One authenticated absolute-form request: request line, our credential,
+    /// `extra` fields (CRLF-terminated), the empty line, then `body`.
+    fn fwd_req(method: &str, target: &str, extra: &str, body: &str) -> String {
+        let c = crlf();
+        let auth = auth_header();
+        format!("{method} {target} HTTP/1.1{c}{auth}{extra}{c}{body}")
+    }
+
+    #[test]
+    fn rewrite_head_makes_it_origin_form_and_drops_connection_scoped_headers() {
+        let head = concat!(
+            "GET http://origin.example:8080/a?b=1 HTTP/1.1\r\n",
+            "Host: origin.example:8080\r\n",
+            "Proxy-Authorization: Basic \"***\"\r\n",
+            "Proxy-Connection: keep-alive\r\n",
+            "Connection: keep-alive\r\n",
+            "X-Keep: yes\r\n",
+            "\r\n",
+        );
+        let rewritten = rewrite_head_for_upstream(head, "/a?b=1", "origin.example:8080");
+        assert_eq!(
+            rewritten,
+            concat!(
+                "GET /a?b=1 HTTP/1.1\r\n",
+                "Host: origin.example:8080\r\n",
+                "X-Keep: yes\r\n",
+                "Connection: close\r\n\r\n",
+            ),
+            "origin-form target, no proxy credential, no client connection headers"
+        );
+        // The method and version survive; only the target changes.
+        let post = "POST http://o/x HTTP/1.1\r\nHost: o\r\n\r\n";
+        assert!(
+            rewrite_head_for_upstream(post, "/x", "o").starts_with("POST /x HTTP/1.1\r\n"),
+            "method and version must be preserved"
+        );
+    }
+
+    /// Admission decides on the request-target authority, so that authority — and
+    /// nothing the client put in a header — is the `Host` the origin sees.
+    #[test]
+    fn rewrite_head_rebuilds_the_host_from_the_admitted_authority() {
+        let head = concat!(
+            "GET http://allowlisted.example/ HTTP/1.1\r\n",
+            "Host: victim.internal\r\n",
+            "\r\n",
+        );
+        let rewritten = rewrite_head_for_upstream(head, "/", "allowlisted.example");
+        assert!(
+            rewritten.contains("\r\nHost: allowlisted.example\r\n"),
+            "the admitted authority must be the Host: {rewritten:?}"
+        );
+        assert!(
+            !rewritten.contains("victim.internal"),
+            "the client's Host must never reach the origin: {rewritten:?}"
+        );
+        assert_eq!(
+            rewritten.matches("Host:").count(),
+            1,
+            "exactly one Host line: {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_head_supplies_a_host_when_the_client_sent_none() {
+        let head = "GET http://origin.example/a HTTP/1.1\r\nX-Keep: yes\r\n\r\n";
+        let rewritten = rewrite_head_for_upstream(head, "/a", "origin.example");
+        assert!(
+            rewritten.contains("\r\nHost: origin.example\r\n"),
+            "HTTP/1.1 requires a Host, so an absent one is supplied: {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn host_value_normalises_the_port_and_brackets_ipv6_literals() {
+        let value = |target: &str| match parse_absolute_target(target) {
+            AbsoluteTarget::Forward(fwd) => upstream_host_value(&fwd),
+            other => panic!("{target} should forward, got {other:?}"),
+        };
+        assert_eq!(value("http://origin.example/"), "origin.example");
+        assert_eq!(
+            value("http://origin.example:80/"),
+            "origin.example",
+            "the default port is omitted"
+        );
+        assert_eq!(
+            value("http://origin.example:8080/"),
+            "origin.example:8080",
+            "a non-default port is included"
+        );
+        assert_eq!(
+            value("http://[2001:db8::1]/p"),
+            "[2001:db8::1]",
+            "an IPv6 literal keeps its brackets"
+        );
+        assert_eq!(
+            value("http://[2001:db8::1]:8080/p"),
+            "[2001:db8::1]:8080",
+            "an IPv6 literal with a port stays bracketed"
+        );
+    }
+
+    #[test]
+    fn rewrite_head_drops_fields_named_in_the_clients_connection_list() {
+        // RFC 9110 7.6.1: whatever the client's `Connection:` names is
+        // connection-scoped for this hop, even if it is not on our fixed list.
+        let head = concat!(
+            "GET http://origin.example/x HTTP/1.1\r\n",
+            "Host: origin.example\r\n",
+            "Connection: keep-alive, X-Secret-Hop\r\n",
+            "X-Secret-Hop: leak\r\n",
+            "X-Keep: yes\r\n",
+            "\r\n",
+        );
+        let rewritten = rewrite_head_for_upstream(head, "/x", "origin.example");
+        assert!(
+            !rewritten.to_ascii_lowercase().contains("x-secret-hop"),
+            "a Connection-listed field must not be forwarded: {rewritten:?}"
+        );
+        assert!(
+            rewritten.contains("X-Keep: yes\r\n"),
+            "an unrelated field survives: {rewritten:?}"
+        );
+        assert!(
+            rewritten.ends_with("Connection: close\r\n\r\n"),
+            "the hop is closed explicitly: {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_head_drops_te_trailer_and_proxy_authenticate() {
+        // The explicit decisions: `TE` (a client's acceptable codings), `Trailer`
+        // (meaningless without chunked, which this path refuses) and
+        // `Proxy-Authenticate` (a response field; forwarding it invites a 407)
+        // are all dropped, while `Content-Length` — the one framing signal — is
+        // forwarded untouched.
+        let head = concat!(
+            "POST http://origin.example/x HTTP/1.1\r\n",
+            "Host: origin.example\r\n",
+            "TE: trailers\r\n",
+            "Trailer: X-Checksum\r\n",
+            "Proxy-Authenticate: Basic realm=\"x\"\r\n",
+            "Content-Length: 2\r\n",
+            "\r\n",
+        );
+        let rewritten = rewrite_head_for_upstream(head, "/x", "origin.example");
+        let lower = rewritten.to_ascii_lowercase();
+        for gone in ["te:", "trailer:", "proxy-authenticate"] {
+            assert!(
+                !lower.contains(gone),
+                "{gone} survived the rewrite: {rewritten:?}"
+            );
+        }
+        assert!(
+            rewritten.contains("Content-Length: 2\r\n"),
+            "the framing signal is forwarded: {rewritten:?}"
+        );
+    }
+
+    /// The target is chosen by the sandboxed child, so a byte offset inside a
+    /// multi-byte character must be a verdict, never a panic.
+    #[test]
+    fn parse_absolute_target_is_utf8_safe_at_the_scheme_boundary() {
+        for target in ["abcd😀://x", "http:/😀x"] {
+            assert_eq!(
+                parse_absolute_target(target),
+                AbsoluteTarget::Malformed,
+                "{target:?} must be refused, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_lf_and_obs_fold_are_framing_errors() {
+        assert_eq!(
+            head_framing_error("GET http://o/x HTTP/1.1\r\n\r\n"),
+            None,
+            "a plain CRLF head is fine"
+        );
+        assert_eq!(
+            head_framing_error("GET http://o/x HTTP/1.1\nX: y\r\n\r\n"),
+            Some("bare LF in the request head")
+        );
+        assert_eq!(
+            head_framing_error("GET http://o/x HTTP/1.1\r\nX: y\r\n z\r\n\r\n"),
+            Some("obs-fold line in the request head")
+        );
+        assert_eq!(
+            head_framing_error("GET http://o/x HTTP/1.1\r\nX: y"),
+            Some("request head is not CRLF-terminated")
+        );
+    }
+
+    /// The exact split the framing rule closes: one CRLF field to the rewriter,
+    /// three to the LF-aware auth gate and request-line parse.
+    #[test]
+    fn bare_lf_in_the_head_is_a_400_and_never_reaches_admission() {
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("bare-lf", &["origin.example"], &[], dialog);
+        let smuggled = "X-Hop: a\nConnection: upgrade\nUpgrade: h2c\r\n";
+        let resp = exchange(
+            t.port,
+            &fwd_req("GET", "http://origin.example/x", smuggled, ""),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+        assert!(
+            resp.contains("bare LF"),
+            "the reason must name the framing fault: {resp}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a framing refusal is not a policy question"
+        );
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "and it is not a consultation either: {:?}",
+            connect_events(&t.sid)
+        );
+    }
+
+    #[test]
+    fn forward_body_framing_accepts_exactly_one_content_length() {
+        let head = |fields: &str| format!("POST http://o/x HTTP/1.1{c}{fields}{c}{c}", c = crlf());
+        assert_eq!(forward_body_framing(&head("")), Ok(ForwardBody::None));
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: 7\r\n")),
+            Ok(ForwardBody::Length(7))
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: 7\r\nContent-Length: 7\r\n")),
+            Ok(ForwardBody::Length(7)),
+            "repeated but identical values are one signal"
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: 7, 7\r\n")),
+            Ok(ForwardBody::Length(7)),
+            "a repeated list of identical values is one signal"
+        );
+        assert_eq!(
+            forward_body_framing(&head("content-length: 7\r\nContent-Length: 8\r\n")),
+            Err(BodyReject::ConflictingContentLength),
+            "two different body lengths must never be resolved by preference"
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: seven\r\n")),
+            Err(BodyReject::BadContentLength)
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: +5\r\n")),
+            Err(BodyReject::BadContentLength),
+            "a leading '+' is accepted by Rust's usize parser but is not a decimal number to every origin (RFC 9110 8.6: 1*DIGIT)"
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: \r\n")),
+            Err(BodyReject::BadContentLength),
+            "an empty value frames nothing and must not be read as zero"
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length: 0x5\r\n")),
+            Err(BodyReject::BadContentLength)
+        );
+        assert_eq!(
+            forward_body_framing(&head("Content-Length:  5 \r\n")),
+            Ok(ForwardBody::Length(5)),
+            "surrounding OWS is legal and keeps the field decimal"
+        );
+        assert_eq!(
+            forward_body_framing(&head("Transfer-Encoding: chunked\r\n")),
+            Err(BodyReject::TransferEncoding)
+        );
+        assert_eq!(
+            forward_body_framing(&head("Transfer-Encoding: identity\r\n")),
+            Err(BodyReject::TransferEncoding),
+            "any Transfer-Encoding, not only chunked"
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_is_a_400_and_reaches_no_origin() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-te", &[origin.host.as_str()], &[], dialog);
+        let extra = "Transfer-Encoding: chunked\r\n";
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{}/x", origin.authority()),
+                extra,
+                "0\r\n\r\n",
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+        assert!(
+            resp.contains("Transfer-Encoding is not accepted on this path"),
+            "Transfer-Encoding cannot be re-framed safely, so it is refused: {resp}"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "nothing may be forwarded: {:?}",
+            origin.requests()
+        );
+    }
+
+    #[test]
+    fn conflicting_content_length_is_a_400_and_reaches_no_origin() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-cl", &[origin.host.as_str()], &[], dialog);
+        let extra = "Content-Length: 5\r\nContent-Length: 6\r\n";
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{}/x", origin.authority()),
+                extra,
+                "hello",
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+        assert!(
+            resp.contains("conflicting Content-Length"),
+            "the reason must name the conflict: {resp}"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "nothing may be forwarded: {:?}",
+            origin.requests()
+        );
+    }
+
+    /// Exactly one request per client connection: a body followed by a second,
+    /// unadmitted request is a 400 and the trailing bytes are never relayed.
+    #[test]
+    fn body_followed_by_trailing_bytes_is_a_400_and_nothing_is_forwarded() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-trailing", &[origin.host.as_str()], &[], dialog);
+        let smuggled = "GET http://origin.example/second HTTP/1.1\r\nHost: origin.example\r\n\r\n";
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{}/upload", origin.authority()),
+                "Content-Length: 5\r\n",
+                &format!("hello{smuggled}"),
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+        assert!(
+            resp.contains("one request per connection"),
+            "the reason must name the rule: {resp}"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "neither the request nor the smuggled second one may be forwarded: {:?}",
+            origin.requests()
+        );
+    }
+
+    #[test]
+    fn post_body_is_forwarded_byte_exact_with_the_admitted_host() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-post", &[origin.host.as_str()], &[], dialog);
+        let body = "{\"hello\":\"world\"}";
+        let authority = origin.authority();
+        let extra = format!(
+            "Host: victim.internal\r\nContent-Length: {}\r\nContent-Type: application/json\r\n",
+            body.len()
+        );
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{authority}/upload?x=1"),
+                &extra,
+                body,
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+        assert!(
+            resp.ends_with("ok"),
+            "the origin's body must be relayed: {resp}"
+        );
+
+        let seen = origin.requests();
+        assert_eq!(seen.len(), 1, "exactly one request: {seen:?}");
+        let raw = &seen[0];
+        assert!(
+            raw.starts_with("POST /upload?x=1 HTTP/1.1\r\n"),
+            "the origin sees an origin-form target: {raw:?}"
+        );
+        assert!(
+            raw.contains(&format!("\r\nHost: {authority}\r\n")),
+            "the Host is the admitted authority, not the client's: {raw:?}"
+        );
+        assert!(
+            !raw.contains("victim.internal"),
+            "the client's Host never reaches the origin: {raw:?}"
+        );
+        assert!(
+            raw.ends_with(&format!("\r\n\r\n{body}")),
+            "the body must arrive byte-exact: {raw:?}"
+        );
+    }
+
+    /// An origin must not be able to answer a *proxy* challenge: an honest client
+    /// would replay our session token to it.
+    #[test]
+    fn origin_407_is_rewritten_to_502_and_the_challenge_is_withheld() {
+        let origin = FakeOrigin::start(concat!(
+            "HTTP/1.1 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"origin\"\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-407", &[origin.host.as_str()], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 502"),
+            "an origin 407 must be a 502 to the client: {resp}"
+        );
+        assert!(
+            !resp.contains("Proxy-Authenticate"),
+            "the challenge must never reach the client: {resp}"
+        );
+        assert!(
+            !resp.contains("407"),
+            "not even the status may be echoed: {resp}"
+        );
+        assert!(
+            resp.contains("X-Sandbox: origin-challenge"),
+            "the rewrite is marked for the operator: {resp}"
+        );
+    }
+
+    // =================================================================
+    // Round 3 — the forward path accepts only boring requests and responses
+    // =================================================================
+
+    #[test]
+    fn field_names_must_be_rfc9110_tokens() {
+        assert_eq!(
+            head_field_syntax_error("GET http://o/x HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            head_field_syntax_error("POST http://o/x HTTP/1.1\r\nContent-Length: 5\r\n\r\n"),
+            None,
+            "a well-formed framing field is accepted"
+        );
+        assert_eq!(
+            head_field_syntax_error("POST http://o/x HTTP/1.1\r\nContent-Length : 5\r\n\r\n"),
+            Some("whitespace in a field name"),
+            "a space before the colon is a different name to a strict origin"
+        );
+        assert_eq!(
+            head_field_syntax_error("POST http://o/x HTTP/1.1\r\nX Y: z\r\n\r\n"),
+            Some("whitespace in a field name")
+        );
+        assert_eq!(
+            head_field_syntax_error("POST http://o/x HTTP/1.1\r\n: v\r\n\r\n"),
+            Some("empty field name in the request head")
+        );
+        assert_eq!(
+            head_field_syntax_error("POST http://o/x HTTP/1.1\r\nnot-a-field\r\n\r\n"),
+            Some("header line without a field name"),
+            "a line with no colon is not a field this proxy may forward"
+        );
+    }
+
+    #[test]
+    fn connection_may_not_name_a_framing_field() {
+        let head = |value: &str| format!("POST http://o/x HTTP/1.1\r\nConnection: {value}\r\n\r\n");
+        assert_eq!(connection_listed_framing_field(&head("close")), None);
+        assert_eq!(
+            connection_listed_framing_field(&head("keep-alive, X-Secret-Hop")),
+            None,
+            "an ordinary hop-by-hop list is still dropped, not refused"
+        );
+        assert_eq!(
+            connection_listed_framing_field(&head("Content-Length")),
+            Some("content-length"),
+            "naming the framing field would strip it"
+        );
+        assert_eq!(connection_listed_framing_field(&head("Host")), Some("host"));
+        assert_eq!(
+            connection_listed_framing_field(&head("keep-alive, Transfer-Encoding")),
+            Some("transfer-encoding")
+        );
+        assert_eq!(
+            connection_listed_framing_field(&head("connection")),
+            Some("connection")
+        );
+    }
+
+    #[test]
+    fn expect_is_detected_whatever_its_value() {
+        let head = |fields: &str| format!("POST http://o/x HTTP/1.1\r\n{fields}\r\n");
+        assert!(
+            !has_expect_field(&head("X-Expect-Thing: 1\r\n")),
+            "only the field named Expect counts"
+        );
+        assert!(has_expect_field(&head("Expect: 100-continue\r\n")));
+        assert!(
+            has_expect_field(&head("expect:\r\n")),
+            "presence decides, not the value"
+        );
+    }
+
+    #[test]
+    fn upstream_status_line_must_be_a_strict_http1_status() {
+        assert_eq!(parse_upstream_status_line("HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(parse_upstream_status_line("HTTP/1.1 404"), Some(404));
+        assert_eq!(
+            parse_upstream_status_line("HTTP/1.1 103 Early Hints"),
+            Some(103),
+            "an interim status parses — the caller is what refuses it"
+        );
+        assert_eq!(
+            parse_upstream_status_line("HTTP/1.0 500 Internal Server Error"),
+            Some(500)
+        );
+        for bad in [
+            "",
+            " 200 OK",
+            "HTTP/1.1  200 OK",
+            "HTTP/2 200 OK",
+            "http/1.1 200 OK",
+            "HTTP/1.1 20 OK",
+            "HTTP/1.1 2000 OK",
+            "HTTP/1.1",
+            "HTTP/1.1 abc OK",
+            "ICY 200 OK",
+        ] {
+            assert_eq!(
+                parse_upstream_status_line(bad),
+                None,
+                "{bad:?} must not yield a status"
+            );
+        }
+    }
+
+    #[test]
+    fn relayed_response_head_carries_exactly_one_connection_close() {
+        // No `Connection` from the origin: exactly one is added, and the rest of
+        // the head — framing fields included — is relayed byte for byte.
+        let relayed = relayed_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        assert_eq!(
+            String::from_utf8(relayed).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        );
+
+        // `keep-alive` is replaced, not appended to.
+        let relayed = relayed_response_head(
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let head = String::from_utf8(relayed).unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(lower.matches("connection:").count(), 1, "{head:?}");
+        assert!(head.contains("Connection: close"), "{head:?}");
+        assert!(!lower.contains("keep-alive"), "{head:?}");
+        assert!(
+            head.ends_with("\r\n\r\nok"),
+            "the body prefix survives: {head:?}"
+        );
+
+        // Two origin fields, in any spelling, collapse to one.
+        let relayed = relayed_response_head(
+            b"HTTP/1.1 204 No Content\r\nconnection: close\r\nCONNECTION: keep-alive\r\n\r\n",
+        );
+        let head = String::from_utf8(relayed).unwrap();
+        assert_eq!(lower_count(&head), 1, "{head:?}");
+        assert!(head.starts_with("HTTP/1.1 204 No Content\r\n"), "{head:?}");
+    }
+
+    fn lower_count(head: &str) -> usize {
+        head.to_ascii_lowercase().matches("connection:").count()
+    }
+
+    async fn classify_upstream(raw: &[u8]) -> UpstreamHead {
+        let (mut client, mut feed) = tokio::io::duplex(256);
+        let raw = raw.to_vec();
+        let writer = tokio::spawn(async move {
+            feed.write_all(&raw).await.unwrap();
+        });
+        let head = read_upstream_head(&mut client)
+            .await
+            .expect("a non-empty reply is classified");
+        writer.await.unwrap();
+        head
+    }
+
+    /// The classification the relay depends on, independent of the wire tests:
+    /// only a final `HTTP/1.x` response with a defined status is relayed.
+    #[tokio::test]
+    async fn read_upstream_head_only_accepts_a_final_http1_response() {
+        assert!(matches!(
+            classify_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await,
+            UpstreamHead::Final { status: 200, .. }
+        ));
+        assert_eq!(
+            classify_upstream(b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n").await,
+            UpstreamHead::Interim,
+            "an interim head is never an answer"
+        );
+        assert_eq!(
+            classify_upstream(b"\r\nHTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await,
+            UpstreamHead::StatusUnparsable,
+            "a leading CRLF leaves no first line to read a status from"
+        );
+        assert_eq!(
+            classify_upstream(b"HTTP/2 200 OK\r\n\r\n").await,
+            UpstreamHead::StatusUnparsable,
+            "only HTTP/1.x is spoken here"
+        );
+        assert_eq!(
+            classify_upstream(b"HTTP/1.1 200").await,
+            UpstreamHead::StatusUnparsable,
+            "an incomplete head is not vouched for"
+        );
+    }
+
+    /// BLOCKER 1: an interim head is not an answer. `103` followed by `407` used
+    /// to be relayed verbatim — an interim header block standing in for a status
+    /// the client never received, with the challenge in it.
+    #[test]
+    fn interim_103_then_407_never_reaches_the_client() {
+        let origin = FakeOrigin::start(concat!(
+            "HTTP/1.1 103 Early Hints\r\n",
+            "Link: </style.css>; rel=preload\r\n",
+            "\r\n",
+            "HTTP/1.1 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"origin\"\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-103", &[origin.host.as_str()], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 502"),
+            "an interim head must not be relayed: {resp}"
+        );
+        assert!(
+            resp.contains("X-Sandbox: interim-response-unsupported"),
+            "the refusal is named: {resp}"
+        );
+        assert!(!resp.contains("Proxy-Authenticate"), "no challenge: {resp}");
+        assert!(!resp.contains("407"), "not even the status: {resp}");
+        assert!(
+            !resp.contains("Early Hints") && !resp.contains("rel=preload"),
+            "not one byte of the interim head: {resp}"
+        );
+        assert_eq!(
+            origin.requests().len(),
+            1,
+            "the request itself was admitted and sent"
+        );
+    }
+
+    /// BLOCKER 2: a leading CRLF makes the status line empty, so the status check
+    /// read `0` and the 407 behind it reached the client.
+    #[test]
+    fn response_starting_with_crlf_is_refused_and_the_challenge_withheld() {
+        let origin = FakeOrigin::start(concat!(
+            "\r\n",
+            "HTTP/1.1 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"origin\"\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-crlf", &[origin.host.as_str()], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 502"),
+            "an unparsable head must be refused: {resp}"
+        );
+        assert!(
+            resp.contains("X-Sandbox: origin-status-unparsable"),
+            "the refusal is named: {resp}"
+        );
+        assert!(!resp.contains("Proxy-Authenticate"), "no challenge: {resp}");
+        assert!(!resp.contains("407"), "not even the status: {resp}");
+    }
+
+    /// BLOCKER 3: `Connection` naming a framing field asks the rewrite to strip
+    /// it, which relays the body to the origin as a second, unadmitted request
+    /// carrying the client's own `Host`.
+    #[test]
+    fn connection_naming_a_framing_field_is_a_400_and_reaches_no_origin() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-conn-framing", &[origin.host.as_str()], &[], dialog);
+        let smuggled =
+            "GET http://victim.internal/second HTTP/1.1\r\nHost: victim.internal\r\n\r\n";
+        for (listed, token) in [
+            ("Content-Length", "content-length"),
+            ("Host", "host"),
+            ("Transfer-Encoding", "transfer-encoding"),
+            ("connection", "connection"),
+        ] {
+            let extra = format!(
+                "Connection: {listed}\r\nContent-Length: {}\r\n",
+                smuggled.len()
+            );
+            let resp = exchange(
+                t.port,
+                &fwd_req(
+                    "POST",
+                    &format!("http://{}/x", origin.authority()),
+                    &extra,
+                    smuggled,
+                ),
+            );
+            assert!(resp.starts_with("HTTP/1.1 400"), "{listed} -> {resp}");
+            assert!(
+                resp.contains(&format!("Connection names the framing field `{token}`")),
+                "{listed} -> {resp}"
+            );
+        }
+        assert!(
+            origin.requests().is_empty(),
+            "nothing may be dialled: {:?}",
+            origin.requests()
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a framing refusal is not a policy question"
+        );
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "and not a consultation either: {:?}",
+            connect_events(&t.sid)
+        );
+    }
+
+    /// DEFECT 4: `Content-Length : 5` is not a field name this proxy may frame
+    /// on, while `Content-Length: 5` still is.
+    #[test]
+    fn whitespace_in_a_field_name_is_a_400_and_a_valid_one_still_forwards() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-field-name", &[origin.host.as_str()], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{}/x", origin.authority()),
+                "Content-Length : 5\r\n",
+                "hello",
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(
+            resp.contains("whitespace in a field name"),
+            "the fault is named: {resp}"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "nothing may be dialled: {:?}",
+            origin.requests()
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a syntax refusal is not a policy question"
+        );
+
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{}/x", origin.authority()),
+                "Content-Length: 5\r\n",
+                "hello",
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let seen = origin.requests();
+        assert_eq!(seen.len(), 1, "exactly one request: {seen:?}");
+        assert!(
+            seen[0].ends_with("\r\n\r\nhello"),
+            "the body arrives byte-exact: {:?}",
+            seen[0]
+        );
+    }
+
+    /// REGRESSION 5: `Expect` is refused before admission — the behaviour chosen
+    /// over stripping it and answering `100 Continue` ourselves.
+    #[test]
+    fn expect_header_is_refused_before_admission() {
+        let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-expect", &[origin.host.as_str()], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &fwd_req(
+                "POST",
+                &format!("http://{}/x", origin.authority()),
+                "Expect: 100-continue\r\nContent-Length: 5\r\n",
+                "hello",
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(
+            resp.contains("X-Sandbox: expect-unsupported"),
+            "the refusal is named: {resp}"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "nothing may be dialled: {:?}",
+            origin.requests()
+        );
+        assert!(calls.lock().unwrap().is_empty(), "refused before admission");
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "and not counted: {:?}",
+            connect_events(&t.sid)
+        );
+    }
+
+    /// REGRESSION 6: the listener closes the client socket after every forward, so
+    /// the relayed head must say `Connection: close` exactly once — a client that
+    /// honoured the origin's `keep-alive` would reuse a dead connection.
+    #[test]
+    fn relayed_response_tells_the_client_the_connection_closes() {
+        let origin = FakeOrigin::start(concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Connection: keep-alive\r\n",
+            "Content-Length: 2\r\n",
+            "\r\n",
+            "ok",
+        ));
+        let (dialog, _c) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup("fwd-close", &[origin.host.as_str()], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert_eq!(
+            lower_count(&resp),
+            1,
+            "exactly one Connection field: {resp}"
+        );
+        assert!(resp.contains("Connection: close"), "{resp}");
+        assert!(
+            !resp.to_ascii_lowercase().contains("keep-alive"),
+            "the origin's keep-alive must not survive: {resp}"
+        );
+        assert!(resp.ends_with("ok"), "the body is relayed: {resp}");
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_exactly_the_framed_body() {
+        let (mut client, mut client_feed) = tokio::io::duplex(64);
+        let (mut upstream_sink, mut upstream_check) = tokio::io::duplex(64);
+        let feed = tokio::spawn(async move {
+            client_feed.write_all(b"llo world").await.unwrap();
+        });
+        relay_framed_body(&mut client, &mut upstream_sink, b"he", 11)
+            .await
+            .expect("the framed body must be forwarded");
+        drop(upstream_sink);
+        let mut got = Vec::new();
+        upstream_check.read_to_end(&mut got).await.unwrap();
+        feed.await.unwrap();
+        assert_eq!(got, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_leftover_beyond_the_framed_body() {
+        let (mut client, _feed) = tokio::io::duplex(64);
+        let (mut upstream_sink, _check) = tokio::io::duplex(64);
+        assert_eq!(
+            relay_framed_body(&mut client, &mut upstream_sink, b"helloGET /x HTTP/1.1", 5).await,
+            Err(BodyRelayError::Trailing),
+            "bytes past the framed body are a second request, never relayed"
+        );
+    }
+
+    /// The host's non-loopback IPv4: the forward path refuses loopback targets by
+    /// design, so a forwardable origin has to live on a real interface.
+    fn route_ipv4() -> std::net::Ipv4Addr {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("route probe socket");
+        probe.connect("1.1.1.1:80").expect("route probe");
+        match probe.local_addr().expect("route probe address").ip() {
+            std::net::IpAddr::V4(v4) if !v4.is_loopback() => v4,
+            other => panic!("this host has no non-loopback IPv4 (probe {other})"),
+        }
+    }
+
+    /// A local origin the forward path can actually reach, recording the exact
+    /// bytes of every request it is sent and answering with a canned response.
+    struct FakeOrigin {
+        host: String,
+        port: u16,
+        seen: Arc<StdMutex<Vec<Vec<u8>>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeOrigin {
+        fn start(response: &str) -> FakeOrigin {
+            use std::io::Write;
+            use std::sync::atomic::Ordering;
+            let ip = route_ipv4();
+            let listener = std::net::TcpListener::bind((ip, 0)).expect("bind fake origin");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_t = Arc::clone(&seen);
+            let stop_t = Arc::clone(&stop);
+            let response = response.to_string();
+            let join = std::thread::spawn(move || {
+                while !stop_t.load(Ordering::SeqCst) {
+                    let Ok((mut s, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    s.set_nonblocking(false).ok();
+                    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    if let Some(raw) = read_one_request(&mut s) {
+                        seen_t.lock().unwrap().push(raw);
+                        let _ = s.write_all(response.as_bytes());
+                    }
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            });
+            FakeOrigin {
+                host: ip.to_string(),
+                port,
+                seen,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn authority(&self) -> String {
+            format!("{}:{}", self.host, self.port)
+        }
+
+        /// Every request the origin received, verbatim (head plus framed body).
+        fn requests(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|raw| String::from_utf8_lossy(raw).into_owned())
+                .collect()
+        }
+    }
+
+    impl Drop for FakeOrigin {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    /// One request (head plus its Content-Length body) as it arrived, or `None`
+    /// if the peer closed first. Anything past the head that the client pipelined
+    /// is kept, so a smuggled second request would show up here.
+    fn read_one_request(s: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 512];
+        while find_head_end(&raw).is_none() {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+            if raw.len() > 64 * 1024 {
+                return None;
+            }
+        }
+        let head_end = find_head_end(&raw).unwrap();
+        let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+        let want = content_length(&head).unwrap_or(0);
+        while raw.len() < head_end + want {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
+        Some(raw)
     }
 
     #[test]
@@ -3970,6 +6228,7 @@ mod tests {
             writer,
             upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
             prompt,
+            counters: LaunchCounters::new(),
         });
         (ctx, base)
     }
