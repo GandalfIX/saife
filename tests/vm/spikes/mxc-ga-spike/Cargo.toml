@@ -1,0 +1,20 @@
+[package]
+name = "mxc-ga-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Keep this crate out of any parent workspace.
+[workspace]
+
+[dependencies]
+mxc-sdk = "=1.0.1"
+serde_json = "1"
+
+[[bin]]
+name = "mxc-ga-spike"
+path = "src/main.rs"
+
+[[bin]]
+name = "mxc-workload"
+path = "src/bin/workload.rs"
