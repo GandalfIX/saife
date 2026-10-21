@@ -103,14 +103,29 @@ a `v1::run` error abandons an open epoch. P1.1 makes epochs per-launch-object
 (or adds a cancel path), turns `MxcBackend` into a state-carrying struct, and
 adds `Send + Sync` if the trait is held across an await.
 
-**D5 — timeout budget.** `timeout_ms` is a passthrough; MXC's default is 30 000
-ms, which would kill a 60 s prompt. P2.1 owns the budget, but P1 must not ship a
-default that silently caps sessions.
+**D5 — timeout budget (corrected in P1 wave 1).** `timeout_ms: None` is carried
+as `0` and `get_timeout_milliseconds(0)` returns `u32::MAX` — **no deadline at
+all**, not the 30 s the earlier plan text assumed
+(`policy/exact/v1_0.rs:311`, `core/mxc_common/script_runner.rs:54-60`). The real
+hazard is therefore an UNBOUNDED child, not a silently capped one. P2.1 must set
+the budget explicitly (`prompt + workload + slack`), and P1 must not let a
+caller-supplied `timeout_ms` be silently replaced by a backend default of None.
 
 **D6 — housekeeping.** Remove `#![cfg_attr(not(test), allow(dead_code))]` from
 `src/net/mxc.rs` when main.rs routes through the backend, and set the
 `ProcessContainerConfig` UI fields explicitly instead of relying on today's
 defaults.
+
+**D7 — in-container probes must not rely on PowerShell (found in P1 wave 1).**
+`powershell.exe` exits `0xC0000142` (`STATUS_DLL_INIT_FAILED`) as a container
+child in this launch shape on this host, with `warnings=[]` and no output, while
+`cmd.exe` and `curl.exe` work. Our harness scenarios S-75/S-77 spawn
+`powershell` as the sandbox child (they were rewritten to managed code *inside*
+the script, but the interpreter itself is still PowerShell). Under the MXC
+backend they would fail with an opaque init error. P2.4/P3 must either ship a
+small compiled probe binary (preferred — one exe, no interpreter, works in every
+backend) or rewrite those probes in `cmd`/`curl`. Do not "fix" it by switching
+shells; the shape is what fails.
 
 ---
 
