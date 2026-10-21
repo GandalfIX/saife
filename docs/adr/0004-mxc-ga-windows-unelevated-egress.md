@@ -215,3 +215,26 @@ what is lost is kernel attack-surface reduction, which this ADR previously got
 for free from the default. The SDK's AppContainer tier applies the same
 mitigation, so it is not an alternative posture - and no doc, audit leaf or CLI
 text may claim Win32k containment from here on.
+
+## Managed clients depend on the 407 challenge (measured 2026-10-21)
+
+.NET 8 (`SocketsHttpHandler`) and pwsh 7 read `HTTP_PROXY`/`HTTPS_PROXY` and
+lift the URL userinfo into a credential, but they do **not** send it
+pre-emptively: the first request on a new proxy connection is
+unauthenticated, and the client authenticates only after a `407` carrying
+`Proxy-Authenticate: Basic`. The listener's challenge is therefore
+**load-bearing**: an unauthenticated consultation that is answered any other
+way (or answered without the header) silently removes egress from every
+managed workload. Pinned by
+`an_unauthenticated_consultation_gets_the_basic_challenge_managed_clients_need`.
+
+Measured consequence: Windows PowerShell 5.1 / .NET Framework have **no**
+usable egress, because they take the proxy from the WinINet system store,
+which reports "direct" inside the container, so they dial directly and fail
+with `WSAEACCES 10013` without ever consulting the proxy. Managed workloads
+must therefore be `pwsh` 7 / .NET 8+; that is a workload requirement, not a
+configuration gap. The alternative - admitting an unauthenticated request
+that provably comes from this run's container (peer SID / WFP attribution)
+instead of a bearer token - would remove the round trip AND the benign
+`no_token` leaf each managed connection currently emits, but it trades away
+P1.4's per-run token, so it needs its own decision.
