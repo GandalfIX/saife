@@ -127,6 +127,58 @@ small compiled probe binary (preferred — one exe, no interpreter, works in eve
 backend) or rewrite those probes in `cmd`/`curl`. Do not "fix" it by switching
 shells; the shape is what fails.
 
+**D8 — the child can only authenticate to *our* proxy if the token rides the
+proxy URL (found in P1 wave 2, blocks any real proxied session).** mxc-sdk 1.0.1
+strips every proxy variable from `request.environment` and then re-injects
+`HTTP_PROXY`/`HTTPS_PROXY` from `runtimeConfig.networkProxy` **verbatim**
+(`config_parser::convert_wire_proxy_at` → `ProxyAddress::original_url`,
+`to_url()` → `inject_proxy_vars`), and `url::Url::parse` accepts `userinfo`. Our
+listener requires `Proxy-Authorization: Basic base64("sandbox:<token>")` ([G-7]),
+so a credential-less URL makes **every** child request a `407` — which is
+deliberately *not* counted as a proxy consultation, so guardrail 1 fails as
+`SessionNotAccepted` while the container looks healthy. Measured in the first
+wave-2 live run: `curl: (22) The requested URL returned error: 407`, exit 22.
+The ADR-0004 spike missed this because its listener answered `200` without
+authenticating anyone.
+
+Chosen fix (in code): the request's `networkProxy` carries
+`http://sandbox:<token>@127.0.0.1:<port>` (`MxcNetworkInput::proxy_token`,
+`MxcBackend::with_proxy_token`, `launch_session(.., proxy_token, ..)`), with the
+token restricted to URL-unreserved characters (`RequestError::UnsafeProxyToken`)
+so it cannot move the authority. `policy_identity` hashes only host+port and
+explicitly excludes userinfo, so the credential neither changes the policy
+identity nor becomes a confirmation oracle. No wrapper/argv plumbing was needed.
+Open for P1.4/P1.5: the token is now in the *request*, so P1.4 is a *rejection*
+rule (a run must not accept another run's token) rather than a delivery problem,
+and P1.5 must measure whether the WinHTTP path is given the same userinfo URL.
+
+**D9 — the listener forwards absolute-form plain HTTP (recorded 2026-10-21 after
+a FAILed review).** Carrying `tunnels` as "upstream established" is only
+meaningful if a plain-HTTP session can actually reach an origin, so the listener
+now runs absolute-form `http://` through the same D-1 pipeline as CONNECT
+(admission, audit leaf, DNS-pinned dial). Rules, all normative:
+
+- `tunnels` counts an upstream connection established on **either** leg (CONNECT
+  dial succeeded, or the forward's own dial came up).
+- Absolute-form `https://` stays **400** (TLS belongs to CONNECT); origin-form
+  outside `/sandbox/` stays **400**.
+- **Host is rewritten** from the validated target; the client's Host is dropped
+  (RFC 9112 §3.2.2). Without this, admission/audit name one host while the
+  origin routes by another.
+- **One head framing**: a bare LF in the head, `Transfer-Encoding`, or ambiguous
+  duplicate `Content-Length` values are **400**; only a single Content-Length is
+  forwarded, byte-exact.
+- **Exactly one admitted request per connection**: bytes after the framed body
+  are **400**, never relayed as an unadmitted second request.
+- Fields named in the client's `Connection:` list are stripped as hop-by-hop.
+- An origin `407`/`Proxy-Authenticate` is rewritten to **502** so an honest
+  client never re-sends the proxy credential to an origin.
+- The audit leaf still says `op: CONNECT` for a forward; the taxonomy question is
+  P2.3's, recorded so a D-5 consumer is not silently wrong.
+
+This is a NEW egress surface whose only gate is D-1 — the same trust boundary as
+CONNECT, now also carrying cleartext HTTP.
+
 ---
 
 ## P0 — Backend skeleton behind a flag (default unchanged)
@@ -159,17 +211,38 @@ current behaviour (harness smoke on 5 scenarios).
 **Files:** `src/net/mxc.rs`, `src/net/proxy.rs` (epoch/token plumbing),
 `src/net/config.rs`, tests.
 
-- [ ] **P1.1** Bind the per-session proxy on 127.0.0.1:0 before launch; pass it
+- [x] **P1.1** Bind the per-session proxy on 127.0.0.1:0 before launch; pass it
   as `runtimeConfig.networkProxy`; keep the CONNECT allow-list and loopback
   refusal on our side (MXC rules are CIDR/port only).
-- [ ] **P1.2** Request mapping: `egress.default = "deny"`,
+- [x] **P1.2** Request mapping: `egress.default = "deny"`,
   `ingress.default = "allow"`, `ingress.hostLoopback = "allow"`,
   `processContainer.network.allowedProxyPeer = null`; strip host proxy env;
   inject `NO_PROXY=localhost,127.0.0.1,::1`.
-- [ ] **P1.3** Filesystem mapping: `readwritePaths = [cwd]`,
-  `deniedPaths = [profile dirs, .ssh, .aws]` (policy-driven), `readonlyPaths`
-  for declared read-only grants; a test asserting the workspace-only posture
-  (outside write and read denied, `C:\Windows` readable = documented caveat).
+- [x] **P1.3** Filesystem mapping: `readwritePaths = [cwd]`; `readonlyPaths` =
+  the declared read-only grants **plus the launcher's directory, inserted before
+  the deny list is filtered** (a deny that covers the launcher used to ship,
+  because the grant was added later in `build_request`); `deniedPaths` = the
+  profile's **four credential subdirectories** (`.ssh`, `.aws`, `.azure`,
+  `.gnupg`) + the configured denies. That is a deliberate narrowing: denying the
+  whole profile directory breaks every workload that needs `%APPDATA%`, so the
+  rest of the profile stays readable and the exposure is recorded rather than
+  assumed away. A deny that **contains** a grant (equal to it, or an ancestor of
+  it — e.g. `%USERPROFILE%` with the workspace or the launcher inside it) is a
+  hard error, `RequestError::DenyCoversGrant`, naming both paths and telling the
+  operator to deny the specific subdirectory; the previous behaviour dropped such
+  a deny silently, which left `Documents`, `Downloads`, `AppData` and browser
+  profiles readable with no warning, no error and no audit trace. Denies that are
+  **descendants** of a grant (`%USERPROFILE%\.ssh` under workspace
+  `%USERPROFILE%`) are the intended expressible case and keep working. Path
+  comparison is normalised — case, separators, trailing dots/spaces, `.`/`..`
+  segments, `\\?\` and `\\.\` prefixes — with no filesystem calls. **Recorded
+  exposure:** the launcher grant is its whole *parent* directory (MXC grants
+  directories, not files), so every container gets read-only visibility of the
+  directory the launcher binary lives in — `target\debug` for a repo-local build,
+  the installation directory for an installed supervisor; narrowing it to a
+  dedicated one-entry launcher directory is deferred. Test asserting the
+  workspace-only posture (outside write and read denied, `C:\Windows` readable =
+  documented caveat).
 - [ ] **P1.4** **Concurrency:** per-run token — the supervisor generates a token,
   the child's `HTTP_PROXY` userinfo carries it, the proxy rejects CONNECTs whose
   token does not match the run; two concurrent containers must both pass their

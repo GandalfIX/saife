@@ -107,7 +107,10 @@ run that exited 0 with no warnings while its proxy connect timed out. Therefore
 a session MUST NOT be reported as successful unless the supervisor can prove the
 child actually reached the proxy — e.g. a connection count on our own listener,
 or an in-container probe that reports back. Failure => fail the session, do not
-warn-and-continue.
+warn-and-continue. **Amended 2026-10-21 (plan D9):** the proof is "an upstream
+connection was established for this launch", on **either** the CONNECT leg
+(dial succeeded) or the plain-HTTP forward leg (its own dial came up) - the
+listener is now also a forward proxy for the hosts D-1 admits.
 
 ### Guardrail 2 — per-session tier recording
 
