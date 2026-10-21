@@ -250,9 +250,22 @@ current behaviour (harness smoke on 5 scenarios).
   token does not match the run; two concurrent containers must both pass their
   own guardrail and neither can satisfy the other's. Alternative (only if the
   token proves impossible): one proxy instance per run — document the cost.
-- [ ] **P1.5** (risk check) WinHTTP per-container proxy path: does a
-  WinHTTP/Chromium-style client honour it? Record the answer; it decides whether
-  GUI/browser workloads are supported in MXC mode.
+- [x] **P1.5** (risk check) WinHTTP per-container proxy path: does a
+  WinHTTP/Chromium-style client honour it? **Measured 2026-10-21: no.** The env is
+  the only proxy information in the child (IE/WinHTTP/WinINet config reads
+  'direct'), yet the container *forces* HTTP egress to `networkProxy` - proven with
+  a WinHTTP session told the deliberately wrong proxy `127.0.0.1:1`, whose request
+  still arrived at the container's proxy - and the consultation arrives without
+  `Proxy-Authorization`, so WinHTTP/WinINet/Chromium get **407** (raw TCP gets
+  `WSAEACCES 10013`; loopback is reachable only on the proxy's port). The only
+  credential lives in the env URL, which none of those stacks read. Consequence:
+  GUI/browser/system-proxy workloads are **not supported** in MXC proxy-only mode
+  and stay on the AppContainer backend; a per-user WinINET/WinHTTP configuration is
+  not a fix (HKCU write is `ERROR_ACCESS_DENIED` inside the container, `netsh
+  winhttp`/HKLM need admin, and the credential still would not arrive).
+  Independently: **the CLR does not start** in this container (coreclr
+  `0x8007045A` / `0xC0000142`; the same binary runs under AppContainer) - P3
+  blocker, root cause open. Evidence: `docs/backends/process-container/winhttp-proxy-path.md`.
 
 **Acceptance:** in the VM, unelevated, the network scenarios (S-27..S-36, S-72,
 S-75..S-77, S-81..S-87, S-90, S-91) pass against `--backend mxc`; the guardrail
