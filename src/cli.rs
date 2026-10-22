@@ -255,6 +255,24 @@ pub enum Cmd {
         #[arg(long, value_name = "SID", hide = true)]
         sid: Option<String>,
 
+        /// Load a plugin sidecar for this session (repeatable). Plugins are looked
+        /// up as `<root>/<name>/plugin.json`, searching each `--plugin-dir` in the
+        /// order given and then `%USERPROFILE%\.sandbox\plugins`; the first hit
+        /// for a name wins. A plugin that cannot be loaded, spawned or made
+        /// healthy refuses the session (exit 5).
+        #[arg(long, value_name = "NAME")]
+        plugin: Vec<String>,
+
+        /// An extra plugin root, consulted BEFORE the global one (repeatable). The
+        /// path directly holds `<name>/plugin.json`. A name found here shadows the
+        /// global copy; it is never merged with it. Nothing inside the workspace
+        /// is discovered implicitly: a cloned repository must never gain host-side
+        /// code execution from the act of running `sandbox run` in it, so
+        /// repo-local plugins are usable only when the operator names the directory
+        /// here.
+        #[arg(long, value_name = "PATH")]
+        plugin_dir: Vec<String>,
+
         /// The command + args, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -432,6 +450,40 @@ pub fn profiles_dir() -> PathBuf {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn run_accepts_repeatable_plugin_and_plugin_dir() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "run",
+            "--plugin",
+            "tngtech",
+            "--plugin",
+            "jira",
+            "--plugin-dir",
+            r"C:\repo\.sandbox\plugins",
+            "--plugin-dir",
+            "rel",
+            "--",
+            "cmd",
+        ]);
+        let Cmd::Run {
+            plugin,
+            plugin_dir,
+            cmd,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Run");
+        };
+        assert_eq!(plugin, vec!["tngtech".to_string(), "jira".to_string()]);
+        assert_eq!(
+            plugin_dir,
+            vec![r"C:\repo\.sandbox\plugins".to_string(), "rel".to_string()],
+            "the order the operator gave is the discovery order"
+        );
+        assert_eq!(cmd, vec!["cmd".to_string()]);
+    }
 
     #[test]
     fn parse_learned_list() {

@@ -1,6 +1,7 @@
 mod audit;
 mod cli;
 mod net;
+mod plugin;
 mod profile;
 mod sandbox;
 mod security_groups;
@@ -63,6 +64,8 @@ fn main() {
             backend,
             print_sid,
             sid,
+            plugin,
+            plugin_dir,
             cmd,
         } => run_cmd(
             backend,
@@ -79,6 +82,8 @@ fn main() {
             audit_strict,
             print_sid,
             sid,
+            plugin,
+            plugin_dir,
             cmd,
         ),
         Cmd::Ps { json, .. } => ps_cmd(json),
@@ -466,6 +471,9 @@ fn run_cmd(
     audit_strict: bool,
     print_sid: bool,
     sid: Option<String>,
+    // P4.1/P1.x: `--plugin` / `--plugin-dir`, repeatable and order-sensitive.
+    plugin: Vec<String>,
+    plugin_dir: Vec<String>,
     cmd: Vec<String>,
 ) -> i32 {
     // Backend selection is refused before anything is spawned or created. The
@@ -512,6 +520,8 @@ fn run_cmd(
         audit_strict,
         print_sid,
         sid.as_deref(),
+        &plugin,
+        &plugin_dir,
         &cmd,
     ) {
         Ok(code) => code,
@@ -546,6 +556,10 @@ fn run_inner(
     audit_strict: bool,
     print_sid: bool,
     sid: Option<&str>,
+    // `--plugin` names, in the order given (repeatable).
+    plugins: &[String],
+    // `--plugin-dir` roots, in the order given (repeatable).
+    plugin_dirs: &[String],
     cmd: &[String],
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
@@ -557,13 +571,18 @@ fn run_inner(
     };
 
     // Resolve the network configuration from the profile slice + CLI flags.
-    let net_cfg_resolved = net::resolve_network(
+    // `--plugin` needs the listener (the facade route lives in the proxy) but
+    // grants no origin: the allow-list is whatever the operator declared, and an
+    // empty one still denies every host that is not a facade mount. `--block-net`
+    // remains an explicit "no listener" and refuses `--plugin` downstream.
+    let net_cfg_resolved = net::resolve_network_with(
         &resolved.network,
         block_net,
         allow_domain,
         deny_domain,
         no_prompt,
         network_profile,
+        !plugins.is_empty(),
     );
 
     // Merge CLI flags on top of the profile.
@@ -590,6 +609,8 @@ fn run_inner(
                 audit_strict,
                 print_sid,
                 no_interactive,
+                plugins,
+                plugin_dirs,
                 cmd,
             );
         }
@@ -601,6 +622,19 @@ fn run_inner(
         {
             anyhow::bail!("{}", cli::MXC_FEATURE_MISSING);
         }
+    }
+
+    // Plugins are wired on the MXC path only (POC). Refused by NAME rather than
+    // ignored: asking for a capability and silently not getting it is the failure
+    // mode this project exists to prevent, and the AppContainer session differs
+    // enough (loopback exemption, elevation) that wiring it without a live leg
+    // would be a claim rather than a feature.
+    if !plugins.is_empty() {
+        eprintln!(
+            "[sandbox] plugin_unsupported_backend: --plugin {} (plugins are wired on --backend mxc only)",
+            plugins.join(", ")
+        );
+        return Ok(2);
     }
 
     // MXC F-C/F-D: before any host-DACL mutation, reap journals of dead
@@ -683,7 +717,14 @@ fn run_inner(
     // the handle MUST outlive `sandbox::spawn` below, so the proxy stays up while
     // the child runs. Extracted in P3.0 so the MXC path starts the *same* listener
     // with the same policy instead of a second implementation of it.
-    let proxy = start_session_proxy(&net_cfg, &sid, audit_writer.clone())?;
+    // An EMPTY registry on this path: plugins are refused above, and an empty
+    // registry is a fully-closed facade (`404` for any `*.sandbox.invalid`).
+    let proxy = start_session_proxy(
+        &net_cfg,
+        &sid,
+        audit_writer.clone(),
+        std::sync::Arc::new(plugin::FacadeRegistry::new()),
+    )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
 
     // P2.3: the listener exists only now, so that is the one fact `complete`
@@ -745,6 +786,15 @@ fn run_inner(
 #[cfg(feature = "mxc-backend")]
 const EXIT_TIMEOUT: i32 = 124;
 
+/// Exit code for a session a PLUGIN refused: load, spawn, health gate, or a
+/// duplicate mount.
+///
+/// `5` is deliberately distinct from `126` (a guardrail refusal) and `1` (a
+/// runtime error): a caller script can tell "the capability I asked for was not
+/// available" from "the session ran and failed".
+#[cfg(feature = "mxc-backend")]
+const EXIT_PLUGIN_REFUSED: i32 = 5;
+
 /// Exit code for a session a guardrail refused.
 ///
 /// `126` is `timeout(1)`'s "found but could not be executed", which is what a
@@ -798,6 +848,8 @@ fn run_mxc_session(
     audit_strict: bool,
     print_sid: bool,
     no_interactive: bool,
+    plugins: &[String],
+    plugin_dirs: &[String],
     cmd: &[String],
 ) -> Result<i32> {
     // Decision 7: `--print-sid` yields the id and returns, exactly as the
@@ -882,9 +934,67 @@ fn run_mxc_session(
     //     token; nothing at all under `--block-net`. No loopback exemption is
     //     registered: this backend's ingress policy allows host loopback, which is
     //     why the migration needs no elevation.
-    let proxy = start_session_proxy(net_cfg, sid, audit_writer.clone())?;
+    //
+    //     The facade registry exists BEFORE the listener so both hold one `Arc`:
+    //     the handler reads it per request, and the plugins below fill it once
+    //     each sidecar has a port and a token. That ordering is what makes
+    //     "proxy binds -> plugins spawn -> child" honest — a request that lands
+    //     in between answers `404`, never a stale allow.
+    if !plugins.is_empty() && net_cfg.is_blocked() {
+        eprintln!(
+            "[sandbox] plugin_requires_proxy: --plugin {} (--block-net starts no listener to route it)",
+            plugins.join(", ")
+        );
+        return Ok(2);
+    }
+    let facade = std::sync::Arc::new(plugin::FacadeRegistry::new());
+    let proxy = start_session_proxy(
+        net_cfg,
+        sid,
+        audit_writer.clone(),
+        std::sync::Arc::clone(&facade),
+    )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
     let token = proxy.as_ref().map(|(_, env)| env.token.value());
+
+    // (5b) Plugins: load, spawn host-side, health-gate, register. Declared AFTER
+    //      `proxy`, so they are dropped BEFORE it on every path (locals drop in
+    //      reverse declaration order): a sidecar never outlives the route that
+    //      points at it, and every `?` below unwinds through both.
+    let roots: Vec<std::path::PathBuf> = plugin_dirs.iter().map(std::path::PathBuf::from).collect();
+    let mut sidecars: Vec<plugin::sidecar::Sidecar> = Vec::new();
+    for name in plugins {
+        let loaded = match plugin::load_plugin(name, &roots) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                eprintln!("[sandbox] plugin '{name}' refused: {e:#}");
+                return Ok(EXIT_PLUGIN_REFUSED);
+            }
+        };
+        let sidecar = match plugin::sidecar::Sidecar::start(&loaded.dir, &loaded.manifest, sid) {
+            Ok(sidecar) => sidecar,
+            Err(e) => {
+                eprintln!("[sandbox] plugin '{name}' refused: {e:#}");
+                return Ok(EXIT_PLUGIN_REFUSED);
+            }
+        };
+        if std::env::var_os("SANDBOX_DIAG").is_some() {
+            eprintln!(
+                "[sandbox] SANDBOX_DIAG: plugin '{}' healthy on 127.0.0.1:{} (pid {:?}, log {})",
+                sidecar.mount(),
+                sidecar.port(),
+                sidecar.pid(),
+                sidecar.log_path().display()
+            );
+        }
+        // The mount goes live only now: a duplicate mount (two plugins asking to
+        // answer for one name) refuses the session instead of picking a winner.
+        if let Err(e) = facade.insert(sidecar.facade_target()) {
+            eprintln!("[sandbox] plugin '{name}' refused: {e:#}");
+            return Ok(EXIT_PLUGIN_REFUSED);
+        }
+        sidecars.push(sidecar);
+    }
 
     // (6) Guardrail 1's proof source. With a proxy it is that listener — the one
     //     the child is pointed at, so the proof cannot come from a different
@@ -1208,6 +1318,7 @@ fn start_session_proxy(
     net_cfg: &net::NetworkConfig,
     sid: &str,
     writer: std::sync::Arc<audit::AuditWriter>,
+    facade: std::sync::Arc<plugin::FacadeRegistry>,
 ) -> Result<Option<(net::proxy::ProxyHandle, net::ProxyEnv)>> {
     // The listener MUST outlive the child: the caller holds the handle until the
     // child has exited (see `seal_audit`).
@@ -1309,6 +1420,7 @@ fn start_session_proxy(
                 upstream,
                 writer: writer.clone(),
                 prompt,
+                facade,
             })
             .context("start localhost proxy")?;
             let proxy_env = net::ProxyEnv {

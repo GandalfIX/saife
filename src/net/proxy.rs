@@ -52,6 +52,7 @@ use crate::net::prompt::{
 };
 use crate::net::token::RunToken;
 use crate::net::upstream::{UpstreamDialer, UpstreamError};
+use crate::plugin::{FacadeRegistry, FacadeTarget};
 
 /// The complete set of valid `source` values for a CONNECT audit event
 /// (D-5 taxonomy). Kept as a const so future validation logic and tests
@@ -142,6 +143,12 @@ pub struct ProxyConfig {
     /// Prompt/intent/learned wiring (Task 3.6). Built by the supervisor
     /// before `spawn`; see [`PromptGate`].
     pub prompt: PromptGate,
+    /// This session's plugin facades. An EMPTY registry is a valid, fully
+    /// closed state (the AppContainer path and `--block-net` both pass one): a
+    /// `*.sandbox.invalid` request then answers `404` and nothing else changes.
+    /// The supervisor fills it after the listener binds, which is why it is
+    /// shared rather than owned — see [`FacadeRegistry`].
+    pub facade: Arc<FacadeRegistry>,
 }
 
 /// The Task 3.6 wiring: everything the D-1 decision pipeline needs
@@ -189,6 +196,10 @@ struct ConnCtx {
     /// one extra header away (`Proxy-Authorization: Basic <anything base64>`
     /// takes the `Foreign` arm instead).
     foreign_token: RefusalBudget,
+    /// The plugin mounts this session may reach through a facade. Empty for a
+    /// session that requested no plugin; a handler that arrives before a mount
+    /// is registered answers `404`, never a stale allow.
+    facade: Arc<FacadeRegistry>,
 }
 
 /// How many refusals of one kind get their own leaf before the aggregate window
@@ -399,6 +410,30 @@ fn emit_connect(
     // that trade: the leaf was always open-shaped (a reader takes the fields it
     // knows), and the alternative is a field whose meaning depends on `reason`.
     e.insert("suppressed".into(), json!(suppressed));
+    writer.append(e)?;
+    Ok(())
+}
+
+/// One facade request, as the chain records it.
+///
+/// `op: "FACADE"`, and never the facade token or the sidecar's port: the mount
+/// and the path answer "which capability did this workload use", while a token in
+/// the chain would be a credential in the audit. `path` is `None` for the CONNECT
+/// refusal, which carries no origin-form request.
+fn emit_facade(
+    writer: &AuditWriter,
+    mount: &str,
+    path: Option<&str>,
+    disposition: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    use serde_json::{Map, json};
+    let mut e = Map::new();
+    e.insert("op".into(), json!("FACADE"));
+    e.insert("mount".into(), json!(mount));
+    e.insert("path".into(), json!(path));
+    e.insert("disposition".into(), json!(disposition));
+    e.insert("reason".into(), json!(reason));
     writer.append(e)?;
     Ok(())
 }
@@ -969,6 +1004,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         writer,
         upstream,
         prompt,
+        facade,
     } = cfg;
     // One credential, one listener (P1.6(b)). Claimed before a runtime or a
     // socket exists, so a refusal costs nothing and cannot leave a half-built
@@ -992,6 +1028,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         counters: Arc::clone(&counters),
         no_token: RefusalBudget::new(),
         foreign_token: RefusalBudget::new(),
+        facade,
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2118,6 +2155,29 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
         return Ok(());
     }
 
+    // A `CONNECT` to a facade host is refused, declared mount or not: the facade
+    // is plain HTTP, and a tunnel would put TLS past the one check that makes
+    // `.sandbox.invalid` special. Refused before the consultation counter, so a
+    // refused tunnel cannot look like a workload that reached an origin. The leaf
+    // goes out before the 403, like every other deny path here.
+    if let Some(label) = crate::plugin::facade_mount(&host) {
+        let _ = emit_facade(
+            &ctx.writer,
+            &label.to_ascii_lowercase(),
+            None,
+            "deny",
+            Some("facade_requires_http"),
+        );
+        write_response(
+            &mut sock,
+            "403 Forbidden",
+            "Content-Type: text/plain\r\nConnection: close\r\n",
+            "facade_requires_http: the plugin facade is plain HTTP only; use http://<mount>.sandbox.invalid/\n",
+        )
+        .await;
+        return Ok(());
+    }
+
     // This connection reached us *as a proxy* and is attributable to the
     // launch: count it before the decision, so a denial (403) or a failed
     // upstream dial (502) still shows up as `consultations=1,
@@ -3030,9 +3090,96 @@ fn response_field_named(line: &[u8], name: &[u8]) -> bool {
 /// The audit leaf is the same one `decide()` produces for a tunnel
 /// (`op: CONNECT`, with `source`/`scope`/`persisted`), so the D-5 taxonomy is
 /// untouched; whether a forward deserves its own `op` is P2.3's decision.
+/// What the facade does with one absolute-form request.
+#[derive(Debug)]
+enum FacadeAction {
+    /// Not a `.sandbox.invalid` host: the ordinary admission pipeline owns it.
+    NotFacade,
+    /// Reserved suffix, but no plugin in this session registered that mount.
+    UnknownMount,
+    /// The mount exists and the method is not one this transport relays.
+    MethodUnsupported,
+    /// Relay this request to the sidecar behind the mount.
+    Relay { mount: String, target: FacadeTarget },
+}
+
+/// The facade routing decision, as one pure function so its table is testable
+/// without a socket.
+///
+/// Order is part of the decision and is pinned by `facade_routing_table`: an
+/// undeclared mount is `404` whatever the method (nothing is declared under that
+/// name), while a known mount with a non-GET method is `501` rather than a
+/// denial — the capability exists, this transport does not carry that operation
+/// yet. The host label is compared case-insensitively but the mount is
+/// canonicalised to the registry's spelling, so audit and `Host` agree.
+fn facade_action(facade: &FacadeRegistry, host: &str, method: &str) -> FacadeAction {
+    let Some(label) = crate::plugin::facade_mount(host) else {
+        return FacadeAction::NotFacade;
+    };
+    let Some(target) = facade.lookup(&label.to_ascii_lowercase()) else {
+        return FacadeAction::UnknownMount;
+    };
+    if !method.eq_ignore_ascii_case("GET") {
+        return FacadeAction::MethodUnsupported;
+    }
+    FacadeAction::Relay {
+        mount: target.mount.clone(),
+        target,
+    }
+}
+
+/// Relay one `GET` to a plugin sidecar and stream the answer back verbatim.
+///
+/// The client's head is NOT forwarded. The sidecar sees exactly the line the
+/// supervisor built — `GET <path> HTTP/1.0`, a `Host` of the mount and the facade
+/// token — so a workload cannot smuggle a header, a body or a second request into
+/// the deputy. `tokio::io::copy` streams the response instead of buffering it: a
+/// 60 KB page is one pass-through, and a later SSE body would arrive as it is
+/// produced rather than at the end.
+async fn relay_facade(
+    sock: &mut TcpStream,
+    writer: &AuditWriter,
+    mount: &str,
+    target: &FacadeTarget,
+    path: &str,
+) -> Result<()> {
+    let mut upstream = match TcpStream::connect(("127.0.0.1", target.port)).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            // Leaf before response, the rule every deny path here follows.
+            let _ = emit_facade(
+                writer,
+                mount,
+                Some(path),
+                "deny",
+                Some("facade_sidecar_unreachable"),
+            );
+            write_response(
+                sock,
+                "502 Bad Gateway",
+                "Content-Type: text/plain\r\nConnection: close\r\n",
+                "facade_sidecar_unreachable\n",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let _ = emit_facade(writer, mount, Some(path), "allow", None);
+    let request = format!(
+        "GET {path} HTTP/1.0\r\nHost: {mount}\r\nX-Facade-Token: {}\r\n\r\n",
+        target.token
+    );
+    if upstream.write_all(request.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+    let _ = tokio::io::copy(&mut upstream, sock).await;
+    Ok(())
+}
+
 async fn handle_forward(
     mut sock: TcpStream,
     ctx: Arc<ConnCtx>,
+    method: &str,
     target: &str,
     head: &str,
     leftover: &[u8],
@@ -3144,6 +3291,62 @@ async fn handle_forward(
         )
         .await;
         return Ok(());
+    }
+
+    // Plugin facade: `<mount>.sandbox.invalid` is a capability the supervisor
+    // started, not an origin. Dispatched HERE — after the head is framed and
+    // before any admission decision — because the name never resolves and must
+    // never reach `decide()`, the prompt, or a dial. It is therefore not a
+    // consultation either: no origin was contacted on the workload's behalf.
+    match facade_action(&ctx.facade, &fwd.host, method) {
+        FacadeAction::NotFacade => {}
+        FacadeAction::UnknownMount => {
+            let label = crate::plugin::facade_mount(&fwd.host).unwrap_or("");
+            let _ = emit_facade(
+                &ctx.writer,
+                &label.to_ascii_lowercase(),
+                Some(fwd.origin_form.as_str()),
+                "deny",
+                Some("facade_unknown_mount"),
+            );
+            write_response(
+                &mut sock,
+                "404 Not Found",
+                "Content-Type: text/plain\r\nConnection: close\r\n",
+                "facade_unknown_mount\n",
+            )
+            .await;
+            return Ok(());
+        }
+        FacadeAction::MethodUnsupported => {
+            let label = crate::plugin::facade_mount(&fwd.host).unwrap_or("");
+            let _ = emit_facade(
+                &ctx.writer,
+                &label.to_ascii_lowercase(),
+                Some(fwd.origin_form.as_str()),
+                "deny",
+                Some("facade_method_unsupported"),
+            );
+            write_response(
+                &mut sock,
+                "501 Not Implemented",
+                "Content-Type: text/plain\r\nConnection: close\r\n",
+                "facade_method_unsupported\n",
+            )
+            .await;
+            return Ok(());
+        }
+        FacadeAction::Relay { mount, target } => {
+            relay_facade(
+                &mut sock,
+                &ctx.writer,
+                &mount,
+                &target,
+                fwd.origin_form.as_str(),
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     // A consultation exactly like a CONNECT, and counted at the same point: a
@@ -3307,7 +3510,7 @@ async fn handle_non_connect(
     // origin-form target starts with `/` and can never contain `://`, so
     // this cannot capture a control-plane request.
     if !target.starts_with('/') && target.contains("://") {
-        return handle_forward(sock, ctx, target, head, leftover).await;
+        return handle_forward(sock, ctx, method, target, head, leftover).await;
     }
     if !target.starts_with("/sandbox/") {
         write_response(&mut sock, "400 Bad Request", "", "").await;
@@ -4680,6 +4883,10 @@ mod tests {
         };
         let sid = temp_sid(label);
         let writer = Arc::new(crate::audit::AuditWriter::open(&sid, false).unwrap());
+        // One registry per listener, shared with the handle's ctx: a facade test
+        // registers its mount on `t.handle.ctx.facade` after spawn, which is the
+        // order the supervisor uses (bind, then plugins).
+        let facade = Arc::new(FacadeRegistry::new());
         let handle = match super::spawn(super::ProxyConfig {
             session_id: sid.clone(),
             token,
@@ -4688,6 +4895,7 @@ mod tests {
             upstream,
             writer,
             prompt: gate,
+            facade,
         }) {
             Ok(handle) => handle,
             Err(e) => {
@@ -9126,6 +9334,7 @@ mod tests {
             counters: LaunchCounters::new(),
             no_token: super::RefusalBudget::new(),
             foreign_token: super::RefusalBudget::new(),
+            facade: Arc::new(super::FacadeRegistry::new()),
         });
         (ctx, base)
     }
@@ -9195,5 +9404,253 @@ mod tests {
             .expect("fake upstream never observed the tunnel's EOF")
             .expect("fake upstream task panicked");
         assert_eq!(echoed_upstream, b"half-close payload".len());
+    }
+
+    // ---- plugin facade: `<mount>.sandbox.invalid` -------------------------
+
+    fn facade_target(mount: &str, port: u16, token: &str) -> FacadeTarget {
+        FacadeTarget {
+            mount: mount.to_string(),
+            port,
+            token: token.to_string(),
+        }
+    }
+
+    /// A one-shot HTTP/1.0 sidecar stand-in: records the request head it received
+    /// and answers a fixed body. Blocking, on a std thread — the proxy connects to
+    /// it from a tokio task, exactly as it reaches the real sidecar.
+    fn fake_sidecar(body: &'static str) -> (u16, Arc<StdMutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_thread = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut head = Vec::new();
+                let mut one = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut one) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => head.push(one[0]),
+                    }
+                }
+                seen_in_thread
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    fn facade_leaves(sid: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(crate::audit::audit_log_path(sid))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["op"] == "FACADE")
+            .collect()
+    }
+
+    #[test]
+    fn facade_routing_table() {
+        let reg = FacadeRegistry::new();
+        reg.insert(facade_target("tngtech", 4321, "tok")).unwrap();
+
+        assert!(matches!(
+            facade_action(&reg, "api.example.com", "GET"),
+            FacadeAction::NotFacade
+        ));
+        assert!(
+            matches!(
+                facade_action(&reg, "sandbox.invalid", "GET"),
+                FacadeAction::NotFacade
+            ),
+            "the bare suffix is not a mount"
+        );
+        assert!(
+            matches!(
+                facade_action(&reg, "tngtech.sandbox.invalid.evil.com", "GET"),
+                FacadeAction::NotFacade
+            ),
+            "a lookalike suffix must never be a facade host"
+        );
+        assert!(matches!(
+            facade_action(&reg, "nope.sandbox.invalid", "GET"),
+            FacadeAction::UnknownMount
+        ));
+        assert!(
+            matches!(
+                facade_action(&reg, "nope.sandbox.invalid", "POST"),
+                FacadeAction::UnknownMount
+            ),
+            "an undeclared mount is 404 whatever the method"
+        );
+        assert!(matches!(
+            facade_action(&reg, "tngtech.sandbox.invalid", "POST"),
+            FacadeAction::MethodUnsupported
+        ));
+        match facade_action(&reg, "TNGTECH.sandbox.invalid", "GET") {
+            FacadeAction::Relay { mount, target } => {
+                assert_eq!(mount, "tngtech", "the mount is the registry's spelling");
+                assert_eq!(target.port, 4321);
+            }
+            other => panic!("expected a relay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn facade_relay_is_verbatim_and_carries_the_facade_token() {
+        const BODY: &str = "<html><title>through the facade</title></html>";
+        let (sidecar_port, seen) = fake_sidecar(BODY);
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-relay", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://fake.sandbox.invalid/page?q=1 HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.0 200 OK"),
+            "the sidecar's status line is relayed as-is: {resp}"
+        );
+        assert!(
+            resp.to_ascii_lowercase()
+                .contains("content-type: text/html"),
+            "{resp}"
+        );
+        assert!(
+            resp.ends_with(BODY),
+            "the body must arrive verbatim: {resp}"
+        );
+
+        let head = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("the sidecar must have been called");
+        assert!(
+            head.starts_with("GET /page?q=1 HTTP/1.0\r\n"),
+            "origin-form with the query: {head}"
+        );
+        assert!(head.contains("Host: fake\r\n"), "{head}");
+        assert!(head.contains("X-Facade-Token: facadetoken\r\n"), "{head}");
+
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "a facade request is not an origin consultation"
+        );
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1, "one request, one leaf: {leaves:?}");
+        assert_eq!(leaves[0]["disposition"], "allow");
+        assert_eq!(leaves[0]["mount"], "fake");
+        assert_eq!(leaves[0]["path"], "/page?q=1");
+        assert_eq!(leaves[0]["reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn facade_unknown_mount_is_404_and_audited_as_a_deny() {
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-unknown", &[], &[], dialog);
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://nope.sandbox.invalid/ HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp}");
+        assert!(resp.contains("facade_unknown_mount"), "got: {resp}");
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0]["disposition"], "deny");
+        assert_eq!(leaves[0]["reason"], "facade_unknown_mount");
+        assert_eq!(leaves[0]["mount"], "nope");
+    }
+
+    #[test]
+    fn facade_non_get_is_501_and_audited_as_a_deny() {
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-post", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", 9, "tok"))
+            .unwrap();
+        let resp = exchange(
+            t.port,
+            &format!(
+                "POST http://fake.sandbox.invalid/ HTTP/1.1\r\n{}Content-Length: 0\r\n\r\n",
+                auth_header()
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 501"), "got: {resp}");
+        assert!(resp.contains("facade_method_unsupported"), "got: {resp}");
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0]["reason"], "facade_method_unsupported");
+    }
+
+    #[test]
+    fn facade_with_a_dead_sidecar_is_502_and_audited() {
+        // Bind and drop: the port is ours and nothing listens on it.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-dead", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", dead_port, "tok"))
+            .unwrap();
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://fake.sandbox.invalid/ HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 502"), "got: {resp}");
+        assert!(resp.contains("facade_sidecar_unreachable"), "got: {resp}");
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0]["disposition"], "deny");
+        assert_eq!(leaves[0]["reason"], "facade_sidecar_unreachable");
+    }
+
+    #[test]
+    fn facade_connect_is_refused_with_facade_requires_http() {
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-connect", &[], &[], dialog);
+        let resp = exchange(t.port, &connect_req("tngtech.sandbox.invalid:443"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("facade_requires_http"), "got: {resp}");
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1, "the refusal is audited: {leaves:?}");
+        assert_eq!(leaves[0]["disposition"], "deny");
+        assert_eq!(leaves[0]["reason"], "facade_requires_http");
+        assert_eq!(leaves[0]["mount"], "tngtech");
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "a refused facade tunnel is not a consultation"
+        );
     }
 }

@@ -134,8 +134,12 @@ pub struct ProxyEnv {
     pub token: RunToken,
 }
 
-/// Merge profile network slice + CLI flags into a `NetworkConfig` (with
-/// port/token placeholders filled in by the proxy layer later).
+/// [`resolve_network_with`] with the facade flag off.
+///
+/// Kept for the resolution table tests, which read better without a trailing
+/// `false`; the supervisor always goes through `resolve_network_with`, because it
+/// is the one caller that knows whether plugins were requested.
+#[cfg(test)]
 pub fn resolve_network(
     profile_net: &NetworkSlice,
     cli_block_net: bool,
@@ -143,6 +147,36 @@ pub fn resolve_network(
     cli_deny_domain: &[String],
     cli_no_prompt: bool,
     cli_network_profile: Option<&str>,
+) -> NetworkConfig {
+    resolve_network_with(
+        profile_net,
+        cli_block_net,
+        cli_allow_domain,
+        cli_deny_domain,
+        cli_no_prompt,
+        cli_network_profile,
+        false,
+    )
+}
+
+/// [`resolve_network`] with the plugin-facade flag.
+///
+/// A session that requested a plugin needs the LISTENER, because the facade route
+/// exists only in the proxy — but it must not gain an ORIGIN. With
+/// `facade_requested` the two "nothing to enforce, skip the proxy" short-circuits
+/// are skipped and the resolved `Allow` keeps exactly the allow-list the operator
+/// declared (usually empty, i.e. every non-facade host is denied or prompted as
+/// before). An explicit block still wins: `--block-net` and the `none` network
+/// profile name no listener at all, so `--plugin` is refused there by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_network_with(
+    profile_net: &NetworkSlice,
+    cli_block_net: bool,
+    cli_allow_domain: &[String],
+    cli_deny_domain: &[String],
+    cli_no_prompt: bool,
+    cli_network_profile: Option<&str>,
+    facade_requested: bool,
 ) -> NetworkConfig {
     let block = cli_block_net
         || profile_net.block_net
@@ -229,13 +263,13 @@ pub fn resolve_network(
     // there is nothing to enforce — skip the proxy entirely. This also avoids
     // spurious "deferred" warnings when the user passes no network flags at
     // all (the common case).
-    if allow.is_empty() && deny.is_empty() {
+    if allow.is_empty() && deny.is_empty() && !facade_requested {
         return NetworkConfig::Blocked;
     }
     // Allow-list mode: an empty allow-list is Blocked only when the prompt is
     // off. When the prompt is on, an empty allow-list means "prompt for
     // everything" (the deny-list still hard-denies its entries).
-    if allow.is_empty() && !prompt_enabled {
+    if allow.is_empty() && !prompt_enabled && !facade_requested {
         return NetworkConfig::Blocked;
     }
 
@@ -347,6 +381,43 @@ mod tests {
             }
             NetworkConfig::Blocked => panic!("expected Allow"),
         }
+    }
+
+    #[test]
+    fn a_facade_only_session_gets_a_listener_and_no_origin() {
+        // `--plugin` needs the proxy (that is where the facade route lives), but
+        // it must not grant an origin: the allow-list stays empty and prompting
+        // stays off, so every non-facade host is denied exactly as before.
+        let cfg = resolve_network_with(&empty_slice(), false, &[], &[], true, None, true);
+        match cfg {
+            NetworkConfig::Allow {
+                allow_domain,
+                prompt_enabled,
+                ..
+            } => {
+                assert!(
+                    allow_domain.is_empty(),
+                    "the facade must not add an allowed domain"
+                );
+                assert!(!prompt_enabled, "no-prompt still means no prompting");
+            }
+            other => panic!("expected a listener for a facade-only session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_facade_does_not_survive_block_net() {
+        // `--block-net` names no listener, so asking for a plugin cannot open one.
+        let cfg = resolve_network_with(&empty_slice(), true, &[], &[], false, None, true);
+        assert!(cfg.is_blocked(), "--block-net must still win over --plugin");
+    }
+
+    #[test]
+    fn without_a_facade_an_empty_network_is_still_blocked() {
+        assert!(
+            resolve_network_with(&empty_slice(), false, &[], &[], false, None, false).is_blocked(),
+            "the facade flag is the only thing that keeps an empty network alive"
+        );
     }
 
     #[test]

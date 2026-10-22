@@ -48,6 +48,10 @@ const KNOWN_KEYS: &[&str] = &[
     "op",
     "disposition",
     "host",
+    // Plugin facade (P4.1): the mount a FACADE leaf names. Filterable so an
+    // operator can ask "did this session use the tngtech capability" without
+    // reading the whole chain, and so a refusal is as findable as a relay.
+    "mount",
     "path",
     "ts",
     "pid",
@@ -509,6 +513,8 @@ mod tests {
         assert!(Filter::parse("op").is_err());           // no operator
         assert!(Filter::parse("op=").is_err());          // no value
         assert!(Filter::parse("boguskey=x").is_err());   // unknown key
+        // P4.1: the facade leaf's key is part of the filter grammar.
+        assert!(Filter::parse("mount=tngtech").is_ok());
         assert!(Filter::parse("op=CONNECT&").is_err());  // trailing empty clause
     }
 

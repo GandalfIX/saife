@@ -7519,6 +7519,7 @@ mod live {
                 upstream: None,
                 writer: writer.clone(),
                 prompt,
+                facade: std::sync::Arc::new(crate::plugin::FacadeRegistry::new()),
             })
             .expect("spawn the session proxy");
             Self {

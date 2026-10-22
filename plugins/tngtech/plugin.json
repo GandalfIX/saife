@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "name": "tngtech",
+  "version": "0.1.0",
+  "description": "Dummy sidecar: returns the tngtech.com homepage to a sandboxed workload.",
+  "mount": "tngtech",
+  "command": ["python", "sidecar.py"],
+  "health": {
+    "path": "/status",
+    "timeout_ms": 15000,
+    "interval_ms": 250
+  },
+  "operations": [
+    { "method": "GET", "path": "/" }
+  ],
+  "secrets": [],
+  "config": {
+    "upstream": "https://www.tngtech.com/"
+  }
+}
