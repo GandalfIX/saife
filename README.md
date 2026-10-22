@@ -12,24 +12,69 @@ container runtime, no daemon, no VM. Windows-native equivalent of
 
 MVP, under active development. Implemented pillars:
 
-- **Filesystem isolation** (US-1, US-2) — AppContainer + per-directory
-  DACL allow-lists, irrevocable for the lifetime of the process tree.
-- **Network filtering (partial)** (US-3) — `--block-net` works fully
-  unprivileged; `--allow-domain` / `--network-profile` are deferred
-  pending an unprivileged loopback mechanism (see
-  [Network filtering status](#network-filtering-status) below).
-- **Audit trail** (US-4) — planned.
+- **Filesystem isolation** (US-1, US-2) - `mxc`: an additive policy over the
+  workspace plus read-only extra grants; `appcontainer`: per-directory DACL
+  allow-lists. Irrevocable for the lifetime of the process tree.
+- **Network filtering** (US-3) - `--block-net` is fully unprivileged; a domain
+  allow/deny-list, block-list, learned denies and an interactive prompt sit in
+  front of every request, and plain-HTTP as well as CONNECT goes through the
+  same pipeline. Unelevated by default (see
+  [Backends and privileges](#backends-and-privileges)).
+- **Audit trail** (US-4) - a tamper-evident hash chain per session, signed with
+  an Ed25519 key, with `sandbox audit show|verify` and a session-start leaf that
+  records the containment tier, elevation and proxy endpoint. `verify` reports
+  `INCOMPLETE` for a session that did not end cleanly rather than silently
+  accepting it.
 
-Out of scope for the MVP: undo/rollback, credential injection, ghost
-sessions, runtime supervisor, Sigstore provenance, GUI/TUI, multi-user
-mode. See `docs/prd/prd-sandbox.md` for the full PRD and
-`docs/future-ideas.md` for the deferred roadmap.
+Default backend is `mxc` in a build with `--features mxc-backend` (P3.2);
+`--backend appcontainer` remains for workloads whose client stack cannot use a
+proxy. Out of scope for the MVP: undo/rollback, credential injection, ghost
+sessions, runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
+See `docs/prd/prd-sandbox.md` for the PRD and `docs/future-ideas.md` for the
+deferred roadmap.
 
 ## Requirements
 
-- Windows 10 1709 (build 16299) or later — AppContainer RuleSet requires it.
-- No admin rights needed to run `sandbox` (the design goal is unprivileged).
+- **Windows 11 24H2 (build 26100.x) or a later supported servicing build** for
+  the default `mxc` backend — the MXC process container requires it. Builds older
+  than 24H2 cannot run that backend at all.
+- The `appcontainer` backend runs on Windows 10 1709 (build 16299) and later.
+- **Administrator rights: not needed for `mxc`.** Network sessions through the
+  default backend run unelevated. They ARE needed for `--backend appcontainer`
+  when the session has network (`--allow-domain`, a profile with a network
+  policy): that backend registers a system-wide loopback exemption for the
+  AppContainer SID, which is an admin-only API.
 - Rust toolchain (for building; only needed by developers, not end users).
+
+## Backends and privileges
+
+`--backend mxc` (default in a build with `--features mxc-backend`) runs the
+workload in an MXC process container: filesystem policy is additive over the
+workspace, egress is forced through this process's own proxy listener, and no
+DACLs, no loopback exemption, no admin rights are involved.
+
+`--backend appcontainer` is the original AppContainer supervisor and remains the
+**escape hatch for workloads whose network stack cannot use a proxy** — WinINet /
+system-proxy applications and PowerShell 5.1 / .NET Framework programs reach the
+proxy but never authenticate, so they have no egress under `mxc`. Use the flag
+for those.
+
+Every successful proxied session prints its proof to stderr:
+
+```text
+[sandbox] mxc: guardrail 1 proof probes=1 accepted=0 tunnels=0 unauthenticated=0
+```
+
+`probes` is this run's own pre-flight probe (the child's path to the proxy
+works), `accepted`/`tunnels` are the traffic it actually made, and
+`unauthenticated` counts attempts that reached the proxy without the run's
+credential. If nothing in the session ever authenticated while something tried,
+the session is **refused** with `workload_cannot_authenticate` and the remedy is
+`--backend appcontainer`.
+
+Session deadlines are `promptTimeoutSecs + workloadTimeoutSecs + slack`
+(defaults 60 s + 30 min + 2 min). Raise `network.workloadTimeoutSecs` in the
+profile for long builds or downloads; there is no unlimited mode.
 
 ## Build
 
@@ -155,32 +200,30 @@ and the network proxy status. Exits non-zero if the host is unsupported.
 ## Network filtering status
 
 **`--block-net` works fully unprivileged.** It removes the AppContainer
-network capability — every `connect()` is kernel-denied. Backs AC-3.1,
-AC-3.2, AC-3.13 from the spec.
+network capability (or, under `mxc`, provides no proxy at all) - every
+`connect()` is kernel-denied. Backs AC-3.1, AC-3.2, AC-3.13 from the spec.
 
-**`--allow-domain` / `--network-profile` are deferred.** The spec's
-chosen loopback mechanism (`NetworkIsolationSetAppContainerConfig`) is
-admin-only — MSDN documents it as "used for debugging purposes" and it
-sets a system-wide loopback-allow list. Running unprivileged it returns
-`ERROR_ACCESS_DENIED (0x5)`, so the sandboxed process cannot reach the
-localhost proxy without admin. The proxy, token, env injection, and
-audit plumbing are all implemented and unit-tested, but the loopback
-gate blocks end-to-end unprivileged use.
+**`--allow-domain` / `--network-profile` work, and under the default `mxc`
+backend they work UNELEVATED.** The supervisor opens its own loopback listener,
+the child is given `HTTP_PROXY`/`HTTPS_PROXY` pointing at it with the run's
+token, and every request is decided by the D-1 pipeline (hard deny, learned
+deny, allow-list, block-list, prompt). D-9 also admits plain-HTTP absolute-form
+requests through the same pipeline, and guardrail 1 refuses a session whose
+child never reached the listener.
 
-Until the unprivileged loopback mechanism lands, `--allow-domain` and
-`--network-profile` are accepted but **downgraded to `--block-net`
-semantics with a clear warning** — so the flags don't silently fail.
+**`--backend appcontainer` still needs administrator rights for networked
+sessions.** That backend relies on the loopback exemption registration
+(`NetworkIsolationSetAppContainerConfig`), an admin-only, system-wide API; an
+unprivileged child cannot reach the listener and fails with
+`WSAEACCES (10013)`, which the supervisor reports as a warning plus a
+degraded, network-less session. This is the measured reason the `mxc` migration
+exists - see ADR-0004.
 
-The planned unprivileged fix is to add a `privateNetworkClientServer`
-capability SID to the AppContainer token (instead of the admin-only
-`NetworkIsolationSetAppContainerConfig` call). This capability allows
-loopback + intranet but NOT public internet, so raw-socket direct
-connects to public hosts still fail closed and the proxy enforces the
-allow-list. Tracked as a follow-up in
-`docs/specs/us-3-network-exfiltration-blocked/spec.md`.
-
-When the fix lands, the integration scenarios S-27..S-34, S-36, S-38
-(`tests/run-tests.ps1`) flip from SKIP to active.
+Prompting: when the policy reaches the prompt stage and no dialog can be shown
+(headless/CI), the configured `on_unavailable` policy applies immediately after
+two consecutive unanswered consultations instead of paying the full budget per
+host, and the refusal reason says which happened
+(`prompt_budget_exhausted`, `no_dialog_backend`, `prompt_suppressed_after_budget`).
 
 ## How it works
 
@@ -211,7 +254,7 @@ When the fix lands, the integration scenarios S-27..S-34, S-36, S-38
 # Rust unit tests (domain matcher, profiles, token, audit, profile merge):
 cargo test --release
 
-# PowerShell integration suite (S-1..S-39):
+# Integration suite (93 scenarios; add -Backend mxc for the default backend):
 pwsh -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
@@ -237,7 +280,7 @@ rule in `docs/testing-principles.md`.
 - `docs/superpowers/plans/2026-07-25-us-3-network-exfiltration-blocked.md`
   — US-3 implementation plan.
 - `docs/critical-review.md` — critical review of the chosen mechanism.
-- `docs/future-ideas.md` — deferred roadmap (F-1..F-19).
+- `docs/future-ideas.md` — deferred roadmap (F-1..F-25; F-25 is superseded for egress by ADR-0004).
 - `agent.md` — high-level project overview.
 - `docs/testing-principles.md` — testing philosophy for the project.
 - `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` — VM-01:

@@ -620,9 +620,11 @@ explained, and a capability table that states what that build cannot do.
   `--features mxc-backend` build, AppContainer with a one-line notice otherwise - a hard
   constant would make every `run` on a feature-less build refuse. The escape hatch is now
   also the remedy named by guardrail 1's `workload_cannot_authenticate` refusal.
-- [ ] **P3.3** Docs: `AGENTS.md` (the "run tests elevated" rules become
-  MXC-specific), README, `sandbox-next-step.md`, supersede F-21 (the broker
-  design is no longer needed).
+- [x] **P3.3** Docs: README (requirements, backends/privileges, the two obsolete blocks replaced),
+  `AGENTS.md` (backends + test lanes), `sandbox-next-step.md`; the broker design is superseded -
+  `docs/future-ideas.md` had two sections numbered F-21, and the elevation-free one is now **F-25**
+  with a banner saying ADR-0004 removed the need for it (egress only; the AppContainer backend still
+  needs its exemption).
 
 **Acceptance:** 0 fail on both images for **both** backends; an unelevated host
 run of a network session works with no UAC anywhere.

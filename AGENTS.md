@@ -24,6 +24,40 @@ runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
 See `docs/prd/prd-sandbox.md` for the full product requirements and
 `docs/critical-review.md` for a critical review of the chosen mechanism.
 
+## Backends, privileges and the default
+
+Two containment backends, selected with `--backend`:
+
+- **`mxc`** (default in a build with `--features mxc-backend`, since P3.2) - the
+  MXC `processcontainer` backend. **Network sessions run UNELEVATED**: the proxy
+  is this process's own listener and the SDK gives the container no other route
+  out. Guardrail 1 proves the child reached that listener before the session is
+  reported successful.
+- **`appcontainer`** - the original AppContainer supervisor. It stays the escape
+  hatch for workloads whose client stack cannot use a proxy (**WinINet /
+  PowerShell 5.1 / system-proxy apps**: they reach the proxy and never
+  authenticate). Those sessions need administrator rights for the loopback
+  exemption, so `--backend appcontainer` is the flag to reach for when a GUI
+  tool has no egress.
+
+A build WITHOUT the feature falls back to `mxc`'s absence loudly (it prints
+`--backend appcontainer` is in use) rather than refusing to run. The default is
+decided by `cli::default_backend(feature_enabled)`, not by a constant, because a
+constant would name a backend a feature-less binary cannot execute.
+
+**Guardrail 1 refusals are informative, not generic:** `proxy_probe_unmet` means
+the child never reached this listener (blocked loopback, dead listener, wrong
+credential); `workload_cannot_authenticate` means something DID reach it without
+the run's credential and nothing in the session ever authenticated - the
+WinINet/system-proxy class, whose remedy is `--backend appcontainer`.
+`guardrail 1 proof probes=N accepted=N tunnels=N unauthenticated=N` is printed on
+stderr for every successful session so the evidence is auditable.
+
+Session deadlines are supervisor arithmetic, not a caller value:
+`promptTimeoutSecs + workloadTimeoutSecs + slack` (profile `network.*`; defaults
+60 s + 30 min + 2 min). A workload that legitimately runs longer must raise
+`network.workloadTimeoutSecs` - there is no "no deadline" mode.
+
 ## Testing
 
 Must follow: If a test needs to change anything on the host system, like setting permissions, ACLs or similar, 
@@ -36,6 +70,24 @@ run inside the disposable test VM via `tests/vm/Invoke-TestsInVM.ps1` — see
 `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`. For VM-run
 tests, VM deletion is the rollback. For any test that still runs on the
 physical host, the rollback-script rule above remains mandatory.
+
+### Test lanes after the backend flip
+
+- `tests/run-tests.ps1 -Backend appcontainer|mxc` selects the backend for every
+  scenario (default `appcontainer`, so the recorded AC baseline stays
+  reproducible). AppContainer-only scenarios SKIP with a named reason under
+  `mxc`; they are listed in `$script:AppContainerOnlyScenarios`.
+- The suite verdict is "any failure fails" - it does NOT consult a scenario
+  allow-list any more (that list printed `PASS` over seven failures on
+  2026-10-22).
+- A VM session always runs with the GUEST's token, which is elevated. The VM
+  therefore proves product logic, **not** elevation. The unelevated claim is
+  carried by host live legs. The standard-user lane that would close this is
+  PARKED (no non-interactive second-account launch works from a PS-Direct
+  session) - see PROGRESS.md, "P3.1 blocker".
+- Live (`#[ignore]`) legs execute `target/debug/sandbox.exe`, not the test
+  binary: run `cargo build --features mxc-backend --bin sandbox` first or the
+  kill-leg's freshness guard fails the lane.
 
 ### ACL / ACE cleanup after every test run
 

@@ -374,7 +374,17 @@ equivalent. Very long-term; mentioned so the architecture does not lock in
 Windows-only assumptions (e.g. keep paths as a generic `OsPath` abstraction,
 not `\\`-hardcoded strings).
 
-### F-21. Elevation-free operation via install-time privilege (spike candidate)
+### F-25. Elevation-free operation via install-time privilege (SUPERSEDED for egress, 2026-10-22)
+
+> **Status: superseded for the network case by ADR-0004.** The MXC
+> `processcontainer` backend runs the proxy path with no administrator rights at
+> all (`sandbox run` is unelevated, guardrail 1 proves the child's path), so the
+> broker/install-time designs below are NOT needed to obtain unelevated egress
+> and must not be built for that purpose. They remain relevant only for the
+> AppContainer backend, which still needs the loopback exemption for network
+> sessions (ADR-0002), and as history for why the migration was worth its cost.
+> Renumbered from a duplicate F-21 on 2026-10-22 - this file's numbering had
+> two sections called F-21.
 Today's ONLY admin dependency is the AppContainer loopback exemption that lets
 the child reach the supervisor's proxy listener (`0x80070005` unprivileged).
 Filesystem isolation already runs as the current user (per-session ACEs on

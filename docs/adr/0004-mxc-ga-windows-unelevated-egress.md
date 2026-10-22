@@ -56,7 +56,7 @@ against a real SPIKE built on the published crate:
 This is the property the current supervisor cannot provide: our AppContainer
 path needs an **admin-only loopback exemption** for every network session, which
 is the sole reason checkpoints, harness runs and manual verification are
-elevated (and the reason F-21 proposed a privileged broker).
+elevated (and the reason F-25 (elevation-free operation) proposed a privileged broker).
 
 ### Limits of the evidence
 
@@ -314,7 +314,7 @@ artefact (one image now suffices). Re-open Option A when upstream ships
 attestation (created-not-running or an atomic require-tier field).
 
 - Gain: no security regression, less test infrastructure.
-- Cost: **UAC stays** for product network sessions (F-21's broker remains the
+- Cost: **UAC stays** for product network sessions (F-25 (elevation-free operation)'s broker remains the
   only elevation-free design under this option).
 
 ## Consequences either way
