@@ -10,7 +10,10 @@
       "$USERPROFILE/AppData/Roaming/opencode",
       "$USERPROFILE/AppData/Local/opencode"
     ],
-    "read_only": ["$HOME/.gitconfig"],
+    "read_only": [
+      "$HOME/.gitconfig",
+      "$USERPROFILE/AppData/Local/Microsoft/WinGet"
+    ],
     "deny": ["$HOME/.ssh", "$HOME/.aws"]
   },
   "network": {

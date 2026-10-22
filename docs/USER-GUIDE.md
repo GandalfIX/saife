@@ -168,16 +168,19 @@ outside the sandbox:
 
 ```powershell
 # opencode, verified 2026-10-22: TUI renders, keys work, egress authenticated
-sandbox run --profile opencode --allow-cwd `
-  --read-only "$env:LOCALAPPDATA\Microsoft\WinGet" -- opencode
+sandbox run --profile opencode --allow-cwd -- opencode
 ```
 
-The `--read-only` grant is only for *finding* the executable: an installed
-program lives in a directory the container cannot see, so its name does not
-resolve on the inherited `PATH`. Grant its install tree read-only and the bare
-name works. Everything opencode *writes* comes from its profile
-(`~/.local/share/opencode`, `~/.cache/opencode`, `~/.config/opencode`,
-`~/.local/state/opencode`), which the profile grants writable.
+Two grants make that work, and the shipped `profiles/opencode.json` carries
+both:
+
+* the four state directories it writes (`~/.local/share/opencode`,
+  `~/.cache/opencode`, `~/.config/opencode`, `~/.local/state/opencode`) — they
+  are outside the workspace, which the MXC backend accepts;
+* `%LOCALAPPDATA%\Microsoft\WinGet` **read-only**, purely so the executable can
+  be *found*: an installed program lives in a directory the container cannot
+  see, so its bare name does not resolve on the inherited `PATH`. Grant the
+  install tree and the name works.
 
 Two consequences worth knowing:
 
