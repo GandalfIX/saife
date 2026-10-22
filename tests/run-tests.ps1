@@ -131,7 +131,7 @@ param(
     [switch]$Strict,
     [switch]$Diag,
     # Containment backend for every `run` invocation. `mxc` requires a binary
-    # built with --features mxc-backend plus mxc-launch.exe beside it; the VM
+    # built with the mxc-backend feature (now default) plus mxc-launch.exe; the VM
     # lane builds that for you when it is given -Backend mxc.
     [ValidateSet('appcontainer', 'mxc')]
     [string]$Backend = 'appcontainer'

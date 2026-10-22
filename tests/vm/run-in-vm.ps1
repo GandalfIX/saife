@@ -54,7 +54,7 @@
   single scenario id can be passed reliably.
 .PARAMETER Backend
   Containment backend passed through to tests\run-tests.ps1 as -Backend:
-  appcontainer (default) or mxc. mxc builds with --features mxc-backend (the
+  appcontainer (default) or mxc. mxc builds with --features mxc-backend (the DEFAULT
   binary refuses --backend mxc without it, and mxc-launch.exe is
   feature-gated in Cargo.toml).
 .PARAMETER Lane
