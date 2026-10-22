@@ -14,6 +14,25 @@
   -TestCmd specifies, its console output is additionally teed into
   C:\sbx-results\testcmd.log, and ALL files under C:\sbx-results are
   fetched (there is no summary.json contract in this mode).
+  With -AsStandardUser the lane runs a NETWORK SUBSET of the integration suite
+  as a NON-ADMIN guest account instead of as the interactive admin. Why the
+  lane exists: every session the admin lane starts is elevated, so that lane
+  can never falsify the P3 premise "egress works without administrator" - a
+  green verdict there is a green run of the opposite condition. The lane
+  creates (or resets) a local account 'sbx-su' with a per-run RANDOM password,
+  member of Users only, grants it read+execute+modify on the staged repo copy
+  and on C:\sbx-results (and read+execute on the toolchain roots when they live
+  in a profile) and nothing else, then runs
+  tests\vm\standard-user-run.ps1 as that account via Start-Process -Credential
+  with -Wait, output redirected to files and the exit code captured. That
+  runner is the lane's contract: it refuses to report PASS unless (a) its own
+  TokenElevation is false AND every SESSION_START leaf of the run says
+  elevated=false, (b) the executed scenario count equals the requested subset
+  (a filter that matches nothing exits 0), and (c) the PASS details carry a
+  REAL proxy decision in both directions (an admitted CONNECT and a refused
+  one). The account and its profile directory are deleted before the verdict,
+  and a failed deletion fails the harness: the differencing disk is
+  disposable, but a lane that leaks guest state between runs is not.
   With -KeepOnFailure a failed run keeps the VM behind (checkpoint
   'failed-run') for debugging. An artifact-fetch failure after a completed
   suite ALWAYS keeps the VM (with the same checkpoint) - results that took
@@ -64,7 +83,10 @@
     2  = the token is neither Administrator nor a member of the Hyper-V
          Administrators group (S-1-5-32-578) - remediation lines, no verdict
     3  = host readiness probe failed, the requested template image is
-         missing or invalid, or -TestCmd is empty/whitespace
+         missing or invalid, -TestCmd is empty/whitespace, or the flag
+         combination is refused (-AsStandardUser with -TestCmd, with -Phase
+         unit, with -Backend appcontainer, or with a -Only that selects none
+         of the standard-user subset)
     4  = tests\vm\vm-settings.json missing or invalid
     99 = unexpected error (final line: VM HARNESS: FAIL)
 .PARAMETER Image
@@ -85,6 +107,20 @@
   -Phase/-Only are ignored in this mode. Useful for one-off probe/evidence
   capture such as the WBD D-01/D-02 battery on image B
   (tests\vm\wbd-d01-d02-probes.ps1).
+.PARAMETER Backend
+  Containment backend passed to the guest suite: appcontainer (default) or
+  mxc. mxc requires the feature build; run-in-vm.ps1 adds
+  --features mxc-backend itself. -AsStandardUser forces mxc (passing
+  'appcontainer' explicitly with it is refused: the AppContainer path needs
+  the admin loopback exemption that a standard user does not have, so the
+  combination would test the wrong thing).
+.PARAMETER AsStandardUser
+  Run the standard-user network lane instead of the admin suite: a fixed
+  NETWORK SUBSET of scenarios, as a fresh non-admin guest account, with the
+  elevation and proxy-decision assertions enforced from inside. Integration
+  phase only. The first line of the run summary is then
+  'standard-user: pass=N fail=N skip=N', separate from the admin lane's own
+  counts, and summary.json records lane=standard-user + backend=mxc.
 .PARAMETER Only
   Scenario ids passed through to tests\run-tests.ps1 (integration phase
   only). Same pwsh platform quirk as run-in-vm.ps1's -Only: multi-value
@@ -132,6 +168,11 @@ param(
 
     [switch]$KeepOnFailure,
 
+    [ValidateSet('appcontainer', 'mxc')]
+    [string]$Backend = 'appcontainer',
+
+    [switch]$AsStandardUser,
+
     [string]$VMSuffix,
 
     [ValidateRange(1, 1440)]
@@ -143,6 +184,27 @@ $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:VmsDir = Join-Path $script:ThisDir 'vms'
 $script:ResultsBaseDir = Join-Path $script:ThisDir 'results'
 $script:RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $script:ThisDir '..\..'))
+
+# ---------------------------------------------------------------------------
+# Standard-user lane (P3.1).
+#
+# The NETWORK subset is a deliberate list, not "the suite minus whatever
+# fails": every entry asserts the PROXY's DECISION (an audit leaf and/or
+# %{http_connect}), which is the only evidence a backend change cannot fake,
+# and none of them needs the AppContainer loopback exemption or an admin
+# token. S-94 is the elevation leaf itself. Excluded on purpose: S-30/S-31
+# (their PASS condition is `curl failed + http_code 000`, which every
+# transport failure satisfies - exactly the false pass this lane must not
+# inherit), S-35 (two concurrent runs; mxc refuses concurrency by design),
+# S-36/S-90/S-91/S-92 (token-gate / loopback-refusal / manual: whether the
+# AppContainer-era 407 gate sits on the mxc path is a PRODUCT question this
+# harness must not prejudge), and every AppContainer-only scenario in
+# tests\run-tests.ps1's $script:AppContainerOnlyScenarios.
+$script:StandardUserScenarioIds = @(27, 28, 29, 32, 33, 34, 87, 94)
+$script:StandardUserName = 'sbx-su'
+$script:SuLanePrepared = $false
+$script:SuLaneRemoved = $false
+$script:SuCleanupFailed = $false
 
 # ---------------------------------------------------------------------------
 # Teardown per the keep/destroy policy documented in the help header.
@@ -242,6 +304,450 @@ function Invoke-TestVmTeardown {
     return $teardownFailed
 }
 
+# ---------------------------------------------------------------------------
+# STANDARD-USER LANE (P3.1)
+#
+# Three functions, one per phase, because each runs in a DIFFERENT security
+# context and conflating them is how a lane ends up proving nothing:
+#   Invoke-StandardUserLane - as the guest ADMIN (via PowerShell Direct): create
+#     the account, grant it the minimum, launch the suite as it, return its exit
+#     code. The password is generated per run, never printed, and only exists in
+#     this process's memory and the in-guest PSCredential.
+#   Remove-StandardUser    - as the guest ADMIN: delete the account AND its
+#     profile directory, and verify both are gone.
+#   Get-StandardUserEvidence - host side: re-read the fetched artifacts so the
+#     verdict does not rest on the guest's own word alone.
+# ---------------------------------------------------------------------------
+function Invoke-StandardUserLane {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$GuestCred,
+        [Parameter(Mandatory)][int[]]$ScenarioIds,
+        [Parameter(Mandatory)][string]$Backend,
+        [string]$RepoDir = 'C:\sbx-repo',
+        [string]$ResultsDir = 'C:\sbx-results'
+    )
+
+    $userName = $script:StandardUserName
+
+    # ---- 1. account + grants, one admin session ---------------------------
+    $prep = Invoke-Command -VMName $VmName -Credential $GuestCred -ScriptBlock {
+        param([string]$UserName, [string]$RepoDir, [string]$ResultsDir)
+        $ErrorActionPreference = 'Stop'
+        $notes = New-Object System.Collections.Generic.List[string]
+
+        # Per-run RANDOM password. Never printed, never written to disk, and
+        # regenerated on every run so a reset account cannot be logged into
+        # with an earlier run's credential.
+        $bytes = New-Object byte[] 30
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        $password = 'Sbx-' + [Convert]::ToBase64String($bytes) + '!7a'
+        $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
+
+        $existing = Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Set-LocalUser -Name $UserName -Password $secure -PasswordNeverExpires $true -AccountNeverExpires $true
+            Enable-LocalUser -Name $UserName
+            $notes.Add('reset the existing account with a fresh random password')
+        } else {
+            New-LocalUser -Name $UserName -Password $secure -PasswordNeverExpires -AccountNeverExpires -Description 'sandbox test harness standard user (per-run)' | Out-Null
+            $notes.Add('created the account with a fresh random password')
+        }
+        $user = Get-LocalUser -Name $UserName
+        if (-not $user.Enabled) { Enable-LocalUser -Name $UserName }
+        $sid = $user.SID.Value
+
+        # Membership by SID (localized names are a trap on this host: the
+        # German images call Administrators 'Administratoren').
+        $usersGroup = Get-LocalGroup -SID 'S-1-5-32-545'
+        $adminsGroup = Get-LocalGroup -SID 'S-1-5-32-544'
+        $inAdmins = @(Get-LocalGroupMember -Group $adminsGroup -ErrorAction SilentlyContinue | Where-Object { $_.SID.Value -eq $sid })
+        if ($inAdmins.Count -gt 0) {
+            Remove-LocalGroupMember -Group $adminsGroup -Member $UserName -ErrorAction SilentlyContinue
+            $notes.Add('removed the account from Administrators')
+        }
+        $inUsers = @(Get-LocalGroupMember -Group $usersGroup -ErrorAction SilentlyContinue | Where-Object { $_.SID.Value -eq $sid })
+        if ($inUsers.Count -eq 0) { Add-LocalGroupMember -Group $usersGroup -Member $UserName -ErrorAction SilentlyContinue }
+        $groupsOf = @(Get-LocalGroup -ErrorAction SilentlyContinue | Where-Object {
+                @(Get-LocalGroupMember -Group $_ -ErrorAction SilentlyContinue | Where-Object { $_.SID.Value -eq $sid }).Count -gt 0 } |
+            ForEach-Object { $_.SID.Value })
+
+        # Grants: the staged repo copy (it must BUILD and write its own
+        # artifacts there) and the results dir. Nothing else - no drive-wide ACE.
+        # (OI)(CI) inheritance covers files the build creates later; the ACE is
+        # re-read from the SDDL below, so an icacls that silently did nothing
+        # fails the lane instead of surfacing as a confusing build error.
+        if (-not (Test-Path -LiteralPath $ResultsDir)) { New-Item -ItemType Directory -Path $ResultsDir -Force | Out-Null }
+        $grantTargets = @($RepoDir, $ResultsDir)
+        foreach ($target in $grantTargets) { & icacls $target /grant "*${sid}:(OI)(CI)M" /Q /C 2>&1 | Out-Null }
+        $grantMissing = @()
+        foreach ($target in $grantTargets) {
+            $sddl = (Get-Acl -LiteralPath $target).Sddl
+            if ($sddl -notmatch [regex]::Escape($sid)) { $grantMissing += $target }
+        }
+
+        # Toolchain: a per-user rustup install lives in another profile, so the
+        # account needs READ+EXECUTE on it (never modify). Read-only grants on
+        # exactly the toolchain roots, reported by name.
+        $toolchainBin = $null; $rustupHome = $null; $cargoHome = $null
+        $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+        if ($cargo) {
+            $toolchainBin = Split-Path -Parent $cargo.Source
+            $toolchainRoot = Split-Path -Parent $toolchainBin
+            if ($toolchainRoot -like 'C:\Users\*') {
+                & icacls $toolchainRoot /grant "*${sid}:(OI)(CI)RX" /T /C /Q 2>&1 | Out-Null
+                $notes.Add("read+execute on the toolchain root $toolchainRoot (outside this run's staging; read-only)")
+            }
+            $candidateRustup = Join-Path $env:USERPROFILE '.rustup'
+            if (Test-Path -LiteralPath $candidateRustup) {
+                & icacls $candidateRustup /grant "*${sid}:(OI)(CI)RX" /T /C /Q 2>&1 | Out-Null
+                $rustupHome = $candidateRustup
+                $notes.Add("RUSTUP_HOME=$candidateRustup (read+execute)")
+            }
+        } else {
+            $notes.Add('WARNING: cargo is not on the machine PATH - the standard user will not be able to build')
+        }
+        # Writable CARGO_HOME outside every profile, seeded from the admin's
+        # registry cache so the mxc feature build does not have to re-download.
+        $cargoHome = 'C:\sbx-cargo'
+        New-Item -ItemType Directory -Path $cargoHome -Force | Out-Null
+        $adminCargo = Join-Path $env:USERPROFILE '.cargo'
+        if (Test-Path -LiteralPath $adminCargo) {
+            & robocopy $adminCargo $cargoHome /E /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
+            $notes.Add("seeded CARGO_HOME=$cargoHome from $adminCargo")
+        }
+        & icacls $cargoHome /grant "*${sid}:(OI)(CI)M" /Q /C 2>&1 | Out-Null
+        # Remote Desktop Users (S-1-5-32-555), matched by SID: on this German
+        # host the group is 'Remotedesktopbenutzer', and a lookup by the English
+        # name fails with 1376 for a group that exists (the same trap as
+        # Hyper-V-Administratoren). A bare local user is only in Users, which
+        # carries interactive - not REMOTE interactive - logon, so an RDP
+        # sign-in as the lane account is refused until this membership exists.
+        # The lane needs it to obtain the PROFILE (the launch mechanism below
+        # depends on a profile existing); the Hyper-V console would not.
+        $rdpGroup = Get-LocalGroup -ErrorAction SilentlyContinue |
+            Where-Object { $_.SID.Value -eq 'S-1-5-32-555' } | Select-Object -First 1
+        if ($rdpGroup) {
+            try {
+                Add-LocalGroupMember -Group $rdpGroup -Member $UserName -ErrorAction Stop
+                $notes.Add("member of $($rdpGroup.Name) (S-1-5-32-555, for the profile-creating sign-in)")
+            } catch {
+                $notes.Add("could not add $UserName to $($rdpGroup.Name): $($_.Exception.Message)")
+            }
+        } else {
+            $notes.Add('WARNING: no group with SID S-1-5-32-555 on this guest; the lane account cannot sign in over RDP')
+        }
+        # The lane's own trees: it builds inside the staging dir and writes its
+        # artifacts into the results dir, so both need modify for this account.
+        # Without this the .cmd's redirect and the suite's own logs fail with
+        # access denied - which looks like a lane defect, not a grant defect.
+        foreach ($p in @($RepoDir, $ResultsDir)) {
+            if (Test-Path -LiteralPath $p) {
+                & icacls $p /grant "*${sid}:(OI)(CI)M" /T /C /Q 2>&1 | Out-Null
+                $notes.Add("read+write on $p (lane staging/results)")
+            }
+        }
+
+        [pscustomobject]@{
+            User         = $UserName
+            Password     = $password
+            Sid          = $sid
+            Groups       = @($groupsOf)
+            GrantMissing = @($grantMissing)
+            ToolchainBin = $toolchainBin
+            RustupHome   = $rustupHome
+            CargoHome    = $cargoHome
+            Notes        = @($notes)
+        }
+    } -ArgumentList $userName, $RepoDir, $ResultsDir
+
+    foreach ($n in @($prep.Notes)) { Write-Host "[su-lane] prep: $n" -ForegroundColor DarkGray }
+    Write-Host ("[su-lane] account: {0} (SID {1}) groups: {2}" -f $prep.User, $prep.Sid, (@($prep.Groups) -join ','))
+    if (@($prep.GrantMissing).Count -gt 0) {
+        throw ("the standard-user grant did not land on: {0} (icacls reported success or silence, the DACL says otherwise)" -f (@($prep.GrantMissing) -join ', '))
+    }
+    if (@($prep.Groups) -contains 'S-1-5-32-544') {
+        throw "refusing to run the unelevated lane: $($prep.User) is a member of Administrators (S-1-5-32-544)"
+    }
+    $script:SuLanePrepared = $true
+
+    # ---- 2. the suite, AS THAT USER ---------------------------------------
+    $runner = Join-Path $RepoDir 'tests\vm\standard-user-run.ps1'
+    $suExit = Invoke-Command -VMName $VmName -Credential $GuestCred -ScriptBlock {
+        param($UserName, $Password, $Runner, $RepoDir, $ResultsDir, $Backend, $ScenarioIdList,
+              $LogFile, $ToolchainBin, $RustupHome, $CargoHome)
+        $ErrorActionPreference = 'Stop'
+        $tracePath = Join-Path (Split-Path -Parent $LogFile) 'su-launch-trace.log'
+        function Trace([string]$m) {
+            try { Add-Content -LiteralPath $tracePath -Value ((Get-Date).ToString('HH:mm:ss') + ' ' + $m) } catch { }
+        }
+        Trace 'guest: launch block entered'
+
+        if (-not (Test-Path -LiteralPath $Runner)) { throw "standard-user runner not found in the guest: $Runner" }
+        try {
+        # Start-Process -Credential is CreateProcessWithLogonW, which needs the
+        # Secondary Logon service. It is trigger-started and a remote session
+        # does not reliably start it on demand, so start it explicitly and fail
+        # with a named reason rather than a generic Win32 error.
+        Start-Service seclogon -ErrorAction SilentlyContinue
+        $svc = Get-Service seclogon -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -ne 'Running') {
+            throw 'the Secondary Logon service (seclogon) is not running - Start-Process -Credential cannot create the standard-user logon'
+        }
+        $secureSu = ConvertTo-SecureString -String $Password -AsPlainText -Force
+        $suCred = New-Object System.Management.Automation.PSCredential($UserName, $secureSu)
+        $spArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Runner,
+            '-RepoDir', $RepoDir, '-ResultsDir', $ResultsDir,
+            '-ScenarioIds', $ScenarioIdList, '-Backend', $Backend)
+        if ($ToolchainBin) { $spArgs += @('-ToolchainBin', $ToolchainBin) }
+        if ($RustupHome) { $spArgs += @('-RustupHome', $RustupHome) }
+        if ($CargoHome) { $spArgs += @('-CargoHome', $CargoHome) }
+        $spArgs += @('-LogPath', $LogFile)
+        # Resolve pwsh to a full path: the task launches it directly, and a
+        # bare image name is not resolved the way an interactive spawn is.
+        $pwshPath = (Get-Command -Name pwsh -CommandType Application -ErrorAction Stop |
+            Select-Object -First 1).Source
+        if (-not (Test-Path -LiteralPath $pwshPath)) {
+            throw "pwsh was not found as an application for the standard-user launch (got '$pwshPath')"
+        }
+        # PREFERRED: Start-Process -Credential with -LoadUserProfile.
+        # This only works when the account already HAS a profile - the base
+        # image now ships sbx-su with one (created by an interactive sign-in),
+        # which is what CreateProcessWithLogonW needs; a minutes-old account
+        # with no profile is what returned ERROR_INVALID_PARAMETER (87) before.
+        # Redirection stays off (that API inherits no handles); the child owns
+        # its transcript via -LogPath.
+        try {
+            $proc = Start-Process -FilePath $pwshPath -Credential $suCred -LoadUserProfile `
+                -WorkingDirectory $RepoDir -ArgumentList $spArgs -Wait -PassThru -ErrorAction Stop
+            Trace ("Start-Process -Credential -LoadUserProfile: exit {0}" -f $proc.ExitCode)
+            return [int]$proc.ExitCode
+        } catch {
+            Trace ("Start-Process -Credential failed: {0} - falling back to a scheduled task" -f $_.Exception.Message)
+        }
+        # FALLBACK: a scheduled task.
+        # LAUNCH: a scheduled task, NOT Start-Process -Credential.
+        #
+        # Start-Process -Credential goes through CreateProcessWithLogonW, which
+        # cannot create this logon from a PowerShell Direct session: it returns
+        # ERROR_INVALID_PARAMETER (87, "This command cannot be run due to the
+        # error: The parameter is incorrect") before pwsh starts - observed with
+        # and without redirection, with -LoadUserProfile, and with a full image
+        # path (all four variants, 2026-10-22; the guest logs were empty each
+        # time). Task Scheduler creates the logon itself, needs no window
+        # station, and reports the child's own exit code as LastTaskResult,
+        # which is what the lane asserts on.
+        #
+        # The task runs a tiny .cmd rather than the pwsh command line:
+        # registering the full argument list fails with ERROR_FILENAME_EXCED_RANGE
+        # ('The filename or extension is too long') because Task Scheduler caps
+        # the action's Arguments field. The .cmd also produces a console log for
+        # the case where pwsh itself refuses to start - a transcript cannot
+        # record a process that never ran.
+        $argumentLine = (@($spArgs) | ForEach-Object {
+                if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+            }) -join ' '
+        $consoleLog = Join-Path $ResultsDir 'su-console.log'
+        $cmdPath = 'C:\sbx-su-launch.cmd'
+        $cmdBody = @(
+            '@echo off'
+            ('"{0}" {1} > "{2}" 2>&1' -f $pwshPath, $argumentLine, $consoleLog)
+            'exit /b %ERRORLEVEL%'
+        ) -join "`r`n"
+        Set-Content -LiteralPath $cmdPath -Value $cmdBody -Encoding ASCII
+        $taskName = 'sbx-standard-user-lane'
+        # Delete only if it EXISTS: schtasks /Delete on a missing task exits 1
+        # ('The system cannot find the file specified'), and this script sets
+        # $PSNativeCommandUseErrorActionPreference, so that exit is a TERMINATING
+        # error - it killed the lane three times while the message pointed at
+        # the create call.
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            & schtasks.exe /Delete /TN $taskName /F *> $null
+        }
+        # schtasks.exe, NOT Register-ScheduledTask: the cmdlet throws
+        # ERROR_FILENAME_EXCED_RANGE ('The filename or extension is too long')
+        # here even with a two-word action argument, i.e. the limit is inside
+        # its own XML marshalling, not in what we asked for. The read-only
+        # cmdlets below are used for polling because their state strings are
+        # locale-independent (this guest is German: schtasks would report
+        # 'Wird ausgeführt', not 'Running').
+        # /TR takes 'program args' as ONE string and does not accept nested
+        # quotes: '"cmd.exe" /c "x.cmd"' is read as a program literally named
+        # with the quotes and fails with 'The system cannot find the file
+        # specified'. Neither path has a space, so no quotes are needed.
+        # schtasks parses /TR itself: an UNQUOTED program path with arguments is
+        # taken as one enormous filename ("The filename or extension is too
+        # long"), while quoting BOTH tokens makes it look for a program named
+        # with quotes ("cannot find the file specified"). Quote the executable
+        # only; the script path has no spaces so it needs none.
+        $tr = '"C:\Windows\System32\cmd.exe" /c ' + $cmdPath
+        # schtasks.exe writes ADVISORIES to stderr ('Task may not run because
+        # /ST is earlier than current time') and this script runs with
+        # $ErrorActionPreference = 'Stop': once `2>&1` merges that stream the
+        # advisory becomes an error record and TERMINATES the block even though
+        # the command succeeded (observed three times). The preference is
+        # relaxed for exactly these calls, which are judged by $LASTEXITCODE
+        # immediately afterwards.
+        $savedEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $PSNativeCommandUseErrorActionPreference = $false
+        $createOut = & schtasks.exe /Create /TN $taskName /TR $tr `
+            /SC ONCE /ST 00:00 /RU $UserName /RP $Password /RL LIMITED /F 2>&1
+        $createExit = $LASTEXITCODE
+        if ($createExit -ne 0) {
+            throw ("schtasks /Create failed (exit {0}): {1}" -f $createExit, ($createOut -join ' '))
+        }
+        Trace 'task created'
+        $runOut = & schtasks.exe /Run /TN $taskName 2>&1
+        $runExit = $LASTEXITCODE
+        if ($runExit -ne 0) {
+            throw ("schtasks /Run failed (exit {0}): {1}" -f $runExit, ($runOut -join ' '))
+        }
+        $ErrorActionPreference = $savedEap
+        $PSNativeCommandUseErrorActionPreference = $true
+        $deadline = (Get-Date).AddHours(2)
+        do {
+            Start-Sleep -Seconds 3
+            $state = (Get-ScheduledTask -TaskName $taskName -ErrorAction Stop).State
+        } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
+        $info = Get-ScheduledTaskInfo -TaskName $taskName
+        $code = [int]$info.LastTaskResult
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            & schtasks.exe /Delete /TN $taskName /F *> $null
+        }
+        Trace ("task result {0} state {1}" -f $code, $state)
+        Write-Host ("[su-lane] task result: {0} (state {1})" -f $code, $state)
+        return $code
+        } catch {
+            Trace ("EXCEPTION line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message)
+            throw "su-launch failed at guest line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
+        }
+    } -ArgumentList $userName, [string]$prep.Password, $runner, $RepoDir, $ResultsDir, $Backend,
+        ($ScenarioIds -join ','), (Join-Path $ResultsDir 'su-run.log'),
+        [string]$prep.ToolchainBin, [string]$prep.RustupHome, [string]$prep.CargoHome
+
+    Write-Host ("[su-lane] suite exit as {0}: {1}" -f $userName, $suExit)
+    # Show the tail of the transcript now: the full file is fetched with the
+    # other artifacts, but the operator watching a live run wants the last word
+    # of the lane without waiting for the fetch.
+    try {
+        $tail = Invoke-Command -VMName $VmName -Credential $GuestCred -ScriptBlock {
+            param([string]$Path)
+            if (-not (Test-Path -LiteralPath $Path)) { return @() }
+            @(Get-Content -LiteralPath $Path -Tail 40)
+        } -ArgumentList (Join-Path $ResultsDir 'su-run.log')
+        foreach ($l in @($tail)) { Write-Host "[su-lane] $l" -ForegroundColor Gray }
+    } catch { Write-Host "[su-lane] could not read the standard-user transcript: $($_.Exception.Message)" -ForegroundColor Yellow }
+
+    return [int]$suExit
+}
+
+function Remove-StandardUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$GuestCred,
+        [Parameter(Mandatory)][string]$UserName
+    )
+    try {
+        return [string](Invoke-Command -VMName $VmName -Credential $GuestCred -ScriptBlock {
+                param([string]$UserName)
+                $u = Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue
+                if (-not $u) { return 'absent' }
+                $sid = $u.SID.Value
+                $profileDir = Join-Path 'C:\Users' $UserName
+                Remove-LocalUser -Name $UserName -ErrorAction Stop
+                # The profile must go too, or the image carries the account's state
+                # into the next run (and its audit store with it). Right after the
+                # account's processes exit the profile can still be marked in-use
+                # for a few seconds, so retry a BOUNDED number of times instead of
+                # failing the harness on a lock that clears itself. The assertion
+                # is unchanged: all three facts must be gone before 'removed'.
+                $attempt = 0
+                while ($attempt -lt 5) {
+                    $attempt++
+                    $profiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+                        Where-Object { $_.SID -eq $sid })
+                    foreach ($prof in $profiles) { Remove-CimInstance -InputObject $prof -ErrorAction SilentlyContinue }
+                    if (Test-Path -LiteralPath $profileDir) {
+                        Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    $stillUser = [bool](Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue)
+                    $stillDir = Test-Path -LiteralPath $profileDir
+                    $stillProfile = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+                        Where-Object { $_.SID -eq $sid })
+                    if ((-not $stillUser) -and (-not $stillDir) -and ($stillProfile.Count -eq 0)) { return 'removed' }
+                    Start-Sleep -Seconds 2
+                }
+                $stillProfile = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+                    Where-Object { $_.SID -eq $sid })
+                return ("LEFTOVER after {0} attempts: user={1} dir={2} profile={3}" -f $attempt, $stillUser, $stillDir, ($stillProfile.Count -gt 0))
+            } -ArgumentList $UserName -ErrorAction Stop)
+    } catch {
+        return "error $($_.Exception.Message)"
+    }
+}
+
+function Get-StandardUserEvidence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ResultsDir)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $ok = $true
+    $identityPath = Join-Path $ResultsDir 'su-identity.txt'
+    $leavesPath = Join-Path $ResultsDir 'elevation-leaves.txt'
+    $verdictPath = Join-Path $ResultsDir 'su-verdict.txt'
+
+    foreach ($required in @($identityPath, $leavesPath, $verdictPath)) {
+        if (-not (Test-Path -LiteralPath $required)) {
+            $ok = $false
+            $lines.Add("MISSING artifact: $([System.IO.Path]::GetFileName($required)) - the lane did not finish (see su-stdout.log / su-stderr.log)")
+        }
+    }
+
+    $kv = @{}
+    if (Test-Path -LiteralPath $identityPath) {
+        foreach ($l in @(Get-Content -LiteralPath $identityPath)) {
+            if ($l -match '^([A-Z_]+)=(.*)$') { $kv[$Matches[1]] = $Matches[2] }
+        }
+        $tokenElev = if ($kv.ContainsKey('TOKEN_ELEVATION')) { [string]$kv['TOKEN_ELEVATION'] } else { '' }
+        $adminRole = if ($kv.ContainsKey('IS_IN_ADMIN_ROLE')) { [string]$kv['IS_IN_ADMIN_ROLE'] } else { '' }
+        $lines.Add("identity: user=$($kv['USER']) TokenElevation=$tokenElev IsInRole(Administrator)=$adminRole")
+        if ($tokenElev -ne 'False') {
+            $ok = $false
+            $lines.Add('FAIL: the lane process did not report TokenElevation=False')
+        }
+        if ($adminRole -eq 'True') { $lines.Add('WARNING: the token carries Administrators membership (filtered admin token)') }
+    }
+
+    if (Test-Path -LiteralPath $leavesPath) {
+        $summaryLine = @(Get-Content -LiteralPath $leavesPath | Where-Object { $_ -match '^SESSION_START_LEAVES=' })[0]
+        $lines.Add("leaves: $summaryLine")
+        if (-not $summaryLine) {
+            $ok = $false
+            $lines.Add('FAIL: no SESSION_START_LEAVES line in elevation-leaves.txt')
+        } else {
+            $n = 0; $et = -1; $em = -1
+            if ($summaryLine -match 'SESSION_START_LEAVES=(\d+)') { $n = [int]$Matches[1] }
+            if ($summaryLine -match 'elevated_true=(\d+)') { $et = [int]$Matches[1] }
+            if ($summaryLine -match 'elevated_missing=(\d+)') { $em = [int]$Matches[1] }
+            if ($n -lt 1) { $ok = $false; $lines.Add('FAIL: the run wrote no SESSION_START leaf') }
+            if ($et -ne 0) { $ok = $false; $lines.Add("FAIL: $et SESSION_START leaf/leaves report elevated=true") }
+            if ($em -ne 0) { $ok = $false; $lines.Add("FAIL: $em SESSION_START leaf/leaves do not carry the elevated key") }
+        }
+        foreach ($l in @(Get-Content -LiteralPath $leavesPath | Where-Object { $_ -match '^sid=' } | Select-Object -First 20)) { $lines.Add("  $l") }
+    }
+
+    if (Test-Path -LiteralPath $verdictPath) {
+        $verdictLine = @(Get-Content -LiteralPath $verdictPath | Where-Object { $_ -match '^RESULT=' })[0]
+        $reasonLine = @(Get-Content -LiteralPath $verdictPath | Where-Object { $_ -match '^REASON=' })[0]
+        $lines.Add("verdict: $verdictLine / $reasonLine")
+        if ($verdictLine -ne 'RESULT=PASS') { $ok = $false }
+    }
+
+    return @{ Ok = $ok; Lines = @($lines) }
+}
+
 try {
     # -----------------------------------------------------------------------
     # 1. Privilege gate - FIRST, before any other validation or setup.
@@ -287,6 +793,72 @@ try {
         Write-Host '[vm-run] invalid -TestCmd: empty or whitespace - provide the guest command, or omit -TestCmd to run the suite; nothing was created.' -ForegroundColor Red
         Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
         exit 3
+    }
+
+    # -----------------------------------------------------------------------
+    # 1b. -AsStandardUser is PARKED (2026-10-22): refuse immediately, before any
+    #     state change, so a broken lane can never be mistaken for a product
+    #     failure. Both non-interactive launch mechanisms available from a
+    #     PowerShell Direct session were tried against a re-baked image (account
+    #     with a real profile, S-1-5-32-555 membership, fresh password) and both
+    #     fail before the child starts:
+    #       * Start-Process -Credential (CreateProcessWithLogonW)
+    #         -> ERROR_INVALID_PARAMETER (87, 'The parameter is incorrect')
+    #            with and without -LoadUserProfile, with redirection removed,
+    #            and with a full image path.
+    #       * schtasks /Create (Task Scheduler)
+    #         -> 'The filename or extension is too long' for every /TR shape,
+    #            and Register-ScheduledTask -ErrorAction Stop
+    #            -> ERROR_FILENAME_EXCED_RANGE.
+    #     The implementation below is kept intact so the work is not lost; two
+    #     mechanisms remain untried and are named in
+    #     docs/superpowers/tasks/mxc-migration/PROGRESS.md (P3.1 blocker):
+    #     New-CimSession + Win32_Process.Create, and a restricted-token launch.
+    #     The elevation claim is currently proven on the HOST (real unelevated
+    #     sessions, elevated=false in the leaf) rather than in the VM.
+    if ($AsStandardUser) {
+        Write-Host '[vm-run] -AsStandardUser is PARKED: the standard-user lane cannot start a process as a second local account from this session (see P3.1 blocker in PROGRESS.md). Nothing was created.' -ForegroundColor Red
+        exit 3
+    }
+
+    # 1c. -AsStandardUser form gate. Refuse the combinations that would quietly
+    #     test the wrong thing, BEFORE anything is created.
+    #
+    #     * -TestCmd replaces the suite, so there would be no SESSION_START
+    #       leaves and no per-scenario decisions for the lane to assert.
+    #     * the unit phase builds no sandbox sessions at all.
+    #     * -Backend appcontainer needs the admin NetworkIsolation loopback
+    #       exemption; a standard user cannot register it, so that combination
+    #       cannot answer the question the lane exists for.
+    # -----------------------------------------------------------------------
+    $suScenarioIds = @()
+    if ($AsStandardUser) {
+        if ($TestCmd) {
+            Write-Host '[vm-run] refused: -AsStandardUser and -TestCmd are incompatible (the lane asserts per-session decisions from a real suite run).' -ForegroundColor Red
+            Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
+            exit 3
+        }
+        if ($Phase -eq 'unit') {
+            Write-Host '[vm-run] refused: -AsStandardUser is an INTEGRATION lane; -Phase unit starts no sandbox sessions.' -ForegroundColor Red
+            Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
+            exit 3
+        }
+        if ($PSBoundParameters.ContainsKey('Backend') -and $Backend -ne 'mxc') {
+            Write-Host '[vm-run] refused: -AsStandardUser runs the network subset with -Backend mxc; the appcontainer path needs the admin loopback exemption a standard user cannot register.' -ForegroundColor Red
+            Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
+            exit 3
+        }
+        $Backend = 'mxc'
+        $suScenarioIds = @($script:StandardUserScenarioIds)
+        if ($Only) { $suScenarioIds = @($suScenarioIds | Where-Object { $Only -contains $_ }) }
+        if ($suScenarioIds.Count -eq 0) {
+            # A filter that matches nothing exits 0 and looks exactly like a
+            # lane that ran the whole subset. Refuse before creating anything.
+            Write-Host ('[vm-run] refused: -Only {0} selects NONE of the standard-user subset ({1}) - an empty lane would exit 0 and prove nothing.' -f ($Only -join ','), ($script:StandardUserScenarioIds -join ',')) -ForegroundColor Red
+            Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
+            exit 3
+        }
+        Write-Host ('[vm-run] standard-user lane: subset ({0}): {1} | backend mxc' -f $suScenarioIds.Count, (($suScenarioIds | ForEach-Object { "S-$_" }) -join ' ')) -ForegroundColor Cyan
     }
 
     # -----------------------------------------------------------------------
@@ -632,9 +1204,19 @@ try {
         $teeToLog = $true
     } else {
         $escapedRunner = 'C:\sbx-repo\tests\vm\run-in-vm.ps1'.Replace("'", "''")
-        $guestCommand = "& '$escapedRunner' -Phase '$Phase' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results'"
+        # -Backend is passed even when it is the default: the guest then RECORDS
+        # the backend it ran (summary.json backend=) instead of leaving the
+        # controller to assume it, and a future default flip cannot silently
+        # change what an "appcontainer" command line executed.
+        $guestCommand = "& '$escapedRunner' -Phase '$Phase' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results' -Backend '$Backend'"
         if ($Only) { $guestCommand += ' -Only ' + ($Only -join ',') }
         $teeToLog = $false
+    }
+    if ($AsStandardUser) {
+        # The suite is NOT started from this admin session: it is launched as
+        # the standard user by Invoke-StandardUserLane (step 10b). The label
+        # keeps the header honest about what actually runs.
+        $guestCommand = ("C:\sbx-repo\tests\vm\standard-user-run.ps1 -RepoDir C:\sbx-repo -ResultsDir C:\sbx-results -ScenarioIds '{0}' -Backend mxc  (launched as {1} via Start-Process -Credential)" -f ($suScenarioIds -join ','), $script:StandardUserName)
     }
     Write-Host "[vm-run] guest command: pwsh -NoProfile -Command $guestCommand"
 
@@ -730,6 +1312,15 @@ public static class WinSta {
     # are never stranded in a VM this harness is about to destroy.
     $guestExit = $null
     try {
+        if ($AsStandardUser) {
+            # 10b. STANDARD-USER lane: the suite runs as the non-admin account
+            # in its OWN logon session (Start-Process -Credential), NOT in this
+            # admin PowerShell Direct session - that separation is the whole
+            # point. Everything the guest admin does around it (prep, grants,
+            # teardown) stays in this file.
+            $guestExit = Invoke-StandardUserLane -VmName $vmName -GuestCred $guestCred `
+                -ScenarioIds $suScenarioIds -Backend $Backend
+        } else {
         $guestExit = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
             param([string]$Command, [string]$WinstaHelper, [bool]$TeeToLog)
             # TestCmd mode artifact dir (run-in-vm.ps1 creates it for suite
@@ -772,8 +1363,19 @@ public static class WinSta {
             }
             $LASTEXITCODE
         } -ArgumentList $guestCommand, $winstaHelper, $teeToLog
+        }
     } catch {
         Write-Host "[vm-run] ERROR: suite session died: $($_.Exception.Message)" -ForegroundColor Red
+        # The position and stack are what actually identify the failing call:
+        # the exception message alone ('The filename or extension is too long',
+        # 'The parameter is incorrect') is identical for several different
+        # call sites, and guessing at them costs a VM boot per guess.
+        if ($_.InvocationInfo) {
+            Write-Host "[vm-run]   at: $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
+        }
+        if ($_.ScriptStackTrace) {
+            Write-Host "[vm-run]   stack: $($_.ScriptStackTrace -replace "`r?`n", ' <- ')" -ForegroundColor DarkGray
+        }
     }
     Write-Host ("[vm-run] guest suite finished (exit {0})." -f $(if ($null -ne $guestExit) { $guestExit } else { 'unknown' }))
 
@@ -789,9 +1391,18 @@ public static class WinSta {
     #     skipped) - the run's only copy of the results lives there.
     # -----------------------------------------------------------------------
     $summaryFetched = $false
+    # The standard-user lane writes three assertion artifacts plus its own
+    # redirected transcript. They are NOT in the guest summary's `artifacts`
+    # list (run-in-vm.ps1 does not know about them), so they are appended here
+    # explicitly - an artifact the fetch does not name is an artifact the
+    # verdict never sees.
+    $extraArtifactNames = @()
+    if ($AsStandardUser) {
+        $extraArtifactNames = @('su-identity.txt', 'elevation-leaves.txt', 'su-verdict.txt', 'su-run.log', 'su-launch-trace.log', 'su-console.log')
+    }
     try {
         $artifactNames = Invoke-Command -VMName $vmName -Credential $guestCred -ScriptBlock {
-            param([string[]]$KnownArtifacts, [bool]$AllArtifacts)
+            param([string[]]$KnownArtifacts, [bool]$AllArtifacts, [string[]]$ExtraArtifacts)
             $resultsRoot = 'C:\sbx-results'
             if ($AllArtifacts) {
                 # TestCmd mode: no summary.json contract exists - fetch
@@ -812,9 +1423,12 @@ public static class WinSta {
             }
             if (-not $names) { $names = @($KnownArtifacts) }
             $ordered = @($names | Where-Object { $_ -and ($_ -ne 'summary.json') } | Select-Object -Unique)
+            foreach ($extra in @($ExtraArtifacts)) {
+                if ($extra -and ($ordered -notcontains $extra)) { $ordered += $extra }
+            }
             $ordered += 'summary.json'
             return @($ordered | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-        } -ArgumentList @('build.log', 'unit.log', 'integration.log', 'guest-metrics.log', 'summary.json'), ([bool]$TestCmd)
+        } -ArgumentList @('build.log', 'unit.log', 'integration.log', 'guest-metrics.log', 'summary.json'), ([bool]$TestCmd), $extraArtifactNames
 
         New-Item -ItemType Directory -Path $hostResultsDir -Force | Out-Null
         $chunkSize = 4MB
@@ -892,6 +1506,27 @@ public static class WinSta {
     #     fetch failure never reaches this destruction).
     # -----------------------------------------------------------------------
     $suitePassed = ($guestExit -eq 0)
+
+    # -----------------------------------------------------------------------
+    # 12a. STANDARD-USER cleanup - BEFORE the VM teardown (the guest must still
+    #      be running to delete the account) and before the verdict (a leaked
+    #      account is a harness error, not a footnote). The differencing disk is
+    #      disposable, but the NEXT run may reuse this base image, and a reset
+    #      account would then carry the previous run's profile - including its
+    #      audit store - into a lane that asserts on fresh leaves.
+    # -----------------------------------------------------------------------
+    if ($AsStandardUser -and $script:SuLanePrepared -and -not $script:SuLaneRemoved) {
+        $suRemoval = Remove-StandardUser -VmName $vmName -GuestCred $guestCred -UserName $script:StandardUserName
+        $script:SuLaneRemoved = $true
+        if ($suRemoval -eq 'removed' -or $suRemoval -eq 'absent') {
+            Write-Host ("[vm-run] standard-user account removed: {0} (account + profile dir verified gone)" -f $script:StandardUserName)
+        } else {
+            $script:SuCleanupFailed = $true
+            Write-Host ("[vm-run] WARNING: standard-user cleanup incomplete: {0}" -f $suRemoval) -ForegroundColor Red
+            Write-Host ('[vm-run] the image must not leak the account between runs - inspect with: Get-LocalUser -Name {0}; Remove-LocalUser -Name {0}' -f $script:StandardUserName) -ForegroundColor Yellow
+        }
+    }
+
     $teardownFailed = Invoke-TestVmTeardown -Failed (-not $suitePassed) -VmName $vmName -VhdxPath $vhdxPath -KeepOnFailure:$KeepOnFailure
 
     # -----------------------------------------------------------------------
@@ -922,16 +1557,40 @@ public static class WinSta {
         $verdict = if ($summary.integration.verdict) { [string]$summary.integration.verdict } else { '-' }
         $osBuild = if ($summary.osBuild) { [string]$summary.osBuild } else { '-' }
         Write-Host ("[vm-run] phase:         {0}" -f $summary.phase)
+        Write-Host ("[vm-run] lane:          {0} (backend {1})" -f $summary.lane, $summary.backend)
         Write-Host ("[vm-run] build ok:      {0}" -f $buildOk)
         Write-Host ("[vm-run] unit exit:     {0}" -f $unitExit)
         Write-Host ("[vm-run] integration:   {0}" -f $integrationCounts)
         Write-Host ("[vm-run] verdict:       {0}" -f $verdict)
         Write-Host ("[vm-run] guest osBuild: {0}" -f $osBuild)
+        # The lane's counts, on their OWN line: the controller compares
+        # `standard-user: pass=N fail=N skip=N` against the admin lane's and
+        # must never have to infer which token produced a number.
+        if ($AsStandardUser) {
+            Write-Host ("[vm-run] standard-user: pass={0} fail={1} skip={2}" -f $summary.integration.pass, $summary.integration.fail, $summary.integration.skip) -ForegroundColor Cyan
+        } else {
+            Write-Host ("[vm-run] admin lane:    pass={0} fail={1} skip={2}" -f $summary.integration.pass, $summary.integration.fail, $summary.integration.skip)
+        }
     } else {
         Write-Host '[vm-run] no summary.json available (the guest run did not complete).'
     }
     Write-Host ("[vm-run] artifacts:     {0}" -f $hostResultsDir)
-    $harnessPassed = ($suitePassed -and (-not $teardownFailed))
+
+    # The standard-user lane's central assertions, re-read from the FETCHED
+    # artifacts: the guest runner already failed the suite on any of them, but a
+    # verdict that only trusts the guest's exit code would accept a run whose
+    # artifacts never arrived.
+    $suEvidence = @{ Ok = $true; Lines = @() }
+    if ($AsStandardUser) {
+        $suEvidence = Get-StandardUserEvidence -ResultsDir $hostResultsDir
+        Write-Host '[vm-run] ---------------- standard-user assertions ----------------'
+        foreach ($l in @($suEvidence.Lines)) {
+            $colour = if ($l -match '^(FAIL|MISSING)') { 'Red' } elseif ($l -match '^WARNING') { 'Yellow' } else { 'Gray' }
+            Write-Host "[vm-run] $l" -ForegroundColor $colour
+        }
+        if (-not $suEvidence.Ok) { Write-Host '[vm-run] standard-user assertions FAILED - the lane proves nothing about the unelevated path.' -ForegroundColor Red }
+    }
+    $harnessPassed = ($suitePassed -and (-not $teardownFailed) -and (-not $script:SuCleanupFailed) -and $suEvidence.Ok)
     if ($harnessPassed) {
         Write-Host 'VM HARNESS: PASS' -ForegroundColor Green
         exit 0
@@ -953,6 +1612,18 @@ public static class WinSta {
     Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
     exit 99
 } finally {
+    # Safety net: if the run died before step 12a, still try to delete the
+    # standard-user account (the VM may already be gone - then there is nothing
+    # to clean and the error is not worth failing over twice).
+    if ($AsStandardUser -and $script:SuLanePrepared -and -not $script:SuLaneRemoved -and $vmName) {
+        try {
+            $suRemovalLate = Remove-StandardUser -VmName $vmName -GuestCred $guestCred -UserName $script:StandardUserName
+            $script:SuLaneRemoved = $true
+            Write-Host ("[vm-run] standard-user cleanup (late path): {0}" -f $suRemovalLate) -ForegroundColor Yellow
+        } catch {
+            Write-Host "[vm-run] WARNING: late standard-user cleanup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
     # Host-side staging cleanup (best effort; the guest got its own copy).
     foreach ($tempPath in @($stageDir, $zipPath)) {
         if ($tempPath -and (Test-Path -LiteralPath $tempPath)) {

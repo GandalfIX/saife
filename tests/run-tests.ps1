@@ -58,17 +58,42 @@
   `elevated` must equal the elevation this harness process's own token reports
   (GetTokenInformation/TokenElevation - the call src/setup.rs::is_elevated makes,
   which is what main.rs writes into the leaf). It is deliberately NOT asserted as
-  `elevated=false`: in the VM guest the harness is an admin (true==true), on an
-  unelevated host lane false==false, and a constant would fail in the guest while
-  passing for the wrong reason on the host.
+  `elevated=false`: in the VM guest's ADMIN lane the harness is an admin
+  (true==true), on an unelevated host lane false==false, and a constant would
+  fail in one and pass for the wrong reason in the other. That is exactly why
+  tests\vm\Invoke-TestsInVM.ps1 grew a STANDARD-USER lane (-AsStandardUser):
+  the guest's admin lane can never falsify 'egress works unelevated'; in the
+  standard-user lane this scenario's two sides are both false, and the lane
+  additionally asserts that every SESSION_START leaf says elevated=false.
   S-93 has NO harness form yet, on purpose: it is guardrail 1's negative case
-  (ADR-0004), guardrail 1 exists only in the MXC backend, and the lane cannot
-  select that backend before P3.1, so a scenario today would exercise the
-  AppContainer backend. The number is reserved out of the run (it is not a
+  (ADR-0004), and guardrail 1 exists only in the MXC backend. The harness can
+  SELECT that backend since P3.1 (-Backend mxc), but S-93's own body is not
+  written in this change, and a scenario run on the AppContainer backend could
+  only pass for the wrong reason. The number is reserved out of the run (it is not a
   skipping scenario); the property is pinned meanwhile by the ignored live leg
   `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful` in
-  src/net/mxc.rs, and its harness form lands with P3.1. Suite total: 93
-  scenarios in 1..=94 with 93 reserved.
+  src/net/mxc.rs. Suite total: 93 scenarios in 1..=94 with 93 reserved.
+
+  BACKEND SELECTION (P3.1 harness plumbing): -Backend appcontainer|mxc
+  (default appcontainer) is passed to EVERY `run` invocation as
+  `--backend <value>`. ONE helper (Add-BackendArgs) performs the injection and
+  both launch paths (Invoke-Sandbox, Start-SandboxProcess) call it, so a new
+  scenario cannot silently test the other backend. The backend lands in the run
+  header, on the Summary line, and (for a VM run) in summary.json.
+
+  Scenarios that assert AppContainer MACHINERY - DACL-based file denial, the
+  per-session <cwd>\.sandbox\<sid> install tree, the drive-root ACE for
+  S-1-15-2-2, the DACL journal, the two-concurrent-sessions model - cannot be
+  exercised on the mxc path, which creates no AppContainer profile and writes
+  no ACLs. Under -Backend mxc they SKIP with a Detail naming the mechanism
+  ($script:AppContainerOnlyScenarios), because letting them run would either
+  fail for a reason the scenario does not assert or, worse, pass vacuously.
+  Every other scenario runs unchanged. The loopback PROBE is AppContainer-
+  specific too (it exists to detect a BLOCKED AppContainer loopback, whose fix
+  is the admin NetworkIsolation exemption): on the mxc path there is no such
+  exemption, so the probe is not applied and the network scenarios assert the
+  proxy's own DECISION - a child that never reaches the proxy FAILS there
+  instead of being filtered into a skip.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -87,8 +112,13 @@
   Propagate SANDBOX_DIAG=1 to the child for verbose ACL diagnostics, and
   enable the supervisor-side [G-42] upstream-override notice (S-86 leg b
   depends on it).
+.PARAMETER Backend
+  Containment backend: appcontainer (default) or mxc. Propagated to every
+  `run` invocation. AppContainer-only scenarios SKIP under mxc (see the
+  BACKEND SELECTION note above); with -Strict those skips count as failures,
+  which is deliberate - a strict mxc run is asserting full parity.
 .EXAMPLE
-  pwsh -ExecutionPolicy Bypass -File tests/run-tests.ps1
+  pwsh -ExecutionPolicy Bypass -File tests/run-tests.ps1 -Backend mxc -Only 27,28,87,94
 #>
 [CmdletBinding()]
 param(
@@ -99,13 +129,22 @@ param(
     [int[]]$Skip,
     [switch]$StopOnFail,
     [switch]$Strict,
-    [switch]$Diag
+    [switch]$Diag,
+    # Containment backend for every `run` invocation. `mxc` requires a binary
+    # built with --features mxc-backend plus mxc-launch.exe beside it; the VM
+    # lane builds that for you when it is given -Backend mxc.
+    [ValidateSet('appcontainer', 'mxc')]
+    [string]$Backend = 'appcontainer'
 )
 
 if ($Diag) { $env:SANDBOX_DIAG = '1' } else { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
 
 $ErrorActionPreference = 'Stop'
 $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# The backend every `run` invocation carries (see Add-BackendArgs). Set once,
+# read by the helpers, the header, the Summary line and the AC-only guard.
+$script:Backend = $Backend
 
 if (-not $SandboxExe) {
     $SandboxExe = Join-Path $script:ThisDir '..\target\release\sandbox.exe'
@@ -154,6 +193,26 @@ function Test-Denied { param([string]$Text)
     return $Text -match '(?i)(access is denied|acces(?:s)? (?:is )?denied|acceso denegado|acces refuse|zugriff (?:wurde )?verweigert)'
 }
 
+# --- backend propagation ----------------------------------------------------
+# `--backend` is a flag of the `run` SUBCOMMAND (src/cli.rs `Cmd::Run`), so it
+# can only be injected into a `run` invocation - `sandbox --backend mxc audit
+# show` is a clap error. Both launch paths below call Add-BackendArgs, and the
+# only two call sites that cannot go through them (the S-35 Start-Job pair and
+# the S-38 Start-Process) build their argument list from Get-BackendArgs
+# themselves. An AST audit over this file is the gate: no `& $SandboxExe run`
+# may exist outside those three shapes.
+function Get-BackendArgs {
+    return @('--backend', $script:Backend)
+}
+
+function Add-BackendArgs {
+    param([string[]]$ArgList)
+    if (-not $ArgList -or $ArgList.Count -eq 0) { return $ArgList }
+    if ($ArgList[0] -ne 'run') { return $ArgList }
+    if ($ArgList.Count -eq 1) { return @('run') + (Get-BackendArgs) }
+    return @('run') + (Get-BackendArgs) + @($ArgList[1..($ArgList.Count - 1)])
+}
+
 function Invoke-Sandbox {
     param(
         [Parameter(Mandatory)][string[]]$Args,
@@ -167,6 +226,8 @@ function Invoke-Sandbox {
         # scenario's environment untouched.
         [hashtable]$Env = $null
     )
+    # Every run goes through the backend helper - see Get-BackendArgs.
+    $Args = Add-BackendArgs -ArgList $Args
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $SandboxExe
     $argParts = foreach ($a in $Args) {
@@ -415,6 +476,11 @@ public static class SbxToken
 # have valid handles. Returns the Process object (Id, HasExited, ExitCode).
 function Start-SandboxProcess {
     param([Parameter(Mandatory)][string]$Arguments, [string]$WorkingDirectory = $script:Cwd)
+    # This path takes a pre-joined argument STRING, so the backend is inserted
+    # after the `run` token instead of going through Add-BackendArgs.
+    if ($Arguments -match '^run\b') {
+        $Arguments = $Arguments -replace '^run\b', ('run ' + ((Get-BackendArgs) -join ' '))
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $SandboxExe
     $psi.Arguments = $Arguments
@@ -450,6 +516,20 @@ function Get-Curl { $c = Get-Command curl.exe -ErrorAction SilentlyContinue; if 
 # Returns $true if loopback-to-proxy works, $false otherwise.
 function Test-LoopbackProxyReachable {
     if ($null -ne $script:LoopbackProxyCache) { return $script:LoopbackProxyCache }
+    # The probe answers ONE AppContainer question: can a child reach the
+    # loopback proxy, and if not, is the fix the admin NetworkIsolation loopback
+    # exemption? That exemption does not exist on the mxc path, so applying the
+    # probe there would either skip ~25 scenarios with a remedy that cannot be
+    # applied or - worse - convert a real mxc egress defect into a skip. On the
+    # mxc path the probe is therefore NOT applied: the dependent scenarios
+    # assert the proxy's own decision (audit leaf / %{http_connect}), so a child
+    # that never reaches the proxy FAILS loudly instead of being filtered out.
+    if ($script:Backend -ne 'appcontainer') {
+        Write-Host ("  [probe] backend={0}: the AppContainer loopback probe does not apply (no admin loopback exemption on this path) - scenarios assert the proxy decision instead" -f $script:Backend)
+        $script:LoopbackProxyProbeExitCodes = @()
+        $script:LoopbackProxyCache = $true
+        return $true
+    }
     $curl = Get-Curl
     if (-not $curl) {
         # Distinguish "no curl" from "loopback blocked": both skip the same
@@ -1248,14 +1328,19 @@ function Invoke-Scenario-S34 {
 # S-35: AC-3.11 — two concurrent sessions get distinct sids (proxy ports differ).
 function Invoke-Scenario-S35 {
     $d = New-ScenarioDir 35
+    # Two concurrent sessions by construction, so these launches cannot use
+    # Invoke-Sandbox (it reads the pipes serially); the backend is carried in
+    # explicitly instead. Note this scenario is AppContainer-only: the mxc
+    # backend refuses more than one concurrent run by design.
+    $backendArgs = Get-BackendArgs
     $jobA = Start-Job -ScriptBlock {
-        param($SandboxExe,$d)
-        & $SandboxExe run --allow-cwd --network-profile minimal --print-sid -- cmd /c echo init
-    } -ArgumentList $SandboxExe,$d
+        param($SandboxExe,$d,[string[]]$BackendArgs)
+        & $SandboxExe run @BackendArgs --allow-cwd --network-profile minimal --print-sid -- cmd /c echo init
+    } -ArgumentList $SandboxExe,$d,(,$backendArgs)
     $jobB = Start-Job -ScriptBlock {
-        param($SandboxExe,$d)
-        & $SandboxExe run --allow-cwd --network-profile minimal --print-sid -- cmd /c echo init
-    } -ArgumentList $SandboxExe,$d
+        param($SandboxExe,$d,[string[]]$BackendArgs)
+        & $SandboxExe run @BackendArgs --allow-cwd --network-profile minimal --print-sid -- cmd /c echo init
+    } -ArgumentList $SandboxExe,$d,(,$backendArgs)
     $rA = Receive-Job $jobA -Wait -AutoRemoveJob
     $rB = Receive-Job $jobB -Wait -AutoRemoveJob
     $sidA = (($rA | Where-Object { $_ -match '^\d{8}-\d{6}-\d{5}$' }) -join '').Trim()
@@ -1339,7 +1424,7 @@ function Invoke-Scenario-S38 {
     try {
         $errFile = Join-Path $d 'proxy-err.txt'
         $proc = Start-Process -FilePath $SandboxExe `
-            -ArgumentList 'run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','echo hi' `
+            -ArgumentList (@('run') + (Get-BackendArgs) + @('--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','echo hi')) `
             -WorkingDirectory $d -NoNewWindow -PassThru -RedirectStandardError $errFile
         # Wait for the sandbox to exit (the child `echo hi` returns immediately).
         $proc.WaitForExit(15000) | Out-Null
@@ -3242,9 +3327,10 @@ $script:MaxScenario = 94
 #
 # It is the harness form of guardrail 1's NEGATIVE case (ADR-0004: a session must
 # not be reported successful without proof the child reached the proxy). That
-# guardrail exists only in the MXC backend, and the VM lane cannot select it
-# before P3.1 (`main.rs` refuses `--backend mxc`), so a scenario today would run
-# the AppContainer backend and could only pass for the wrong reason. Registering
+# guardrail exists only in the MXC backend. The harness can SELECT that backend
+# since P3.1 (-Backend mxc -> `--backend mxc`), but S-93's own body is not
+# written in this change, and a scenario run on the AppContainer backend could
+# only pass for the wrong reason. Registering
 # it as a permanently-skipping scenario would also make the suite's skip count
 # carry a slot that never executes, which is how a coverage hole gets counted as
 # coverage. So the number is reserved OUT of the run: `Select-ScenarioNumbers`
@@ -3253,6 +3339,49 @@ $script:MaxScenario = 94
 # `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful` in
 # `src/net/mxc.rs`; S-93's harness form lands with P3.1.
 $script:ReservedScenarioNumbers = @(93)
+
+# ---------------------------------------------------------------------------
+# AppContainer-only scenarios (P3.1).
+#
+# These are the scenarios whose PASS CONDITION is AppContainer machinery, and
+# the mxc path does not build that machinery: it creates no AppContainer
+# profile, has no AppContainer SID, and writes no ACLs (grep SetSecurityInfo /
+# icacls: the only writers are src/sandbox/appcontainer.rs and src/setup.rs,
+# both on the AppContainer path). Letting them RUN under -Backend mxc would
+# produce one of two dishonest outcomes: a failure that names an unrelated
+# mechanism, or a pass that never exercised the thing it claims to test (a
+# DACL denial cannot be observed where no DACL was written). They therefore
+# SKIP on any non-appcontainer backend, with the mechanism in the Detail.
+#
+# This is deliberately NOT a per-scenario `if` inside each function: ONE guard
+# in Invoke-Scenario consults the table, so adding a scenario cannot bypass it
+# and the classification is reviewable in one place. Under the default backend
+# the table is never consulted and the recorded baseline is unchanged.
+#
+# A PLAIN hashtable, deliberately: `[ordered]@{ 2 = 'a'; 3 = 'b' }` with
+# INTEGER keys mis-associates its values on pwsh 7.6.7 (measured: 2 = the
+# THIRD value, the rest empty) while this shape is correct. The header print
+# sorts the keys so the output order is stable without the ordered type.
+$script:AppContainerOnlyScenarios = @{
+    2  = 'PASS condition is an AppContainer DACL denial (src/sandbox/appcontainer.rs writes the ACE); the mxc path writes no DACLs, so a pass would be vacuous'
+    3  = 'sibling-project read denial is the same DACL mechanism (appcontainer.rs grant_access) - no DACLs exist on the mxc path'
+    5  = 'write denial outside the allow-list is a DACL outcome (appcontainer.rs); the mxc path writes no DACLs'
+    6  = 'GATE scenario: copies a binary into the per-session AppContainer install tree <cwd>/.sandbox/<sid>/bin (src/sandbox/allowlist.rs build_allowlist); the mxc path creates no such tree'
+    7  = 'writes into the per-session AppContainer install tree <cwd>/.sandbox/<sid>/bin, which the mxc path does not create'
+    9  = 'venv is created under the per-session AppContainer tree <cwd>/.sandbox/<sid>/venv, which the mxc path does not create'
+    10 = 'depth-3 containment is asserted as an AppContainer token + DACL denial on an unlisted path'
+    13 = 'per-session isolation is asserted as two DISTINCT <cwd>/.sandbox/<sid> install trees - an AppContainer-only layout'
+    17 = 'the --read-only deny is implemented as an ACE on the read-only path (appcontainer.rs); no ACLs on the mxc path'
+    19 = 'asserts a path ACE granted to the AppContainer SID by the python_runtime security group; the mxc path has no AppContainer SID to grant to, so a pass would be vacuous'
+    20 = 'asserts a path ACE granted to the AppContainer SID by the node_runtime security group; no AppContainer SID on the mxc path'
+    21 = 'wrapper confinement is the restricted-token + inherited-DACL property; there is no AppContainer token on the mxc path'
+    35 = 'asserts TWO CONCURRENT sessions; the mxc backend refuses more than one concurrent run by design (MXC_CONCURRENCY_REFUSED, src/cli.rs)'
+    40 = 'needs the drive-root ACE for S-1-15-2-2 (All Application Packages) that sandbox setup --grant-drive-root writes; the mxc path has no such subject'
+    41 = 'same drive-root S-1-15-2-2 ACE as S-40; no AppContainer SIDs on the mxc path'
+    42 = 'regression guard on the same drive-root ACE (the grant must not weaken an unrelated denial)'
+    73 = 'asserts DACL-journal teardown restore; the mxc path writes no ACLs, so there is no journal and no restore to observe'
+    74 = 'asserts DACL-journal crash recovery (orphan reap); no ACLs and no journal on the mxc path'
+}
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
     73 = { Invoke-Scenario-S73 }
@@ -3280,6 +3409,15 @@ $script:ScenarioFunctions = @{
 
 function Invoke-Scenario { param([int]$Number)
     if ($Number -lt 1 -or $Number -gt $script:MaxScenario) { return $null }
+    # The ONE place the backend can move a scenario out of the run (see
+    # $script:AppContainerOnlyScenarios). A skip - never a pass, never a fail:
+    # the scenario did not execute, and the Detail says which AppContainer
+    # mechanism it needs. AppContainerOnly=$true lets the summary distinguish
+    # "this backend cannot test it" from "the environment blocked it".
+    if ($script:Backend -ne 'appcontainer' -and $script:AppContainerOnlyScenarios.Contains($Number)) {
+        return @{ Num=$Number; Name="S-$Number (AppContainer-only)"; Passed=$true; Skipped=$true; AppContainerOnly=$true
+            Detail = ('backend={0}: not exercised - {1}' -f $script:Backend, $script:AppContainerOnlyScenarios[$Number]) }
+    }
     if ($script:ScenarioFunctions.ContainsKey($Number)) { return & $script:ScenarioFunctions[$Number] }
     if ($Number -gt $script:Scenarios.Count) {
         return @{ Num=$Number; Name="S-$Number (reserved)"; Passed=$false; Skipped=$true
@@ -3303,9 +3441,21 @@ function Select-ScenarioNumbers {
 function Main {
     Write-Host "sandbox test harness" -ForegroundColor White
     Write-Host "  SandboxExe : $SandboxExe"
+    Write-Host "  Backend    : $script:Backend"
     Write-Host "  Cwd        : $script:Cwd"
     Write-Host "  Keep       : $Keep"
     Write-Host ""
+    if ($script:Backend -ne 'appcontainer') {
+        # A skip SET is evidence, so the classification is printed up front:
+        # the operator must be able to see which scenarios this backend removed
+        # from the run and why, without reading 93 result lines.
+        Write-Host ("  AppContainer-only, skipped on backend '{0}' ({1}):" -f $script:Backend, $script:AppContainerOnlyScenarios.Count) -ForegroundColor Cyan
+        foreach ($k in @($script:AppContainerOnlyScenarios.Keys | Sort-Object)) {
+            Write-Host ("    S-{0} -> {1}" -f $k, $script:AppContainerOnlyScenarios[$k]) -ForegroundColor DarkGray
+        }
+        Write-Host '  The loopback probe is AppContainer-specific and is not applied on this backend: network scenarios assert the proxy decision and FAIL if the child never reaches it.' -ForegroundColor DarkGray
+        Write-Host ""
+    }
     Write-GuestMetric 'suite-begin' 0
 
     $nums = Select-ScenarioNumbers
@@ -3346,7 +3496,18 @@ function Main {
     }
     Write-GuestMetric 'suite-end' 0
     Write-Host ""
-    Write-Host ("Summary: total={0} pass={1} fail={2} skip={3}" -f $total,$pass,$fail,$skip) -ForegroundColor White
+    # backend= is APPENDED: the guest parser in tests/vm/run-in-vm.ps1 matches
+    # the four leading fields and ignores the tail (verified - its regex is
+    # anchored at ^ only), so existing log consumers keep working.
+    Write-Host ("Summary: total={0} pass={1} fail={2} skip={3} backend={4}" -f $total,$pass,$fail,$skip,$script:Backend) -ForegroundColor White
+    if ($script:Backend -ne 'appcontainer') {
+        $acOnly = 0; $otherSkip = 0
+        foreach ($r in $results) {
+            if ($r.State -ne 'skip') { continue }
+            if ($r.AppContainerOnly) { $acOnly++ } else { $otherSkip++ }
+        }
+        Write-Host ("  skips: {0} AppContainer-only (this backend cannot exercise them) + {1} environmental" -f $acOnly, $otherSkip) -ForegroundColor Cyan
+    }
 
     $gateFailed = $false
     foreach ($r in $results) { if ($r.IsGate -and $r.State -eq 'fail') { $gateFailed = $true } }

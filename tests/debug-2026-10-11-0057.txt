@@ -1,0 +1,550 @@
+=== 1. AppContainer dir state ===
+  C:\Users\sbxadmin\AppData\Local\Microsoft\Windows\AppContainer\Profiles
+=== 2. AppContainer registry chain ===
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1050576210-4101474698-56307613-2706264498-167457550-835605972-784472318
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1050576210-4101474698-56307613-2706264498-167457550-835605972-784472318\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1075972307-1477995677-3981890472-2965168153-2910496065-638303522-2449858333
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1075972307-1477995677-3981890472-2965168153-2910496065-638303522-2449858333\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1083666204-94104884-4233206613-1271453470-922726920-1064507403-787610193
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1083666204-94104884-4233206613-1271453470-922726920-1064507403-787610193\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1109362956-2100780101-319062966-2338756854-4293192295-1380407347-1234162549
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1109362956-2100780101-319062966-2338756854-4293192295-1380407347-1234162549\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1173182187-4214477733-4163864258-4245696707-2071662337-195254785-237729376
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1173182187-4214477733-4163864258-4245696707-2071662337-195254785-237729376\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1249711459-134733902-3948140224-2141153427-3532413295-2701054830-2870725241
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1249711459-134733902-3948140224-2141153427-3532413295-2701054830-2870725241\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1254322593-1477425798-1529151232-702750859-81020123-3651049416-2875749711
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1254322593-1477425798-1529151232-702750859-81020123-3651049416-2875749711\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1255970798-2717750985-493741290-1721212560-3530798636-1829112236-3118580706
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1255970798-2717750985-493741290-1721212560-3530798636-1829112236-3118580706\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1288279408-4010470124-2163985056-447644096-1946037256-752919663-3751275627
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1288279408-4010470124-2163985056-447644096-1946037256-752919663-3751275627\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1310292540-1029022339-4008023048-2190398717-53961996-4257829345-603366646
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1310292540-1029022339-4008023048-2190398717-53961996-4257829345-603366646\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1312876954-3728250218-3694470604-4188764552-3197360367-780678243-3229644300
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1312876954-3728250218-3694470604-4188764552-3197360367-780678243-3229644300\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1314543265-1088296281-3062384521-599120848-2684354913-2116478879-1455197332
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1314543265-1088296281-3062384521-599120848-2684354913-2116478879-1455197332\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1327587233-2730283621-3908338074-337181141-3891108920-2047653661-4124462636
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1327587233-2730283621-3908338074-337181141-3891108920-2047653661-4124462636\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1430448594-2639229838-973813799-439329657-1197984847-4069167804-1277922394
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1430448594-2639229838-973813799-439329657-1197984847-4069167804-1277922394\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1433382107-525783102-3264187439-2233956802-150629141-2653644966-3104780440
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1433382107-525783102-3264187439-2233956802-150629141-2653644966-3104780440\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1443768658-4142614663-2184295616-261691820-2296379425-3814639016-258098527
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1443768658-4142614663-2184295616-261691820-2296379425-3814639016-258098527\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1484987186-1222498055-1895867193-3865138943-3428356477-682207028-3900627692
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1484987186-1222498055-1895867193-3865138943-3428356477-682207028-3900627692\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1519153344-717422182-3767175692-1118150562-4047497999-3652784684-536602263
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1519153344-717422182-3767175692-1118150562-4047497999-3652784684-536602263\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-155514346-2573954481-755741238-1654018636-1233331829-3075935687-2861478708
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-155514346-2573954481-755741238-1654018636-1233331829-3075935687-2861478708\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1609473798-1231923017-684268153-4268514328-882773646-2760585773-1760938157
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1609473798-1231923017-684268153-4268514328-882773646-2760585773-1760938157\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1638675529-561647227-3538720794-2648656034-920061445-2890348547-1054875957
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1638675529-561647227-3538720794-2648656034-920061445-2890348547-1054875957\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1714399563-1326177402-2048222277-143663168-2151391019-765408921-4098702777
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1714399563-1326177402-2048222277-143663168-2151391019-765408921-4098702777\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1723189366-2159580849-2248400763-1481059666-1951766778-2756563051-3565589001
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1723189366-2159580849-2248400763-1481059666-1951766778-2756563051-3565589001\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1726375552-1729233799-74693324-3851689839-2151781990-3623637752-3611872497
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1726375552-1729233799-74693324-3851689839-2151781990-3623637752-3611872497\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1760019844-2681172078-3872633735-798519778-3824819574-1684089895-1452983902
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1760019844-2681172078-3872633735-798519778-3824819574-1684089895-1452983902\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1794666530-1473249818-1588996214-3976422419-3023849891-1013843484-2185627956
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1794666530-1473249818-1588996214-3976422419-3023849891-1013843484-2185627956\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1862275542-1254060742-1006630753-971163975-25177346-1977832528-4247160915
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1862275542-1254060742-1006630753-971163975-25177346-1977832528-4247160915\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1865096472-3228082684-3088735348-2044108251-975292724-3239066845-4226050315
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1865096472-3228082684-3088735348-2044108251-975292724-3239066845-4226050315\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1910091885-1573563583-1104941280-2418270861-3411158377-2822700936-2990310272
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1910091885-1573563583-1104941280-2418270861-3411158377-2822700936-2990310272\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1912509539-3368118754-2471371924-3037708167-1407372224-1099830378-371392376
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1912509539-3368118754-2471371924-3037708167-1407372224-1099830378-371392376\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-19479607-1015771884-3827151630-3301822711-2267158487-4079414233-1230461222
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-19479607-1015771884-3827151630-3301822711-2267158487-4079414233-1230461222\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1985198343-3186790915-4047221937-1969271670-3792558349-1325541827-400269725
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-1985198343-3186790915-4047221937-1969271670-3792558349-1325541827-400269725\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2040986369-264322980-3882385089-1970153872-3662121739-3363227934-2464603330
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2040986369-264322980-3882385089-1970153872-3662121739-3363227934-2464603330\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2056075683-1419233952-3861986872-1138878682-2918538514-3668736794-3483596717
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2056075683-1419233952-3861986872-1138878682-2918538514-3668736794-3483596717\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2157510589-3124143007-2432424454-574858632-2039108079-2945159833-487967461
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2157510589-3124143007-2432424454-574858632-2039108079-2945159833-487967461\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-216940756-3926213634-2086602690-3208050060-4189571744-4076504916-545222953
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-216940756-3926213634-2086602690-3208050060-4189571744-4076504916-545222953\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2188130720-2839601841-3157732644-2592691638-1140003976-1644640269-1870447086
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2188130720-2839601841-3157732644-2592691638-1140003976-1644640269-1870447086\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2197893946-3171714009-3374444288-1699955487-101602993-2692090542-242745639
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2197893946-3171714009-3374444288-1699955487-101602993-2692090542-242745639\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2226957697-3030467180-2301525-4248967783-2024719031-2325529081-2915787518
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2226957697-3030467180-2301525-4248967783-2024719031-2325529081-2915787518\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2246242352-370130666-2593524754-1827188282-2313440240-2317694540-2761805292
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2246242352-370130666-2593524754-1827188282-2313440240-2317694540-2761805292\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2269821974-2804717365-38134953-90350692-1918769177-1574586844-3008652034
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2269821974-2804717365-38134953-90350692-1918769177-1574586844-3008652034\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2376884767-3641813526-1736181949-1293975252-228260496-2789807194-3363476418
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2376884767-3641813526-1736181949-1293975252-228260496-2789807194-3363476418\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2401218348-24943025-1757821970-1018284884-201032909-2384433689-2231545691
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2401218348-24943025-1757821970-1018284884-201032909-2384433689-2231545691\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2404949842-1813268520-2470536603-3173970896-1111942218-1353792839-2715846399
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2404949842-1813268520-2470536603-3173970896-1111942218-1353792839-2715846399\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2432820154-214690117-2638483218-3299957948-3041975438-3418652010-4243016273
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2432820154-214690117-2638483218-3299957948-3041975438-3418652010-4243016273\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2434737943-167758768-3180539153-984336765-1107280622-3591121930-2677285773
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2434737943-167758768-3180539153-984336765-1107280622-3591121930-2677285773\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2471035258-3779105804-3042361578-1479730176-3542935467-3195938656-1871906695
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2471035258-3779105804-3042361578-1479730176-3542935467-3195938656-1871906695\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2473817148-3930944034-1235795307-187980641-3967865409-1804095407-1113801530
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2473817148-3930944034-1235795307-187980641-3967865409-1804095407-1113801530\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2537927067-2140208811-1083047336-3825492100-1188134376-3459723148-3131426163
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2537927067-2140208811-1083047336-3825492100-1188134376-3459723148-3131426163\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2603511428-3224021693-1028932517-3941269705-3349582775-2312504883-4057327947
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2603511428-3224021693-1028932517-3941269705-3349582775-2312504883-4057327947\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-264739638-287404034-2676211764-1818169219-528244620-1404816131-2903563069
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-264739638-287404034-2676211764-1818169219-528244620-1404816131-2903563069\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2652307757-2298579837-578647688-3387406430-2756081349-614783772-2601174805
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2652307757-2298579837-578647688-3387406430-2756081349-614783772-2601174805\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2679466428-2257802901-1755839644-3032159574-3452485508-990264208-3332697187
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2679466428-2257802901-1755839644-3032159574-3452485508-990264208-3332697187\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2705751783-1496458293-2835996032-3143071717-1071345625-677459937-2760321769
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2705751783-1496458293-2835996032-3143071717-1071345625-677459937-2760321769\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2743877165-1931364543-2468930561-3765762410-1162139025-1178895811-1086226821
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2743877165-1931364543-2468930561-3765762410-1162139025-1178895811-1086226821\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2758101530-1321080646-1475665648-4066602542-2880396197-3643791541-2654759312
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2758101530-1321080646-1475665648-4066602542-2880396197-3643791541-2654759312\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2769473560-3578709263-3489983406-2684532483-2842214997-2023354280-3433069635
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2769473560-3578709263-3489983406-2684532483-2842214997-2023354280-3433069635\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-283421221-3183566570-1718213290-751554359-3541592344-2312209569-3374928651
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-283421221-3183566570-1718213290-751554359-3541592344-2312209569-3374928651\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-284907560-3695622717-2124867970-90980536-1928201052-1028515541-1033863524
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-284907560-3695622717-2124867970-90980536-1928201052-1028515541-1033863524\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2932635078-2083127429-3588030127-3048655639-78464744-446804135-4255923089
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-2932635078-2083127429-3588030127-3048655639-78464744-446804135-4255923089\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3024644944-341862885-1170623225-3544868822-2883921911-975687952-948131898
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3024644944-341862885-1170623225-3544868822-2883921911-975687952-948131898\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3024871829-3976948118-2663862959-2402944110-3647003743-4018965598-3259370425
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3024871829-3976948118-2663862959-2402944110-3647003743-4018965598-3259370425\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3072599432-1607568789-957273504-856596282-71567818-1546726304-1084662928
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3072599432-1607568789-957273504-856596282-71567818-1546726304-1084662928\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3110756066-2507771734-389907848-353554127-1230786711-3973453966-120447785
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3110756066-2507771734-389907848-353554127-1230786711-3973453966-120447785\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3119458392-1009845475-4083330090-3659807469-4003170139-1239840055-303833190
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3119458392-1009845475-4083330090-3659807469-4003170139-1239840055-303833190\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3127391486-654165588-1135944943-943820645-244210695-3344878592-833444881
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3127391486-654165588-1135944943-943820645-244210695-3344878592-833444881\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3132517012-1571311091-3263739450-2968124769-4061529133-2106415361-233808003
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3132517012-1571311091-3263739450-2968124769-4061529133-2106415361-233808003\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3147918054-4251542582-2404553452-1793583264-1546801782-1235146273-4024180735
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3147918054-4251542582-2404553452-1793583264-1546801782-1235146273-4024180735\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3155986392-3975291318-3290200901-3688105942-3149078057-1179077593-1847296678
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3155986392-3975291318-3290200901-3688105942-3149078057-1179077593-1847296678\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3173323527-1370142926-3440071442-4097462880-1944842275-2641970605-339160986
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3173323527-1370142926-3440071442-4097462880-1944842275-2641970605-339160986\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3261124336-967904692-548716175-2724082555-235625598-1533749622-1468861831
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3261124336-967904692-548716175-2724082555-235625598-1533749622-1468861831\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3454040486-2837767420-2398300611-2444005331-4037059961-341738144-1918557667
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3454040486-2837767420-2398300611-2444005331-4037059961-341738144-1918557667\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3474344596-1361774275-169937050-1715369765-655753896-4292765343-1302149271
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3474344596-1361774275-169937050-1715369765-655753896-4292765343-1302149271\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3501455044-2582412288-1426596574-4083325953-1804646004-2144057959-3023214061
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3501455044-2582412288-1426596574-4083325953-1804646004-2144057959-3023214061\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-350187224-1905355452-1037786396-3028148496-2624191407-3283318427-1255436723
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-350187224-1905355452-1037786396-3028148496-2624191407-3283318427-1255436723\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3528834342-470806326-1880701413-1680063135-2149661979-2141157734-685366862
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3528834342-470806326-1880701413-1680063135-2149661979-2141157734-685366862\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3539788797-2700867667-1432428195-1581642-2885308443-3834444517-2495346167
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3539788797-2700867667-1432428195-1581642-2885308443-3834444517-2495346167\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3560616614-2443124858-2671974668-1543263898-3536119268-1279657150-1433109665
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3560616614-2443124858-2671974668-1543263898-3536119268-1279657150-1433109665\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3637181099-3165582941-2384801395-3283118383-1187078190-3493346776-3423618717
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3637181099-3165582941-2384801395-3283118383-1187078190-3493346776-3423618717\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-364329911-4150717405-3056445719-2033109410-984633417-3778061428-3365209672
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-364329911-4150717405-3056445719-2033109410-984633417-3778061428-3365209672\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3733603082-4179795269-1217541644-381468798-1681740699-3059609168-2054985149
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3733603082-4179795269-1217541644-381468798-1681740699-3059609168-2054985149\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3784866113-3187381476-3433752343-3391928953-3760210436-1684329488-1912184601
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3784866113-3187381476-3433752343-3391928953-3760210436-1684329488-1912184601\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3828360675-3123616087-1283226262-1036109304-3961725198-2080846782-1645323766
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3828360675-3123616087-1283226262-1036109304-3961725198-2080846782-1645323766\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3873744419-3997242182-2340346981-2691667840-1138843701-1763581384-457371629
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3873744419-3997242182-2340346981-2691667840-1138843701-1763581384-457371629\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3911328773-608413955-1309177842-678056087-3306350038-3682494511-2300153425
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3911328773-608413955-1309177842-678056087-3306350038-3682494511-2300153425\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3912597219-1073764063-4221279274-2430493127-3107599948-1184173955-951593363
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3912597219-1073764063-4221279274-2430493127-3107599948-1184173955-951593363\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3919898394-240971480-980890888-3230558242-4058805054-3280384575-963836242
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3919898394-240971480-980890888-3230558242-4058805054-3280384575-963836242\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3950126717-3641943460-3038804466-693777006-783539386-1288712031-1294249617
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3950126717-3641943460-3038804466-693777006-783539386-1288712031-1294249617\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3966274651-3828435918-2172680608-3393248125-2230136616-3833916919-2116442815
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-3966274651-3828435918-2172680608-3393248125-2230136616-3833916919-2116442815\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-4114933130-2225810789-275526614-23959559-3559893689-4003239242-3329393807
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-4114933130-2225810789-275526614-23959559-3559893689-4003239242-3329393807\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-418148156-2537829053-392682906-1521907270-1991806091-3082126130-3744404225
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-418148156-2537829053-392682906-1521907270-1991806091-3082126130-3744404225\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-4239071319-2881602905-407801514-2077749337-330983930-4104761926-1855635098
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-4239071319-2881602905-407801514-2077749337-330983930-4104761926-1855635098\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-4264928162-86341590-2006646042-3756743162-890444002-3415177634-881149292
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-4264928162-86341590-2006646042-3756743162-890444002-3415177634-881149292\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-447965956-1595884426-2614601585-2128949372-556907266-1570989533-1058743812
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-447965956-1595884426-2614601585-2128949372-556907266-1570989533-1058743812\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-466767348-3739614953-2700836392-1801644223-4227750657-1087833535-2488631167
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-466767348-3739614953-2700836392-1801644223-4227750657-1087833535-2488631167\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-508114518-3340871649-811464485-526616082-4258465299-1774086546-1865468257
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-508114518-3340871649-811464485-526616082-4258465299-1774086546-1865468257\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-515815643-2845804217-1874292103-218650560-777617685-4287762684-137415000
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-515815643-2845804217-1874292103-218650560-777617685-4287762684-137415000\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-543634040-274359014-2226501544-3561766748-3991453649-3543631192-522786984
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-543634040-274359014-2226501544-3561766748-3991453649-3543631192-522786984\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-555825887-3428964027-302557850-3843577689-3381736175-1190830980-2560173454
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-555825887-3428964027-302557850-3843577689-3381736175-1190830980-2560173454\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-577703620-721806600-2575725278-1938300505-2177978512-2240326487-1220425747
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-577703620-721806600-2575725278-1938300505-2177978512-2240326487-1220425747\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-58910866-3222973021-3644791724-2336003105-2142029753-2093886826-3648459896
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-58910866-3222973021-3644791724-2336003105-2142029753-2093886826-3648459896\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-599759058-3479938838-1253218824-33263930-1483063708-2104800716-3218279855
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-599759058-3479938838-1253218824-33263930-1483063708-2104800716-3218279855\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-652398941-3105653600-2915300332-119994831-3460387998-2584415950-728642102
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-652398941-3105653600-2915300332-119994831-3460387998-2584415950-728642102\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-815187177-996385781-3071627725-3674054744-306962016-2316107673-1133445636
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-815187177-996385781-3071627725-3674054744-306962016-2316107673-1133445636\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-863593341-1254161421-265558157-1864070106-154078161-175705315-1002059263
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-863593341-1254161421-265558157-1864070106-154078161-175705315-1002059263\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-87076641-3190110020-2981370839-3406873010-3853733481-1254120296-1009409985
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-87076641-3190110020-2981370839-3406873010-3853733481-1254120296-1009409985\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-899261656-4055568758-2400112791-3940088751-3987735885-2174448918-1852080545
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-899261656-4055568758-2400112791-3940088751-3987735885-2174448918-1852080545\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-932905279-1352884144-690731472-1935380077-77221151-3040906485-3167188873
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-932905279-1352884144-690731472-1935380077-77221151-3040906485-3167188873\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-937955258-4038542540-364486478-666379738-3697399013-431555883-24972786
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-937955258-4038542540-364486478-666379738-3697399013-431555883-24972786\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-957941444-2271171641-4049211970-804197638-2225746618-2474488012-4131196493
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-957941444-2271171641-4049211970-804197638-2225746618-2474488012-4131196493\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-969871995-3242822759-583047763-1618006129-3578262429-3647035748-2471858633
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\S-1-15-2-969871995-3242822759-583047763-1618006129-3578262429-3647035748-2471858633\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\clipchamp.clipchamp_yxz26nhyzhsrt
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\clipchamp.clipchamp_yxz26nhyzhsrt\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\clipchamp.clipchamp_yxz26nhyzhsrt\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.aad.brokerplugin_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.aad.brokerplugin_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.applicationcompatibilityenhancements_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.applicationcompatibilityenhancements_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.applicationcompatibilityenhancements_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.av1videoextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.av1videoextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.av1videoextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.avcencodervideoextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.avcencodervideoextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.avcencodervideoextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingnews_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingnews_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingnews_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingsearch_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingsearch_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingsearch_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingweather_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingweather_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.bingweather_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.desktopappinstaller_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.desktopappinstaller_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.desktopappinstaller_8wekyb3d8bbwe\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.desktopappinstaller_8wekyb3d8bbwe\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.desktopappinstaller_8wekyb3d8bbwe\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.desktopappinstaller_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.gamingapp_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.gamingapp_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.gamingapp_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.gethelp_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.gethelp_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.gethelp_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.heifimageextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.heifimageextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.heifimageextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.hevcvideoextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.hevcvideoextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.hevcvideoextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftedge.stable_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftedge.stable_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftedge.stable_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftsolitairecollection_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftsolitairecollection_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftsolitairecollection_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftstickynotes_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftstickynotes_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftstickynotes_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.mpeg2videoextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.mpeg2videoextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.mpeg2videoextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.net.native.framework.2.2_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.net.native.framework.2.2_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.net.native.framework.2.2_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.net.native.runtime.2.2_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.net.native.runtime.2.2_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.net.native.runtime.2.2_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.outlookforwindows_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.outlookforwindows_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.outlookforwindows_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.paint_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.paint_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.paint_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.powerautomatedesktop_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.powerautomatedesktop_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.powerautomatedesktop_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.powershell_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.powershell_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.powershell_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.rawimageextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.rawimageextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.rawimageextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.screensketch_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.screensketch_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.screensketch_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.sechealthui_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.sechealthui_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.sechealthui_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.startexperiencesapp_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.startexperiencesapp_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.startexperiencesapp_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.storepurchaseapp_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.storepurchaseapp_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.storepurchaseapp_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.todos_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.todos_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.todos_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.ui.xaml.2.8_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.ui.xaml.2.8_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.ui.xaml.2.8_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vclibs.140.00.uwpdesktop_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vclibs.140.00.uwpdesktop_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vclibs.140.00.uwpdesktop_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vclibs.140.00_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vclibs.140.00_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vclibs.140.00_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vp9videoextensions_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vp9videoextensions_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.vp9videoextensions_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.webmediaextensions_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.webmediaextensions_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.webmediaextensions_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.webpimageextension_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.webpimageextension_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.webpimageextension_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.widgetsplatformruntime_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.widgetsplatformruntime_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.widgetsplatformruntime_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.win32webviewhost_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.win32webviewhost_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache\Content
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache\Cookies
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache\Extensible Cache\BackgroundTransferApi
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache\Extensible Cache\BackgroundTransferApiGroup
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.contentdeliverymanager_cw5n1h2txyewy\Internet Settings\Cache\History
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.devhome_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.devhome_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.devhome_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.narratorquickstart_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.narratorquickstart_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.photos_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.photos_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.photos_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.shellexperiencehost_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.shellexperiencehost_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.startmenuexperiencehost_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.startmenuexperiencehost_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.startmenuexperiencehost_cw5n1h2txyewy\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.startmenuexperiencehost_cw5n1h2txyewy\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windows.startmenuexperiencehost_cw5n1h2txyewy\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsalarms_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsalarms_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsalarms_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.1.7_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.1.7_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.1.7_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.1.8_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.1.8_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.1.8_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.2_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.2_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsappruntime.2_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowscalculator_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowscalculator_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowscalculator_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowscamera_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowscamera_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowscamera_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsfeedbackhub_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsfeedbackhub_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsfeedbackhub_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsnotepad_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsnotepad_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsnotepad_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowssoundrecorder_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowssoundrecorder_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowssoundrecorder_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\CA
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\CA\Certificates
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\CA\Certificates\336D3E5451315294F6E1E7CFDA84E51C8B1E4054
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\CA\Certificates\7FA05ACF9B4AABB0DE0CFAFA297DDF92FDC5F3F5
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\CA\CRLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\CA\CTLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Disallowed
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Disallowed\Certificates
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Disallowed\CRLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Disallowed\CTLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Root
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Root\Certificates
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Root\CRLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\Root\CTLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\trust
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\trust\Certificates
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\trust\CRLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\trust\CTLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\TrustedPeople
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\TrustedPeople\Certificates
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\TrustedPeople\CRLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsstore_8wekyb3d8bbwe\Software\Microsoft\SystemCertificates\TrustedPeople\CTLs
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsterminal_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsterminal_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.windowsterminal_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.winget.source_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.winget.source_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.winget.source_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xbox.tcui_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xbox.tcui_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xbox.tcui_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache\Content
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache\Cookies
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache\Extensible Cache\BackgroundTransferApi
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache\Extensible Cache\BackgroundTransferApiGroup
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\Internet Settings\Cache\History
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxgamingoverlay_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxidentityprovider_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxidentityprovider_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxidentityprovider_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxspeechtotextoverlay_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxspeechtotextoverlay_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.xboxspeechtotextoverlay_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.yourphone_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.yourphone_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.yourphone_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.zunemusic_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.zunemusic_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.zunemusic_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftcorporationii.quickassist_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftcorporationii.quickassist_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftcorporationii.quickassist_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Internet Settings\Cache\Content
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Internet Settings\Cache\Cookies
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.cbs_cw5n1h2txyewy\Internet Settings\Cache\History
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.coreai_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.coreai_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.core_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.core_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Internet Settings
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Internet Settings\Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Internet Settings\Cache\Content
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Internet Settings\Cache\Cookies
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Internet Settings\Cache\Extensible Cache
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.oobe_cw5n1h2txyewy\Internet Settings\Cache\History
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.webexperience_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.webexperience_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.client.webexperience_cw5n1h2txyewy\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.crossdevice_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.crossdevice_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoftwindows.crossdevice_cw5n1h2txyewy\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\msteams_8wekyb3d8bbwe
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\msteams_8wekyb3d8bbwe\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\msteams_8wekyb3d8bbwe\ResourcesConfig
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\windows.immersivecontrolpanel_cw5n1h2txyewy
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\windows.immersivecontrolpanel_cw5n1h2txyewy\Children
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\windows_ie_ac_001
+  HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\windows_ie_ac_001\Children
+=== 3. manual run in this FRESH session ===
+  manual-ok
+  exit: 0
+=== 4. memory ===
+  % committed bytes in use = 42.2
+  available mbytes = 432.0
+=== 5. crash events (2h before suite end) ===
+=== 6. S-9 repro: venv, then pip's real error ===
+  Error: Command '['C:\\Users\\sbxadmin\\AppData\\Local\\Temp\\manual-venv-repro\\venv\\Scripts\\python.exe', '-m', 'ensurepip', '--upgrade', '--default-pip']' returned non-zero exit status 1.
+  venv exit: 1
+  Traceback (most recent call last):
+    File "C:\Program Files\Python312\Lib\ensurepip\__init__.py", line 184, in _bootstrap
+      with open(filename, "wb") as fp:
+           ^^^^^^^^^^^^^^^^^^^^
+  PermissionError: [Errno 13] Permission denied: 'C:\\Users\\sbxadmin\\AppData\\Local\\Packages\\sandbox.20261010-225602-78432.ac\\AC\\Temp\\tmpf_x12spi\\pip-25.0.1-py3-none-any.whl'
+  System.Management.Automation.RemoteException
+  During handling of the above exception, another exception occurred:
+  System.Management.Automation.RemoteException
+  Traceback (most recent call last):
+    File "<frozen os>", line 366, in walk
+  PermissionError: [WinError 5] Access is denied: 'C:\\Users\\sbxadmin\\AppData\\Local\\Packages\\sandbox.20261010-225602-78432.ac\\AC\\Temp\\tmpf_x12spi'
+  System.Management.Automation.RemoteException
+  During handling of the above exception, another exception occurred:
+  System.Management.Automation.RemoteException
+  Traceback (most recent call last):
+    File "<frozen runpy>", line 198, in _run_module_as_main
+    File "<frozen runpy>", line 88, in _run_code
+    File "C:\Program Files\Python312\Lib\ensurepip\__main__.py", line 5, in <module>
+      sys.exit(ensurepip._main())
+               ^^^^^^^^^^^^^^^^^
+    File "C:\Program Files\Python312\Lib\ensurepip\__init__.py", line 284, in _main
+      return _bootstrap(
+             ^^^^^^^^^^^
+    File "C:\Program Files\Python312\Lib\ensurepip\__init__.py", line 167, in _bootstrap
+      with tempfile.TemporaryDirectory() as tmpdir:
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Program Files\Python312\Lib\tempfile.py", line 950, in __exit__
+      self.cleanup()
+    File "C:\Program Files\Python312\Lib\tempfile.py", line 954, in cleanup
+      self._rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
+    File "C:\Program Files\Python312\Lib\tempfile.py", line 934, in _rmtree
+      _shutil.rmtree(name, onexc=onexc)
+    File "C:\Program Files\Python312\Lib\shutil.py", line 781, in rmtree
+      return _rmtree_unsafe(path, onexc)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Program Files\Python312\Lib\shutil.py", line 623, in _rmtree_unsafe
+      for dirpath, dirnames, filenames in results:
+                                          ^^^^^^^
+    File "<frozen os>", line 369, in walk
+    File "C:\Program Files\Python312\Lib\shutil.py", line 621, in onerror
+      onexc(os.scandir, err.filename, err)
+    File "C:\Program Files\Python312\Lib\tempfile.py", line 906, in onexc
+      _resetperms(path)
+    File "C:\Program Files\Python312\Lib\tempfile.py", line 286, in _resetperms
+      _dont_follow_symlinks(_os.chmod, path, 0o700)
+    File "C:\Program Files\Python312\Lib\tempfile.py", line 277, in _dont_follow_symlinks
+      func(path, *args)
+  PermissionError: [WinError 5] Access is denied: 'C:\\Users\\sbxadmin\\AppData\\Local\\Packages\\sandbox.20261010-225602-78432.ac\\AC\\Temp\\tmpf_x12spi'
+  ensurepip exit: 1
+PS C:\Users\marku\tools\sandbox>

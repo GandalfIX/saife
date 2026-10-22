@@ -10,6 +10,8 @@
 
   Phases:
     unit        -> cargo build --release, then cargo test --release
+                   (both carry --features mxc-backend when -Backend mxc, so the
+                   feature build is never clobbered by a feature-less test build)
     integration -> cargo build --release (sandbox.exe), then a child
                    pwsh -NoProfile -ExecutionPolicy Bypass -Command
                    "& <RepoDir>\tests\run-tests.ps1 -Only <ids>"
@@ -24,6 +26,14 @@
   -ResultsDir while also streaming to the caller's console. summary.json
   (schema 1) is emitted LAST and is written best-effort even when steps
   fail. Unknown numbers are null in the summary.
+
+  summary.json carries `backend` and `lane` so the host-side harness (and the
+  controller reading tests\vm\results\<runid>\summary.json) can tell an
+  ADMIN lane run from a STANDARD-USER lane run without inferring it from the
+  numbers. The standard-user lane exists because the guest's admin lane can
+  never falsify an "egress works unelevated" claim: every session it starts is
+  elevated. See Invoke-TestsInVM.ps1 -AsStandardUser and
+  tests\vm\standard-user-run.ps1.
 
   Exit codes:
     0  = every requested step exited 0        (final line: VM RUN: PASS)
@@ -42,6 +52,18 @@
   `pwsh -Command`. When invoked via `pwsh -File`, a comma token like
   "1,2,6" binds as a single culture-parsed int (126); via -File only a
   single scenario id can be passed reliably.
+.PARAMETER Backend
+  Containment backend passed through to tests\run-tests.ps1 as -Backend:
+  appcontainer (default) or mxc. mxc builds with --features mxc-backend (the
+  binary refuses --backend mxc without it, and mxc-launch.exe is
+  feature-gated in Cargo.toml).
+.PARAMETER Lane
+  Which lane this run represents: admin (default) or standard-user. It is
+  recorded in summary.json and in the log header ONLY - it changes no
+  behaviour here, because the guest-side launcher that runs as the standard
+  user is the host harness's job (Start-Process -Credential). Labelling is not
+  cosmetic: a lane whose numbers cannot be attributed to a token is not
+  evidence.
 .PARAMETER RepoDir
   Repo root. Defaults to the repo containing this script ($PSScriptRoot\..\..),
   NOT C:\sbx-repo, so manual smoke runs from other locations work.
@@ -63,7 +85,13 @@ param(
 
     [string]$RepoDir,
 
-    [string]$ResultsDir = 'C:\sbx-results'
+    [string]$ResultsDir = 'C:\sbx-results',
+
+    [ValidateSet('appcontainer', 'mxc')]
+    [string]$Backend = 'appcontainer',
+
+    [ValidateSet('admin', 'standard-user')]
+    [string]$Lane = 'admin'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +106,11 @@ $script:Summary = [ordered]@{
     osEdition   = $null
     repoDir     = $null
     phase       = $Phase
+    # Attribution, not decoration: which backend ran, and which lane (which
+    # token) produced the numbers. Both are read back by
+    # Invoke-TestsInVM.ps1's verdict block.
+    backend     = $Backend
+    lane        = $Lane
     build       = @{ ok = $null; exit = $null }
     unit        = @{ requested = $false; exit = $null; log = 'unit.log' }
     integration = @{ requested = $false; exit = $null; total = $null; pass = $null
@@ -117,7 +150,8 @@ try {
         Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host ("[vm-guest] phase={0} repo={1} results={2}" -f $Phase, $RepoDir, $script:ResultsRoot)
+    Write-Host ("[vm-guest] phase={0} lane={1} backend={2} repo={3} results={4}" -f $Phase, $Lane, $Backend, $RepoDir, $script:ResultsRoot)
+    Write-Host ("[vm-guest] summary will record lane={0} backend={1}" -f $Lane, $Backend)
 
     # -----------------------------------------------------------------------
     # OS info for the summary (null on failure - never fatal).
@@ -148,10 +182,17 @@ try {
     # Build (runs in every phase; integration needs sandbox.exe, unit needs
     # the compiled test binary).
     # -----------------------------------------------------------------------
-    Write-Host '[vm-guest] step: cargo build --release'
+    # --backend mxc needs BOTH the `mxc-backend` feature (src/cli.rs refuses the
+    # flag otherwise) and the feature-gated mxc-launch.exe, so the build and the
+    # unit-test build carry the SAME feature set: `cargo test --release` builds
+    # the bin target too, and a feature-less unit build would silently clobber
+    # the binary the integration phase then runs.
+    $featureArgs = @()
+    if ($Backend -eq 'mxc') { $featureArgs = @('--features', 'mxc-backend') }
+    Write-Host ('[vm-guest] step: cargo build --release {0}' -f ($featureArgs -join ' '))
     Push-Location -LiteralPath $RepoDir
     try {
-        & cargo build --release 2>&1 | Tee-Object -FilePath $buildLog
+        & cargo build --release @featureArgs 2>&1 | Tee-Object -FilePath $buildLog
         $buildExit = $LASTEXITCODE
     } finally { Pop-Location }
     $script:Summary.build.exit = $buildExit
@@ -166,10 +207,10 @@ try {
     # Unit phase: cargo test --release.
     # -----------------------------------------------------------------------
     if (($buildExit -eq 0) -and $wantUnit) {
-        Write-Host '[vm-guest] step: cargo test --release'
+        Write-Host ('[vm-guest] step: cargo test --release {0}' -f ($featureArgs -join ' '))
         Push-Location -LiteralPath $RepoDir
         try {
-            & cargo test --release 2>&1 | Tee-Object -FilePath $unitLog
+            & cargo test --release @featureArgs 2>&1 | Tee-Object -FilePath $unitLog
             $unitExit = $LASTEXITCODE
         } finally { Pop-Location }
         $script:Summary.unit.exit = $unitExit
@@ -198,7 +239,7 @@ try {
         # exits 0 or 1 (its contract), and both propagate faithfully through
         # -Command.
         $escapedPath = $runTestsPath -replace "'", "''"
-        $childCommand = "& '$escapedPath'"
+        $childCommand = "& '$escapedPath' -Backend '$Backend'"
         if ($Only) { $childCommand += (' -Only ' + ($Only -join ',')) }
         $rtArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $childCommand)
         # Per-scenario metrics go to a guest file (not just the streamed
