@@ -312,14 +312,89 @@ containers.
 
 ## P2 — Prompt, intent, audit parity
 
-**D3 addendum (2026-10-22, found while re-baselining the VM suite):** the 60 s prompt budget must cover the plain-HTTP FORWARD path, not only CONNECT. Since D9 an absolute-form request to a host that is neither allow-listed nor blocklisted goes to the prompt policy; in a headless context there is no dialog to answer, and the client stalls until the budget expires (observed as curl exit 28 at `-m 15`). The budget has to be enforced on both legs, and a forward-path prompt timeout must produce the same deny leaf a CONNECT timeout does.
+**D3 addendum (2026-10-22, opened while re-baselining the VM suite; rewritten
+2026-10-22 after P2.1's reviews, because its first reading was wrong).**
+
+*The observation:* a headless session has no dialog to answer, so a request to a
+host that is neither allow- nor block-listed waited for the whole prompt budget
+(observed as `curl -m 15` exit 28 at a 60 s budget).
+
+*What was NOT the defect:* the forward leg was **already bounded**. Since D9 both
+legs (CONNECT and the absolute-form plain-HTTP forward) reach the coordinator
+through one `decide()`, so the one budget covers both and a forward timeout already
+produced the same deny leaf a CONNECT timeout did. "The budget must be enforced on
+the forward path too" was a misdiagnosis of a measurement that never distinguished
+the two legs.
+
+*What WAS the defect — one reason for two causes:* both a spent budget and a missing
+dialog backend left the single string `prompt unavailable (timeout or no dialog
+backend)`, so the audit could not say which had happened; the probe whose exit code
+opened this addendum could not either. P2.1 fixed that with `UnavailableCause`
+(`BudgetElapsed` / `NoDialogBackend` / `CallerGone`) and the
+`prompt_budget_exhausted` token on both legs.
+
+*What is now CLOSED, not renamed:* nothing short-circuited a **known-absent** dialog
+backend, so the deny could only arrive when the budget expired — one budget per
+unlisted host, which is the cost the observation measured. P2.1's review fix makes
+"no answer is obtainable" sticky: after `NO_BACKEND_STICKY_AFTER` (**3**, raised from
+2 in the second review round because two *concurrent* consultations elapse at the
+same deadline — one budget's worth of evidence, with no grace consultation after
+it) consecutive consultations produce no decision, later consultations skip the
+dialog and apply `on_unavailable` immediately, one leaf per request. Measured over
+nine unanswered requests at an 80 ms budget: the first three pay, then 0.7-0.9 ms
+each (PROGRESS row P2.1).
+
+Three corrections the second review round made to that mechanism, all in
+`src/net/prompt.rs::BackendStickiness`:
+
+- **The refusal names the arming cause.** `no_dialog_backend` when the backend
+  failed to show a dialog, `prompt_suppressed_after_budget` when the dialogs were
+  shown and nobody answered: folding them together told an operator to run
+  interactively about a desktop that demonstrably worked.
+- **Deny posture only.** Under `on_unavailable = allow` a skip *permitted* every
+  later unlisted host with no dialog at all, deleting the user's veto, so allow
+  keeps consulting and pays the per-host budget (a headless + allow profile is the
+  operator's explicit choice, and it is the posture that has no veto to protect).
+- **Not one-way.** Once armed nothing spawned a dialog, so the `Decided` reset was
+  unreachable and an operator who returned to a still-open dialog had their answer
+  discarded. After `NO_BACKEND_REPROBE_COOLDOWN` (10 min) the next consultation
+  re-probes once: a decision un-arms the latch, a failure re-arms it.
+
+The latch is also **launch-scoped**: it lives on the coordinator, which is per
+listener, and a listener can serve sequential launches — launch N's stalled prompts
+would otherwise deny every prompt of launch N+1. `LaunchCounters::begin_epoch` runs
+the reset as the attribution window opens.
+
+*What remains:* the deny body still says "CONNECT to host:port" for a plain-HTTP
+forward (`respond_deny` is shared) — recorded, not fixed.
 
 **Files:** `src/net/mxc.rs`, `src/net/prompt.rs`, `src/audit/*.rs`, `src/main.rs`.
 
-- [ ] **P2.1** Budget: `timeout_ms = prompt_budget + workload_budget + slack`,
+- [x] **P2.1** Budget: `timeout_ms = prompt_budget + workload_budget + slack`,
   supervisor-owned constants; a dialog that takes 30 s must not kill the
   container; a workload that exceeds its budget must still be killed with a
-  distinct reason.
+  distinct reason. **Landed:** `SessionBudget` with `PROMPT_BUDGET` (60 s, the
+  coordinator's own default), `WORKLOAD_BUDGET` (30 min) and `SESSION_SLACK`
+  (2 min) = 1 980 000 ms, written unconditionally by `MxcBackend::request_for`
+  (`with_budget` takes the type, so `None` is unrepresentable); a kill at the
+  deadline is attributed to a term (`TimeoutReason` + the listener's own
+  `prompt_wait`) instead of a boolean. Both legs deny a spent budget as
+  `prompt_budget_exhausted` with the same leaf, and a timed-out consultation
+  releases its coordinator slot. **Review fixes (same task, 2026-10-22, both
+  reviewers' six findings):** `prompt_wait` is clamped to the session and the kill
+  label is deprivation-based (prompt-bound only when the workload was actually
+  starved), the handshake is measured separately (`SessionOutcome::clock` = elapsed
+  + handshake_elapsed + prompt_wait) so a container that never became ready is
+  `SessionHandshake` instead of the operator's overrun, a known-absent dialog
+  backend fast-fails after three consultations (`no_dialog_backend` when the backend
+  failed, `prompt_suppressed_after_budget` when the budgets elapsed), deny posture
+  only, launch-scoped and self-healing after a re-probe cooldown, `Overloaded`
+  names which of the two capacity pools ran out (`prompt_abandoned_capacity`),
+  `abandoned_dialogs()` no longer counts dialogs still being waited on, and the
+  budget is sized from the RESOLVED profile (`SessionBudget::from_config`) with the
+  new `network.workloadTimeoutSecs` knob (default 1800 s, validated `1..=86400`) —
+  a longer build must raise it, because the workload term is the tool's first-ever
+  session bound. Evidence: PROGRESS row P2.1 and its Event Log entry.
 - [ ] **P2.2** D-4 endpoints under MXC (NO_PROXY verified end-to-end); S-77
   parity.
 - [ ] **P2.3** `session.start` audit leaf extended with `tier`, `tier_source`,
