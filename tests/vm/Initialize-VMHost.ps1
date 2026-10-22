@@ -40,17 +40,27 @@ $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 try {
     # -----------------------------------------------------------------------
-    # 1. Elevation - must be the first check; Hyper-V cmdlets fail with a
-    #    confusing permission error otherwise.
+    # 1. Privilege - must be the first check; Hyper-V cmdlets fail with a
+    #    confusing permission error otherwise. Hyper-V authorizes on full
+    #    Administrator OR membership in S-1-5-32-578 ("Hyper-V
+    #    Administrators", localized as "Hyper-V-Administratoren"). Match the
+    #    SID, never the localized name: an English name lookup on a German host
+    #    fails for a group that exists. Membership lands in the token at LOGON.
     # -----------------------------------------------------------------------
     $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
-    if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host '[vm-host] not elevated - run from an elevated (administrator) pwsh, then re-run tests\vm\Initialize-VMHost.ps1' -ForegroundColor Red
+    $isAdministrator = $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $isHyperVAdmin = $false
+    foreach ($group in $windowsIdentity.Groups) {
+        if ($group.Value -eq 'S-1-5-32-578') { $isHyperVAdmin = $true; break }
+    }
+    if (-not ($isAdministrator -or $isHyperVAdmin)) {
+        Write-Host '[vm-host] needs Administrator or the Hyper-V Administrators group (S-1-5-32-578); this token has neither.' -ForegroundColor Red
+        Write-Host '[vm-host] one-time, elevated: net localgroup "Hyper-V-Administratoren" <user> /add  (then sign out and back in)' -ForegroundColor Yellow
         exit 2
     }
 
-    Write-Host '[vm-host] running elevated; checking host readiness...' -ForegroundColor Gray
+    Write-Host '[vm-host] running with the required Hyper-V privileges; checking host readiness...' -ForegroundColor Gray
 
     # -----------------------------------------------------------------------
     # 2. Hyper-V management tools (probe without invoking a Hyper-V cmdlet).
