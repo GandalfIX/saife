@@ -866,7 +866,16 @@ fn run_mxc_session(
         audit::session_start::SessionStartFacts::measured(
             audit::session_start::TierFacts::default(),
             Some(setup::is_elevated()),
-        ),
+        )
+        // P3.5: the enforced filesystem posture, from the SAME value the launch
+        // uses — recorded before the child exists, so the root states what was
+        // allowed even for a session that then dies.
+        .with_filesystem(audit::session_start::FilesystemFacts {
+            workspace: Some(cwd.display().to_string()),
+            readwrite: filesystem.readwrite_paths.clone(),
+            readonly: filesystem.readonly_paths.clone(),
+            deny: filesystem.denied_paths.clone(),
+        }),
     );
 
     // (5) The SAME listener the AppContainer path starts, with its own per-run

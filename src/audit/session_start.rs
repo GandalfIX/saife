@@ -222,8 +222,34 @@ impl serde::Serialize for LoopbackEndpoint {
 
 /// Everything the session-start leaf records beyond `op`/`sid`/`command`.
 ///
+/// The filesystem policy a session was launched with.
+///
+/// Recorded because the audit could say exactly which *hosts* a session was
+/// allowed to reach and nothing about which *paths* it was allowed to touch: a
+/// reader asking "did this session really deny `.ssh`?" had no record to consult,
+/// and the only answer available was the profile on disk, which is not what the
+/// launch used. Under `mxc` these are the very lists the kernel policy was built
+/// from (PSEC `fs_read_write`/`fs_read_only`/`fs_deny`), so the leaf states the
+/// enforced posture rather than a request.
+///
+/// What this cannot say is what was *attempted*: the backend reports no denial
+/// events, so a refused `CreateFile` leaves no trace anywhere. Grants are
+/// auditable; accesses are not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilesystemFacts {
+    /// The session's working directory, i.e. the root the work happens under.
+    pub workspace: Option<String>,
+    /// Paths the child may write (`fs_readwrite`).
+    pub readwrite: Vec<String>,
+    /// Paths the child may read (`fs_read_only`).
+    pub readonly: Vec<String>,
+    /// Paths explicitly denied; these win over any grant.
+    pub deny: Vec<String>,
+}
+
 /// Built through a named constructor ([`SessionStartFacts::appcontainer_dacl`],
-/// [`SessionStartFacts::measured`]) plus [`SessionStartFacts::with_endpoint`] —
+/// [`SessionStartFacts::measured`]) plus [`SessionStartFacts::with_endpoint`] and
+/// [`SessionStartFacts::with_filesystem`] —
 /// never field-by-field at the call site, because the fields are private and there
 /// is deliberately **no `Default`**: a caller cannot half-fill it, and cannot
 /// leave the tier or the elevation unsaid.
@@ -236,6 +262,11 @@ pub struct SessionStartFacts {
     /// The listener this run bound, when it bound one: `None` under `--block-net`,
     /// and on the `Drop` path, which never reached the bind.
     proxy_endpoint: Option<LoopbackEndpoint>,
+    /// The filesystem policy, when the caller resolved one before arming. `None`
+    /// on the AppContainer path, whose DACL grants are computed later in the run
+    /// (and on the `Drop` path, which never got that far) — an absent section is
+    /// distinguishable from an empty policy, which is a session allowed nothing.
+    filesystem: Option<FilesystemFacts>,
 }
 
 impl SessionStartFacts {
@@ -252,7 +283,20 @@ impl SessionStartFacts {
             tier,
             elevated,
             proxy_endpoint: None,
+            filesystem: None,
         }
+    }
+
+    /// Record the resolved filesystem policy (P3.5).
+    ///
+    /// Called before arming, from the same value the launch uses, so the leaf
+    /// cannot describe a policy different from the enforced one. `allow` like the
+    /// rest of this builder surface: only the `mxc` path resolves a policy before
+    /// arming, and a build without that feature would otherwise warn.
+    #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+    pub fn with_filesystem(mut self, filesystem: FilesystemFacts) -> Self {
+        self.filesystem = Some(filesystem);
+        self
     }
 
     /// Record the listener this session bound.
@@ -537,6 +581,15 @@ fn write_leaf(
     );
     e.insert("elevated".into(), json!(facts.elevated));
     e.insert("proxy_endpoint".into(), json!(facts.proxy_endpoint));
+    // P3.5: the enforced filesystem posture, omitted when the caller had none to
+    // state. Omitted keys (rather than empty arrays) keep "not recorded" and
+    // "allowed nothing" distinguishable in `audit show`.
+    if let Some(fs) = &facts.filesystem {
+        e.insert("fs_workspace".into(), json!(fs.workspace));
+        e.insert("fs_readwrite".into(), json!(fs.readwrite));
+        e.insert("fs_readonly".into(), json!(fs.readonly));
+        e.insert("fs_deny".into(), json!(fs.deny));
+    }
     writer.append(e)
 }
 
@@ -572,6 +625,74 @@ mod tests {
 
     fn cleanup(sid: &str) {
         let _ = std::fs::remove_file(log_path(sid));
+    }
+
+    fn fs_facts() -> FilesystemFacts {
+        FilesystemFacts {
+            workspace: Some(r"C:\work\repo".to_string()),
+            readwrite: vec![r"C:\work\repo".to_string(), r"C:\Users\u\.cache\tool".to_string()],
+            readonly: vec![r"C:\Users\u\.gitconfig".to_string()],
+            deny: vec![r"C:\Users\u\.ssh".to_string()],
+        }
+    }
+
+    /// P3.5: the leaf states the filesystem posture that was ENFORCED, so an
+    /// operator can answer "was `.ssh` denied in that session?" from the record
+    /// instead of from the profile on disk.
+    #[test]
+    fn the_leaf_records_the_enforced_filesystem_policy() {
+        let sid = fresh_sid("fs-facts");
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            let guard = SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo hi",
+                SessionStartFacts::measured(TierFacts::default(), Some(false))
+                    .with_filesystem(fs_facts()),
+            );
+            guard.complete(Some(LoopbackEndpoint::new(41_235))).unwrap();
+        }
+        let leaves = leaves(&sid);
+        cleanup(&sid);
+
+        assert_eq!(leaves.len(), 1, "one leaf: {leaves:?}");
+        let leaf = &leaves[0];
+        assert_eq!(leaf["fs_workspace"], r"C:\work\repo");
+        assert_eq!(
+            leaf["fs_readwrite"],
+            json!([r"C:\work\repo", r"C:\Users\u\.cache\tool"])
+        );
+        assert_eq!(leaf["fs_readonly"], json!([r"C:\Users\u\.gitconfig"]));
+        assert_eq!(leaf["fs_deny"], json!([r"C:\Users\u\.ssh"]));
+        // The pre-existing keys are untouched.
+        assert_eq!(leaf["op"], OP_SESSION_START);
+        assert_eq!(leaf["tier"], Value::Null);
+        assert_eq!(leaf["elevated"], false);
+    }
+
+    /// A session that recorded no policy must not claim one: absent keys, not
+    /// empty arrays, because "not recorded" and "allowed nothing" differ.
+    #[test]
+    fn a_session_without_a_filesystem_policy_omits_the_keys() {
+        let sid = fresh_sid("fs-none");
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            let guard = SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo hi",
+                SessionStartFacts::appcontainer_dacl(true),
+            );
+            guard.complete(None).unwrap();
+        }
+        let leaves = leaves(&sid);
+        cleanup(&sid);
+
+        let leaf = &leaves[0];
+        for key in ["fs_workspace", "fs_readwrite", "fs_readonly", "fs_deny"] {
+            assert!(leaf.get(key).is_none(), "{key} must be absent: {leaf:?}");
+        }
     }
 
     /// Acceptance 1 (P2.3): the AppContainer backend IS the DACL tier, so its

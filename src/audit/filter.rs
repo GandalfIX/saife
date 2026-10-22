@@ -3,7 +3,7 @@
 //! Grammar (AC-4.13):
 //!   filter  := clause ( "&" clause )*
 //!   clause  := key ( "=" | "~=" | ">=" | "<=" ) value
-//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted" | "reason" | "suppressed" | "tier" | "tier_source" | "tier_needs_dacl_augmentation" | "elevated" | "proxy_endpoint" | "expected_tier"
+//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted" | "reason" | "suppressed" | "tier" | "tier_source" | "tier_needs_dacl_augmentation" | "elevated" | "proxy_endpoint" | "expected_tier" | "fs_workspace" | "fs_readwrite" | "fs_readonly" | "fs_deny"
 //!   value   := bare-string (no & or = chars)
 //!
 //! Semantics:
@@ -68,7 +68,21 @@ const KNOWN_KEYS: &[&str] = &[
     "proxy_endpoint",
     // The refusal leaf's counterpart to `tier`: what the session required.
     "expected_tier",
+    // P3.5, the filesystem posture in the session-start leaf. The three lists are
+    // JSON arrays; `=` matches any element and `~=` any element containing the
+    // needle (see `ARRAY_KEYS`), so `fs_deny~=.ssh` asks the question an operator
+    // actually asks.
+    "fs_workspace",
+    "fs_readwrite",
+    "fs_readonly",
+    "fs_deny",
 ];
+
+/// Leaf keys whose value is a JSON **array of strings**.
+///
+/// Comparing them as scalars would match nothing, which is indistinguishable from
+/// "no such leaf" — the same failure `BOOL_KEYS` exists to prevent.
+const ARRAY_KEYS: &[&str] = &["fs_readwrite", "fs_readonly", "fs_deny"];
 
 /// Leaf keys whose value is a JSON boolean, so `=true` / `=false` compare against
 /// the boolean rather than a string.
@@ -175,7 +189,7 @@ fn clause_matches(c: &Clause, leaf: &Value) -> bool {
     };
     match c.op {
         Op::Eq => eq_match(&c.key, actual, &c.value),
-        Op::Sub => sub_match(actual, &c.value),
+        Op::Sub => sub_match(&c.key, actual, &c.value),
         Op::Gte | Op::Lte => ordered_match(&c.key, c.op.clone(), actual, &c.value),
     }
 }
@@ -193,6 +207,9 @@ fn eq_match(key: &str, actual: &Value, expected: &str) -> bool {
     // used to read `null` as the string it is not, and coerce it to `false`.
     if expected == NULL_LITERAL {
         return actual.is_null();
+    }
+    if ARRAY_KEYS.contains(&key) {
+        return array_any(actual, &|s| s.eq_ignore_ascii_case(expected));
     }
     if BOOL_KEYS.contains(&key) {
         // A boolean field. The value was already refused at parse time unless it
@@ -223,9 +240,20 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn sub_match(actual: &Value, needle: &str) -> bool {
-    actual.as_str()
-        .map(|s| s.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()))
+fn sub_match(key: &str, actual: &Value, needle: &str) -> bool {
+    let contains = |s: &str| s.to_ascii_lowercase().contains(&needle.to_ascii_lowercase());
+    if ARRAY_KEYS.contains(&key) {
+        return array_any(actual, &contains);
+    }
+    actual.as_str().map(contains).unwrap_or(false)
+}
+
+/// Does any string element of `actual` satisfy `pred`? A non-array (or an array
+/// with no string elements) satisfies nothing.
+fn array_any(actual: &Value, pred: &dyn Fn(&str) -> bool) -> bool {
+    actual
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).any(pred))
         .unwrap_or(false)
 }
 
@@ -518,6 +546,28 @@ mod tests {
         let f = Filter::parse("persisted=true").unwrap();
         assert!(f.matches(&leaf(&[("persisted", json!(true))])));
         assert!(!f.matches(&leaf(&[("persisted", json!(false))])));
+    }
+
+    /// P3.5: `fs_*` values are arrays. `~=` asks "did any granted/denied path
+    /// contain this?" — the question an operator asks after an incident.
+    #[test]
+    fn array_keys_match_any_element() {
+        let deny = leaf(&[("fs_deny", json!([r"C:\Users\u\.ssh", r"C:\Users\u\.aws"]))]);
+
+        let sub = Filter::parse("fs_deny~=.SSH").unwrap();
+        assert!(sub.matches(&deny), "substring, case-insensitive, any element");
+
+        let eq = Filter::parse(r"fs_deny=C:\Users\u\.aws").unwrap();
+        assert!(eq.matches(&deny), "exact match on a non-first element");
+
+        let miss = Filter::parse("fs_deny~=.gnupg").unwrap();
+        assert!(!miss.matches(&deny), "no element contains it");
+
+        // A scalar where an array is expected, and a missing key, both match
+        // nothing — never a silent `true`.
+        let scalar = leaf(&[("fs_deny", json!("not-an-array"))]);
+        assert!(!sub.matches(&scalar));
+        assert!(!sub.matches(&leaf(&[("host", json!("x"))])));
     }
 
     #[test]
