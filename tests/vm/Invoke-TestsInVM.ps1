@@ -50,8 +50,8 @@
   under tests\vm\vms).
 
   Every nonzero exit prints a final 'VM HARNESS: FAIL' line before exiting
-  (exception: exit 2, the elevation gate, which prints only its single
-  remediation line).
+  (exception: exit 2, the privilege gate, which prints only its
+  remediation lines).
 
   Exit codes:
     0  = suite passed AND teardown succeeded (final line: VM HARNESS: PASS)
@@ -61,7 +61,8 @@
          rejection, repo copy verification failure, artifact fetch failure
          (the VM is then kept), or teardown failed
          (final line: VM HARNESS: FAIL)
-    2  = not elevated (single remediation line, no verdict line)
+    2  = the token is neither Administrator nor a member of the Hyper-V
+         Administrators group (S-1-5-32-578) - remediation lines, no verdict
     3  = host readiness probe failed, the requested template image is
          missing or invalid, or -TestCmd is empty/whitespace
     4  = tests\vm\vm-settings.json missing or invalid
@@ -243,15 +244,37 @@ function Invoke-TestVmTeardown {
 
 try {
     # -----------------------------------------------------------------------
-    # 1. Elevation gate - FIRST, before any other validation or setup;
-    #    Hyper-V cmdlets require an elevated shell (even Get-VM fails
-    #    otherwise).
+    # 1. Privilege gate - FIRST, before any other validation or setup.
+    #
+    #    Hyper-V cmdlets authorize on EITHER full Administrator OR membership
+    #    in the well-known group S-1-5-32-578 ("Hyper-V Administrators";
+    #    localized name, e.g. "Hyper-V-Administratoren" on German Windows).
+    #    Accepting the group is the point: it lets the host-side VM lane run
+    #    from a normal shell instead of a UAC-elevated one.
+    #
+    #    Match on the SID, never on the localized name, and never infer absence
+    #    from a failed name lookup (an English `net localgroup` on a German
+    #    host returns 1376 for a group that exists).
+    #
+    #    The group is added to a user's token at LOGON: after adding the
+    #    account, sign out and back in, or the check still sees the old token.
     # -----------------------------------------------------------------------
     $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
-    if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host '[vm-run] not elevated - run from an elevated pwsh; one-time prep: tests\vm\Initialize-VMHost.ps1' -ForegroundColor Red
+    $isAdministrator = $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $hyperVGroupSid = 'S-1-5-32-578'
+    $isHyperVAdmin = $false
+    foreach ($group in $windowsIdentity.Groups) {
+        if ($group.Value -eq $hyperVGroupSid) { $isHyperVAdmin = $true; break }
+    }
+    if (-not ($isAdministrator -or $isHyperVAdmin)) {
+        Write-Host ('[vm-run] needs Administrator or the Hyper-V Administrators group ({0}) - this token has neither.' -f $hyperVGroupSid) -ForegroundColor Red
+        Write-Host '[vm-run] one-time, elevated:  net localgroup "Hyper-V-Administratoren" <user> /add   (then sign out and back in so the token carries it)' -ForegroundColor Yellow
+        Write-Host '[vm-run] one-time prep:       tests\vm\Initialize-VMHost.ps1' -ForegroundColor Yellow
         exit 2
+    }
+    if (-not $isAdministrator) {
+        Write-Host '[vm-run] running with Hyper-V Administrators membership (not full Administrator)' -ForegroundColor DarkGray
     }
 
     # -----------------------------------------------------------------------
@@ -267,7 +290,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Run identity (computed only past the elevation gate).
+    # Run identity (computed only past the privilege gate).
     # -----------------------------------------------------------------------
     $script:RunId = (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
     if (-not $VMSuffix) { $VMSuffix = $script:RunId }
