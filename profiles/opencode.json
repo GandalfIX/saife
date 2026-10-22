@@ -27,10 +27,7 @@
     "block_net": false,
     "profile": "developer",
     "allow_domain": [
-      "*.trustedtokens.eu",
-      "*.trustedtoken.eu",
-      "models.opencode.ai",
-      "models.dev"
+      "*.trustedtokens.eu"
     ]
   }
 }

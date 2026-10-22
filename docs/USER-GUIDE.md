@@ -185,12 +185,19 @@ is granted read-only — measured all three ways with the same binary and profil
 sandbox run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
 ```
 
-It also needs two hosts opencode queries before it can talk to any model: its
-model catalogue (`models.opencode.ai`, `models.dev`) and the provider itself
-(`*.trustedtokens.eu` in the shipped profile). Without them the start-up
-catalogue fetch is denied, opencode reports `Failed to fetch models.dev … 403`
-and dies before the model is ever called — a crash that looks like the sandbox
-refusing the provider when it never asked.
+The shipped profile allow-lists only the **provider** (`*.trustedtokens.eu`).
+opencode also fetches a model catalogue at start-up (`models.opencode.ai`,
+`models.dev`), and that host is deliberately **not** allow-listed: it prompts.
+Answer the prompt and the session continues; deny it, or let it time out, and
+opencode dies before it ever calls the model, with
+`Failed to fetch models.dev … 403` — a crash that reads like the sandbox
+refusing the provider when the provider was never contacted. For a headless or
+unattended run, allow the catalogue explicitly:
+
+```powershell
+sandbox run --profile opencode --allow-cwd --allow-domain models.opencode.ai `
+  --allow-domain models.dev -- opencode
+```
 
 Two filesystem grants make that work, and the shipped `profiles/opencode.json`
 carries both:
