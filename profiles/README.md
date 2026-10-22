@@ -4,8 +4,8 @@ Copy the one you need to `%USERPROFILE%\.sandbox\profiles\` and run
 `sandbox run --profile <name> --allow-cwd -- <command>`.
 
 Paths use the variables the loader expands: `$CWD`, `$HOME`, `$USERPROFILE`,
-`$TEMP`, `$SID`. There is no `$LOCALAPPDATA`/`$APPDATA`, hence
-`$USERPROFILE/AppData/Local|Roaming/...`.
+`$TEMP`, `$LOCALAPPDATA`, `$APPDATA`, `$SID`. (`$LOCALAPPDATA`/`$APPDATA` were
+added on 2026-10-23; before that the samples spelled `AppData/Local` out.)
 
 These profiles were built from the toolchains installed on this machine and each
 one was exercised in a real sandboxed run, not just parsed.
@@ -30,9 +30,9 @@ a profile restriction.
 | access | path | why |
 |---|---|---|
 | read-write | `$CWD` | the project, `node_modules` |
-| read-write | `%LOCALAPPDATA%\npm-cache` | npm's content cache |
-| read-write | `%APPDATA%\npm` | global installs and shims |
-| read-only | `%LOCALAPPDATA%\nvm` | the Node versions nvm-windows manages |
+| read-write | `$LOCALAPPDATA\npm-cache` | npm's content cache |
+| read-write | `$APPDATA\npm` | global installs and shims |
+| read-only | `$LOCALAPPDATA\nvm` | the Node versions nvm-windows manages |
 | read-only | `C:\nvm4w` | the `NVM_SYMLINK` that `node`/`npm` resolve through |
 | read-only | `$HOME\.npmrc` | user config |
 | network | `registry.npmjs.org`, `registry.npmjs.com`, `nodejs.org` | packages, and nvm version downloads |

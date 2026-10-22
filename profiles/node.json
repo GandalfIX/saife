@@ -1,17 +1,17 @@
 {
   "meta": {
     "name": "node",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "schema_version": 1
   },
   "filesystem": {
     "allow": [
       "$CWD",
-      "$USERPROFILE/AppData/Local/npm-cache",
-      "$USERPROFILE/AppData/Roaming/npm"
+      "$LOCALAPPDATA/npm-cache",
+      "$APPDATA/npm"
     ],
     "read_only": [
-      "C:/Users/marku/AppData/Local/nvm",
+      "$LOCALAPPDATA/nvm",
       "C:/nvm4w",
       "$USERPROFILE/.npmrc"
     ],

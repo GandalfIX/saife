@@ -572,7 +572,8 @@ fn resolve_network_slice(raw: &Option<RawNetwork>) -> NetworkSlice {
     }
 }
 
-/// Expand `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`, `$SID` in each path string.
+/// Expand `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`, `$LOCALAPPDATA`, `$APPDATA`,
+/// `$SID` in each path string.
 fn expand_paths(paths: &[String], cwd: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
@@ -591,6 +592,19 @@ pub fn expand_vars(s: &str, cwd: &Path) -> Result<String> {
     let temp = std::env::var_os("TEMP")
         .map(|o| o.to_string_lossy().to_string())
         .unwrap_or_default();
+    // The two AppData roots. `$LOCALAPPDATA`/`$APPDATA` before 2026-10-23 were not
+    // expandable, so profiles spelled `$USERPROFILE/AppData/Local/...` out — which
+    // works but hides the intent, and made every sample look like it knew the
+    // layout of this machine. Fall back to the conventional locations when the
+    // variables are absent (a service context), so a profile still resolves.
+    let localappdata = std::env::var_os("LOCALAPPDATA")
+        .map(|o| o.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{userprofile}\\AppData\\Local"));
+    let appdata = std::env::var_os("APPDATA")
+        .map(|o| o.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{userprofile}\\AppData\\Roaming"));
     let cwd_s = cwd.to_string_lossy().to_string();
     let home = userprofile.clone();
 
@@ -600,6 +614,10 @@ pub fn expand_vars(s: &str, cwd: &Path) -> Result<String> {
     result = result.replace("$HOME", &home);
     result = result.replace("$USERPROFILE", &userprofile);
     result = result.replace("$TEMP", &temp);
+    // No prefix collision: the `$` makes `$APPDATA` a distinct token from the tail
+    // of `$LOCALAPPDATA`, so the order of these two does not matter.
+    result = result.replace("$LOCALAPPDATA", &localappdata);
+    result = result.replace("$APPDATA", &appdata);
     // $SID is expanded at a later stage when the session id is known; leave as-is
     // here and the caller will substitute. For now, replace with empty if present
     // in the filesystem slice (per-session dirs are auto-added by the sandbox).
@@ -706,6 +724,33 @@ mod tests {
         let s = expand_vars("$HOME/.ssh and $CWD/x", &p).unwrap();
         assert!(s.starts_with("C:\\Users\\"));
         assert!(s.contains("\\.ssh and C:\\projekte\\myapp\\x"));
+    }
+
+    /// `$LOCALAPPDATA`/`$APPDATA` resolve to this machine's roots rather than to a
+    /// spelling that only works on the machine the profile was written on.
+    #[test]
+    fn expand_appdata_roots() {
+        let _env = crate::env_lock();
+        let p = PathBuf::from("C:\\projekte\\myapp");
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(|o| o.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty());
+        let s = expand_vars("$LOCALAPPDATA/npm-cache and $APPDATA/npm", &p).unwrap();
+        if let Some(local) = local {
+            assert!(
+                s.starts_with(&local),
+                "expected {s:?} to start with LOCALAPPDATA {local:?}"
+            );
+        }
+        assert!(s.contains("npm-cache and "), "both tokens expand: {s:?}");
+        assert!(!s.contains('$'), "nothing left unexpanded: {s:?}");
+        // The fallback path, when the variable is absent: derived from USERPROFILE.
+        let home = std::env::var_os("USERPROFILE")
+            .map(|o| o.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !home.is_empty() && s.len() > home.len() {
+            assert!(s.starts_with(&home), "resolved under the profile: {s:?}");
+        }
     }
 
     #[test]

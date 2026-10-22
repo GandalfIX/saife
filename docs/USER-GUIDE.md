@@ -329,6 +329,12 @@ A profile is a JSON file in `%USERPROFILE%\.sandbox\profiles\<name>.json`:
 options `denyDomain`, `promptEnabled`, `onUnavailable`, `promptTimeoutSecs` and
 `workloadTimeoutSecs`.
 
+Paths may use `$CWD`, `$HOME`, `$USERPROFILE`, `$TEMP`, `$LOCALAPPDATA`,
+`$APPDATA` and `$SID`; anything else (including `%VAR%`) is taken literally, and a
+path that is neither absolute nor expandable is resolved against the working
+directory — which is how a typo turns into a grant nobody intended, so it is
+worth checking with `sandbox audit show <sid> --filter 'op=SESSION_START'`.
+
 ```powershell
 sandbox profile list
 sandbox profile show demo      # resolved contents, including inherited fields
