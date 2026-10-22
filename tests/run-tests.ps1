@@ -377,7 +377,15 @@ function Test-LoopbackProxyReachable {
     $reachable = $false
     try {
         for ($i = 1; $i -le 3; $i++) {
-            $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} http://denied.invalid/') -WorkingDirectory $d
+            # `--no-prompt` is the point: without it a request to a host that is
+            # neither allow-listed nor blocklisted goes to the prompt policy,
+            # which has no UI in a headless guest, so curl simply expires with
+            # exit 28 and the probe mis-reads that as "loopback blocked". With
+            # --no-prompt the decision is immediate (deny), so any exit other
+            # than 28 means the child really did reach the proxy. Plain-HTTP
+            # forwarding (D9) made this reachable: pre-D9 the request was
+            # refused with 400 before admission, so the probe never noticed.
+            $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} http://denied.invalid/') -WorkingDirectory $d
             $attempts += [int]$r.ExitCode
             if ($r.ExitCode -ne 28) { $reachable = $true; break }
         }
