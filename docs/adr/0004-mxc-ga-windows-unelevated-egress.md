@@ -2,6 +2,11 @@
 
 - **Status:** **Accepted 2026-10-21 — Option A with guardrails** (decided by the product owner).
   ADR-0002's stop-work consequence and ADR-0003's posture are amended accordingly.
+  **Amended 2026-10-22 (P3.1):** guardrail 1's evidence is an **in-container
+  pre-flight probe** (`GET /sandbox/probe`, counted on the supervisor's listener),
+  not `>= 1 tunnel`. The superseded rule is quoted as history in §"Prototype
+  evidence for the guardrails"; the normative consequences of the relaxation and
+  what is still proven are stated there.
 - **Date:** 2026-10-21
 - **Supersedes:** nothing. Amends the premise of ADR-0002 §"platform" (MXC
   required an Insider build) and leaves ADR-0003's enforcement posture intact.
@@ -155,6 +160,56 @@ it is not always the file's `seq 0` (the listener is bound first, and a reused
   Two further branches show why `tunnels>=1` is required: an unresolvable target
   (proxy 502) and a loopback target (proxy 403) both give `accepted=1,
   tunnels=0` → FAIL.
+
+  **Amended 2026-10-22 (P3.1) — the rule above is SUPERSEDED, quoted as history:**
+  *"the gate requires `accepted >= 1 AND tunnels_established >= 1` (a tunnel
+  exists only if the proxy's own origin dial succeeded)"* and *"`tunnels>=1` is
+  required"*. Both counters are produced by the **workload**, so that rule refused
+  every network-enabled session whose workload makes no request: the four P3.1
+  scenarios (S-55, S-77, S-86, S-91 — an intent roundtrip, an audit-log check,
+  `cmd /c echo`, a raw 407 probe), and in the product
+  `sandbox run --allow-domain api.anthropic.com -- echo hi`, which failed a user
+  who did nothing wrong. A gate must prove the **path**, never the workload's use
+  of it.
+
+  Guardrail 1's evidence is now an **in-container pre-flight probe**. Before it
+  starts the payload, `mxc-launch` sends ONE origin-form `GET /sandbox/probe` to
+  `127.0.0.1:<proxy-port>`, carrying the `Basic` credential it derives from its
+  **own** `HTTP_PROXY` — never from a command-line flag, because the wrapper's
+  command line is part of the child's, where a token is visible to anything that
+  can list processes. The listener answers `204` and records one probe
+  observation on the launch's epoch in a counter of its own (`probes`: a probe is
+  neither a policy consultation nor an upstream connection, and counting it as
+  either would respectively make `MustBeAbsent` unsatisfiable or claim a dial
+  nobody made). `Required` is satisfied by `probes >= 1`; `accepted` and
+  `tunnels` stay in the proof record and in the operator's transcript as
+  coverage.
+
+  NORMATIVE consequences of the relaxation:
+
+  1. The probe is **token-gated exactly like every other control-plane request**
+     (same `Proxy-Authorization: Basic sandbox:<token>`, same `407`). A probe
+     under a foreign or absent credential is counted **nowhere**, so a broken
+     path cannot be masked by another process's socket.
+  2. The observation lives on the **supervisor's** listener, not in the
+     container: a marker file or a counter the workload can reach is forgeable,
+     a listener-side counter is not.
+  3. The wrapper's probe is **bounded (2 s) and best effort**: a probe that
+     cannot connect never fails a launch by itself. The supervisor decides, which
+     is what makes "loopback blocked / listener dead / wrong credential" a
+     refusal rather than a silent success.
+  4. **`--block-net` is unchanged.** A proxy-less session has no listener to
+     probe and expects no probe; `MustBeAbsent` (accepted == 0 && tunnels == 0)
+     still fails a session that was supposed to stay offline and went out.
+
+  **What is still proven:** that the child's own path to THIS listener works —
+  right port, right credential, loopback reachable from inside the container — in
+  this launch's epoch (one listener per run, one token per run, one epoch per
+  launch). **What is no longer claimed:** that any traffic crossed the proxy.
+  That is recorded detail now, and a workload that makes no request legitimately
+  has none. A refused launch carries a distinct reason, `proxy_probe_unmet`
+  (the audit leaf's `reason` field remains `proxy_proof_unmet`: it names the
+  gate, not the leg).
 - **Guardrail 2 implemented.** The tier is taken from `v1::probe()` on the exact
   request being launched (not a lookalike, not the backend ceiling), recorded as
   `tier=base-container`, `tier_source=probe`, `tier_needs_dacl_augmentation=false`,

@@ -558,6 +558,18 @@ baseline. Never read a green VM run as MXC coverage.
   blocker entry in PROGRESS.md for the evidence and the two untried mechanisms. Until it lands,
   every VM session runs with an elevated guest token, so the VM proves product logic, NOT elevation;
   the unelevated claim is carried by host live legs.
+  **Guardrail 1 amended before the run (2026-10-22) — P3.0's open item is CLOSED.** The gate's
+  evidence is the wrapper's in-container pre-flight probe (`GET /sandbox/probe`, a listener-side
+  `probes` counter, token-gated, per launch epoch), not `>= 1 tunnel`. A network session whose
+  workload makes no request now SUCCEEDS (the S-55/S-77/S-86/S-91 shape; unelevated CLI:
+  `sandbox run --backend mxc --allow-domain api.anthropic.com -- cmd /c echo PROBE-OK` exits 0 with
+  `probes=1 accepted=0 tunnels=0`), while a session whose probe never arrives is REFUSED with
+  `proxy_probe_unmet`. ADR-0004's guardrail-1 section carries the amendment and what is still
+  proven. Two consequences for THIS run: (1) every successful MXC session writes one stderr line
+  `[sandbox] mxc: guardrail 1 proof probes=… accepted=… tunnels=…`, so S-93's harness form asserts
+  the probe rather than a tunnel and **no MXC scenario may assert an empty stderr**; (2) S-55, S-77,
+  S-86 and S-91 are expected to pass under mxc for the probe reason — their Details should read
+  `probes=1`, and an `http_connect` value there is coverage, not the verdict.
 - [ ] **P3.2** Flip the default to `mxc`; keep `--backend appcontainer` as an
   escape hatch for one release.
 - [ ] **P3.3** Docs: `AGENTS.md` (the "run tests elevated" rules become
