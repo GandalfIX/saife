@@ -33,23 +33,27 @@ landed in P1.4)";
 pub const MXC_NOT_WIRED: &str = "`--backend mxc` is not wired into the session path yet (plan P1); \
 refusing rather than falling back to `appcontainer`";
 
-/// Refusal when the resolved session asks for a writable grant the MXC backend
-/// cannot honour (P3.0, decision 9).
+/// Whether this session may hand the child OUR console (P3.4).
 ///
-/// MXC's filesystem policy is **workspace-only by design** (ADR-0004 P1.3):
-/// [`net::mxc::filesystem_policy`] grants read-write exactly the workspace and
-/// takes only *read-only* extras. A second **writable** grant therefore has no
-/// launch it could describe, and dropping it would run the workload with a
-/// narrower filesystem than the operator asked for — silently. Read-only extras
-/// are expressible, so the message names that alternative instead of leaving the
-/// operator to guess.
+/// The MXC backend launches the child with `StdioMode::Inherit` when this is
+/// true: the child then sees a TTY exactly when the supervisor does, which is
+/// what an interactive workload (opencode's TUI) needs and what a captured-pipes
+/// launch can never provide. It is chosen AUTOMATICALLY — both of this process's
+/// standard streams must be terminals — so the common case (`sandbox run --
+/// opencode`) needs no flag.
+///
+/// `--no-interactive` forces the captured mode, which is the shape a script
+/// wants: it reads the session's output, and an inherited child would have
+/// written it straight to the console instead. There is deliberately no
+/// *required* flag in either direction: a required one would break every existing
+/// caller, and a prompt about a stream is worse than a rule.
+///
+/// Both streams, not just stdout: a task scheduler or a CI runner can give a
+/// child a console-ish stdout while stdin is NUL, and a TUI started that way
+/// renders and then cannot read a keystroke.
 #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
-pub fn mxc_writable_grant_unsupported(path: &str) -> String {
-    format!(
-        "`--backend mxc` cannot honour a writable grant outside the workspace: {path} — MXC \
-         filesystem policy is workspace-only (ADR-0004 P1.3), so a second writable grant has no \
-         honest mapping; grant it read-only (`--allow <path>:read`) or run `--backend appcontainer`"
-    )
+pub fn inherit_console(no_interactive: bool, stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
+    !no_interactive && stdin_is_tty && stdout_is_tty
 }
 
 /// Refusal when `mxc-launch.exe` does not sit beside the supervisor binary.
@@ -214,6 +218,14 @@ pub enum Cmd {
         /// `onUnavailable=deny`, which only governs the prompt-unavailable case.
         #[arg(long)]
         no_prompt: bool,
+
+        /// Force captured output instead of handing the child this console.
+        /// By default a session whose stdin and stdout are both terminals runs
+        /// the workload with inherited stdio (so a TUI works); this flag is for
+        /// scripts that read the session's output. No effect on the
+        /// `appcontainer` backend, which has no passthrough mode.
+        #[arg(long)]
+        no_interactive: bool,
 
         /// Network profile name: none | minimal | developer.
         #[arg(long, value_name = "NAME")]
@@ -674,26 +686,56 @@ mod tests {
         );
     }
 
-    /// P3.0 decision 9: a capability with no honest MXC mapping is refused by
-    /// name — the message has to say WHICH flag, WHICH path, and what to do
-    /// instead, because "unsupported" without a workaround is a dead end.
+    /// P3.4: the console decision is a PURE function of two observed facts and one
+    /// flag, so it can be table-tested — no terminal required, and no path where a
+    /// caller has to guess what the product does on a CI runner.
+    ///
+    /// Both streams are load-bearing: stdout-only is the task-scheduler shape
+    /// (a console-ish handle with stdin at NUL) in which a TUI renders and cannot
+    /// read a key, and stdin-only is a redirect that would swallow the child's
+    /// output into a terminal nobody is reading.
     #[test]
-    fn the_writable_grant_refusal_names_the_flag_the_path_and_the_alternative() {
-        let msg = mxc_writable_grant_unsupported(r"C:\data\datasets");
-        assert!(msg.contains("--backend mxc"), "{msg}");
-        assert!(msg.contains(r"C:\data\datasets"), "{msg}");
-        assert!(
-            msg.contains(":read"),
-            "must name the read-only alternative: {msg}"
-        );
-        assert!(
-            msg.contains("appcontainer"),
-            "must name the other backend: {msg}"
-        );
-        assert!(
-            !msg.contains("plan P"),
-            "no internal plan references: {msg}"
-        );
+    fn the_console_is_inherited_only_when_both_streams_are_terminals_and_nothing_forbids_it() {
+        let cases = [
+            (
+                false,
+                true,
+                true,
+                true,
+                "an interactive shell: the CLI/TUI case",
+            ),
+            (true, true, true, false, "--no-interactive forces capture"),
+            (
+                false,
+                true,
+                false,
+                false,
+                "stdout redirected: a script reads the output",
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                "stdin redirected: no way to type at a TUI",
+            ),
+            (false, false, false, false, "both redirected"),
+            (
+                true,
+                false,
+                false,
+                false,
+                "a pipe with the flag: still capture",
+            ),
+        ];
+        for (no_interactive, stdin_is_tty, stdout_is_tty, expected, why) in cases {
+            assert_eq!(
+                inherit_console(no_interactive, stdin_is_tty, stdout_is_tty),
+                expected,
+                "no_interactive={no_interactive} stdin_tty={stdin_is_tty} \
+                 stdout_tty={stdout_is_tty}: {why}"
+            );
+        }
     }
 
     /// The refusal is vacuous today (no `--concurrency` flag exists), so a

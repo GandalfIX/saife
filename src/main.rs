@@ -9,6 +9,11 @@ mod signing;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+// P3.4: `IsTerminal` is what decides whether a session gets this console. Only
+// the MXC session path reads it (the AppContainer path has no passthrough
+// mode), so a feature-less build must not import it.
+#[cfg(feature = "mxc-backend")]
+use std::io::IsTerminal;
 
 use cli::Cli;
 use cli::Cmd;
@@ -52,6 +57,7 @@ fn main() {
             allow_domain,
             deny_domain,
             no_prompt,
+            no_interactive,
             network_profile,
             audit_strict,
             backend,
@@ -68,6 +74,7 @@ fn main() {
             allow_domain,
             deny_domain,
             no_prompt,
+            no_interactive,
             network_profile,
             audit_strict,
             print_sid,
@@ -454,6 +461,7 @@ fn run_cmd(
     allow_domain: Vec<String>,
     deny_domain: Vec<String>,
     no_prompt: bool,
+    no_interactive: bool,
     network_profile: Option<String>,
     audit_strict: bool,
     print_sid: bool,
@@ -499,6 +507,7 @@ fn run_cmd(
         &allow_domain,
         &deny_domain,
         no_prompt,
+        no_interactive,
         network_profile.as_deref(),
         audit_strict,
         print_sid,
@@ -514,6 +523,10 @@ fn run_cmd(
 }
 
 #[allow(clippy::too_many_arguments)]
+// `no_interactive` only reaches the MXC path, which a feature-less build does
+// not have: the parameter stays (both builds take the same shape) and is
+// allowed to go unread there.
+#[cfg_attr(not(feature = "mxc-backend"), allow(unused_variables))]
 fn run_inner(
     // P3.0: the backend `cli::route_backend` already approved. `AppContainer`
     // keeps the code path below byte for byte; `Mxc` branches out after the
@@ -527,6 +540,8 @@ fn run_inner(
     allow_domain: &[String],
     deny_domain: &[String],
     no_prompt: bool,
+    // P3.4: `--no-interactive`, threaded to the MXC path's stdio decision.
+    no_interactive: bool,
     network_profile: Option<&str>,
     audit_strict: bool,
     print_sid: bool,
@@ -574,6 +589,7 @@ fn run_inner(
                 &fs,
                 audit_strict,
                 print_sid,
+                no_interactive,
                 cmd,
             );
         }
@@ -744,9 +760,11 @@ const EXIT_REFUSED: i32 = 126;
 ///
 /// * **filesystem** — the workspace read-write, declared read-only grants
 ///   read-only, profile secret dirs and configured denies denied
-///   ([`net::mxc::filesystem_policy`], P1.3). A **second writable** grant is
-///   refused ([`cli::mxc_writable_grant_unsupported`]) rather than silently
-///   narrowed: the workspace-only posture is ADR-0004's decision, not an omission.
+///   ([`net::mxc::filesystem_policy`], P1.3 + P3.4). `fs.allow` — the profile's
+///   `filesystem.allow` merged with every `--allow <path>` — is granted
+///   read-write beside the workspace, which is what makes a tool with state in
+///   the profile runnable; the credential directories stay denied and a deny that
+///   covers a grant still refuses the session.
 /// * **network** — the same in-process listener with a fresh per-run token, or
 ///   nothing at all under `--block-net`.
 /// * **budget** — the resolved [`net::NetworkConfig::session_budget`], so the
@@ -766,6 +784,11 @@ const EXIT_REFUSED: i32 = 126;
 /// per-session install dirs. MXC needs none of them — that is the migration's
 /// whole point (no elevation) — and doing them would mutate host state for a
 /// session that never uses it.
+// P3.4 added the stdio decision as an argument, which takes this past clippy's
+// default arity. Bundling the session facts into a struct would be a larger
+// refactor of a function whose whole point is to be readable top to bottom,
+// and `run_inner` (its caller) already carries the same allow.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "mxc-backend")]
 fn run_mxc_session(
     sid: &str,
@@ -774,16 +797,9 @@ fn run_mxc_session(
     fs: &profile::FilesystemSlice,
     audit_strict: bool,
     print_sid: bool,
+    no_interactive: bool,
     cmd: &[String],
 ) -> Result<i32> {
-    // (1) Decision 9. Refused by NAME, before a container, a listener or a leaf
-    //     exists. Dropping such a grant instead would run the workload on a
-    //     narrower filesystem than the operator asked for, silently.
-    if let Some(path) = net::mxc::writable_grants_outside_workspace(cwd, &fs.allow).first() {
-        eprintln!("[sandbox] {}", cli::mxc_writable_grant_unsupported(path));
-        return Ok(2);
-    }
-
     // Decision 7: `--print-sid` yields the id and returns, exactly as the
     // AppContainer path does — nothing is launched, so nothing needs a launcher.
     if print_sid {
@@ -812,8 +828,22 @@ fn run_mxc_session(
         .collect();
     let denies: Vec<String> = fs.deny.iter().map(|p| p.display().to_string()).collect();
     let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
-    let filesystem =
-        match net::mxc::filesystem_policy(cwd, &readonly, &denies, home.as_deref(), &launcher) {
+    // P3.4: `fs.allow` is the operator's explicit writable grants — the profile's
+    // `filesystem.allow` merged with every `--allow <path>` whose mode is not
+    // `read` (the CLI's default is readwrite). They join the workspace as
+    // read-write grants instead of being refused: a tool that keeps state in the
+    // profile (opencode's `~/.local/share/opencode`, `~/.cache/opencode`) has no
+    // other way to run here, and refusing was not a narrower posture but an
+    // unusable backend. Every deny below still applies, and a deny that COVERS one
+    // of these grants still refuses the session by name.
+    let filesystem = match net::mxc::filesystem_policy(
+        cwd,
+        &fs.allow,
+        &readonly,
+        &denies,
+        home.as_deref(),
+        &launcher,
+    ) {
             Ok(policy) => policy,
             Err(e) => {
                 eprintln!("[sandbox] mxc: {e}");
@@ -879,6 +909,20 @@ fn run_mxc_session(
         },
         // The backend always writes `Some(budget.timeout_ms())`; never trusted here.
         timeout_ms: None,
+        // P3.4: a real console for the child when this process has one, so an
+        // interactive workload (a TUI) can run; captured pipes otherwise, and
+        // always when `--no-interactive` asks for them. The decision is
+        // `cli::inherit_console` (pure, table-tested); the terminals are read
+        // here, at the one place that knows it is the supervisor.
+        stdio: if cli::inherit_console(
+            no_interactive,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) {
+            net::mxc::StdioSelection::Inherit
+        } else {
+            net::mxc::StdioSelection::Capture
+        },
     };
     // Decision 3: the deadline is the RESOLVED profile's terms, never the defaults.
     let budget = net_cfg.session_budget();

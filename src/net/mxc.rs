@@ -37,8 +37,12 @@
 //!   is the seam that binds one to the other — the port the supervisor bound is
 //!   the port the request configures, and the same port decides which guardrail
 //!   leg applies.
-//! * P1.3's filesystem policy is [`filesystem_policy`]: the workspace is the only
-//!   writable grant, the launcher's directory is added automatically
+//! * P1.3's filesystem policy is [`filesystem_policy`] (amended by P3.4): the
+//!   writable grants are the workspace **plus every explicit operator grant**
+//!   (the profile's `filesystem.allow` and each `--allow <path>` that is not
+//!   `:read`) — refusing a second writable root made every tool that keeps state
+//!   in the profile unrunnable, so it is wired now — and the launcher's directory
+//!   is added automatically
 //!   ([`ensure_launcher_grant`]) **before** the deny list is filtered against the
 //!   grant set, and the profile's four credential directories plus the configured
 //!   deny list become `denied_paths`. A deny that contains a grant (equal to it,
@@ -92,16 +96,16 @@ use std::time::Duration;
 
 use crate::net::proxy::EpochAlreadyOpen;
 
+use mxc_sdk::mxc_common::config_parser::{
+    ExactOneShotContract, load_one_shot_request_from_contract,
+};
+use mxc_sdk::mxc_common::logger::{Logger, Mode};
+use mxc_sdk::mxc_common::models::ExecutionRequest;
+use mxc_sdk::mxc_common::sandbox_process::{SandboxProcess, StdioMode};
+use mxc_sdk::mxc_contract::published::v1_0_0 as contract;
+use mxc_sdk::process_container_common::dispatcher::{DispatchedProcess, spawn_with_fallback};
 use mxc_sdk::v1;
-use mxc_sdk::v1::configs::{
-    ProcessContainerConfig, ProcessContainerSystemSettings, ProcessContainerUi,
-    ProcessContainerUiIsolation,
-};
-use mxc_sdk::v1::{
-    ClipboardPolicy, ContainerRequest, Containment, FilesystemPolicy, NetworkAction,
-    NetworkEgressPolicy, NetworkIngressPolicy, NetworkPolicy, NetworkRuntimeConfig, SpawnOptions,
-    UiPolicy, WaitResult,
-};
+use mxc_sdk::v1::WaitResult;
 
 // ---------------------------------------------------------------------------
 // Environment allow-list
@@ -511,38 +515,6 @@ pub fn launcher_beside(supervisor_exe: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// The writable grants [`filesystem_policy`] cannot honour (P3.0 decision 9).
-///
-/// [`filesystem_policy`] grants read-write **exactly the workspace** and takes only
-/// *read-only* extras: the workspace-only posture is ADR-0004 P1.3's decision, not
-/// an omission, and a launch that widened it would be a second filesystem policy
-/// nobody reviewed. So any other writable path a resolved profile asks for — a
-/// profile's `filesystem.allow`, or a `--allow <path>` without `:read` — has no
-/// launch it could describe.
-///
-/// Returned rather than dropped. Dropping is what this function exists to prevent:
-/// the workload would run with a narrower filesystem than the operator asked for,
-/// and nothing in the transcript, the audit chain or the exit code would say so.
-/// The caller refuses by name, naming the path and the read-only alternative
-/// ([`crate::cli::mxc_writable_grant_unsupported`]).
-///
-/// Compared on [`path_key`]s, so the workspace matches however it is spelled (a
-/// trailing separator, a case difference, a `.` segment). A workspace that cannot
-/// be made absolute is reported as *no* offending grant here: [`filesystem_policy`]
-/// names that condition itself, and refusing every grant because the comparison
-/// failed would blame the wrong input.
-pub fn writable_grants_outside_workspace(cwd: &Path, writable: &[PathBuf]) -> Vec<String> {
-    let workspace = match absolute_path("workspace directory", cwd) {
-        Ok(path) => path_key(&path.display().to_string()),
-        Err(_) => return Vec::new(),
-    };
-    writable
-        .iter()
-        .filter(|grant| path_key(&grant.display().to_string()) != workspace)
-        .map(|grant| grant.display().to_string())
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Input: our resolved session data (plain, no SDK types)
 // ---------------------------------------------------------------------------
@@ -605,6 +577,51 @@ impl fmt::Debug for MxcNetworkInput {
     }
 }
 
+/// How the sandboxed child's standard streams are wired (P3.4).
+///
+/// `mxc-sdk 1.0.1` exposes the choice as
+/// `mxc_common::sandbox_process::StdioMode`, and it decides more than where bytes
+/// go: with `StdioMode::Pipes` the backend hands the child capture pipes and no
+/// console, so a TUI cannot start; with `StdioMode::Inherit` the child inherits
+/// *this* process's std handles and sees a TTY exactly when we do. Until P3.4 the
+/// supervisor requested no mode at all, which meant the capture path — and
+/// therefore no interactive workload could run under `mxc`.
+///
+/// This type is ours (not the SDK's) for the same reason the rest of a session
+/// input is: the decision is data the caller states, and whether it is
+/// satisfiable is checked where the process is spawned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StdioSelection {
+    /// Capture the child's output through pipes (the SDK's `StdioMode::Pipes`).
+    /// Every pre-P3.4 session ran this way, and it is the only shape where the
+    /// supervisor has the child's bytes to print, audit or re-emit.
+    #[default]
+    Capture,
+    /// The child inherits this process's stdin/stdout/stderr
+    /// (`StdioMode::Inherit`): a TTY exactly when we have one, no streams to tee,
+    /// and the wait-only launch path.
+    Inherit,
+}
+
+impl StdioSelection {
+    /// The SDK mode this selection asks the backend to wire.
+    pub fn mode(self) -> StdioMode {
+        match self {
+            Self::Capture => StdioMode::Pipes,
+            Self::Inherit => StdioMode::Inherit,
+        }
+    }
+
+    /// Whether the launch captures the child's output itself.
+    ///
+    /// The load-bearing half of the choice: with inherited stdio `take_stdout`
+    /// returns `None` and there is nothing to read, so the launch must not build
+    /// a capture path over it (a reader thread over a stream that never exists).
+    pub fn captures_output(self) -> bool {
+        matches!(self, Self::Capture)
+    }
+}
+
 /// One session, as the supervisor resolved it. Plain data — deliberately free
 /// of SDK types so the mapping can be tested without the runtime.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -631,6 +648,11 @@ pub struct MxcSessionInput {
     /// unchanged (it is a pure mapping), so the guarantee lives where the launch
     /// is decided — see [`MxcBackend::request_for`].
     pub timeout_ms: Option<u32>,
+    /// How the child's standard streams are wired (P3.4). `Capture` by default,
+    /// which is what every pre-P3.4 session had; `Inherit` is what an interactive
+    /// workload needs and what the CLI's stdio decision selects when this process
+    /// has a terminal.
+    pub stdio: StdioSelection,
 }
 
 impl fmt::Debug for MxcSessionInput {
@@ -646,12 +668,13 @@ impl fmt::Debug for MxcSessionInput {
             .field("filesystem", &self.filesystem)
             .field("network", &self.network)
             .field("timeout_ms", &self.timeout_ms)
+            .field("stdio", &self.stdio)
             .finish()
     }
 }
 
 // ---------------------------------------------------------------------------
-// P1.3: filesystem policy (workspace-only posture)
+// P1.3 + P3.4: filesystem policy (the workspace and the operator's grants)
 // ---------------------------------------------------------------------------
 
 /// Profile subdirectories that hold credentials, denied for every MXC launch.
@@ -665,9 +688,11 @@ pub const PROFILE_SECRET_DIRS: [&str; 4] = [".ssh", ".aws", ".azure", ".gnupg"];
 
 /// Build the launch's filesystem grants from policy (plan P1.3).
 ///
-/// * `readwrite_paths` is exactly the session's working directory — the
-///   workspace, and nothing else. Extra writable grants are not derived from
-///   the profile: the workspace-only posture is the point of the mapping.
+/// * `readwrite_paths` is the session's working directory **plus** the caller's
+///   explicit `writable_extra` grants (P3.4: the profile's `filesystem.allow`
+///   and every `--allow <path>` that is not `:read`). The grant set stays closed
+///   — the workspace, what the operator named, and the launcher's directory —
+///   and nothing is derived from a convention or from the environment.
 /// * `cwd` and `launcher` are made absolute first ([`absolute_path`]). A relative
 ///   spelling keys as itself (`tools\sandbox`, or empty for `.`), which no
 ///   absolute deny can cover, so resolving here is what keeps the guard below
@@ -714,6 +739,7 @@ pub const PROFILE_SECRET_DIRS: [&str; 4] = [".ssh", ".aws", ".azure", ".gnupg"];
 /// deny list that cannot work.
 pub fn filesystem_policy(
     cwd: &Path,
+    writable_extra: &[PathBuf],
     readonly: &[String],
     configured_denies: &[String],
     profile_dir: Option<&Path>,
@@ -729,6 +755,36 @@ pub fn filesystem_policy(
         readonly_paths: readonly.to_vec(),
         denied_paths: Vec::new(),
     };
+    // P3.4: the operator's EXPLICIT writable grants join the workspace. Before
+    // P3.4 any second writable grant was refused by name (P3.0 decision 9),
+    // which made every tool that keeps state in the profile — opencode's
+    // `~/.local/share/opencode`, `~/.cache/opencode`, `~/.config/opencode` —
+    // unrunnable under this backend. The posture therefore becomes "the
+    // workspace plus what the operator named", not "the workspace alone": the
+    // grants are still a closed set, still reviewed, and still subject to every
+    // deny below (the four credential directories are denies for every launch,
+    // and a deny that covers one of these grants REFUSES the session rather than
+    // being dropped).
+    //
+    // Resolved here for the same reason `cwd` is: a relative spelling keys as
+    // itself, and an absolute deny could not cover it.
+    let workspace = path_key(&filesystem.readwrite_paths[0]);
+    for grant in writable_extra {
+        let resolved = absolute_path("writable grant", grant)?;
+        let text = resolved.display().to_string();
+        let key = path_key(&text);
+        // The workspace is already granted; duplicating it would make the
+        // request say the same thing twice.
+        if key == workspace
+            || filesystem
+                .readwrite_paths
+                .iter()
+                .any(|kept| path_key(kept) == key)
+        {
+            continue;
+        }
+        filesystem.readwrite_paths.push(text);
+    }
     // Before any deny is filtered, never after: the launcher grant is a grant
     // like any other, and `build_request` would otherwise insert it into a
     // request whose deny list was filtered against a grant set missing it.
@@ -1290,8 +1346,19 @@ pub fn tier_record(view: ProbeView) -> TierRecord {
 /// Never called with a lookalike or a copy: `v1::probe` is the only way to learn
 /// which tier *this* request dispatches to, and a tier is observable after
 /// dispatch only (there is no `require_tier` at 1.0.1).
-pub fn probe_tier(request: &ContainerRequest) -> Result<TierRecord, MxcError> {
-    let probe = v1::probe(Some(request))?;
+pub fn probe_tier(request: &ExecutionRequest) -> Result<TierRecord, MxcError> {
+    // `v1::probe` is `prepare_request` followed by exactly this call, so probing
+    // the already-normalized request is the same adjudication — and it is the only
+    // way to probe a request that is not a `ContainerRequest`. The P3.4 stdio
+    // change forced the normalized model: `StdioMode` exists only on its spawn
+    // path, and the SDK exposes no `ContainerRequest` → `ExecutionRequest`
+    // conversion.
+    let probe = mxc_sdk::mxc_engine::probe_execution_request(Some(request)).map_err(|error| {
+        MxcError::Sdk(v1::Error::new(
+            v1::ErrorCode::BackendError,
+            format!("probing the sandbox tier failed: {error}"),
+        ))
+    })?;
     Ok(tier_record(ProbeView::from_probe(&probe)))
 }
 
@@ -1439,9 +1506,21 @@ pub enum RequestError {
     DenyCoversGrant {
         /// The operator-supplied denied path.
         deny: String,
-        /// The grant it contains: the workspace, a declared read-only grant, or
-        /// the launcher's directory.
+        /// The grant it contains: the workspace, a declared writable grant, a
+        /// declared read-only grant, or the launcher's directory.
         grant: String,
+    },
+    /// The SDK's own contract adapter rejected the assembled request.
+    ///
+    /// The mapping is a pure function that no longer constructs the normalized
+    /// model by hand: it builds the published `1.0.0` one-shot contract and lets
+    /// the SDK parse, validate and normalize it. That adapter is the authority on
+    /// what a well-formed request is, so its refusal is carried here verbatim
+    /// rather than paraphrased — and it is a *request* error, not a launch
+    /// failure, because nothing has been spawned.
+    InvalidRequest {
+        /// The SDK's message, unedited.
+        reason: String,
     },
 }
 
@@ -1482,6 +1561,10 @@ impl fmt::Display for RequestError {
                  If `{deny}` is one of the built-in profile credential denies (`.ssh`, `.aws`, \
                  `.azure`, `.gnupg` under the user profile), no configuration can remove it — \
                  move the workspace outside it"
+            ),
+            Self::InvalidRequest { reason } => write!(
+                f,
+                "the sandbox SDK rejected this session's request: {reason}"
             ),
         }
     }
@@ -1682,21 +1765,36 @@ struct TimedChild {
 /// run is over, and [`v1::MxcProcess::kill_for_timeout`] is the SDK's own timeout
 /// arm. `wait` then reports `TimedOut` and the teardown it performs is measured on
 /// its own. A run that ends earlier never reaches that arm.
-fn run_timed(process: v1::MxcProcess, deadline: std::time::Instant) -> std::io::Result<TimedChild> {
+fn run_timed(
+    mut process: Box<dyn SandboxProcess>,
+    deadline: std::time::Instant,
+    capture: bool,
+) -> std::io::Result<TimedChild> {
     // How often the child's exit is sampled: the cost of noticing it, paid once per
     // launch. Small against the `slack` a session budgets for startup and teardown,
     // large against the syscall's own cost.
     const EXIT_POLL: Duration = Duration::from_millis(20);
 
-    let mut process = process;
-    // Take both streams before waiting so `wait` cannot discard them, and read each on
-    // its own thread so an output-heavy child cannot deadlock on a full pipe. Same
-    // shape as the SDK's `wait_with_output`, whose closers are what let a timed-out
-    // descendant's readers finish.
-    let stdout_closer = process.stdout_closer();
-    let stderr_closer = process.stderr_closer();
-    let stdout = capture_stream(process.take_stdout());
-    let stderr = capture_stream(process.take_stderr());
+    // Take both streams before waiting so `wait` cannot discard them, and read each
+    // on its own thread so an output-heavy child cannot deadlock on a full pipe.
+    // Same shape as the SDK's `wait_with_output`, whose closers are what let a
+    // timed-out descendant's readers finish.
+    //
+    // **Not in inherit mode (P3.4).** With `StdioMode::Inherit` the child writes to
+    // this process's own console: `take_stdout`/`take_stderr` return `None` and the
+    // `*_closer`s return `None`, so there is nothing to tee — building reader
+    // threads over inherited stdio would pretend to capture output that already
+    // went to the console. The wait path is identical either way: deadline, kill,
+    // exit code.
+    let (stdout_closer, stderr_closer, stdout, stderr) = if capture {
+        let stdout_closer = process.stdout_closer();
+        let stderr_closer = process.stderr_closer();
+        let stdout = capture_stream(process.take_stdout());
+        let stderr = capture_stream(process.take_stderr());
+        (stdout_closer, stderr_closer, Some(stdout), Some(stderr))
+    } else {
+        (None, None, None, None)
+    };
 
     // (1) The workload's own time: from the handshake to the child being gone.
     loop {
@@ -1716,7 +1814,7 @@ fn run_timed(process: v1::MxcProcess, deadline: std::time::Instant) -> std::io::
 
     // (2) The supervisor's own time: tree kill, teardown, release.
     let teardown_started = std::time::Instant::now();
-    let wait = process.wait();
+    let wait = map_wait(process.wait());
     let teardown_elapsed = teardown_started.elapsed();
     // Sampled after the wait: a backend whose teardown runs there reports its
     // failures here.
@@ -1734,8 +1832,14 @@ fn run_timed(process: v1::MxcProcess, deadline: std::time::Instant) -> std::io::
             closer.close();
         }
     }
-    let stdout = join_capture(stdout)?;
-    let stderr = join_capture(stderr)?;
+    let stdout = match stdout {
+        Some(handle) => join_capture(handle)?,
+        None => Vec::new(),
+    };
+    let stderr = match stderr {
+        Some(handle) => join_capture(handle)?,
+        None => Vec::new(),
+    };
     Ok(TimedChild {
         child: ChildRun {
             wait: wait?,
@@ -1745,6 +1849,57 @@ fn run_timed(process: v1::MxcProcess, deadline: std::time::Instant) -> std::io::
         },
         teardown_elapsed,
     })
+}
+
+/// Flatten the dispatcher's two-shaped error into a launch failure.
+///
+/// `SpawnDispatchError` implements neither `Display` nor `Debug`, so the message
+/// is built from its parts instead of being formatted with `{:?}`: a dispatch
+/// failure carries the dispatcher's own (debug-formatted, and stable for
+/// diagnosis) error, and a backend spawn failure carries the SDK's
+/// `ScriptResponse` — whose `error_message` names what the backend refused — plus
+/// the tier it was refused at and the tier-selection warnings, which would
+/// otherwise be lost on exactly the path an operator needs them.
+fn spawn_failed(
+    error: mxc_sdk::process_container_common::dispatcher::SpawnDispatchError,
+) -> MxcError {
+    use mxc_sdk::process_container_common::dispatcher::SpawnDispatchError;
+    let detail = match error {
+        SpawnDispatchError::Dispatch(inner) => format!("tier selection failed: {inner:?}"),
+        SpawnDispatchError::Spawn {
+            response,
+            tier,
+            warnings,
+        } => {
+            let mut detail = format!(
+                "the {} tier refused the launch: {}",
+                tier.as_str(),
+                response.error_message
+            );
+            for warning in warnings {
+                detail.push_str(&format!("; {warning}"));
+            }
+            detail
+        }
+    };
+    MxcError::Sdk(v1::Error::new(
+        v1::ErrorCode::BackendError,
+        format!("spawning the sandboxed process failed: {detail}"),
+    ))
+}
+
+/// The handle's exit code, in the vocabulary the gate reads.
+///
+/// `SandboxProcess::wait` reports a deadline kill as `ErrorKind::TimedOut` and a
+/// real exit as the code; [`WaitResult`] is the SDK's typed form of the same two
+/// answers, and the gate must keep seeing it (`SessionOutcome::timeout` is derived
+/// from it, and a timeout attributed to a budget term depends on that label).
+fn map_wait(result: std::io::Result<i32>) -> std::io::Result<WaitResult> {
+    match result {
+        Ok(code) => Ok(WaitResult::Exited(code)),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(WaitResult::TimedOut),
+        Err(error) => Err(error),
+    }
 }
 
 /// Read one of the child's pipes to EOF on its own thread (see [`run_timed`]).
@@ -1774,36 +1929,50 @@ fn join_capture(
 // Request mapping (pure)
 // ---------------------------------------------------------------------------
 
-/// The `ProcessContainerConfig` posture, pinned field by field.
+/// The unnormalized launch mode for the SDK's own logger.
 ///
-/// The SDK types are `#[non_exhaustive]` and their `Default` is a *patchable*
-/// value, so every field we care about is set here explicitly (plan decision
-/// D6) instead of inherited: a bump that changed one of them would otherwise
-/// change containment silently. The values are today's SDK defaults and must
-/// stay so — `pinned_ui_fields_match_the_sdk_default` is the drift alarm.
-fn process_container_config() -> ProcessContainerConfig {
-    let mut ui = ProcessContainerUi::default();
-    ui.isolation = ProcessContainerUiIsolation::Container;
-    ui.desktop_system_control = false;
-    ui.system_settings = ProcessContainerSystemSettings::None;
-    ui.ime = false;
-
-    let mut config = ProcessContainerConfig::default();
-    // No deny-and-record ETL capture: learning mode is a discovery tool, not a
-    // containment posture, and it writes a trace.
-    config.learning_mode = false;
-    // No additional capability SIDs beyond what proxy-only egress implies.
-    config.capabilities = Vec::new();
-    config.capture_denials = None;
-    config.ui = Some(ui);
-    // No enumerate-without-read grants.
-    config.filesystem = None;
-    // Identity-less deployment: `allowedProxyPeer` stays unset (a `host:port`
-    // peer fails the request build with `malformed_request`).
-    config.network = None;
-    config
+/// `Mode::Buffer` collects the backend's log lines in memory instead of writing
+/// them to our stdout: with inherited stdio the child owns that console (a log
+/// line interleaved into a TUI's frames would corrupt the display), and with
+/// captured stdio the supervisor prints the child's output itself. The buffer is
+/// dropped with the launch, exactly as `v1::spawn`/`v1::run` do internally.
+fn launch_log_mode() -> Mode {
+    Mode::Buffer
 }
 
+/// The `ProcessContainer` posture, pinned field by field.
+///
+/// The SDK's contract types state every field explicitly instead of inheriting a
+/// patchable default (plan decision D6): a bump that changed one of them would
+/// otherwise change containment silently. The values are today's SDK defaults and
+/// must stay so — `process_container_contract_pins_every_field_explicitly` is the
+/// drift alarm.
+fn process_container_contract() -> contract::ProcessContainer {
+    contract::ProcessContainer {
+        // Stated, not inherited: absent and "explicitly false" are different
+        // requests, and `false` is today's default.
+        least_privilege: contract::OptionalField::present(false),
+        // No deny-and-record ETL capture: learning mode is a discovery tool, not
+        // a containment posture, and it writes a trace.
+        learning_mode: Default::default(),
+        // No additional capability SIDs beyond what proxy-only egress implies.
+        capabilities: contract::OptionalField::present(Vec::new()),
+        capture_denials: Default::default(),
+        ui: contract::OptionalField::present(contract::ProcessContainerUi {
+            isolation: contract::OptionalField::present(
+                contract::ProcessContainerUiIsolation::Container,
+            ),
+            desktop_system_control: contract::OptionalField::present(false),
+            system_settings: contract::OptionalField::present("none".to_string()),
+            ime: contract::OptionalField::present(false),
+        }),
+        // No enumerate-without-read grants.
+        filesystem: Default::default(),
+        // Identity-less deployment: `allowedProxyPeer` stays unset (a
+        // `host:port` peer fails the request build with `malformed_request`).
+        network: Default::default(),
+    }
+}
 /// Map resolved session data to a `ContainerRequest` (pure: no I/O, no SDK
 /// calls).
 ///
@@ -1841,7 +2010,7 @@ fn process_container_config() -> ProcessContainerConfig {
 pub fn build_request(
     input: &MxcSessionInput,
     launcher: &Path,
-) -> Result<ContainerRequest, RequestError> {
+) -> Result<ExecutionRequest, RequestError> {
     if input.command.trim().is_empty() {
         return Err(RequestError::EmptyCommand);
     }
@@ -1880,133 +2049,164 @@ pub fn build_request(
 
     // Invariant 5: the host's proxy configuration never crosses. Always an
     // explicit list, even when empty — `None` would mean "backend default".
-    let environment: Vec<(String, String)> = input
+    let environment: Vec<String> = input
         .environment
         .iter()
         .filter(|(key, _)| !is_blocked_env_key(key))
-        .cloned()
+        .map(|(key, value)| format!("{key}={value}"))
         .collect();
 
-    let network = match input.network.proxy_port {
-        // Proxy-only egress: everything outbound is denied at the container
-        // level and the only path out is the supervisor's loopback proxy.
-        Some(port) => NetworkPolicy {
-            egress: Some(NetworkEgressPolicy {
-                default: Some(NetworkAction::Deny),
-                allow: None,
-                deny: None,
-            }),
-            // Both are mandatory for proxy-only egress (ADR-0004 constraint).
-            ingress: Some(NetworkIngressPolicy {
-                default: Some(NetworkAction::Allow),
-                host_loopback: Some(NetworkAction::Allow),
-            }),
-            runtime_config: Some(NetworkRuntimeConfig {
-                // With the session token as userinfo: the SDK copies this URL
-                // verbatim into the child's HTTP_PROXY/HTTPS_PROXY, and our
-                // proxy's token gate ([G-7]) is what it has to satisfy.
-                network_proxy: Some(proxy_url(port, input.network.proxy_token.as_deref())?),
-            }),
-        },
-        // No proxy: no network at all, and no host loopback.
-        None => NetworkPolicy {
-            egress: Some(NetworkEgressPolicy {
-                default: Some(NetworkAction::Deny),
-                allow: None,
-                deny: None,
-            }),
-            ingress: Some(NetworkIngressPolicy {
-                default: Some(NetworkAction::Deny),
-                host_loopback: Some(NetworkAction::Deny),
-            }),
-            runtime_config: None,
-        },
+    // The proxy URL is the ONLY channel that reaches the child's
+    // `HTTP_PROXY`/`HTTPS_PROXY` (mxc-sdk 1.0.1 strips every proxy variable from
+    // the environment and re-injects this one verbatim), and its presence is also
+    // what decides the ingress posture below.
+    let network_proxy = match input.network.proxy_port {
+        Some(port) => Some(proxy_url(port, input.network.proxy_token.as_deref())?),
+        None => None,
+    };
+    // Proxy-only egress: everything outbound is denied at the container level and
+    // the only path out is the supervisor's loopback proxy. Both ingress fields
+    // are mandatory for it (ADR-0004 constraint); with no proxy, no network at
+    // all and no host loopback.
+    // Both ingress fields carry the SAME answer, so they are built from one
+    // expression rather than a cloned value (`NetworkAction` is not `Clone`, and a
+    // copy that drifted between the two fields would be an unenforced policy).
+    let ingress_action = || {
+        if network_proxy.is_some() {
+            contract::NetworkAction::Allow
+        } else {
+            contract::NetworkAction::Deny
+        }
+    };
+    let network = contract::Network {
+        egress: contract::OptionalField::present(contract::NetworkEgress {
+            default: contract::OptionalField::present(contract::NetworkAction::Deny),
+            allow: Default::default(),
+            deny: Default::default(),
+        }),
+        ingress: contract::OptionalField::present(contract::NetworkIngress {
+            default: contract::OptionalField::present(ingress_action()),
+            host_loopback: contract::OptionalField::present(ingress_action()),
+        }),
     };
 
-    // Same `proxy_port` that became `networkProxy` above, so the workload's
-    // discovery variable and the proxy URL cannot name different listeners.
-    let mut request = ContainerRequest::new(launcher_command(
-        &launcher,
-        &input.command,
-        input.network.proxy_port,
-    ));
-    request.filesystem = Some(FilesystemPolicy {
-        readwrite_paths: filesystem.readwrite_paths,
-        readonly_paths: filesystem.readonly_paths,
-        denied_paths: filesystem.denied_paths,
-        clear_policy_on_exit: Some(true),
-    });
-    request.network = Some(network);
-    // P3 — the Win32k ban is *this* field, and its default is the trap.
-    //
-    // `ContainerRequest::ui` is not `processContainer.ui` above: that one is the
-    // job-object UI-restriction knob (`isolation`, `desktopSystemControl`,
-    // `systemSettings`, `ime`).  This one is the cross-cutting `UiPolicy` whose
-    // `disable` flag the backend copies into the process-security-environment
-    // spec as `disallow_win32k_system_calls` (mxc-sdk 1.0.1,
-    // `backends/process_container/common/base_container_helpers.rs:57`), which
-    // the OS applies as `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE`
-    // before the child runs any user-mode code.
-    //
-    // Leaving the field unset is NOT "no opinion": absence resolves to
-    // `UiPolicy::default()`, and that default is `disable: true`
-    // (`mxc_common/models.rs:583` for the internal twin, `policy.rs:564` for the
-    // public type, and the wire default agrees —
-    // `mxc_common/config_parser.rs:1597` `disable: raw_ui.disable.unwrap_or(true)`).
-    // So every launch so far shipped the harshest posture, and with Win32k
-    // syscalls banned `user32.dll`, `gdi32.dll` and `ole32.dll` fail their
-    // `DllMain` with `ERROR_DLL_INIT_FAILED` (1114) and the loader kills the
-    // process before `main`. Measured A/B on this exact request, one field
-    // different: `powershell.exe -Command "Write-Output FXOK"` exits
-    // `0xC0000142` with the default and `0` with `disable: false`, and
-    // `dotnet hello.dll` fails to load `coreclr.dll` with `HRESULT 0x8007045A`
-    // (0xC0000409) versus printing `HELLO-OK`. `coreclr.dll` statically imports
-    // USER32 *and* ole32, so there is no middle setting — it is Win32k syscalls
-    // or no CLR, never both.
-    //
-    // The cost, accepted deliberately and not hidden: the child may now enter
-    // Win32k at all — create windows and reach that large kernel attack surface
-    // — which is precisely what the mitigation existed to remove. Everything
-    // else stays closed: clipboard and input injection are pinned default-deny
-    // right here, and the ten `JOB_OBJECT_UILIMIT_*` restrictions
-    // `resolve_ui_restrictions` derives from `processContainer.ui` are still
-    // emitted. Do not "tidy" this back to the default; the canary test
-    // `sdk_ui_policy_default_is_still_the_win32k_ban_we_explicitly_escape` is
-    // what tells us if a bump ever moves the default out from under it.
-    // Evidence: `docs/research/backends/process-container/clr-startup-failure.md`.
-    request.ui = Some(UiPolicy {
-        disable: false,
-        // Default-deny: the child keeps no clipboard and cannot inject input.
-        clipboard: ClipboardPolicy::None,
-        allow_input_injection: false,
-    });
-    request.timeout_ms = input.timeout_ms;
-    // Identity-less deployment: `allowedProxyPeer` is left unset because an
-    // unpackaged caller-owned proxy has no package family name, and the
-    // identity-scoped form fails the request build with `malformed_request`.
-    request.containment = Containment::ProcessContainer(process_container_config());
-    request.working_directory = input.working_directory.clone();
-    request.environment = Some(environment);
-    // D2 — deliberately `Some(true)`. At `mxc-sdk 1.0.1` this block is the
-    // user's **profile** environment (`create_default_env_entries` →
-    // `CreateEnvironmentBlock(.., bInherit = FALSE)`), never this process's
-    // environment, and it is what makes an ordinary workload work at all
-    // (PATH/TEMP/USERPROFILE/PSModulePath); `Some(false)` would hand the child a
-    // bare allow-list, and the SDK's `validate_required_child_env` exists
-    // precisely because that breaks CreateProcessW.
-    //
-    // It is safe *because* `build_inherited_entries` lays our filtered list on
-    // top and then `inject_proxy_vars` strips HTTP_PROXY/HTTPS_PROXY/NO_PROXY/
-    // ALL_PROXY (case-insensitive) from the merged block before injecting the
-    // configured proxy: no host proxy value can survive into a proxied session.
-    // In the proxy-less branch a persisted proxy value does survive, and is
-    // inert — `egress.default = deny` and `host_loopback = deny`. Residual risk,
-    // accepted: other profile-persisted variables (e.g. a CA-bundle override) do
-    // reach the child; filesystem and network policy, not env, are the
-    // containment boundary. `NO_PROXY` needs no exception here — the wrapper
-    // supplies it (D1).
-    request.inherit_default_environment = Some(true);
-    Ok(request)
+    // The command is the wrapper launcher, not the workload (D1).
+    let command = launcher_command(&launcher, &input.command, input.network.proxy_port);
+    let request = contract::OneShotRequest {
+        schema: Default::default(),
+        comment: Default::default(),
+        version: contract::Version::V1_0_0,
+        // Left to the SDK: it mints an identifier when the caller names none, and
+        // this request is per-session by construction (one listener, one epoch,
+        // one container).
+        container_id: Default::default(),
+        containment: contract::OptionalField::present(
+            contract::OneShotContainment::ProcessContainer,
+        ),
+        // `clearPolicyOnExit: true`, as the pre-P3.4 request stated it: the
+        // container's policy is not preserved after the run.
+        lifecycle: contract::OptionalField::present(contract::Lifecycle {
+            destroy_on_exit: contract::OptionalField::present(true),
+            preserve_policy: contract::OptionalField::present(false),
+        }),
+        process: contract::Process {
+            command_line: contract::NonEmptyString::new(command)
+                .map_err(|reason| RequestError::InvalidRequest { reason })?,
+            cwd: match &input.working_directory {
+                Some(directory) => contract::OptionalField::present(directory.clone()),
+                None => Default::default(),
+            },
+            env: contract::OptionalField::present(environment),
+            // D2 — deliberately `true`. At `mxc-sdk 1.0.1` this block is the
+            // user's **profile** environment (`create_default_env_entries` →
+            // `CreateEnvironmentBlock(.., bInherit = FALSE)`), never this
+            // process's environment, and it is what makes an ordinary workload
+            // work at all (PATH/TEMP/USERPROFILE/PSModulePath); `false` would
+            // hand the child a bare allow-list, and the SDK's
+            // `validate_required_child_env` exists precisely because that breaks
+            // CreateProcessW.
+            //
+            // It is safe *because* `build_inherited_entries` lays our filtered
+            // list on top and then `inject_proxy_vars` strips HTTP_PROXY /
+            // HTTPS_PROXY / NO_PROXY / ALL_PROXY (case-insensitive) from the
+            // merged block before injecting the configured proxy: no host proxy
+            // value can survive into a proxied session. In the proxy-less branch
+            // a persisted proxy value does survive, and is inert —
+            // `egress.default = deny` and `host_loopback = deny`. Residual risk,
+            // accepted: other profile-persisted variables (e.g. a CA-bundle
+            // override) do reach the child; filesystem and network policy, not
+            // env, are the containment boundary. `NO_PROXY` needs no exception
+            // here — the wrapper supplies it (D1).
+            inherit_default_env: contract::OptionalField::present(true),
+            // `None` keeps the SDK's "no deadline" spelling (`0` → INFINITE); the
+            // supervisor never ships it as-is — [`MxcBackend`] always writes its
+            // own budget.
+            timeout: contract::OptionalField::present(input.timeout_ms.unwrap_or(0)),
+        },
+        filesystem: contract::OptionalField::present(contract::Filesystem {
+            readwrite_paths: contract::OptionalField::present(filesystem.readwrite_paths.clone()),
+            readonly_paths: contract::OptionalField::present(filesystem.readonly_paths.clone()),
+            denied_paths: contract::OptionalField::present(filesystem.denied_paths.clone()),
+        }),
+        fallback: Default::default(),
+        network: contract::OptionalField::present(network),
+        // P3 — the Win32k ban is *this* section, and its default is the trap.
+        //
+        // An ABSENT `ui` section is not "no opinion": it resolves to
+        // `UiPolicy::default()`, whose `disable: true` the PSEC path maps to
+        // `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE`, and
+        // every child that loads `user32`/`gdi32`/`ole32` then dies at load
+        // (`0xC0000142`). Measured A/B on this exact request, one field
+        // different: `powershell.exe -Command "Write-Output FXOK"` exits
+        // `0xC0000142` with the default and `0` with `disable: false`, and
+        // `dotnet hello.dll` fails to load `coreclr.dll` with `HRESULT
+        // 0x8007045A` (0xC0000409) versus printing `HELLO-OK`. `coreclr.dll`
+        // statically imports USER32 *and* ole32, so there is no middle setting —
+        // it is Win32k syscalls or no CLR, never both.
+        //
+        // The cost, accepted deliberately and not hidden: the child may now enter
+        // Win32k at all — create windows and reach that large kernel attack
+        // surface — which is precisely what the mitigation existed to remove.
+        // Everything else stays closed: clipboard and input injection are pinned
+        // default-deny here, and the ten `JOB_OBJECT_UILIMIT_*` restrictions
+        // `resolve_ui_restrictions` derives from `processContainer.ui` are still
+        // emitted. Do not "tidy" this back to the default;
+        // `sdk_ui_policy_default_is_still_the_win32k_ban_we_explicitly_escape`
+        // is what tells us if a bump ever moves the default out from under it.
+        // Evidence: `docs/research/backends/process-container/clr-startup-failure.md`.
+        ui: contract::OptionalField::present(contract::Ui {
+            disable: contract::OptionalField::present(false),
+            // Default-deny: the child keeps no clipboard and cannot inject input.
+            clipboard: contract::OptionalField::present(contract::UiClipboard::None),
+            injection: contract::OptionalField::present(false),
+        }),
+        // Identity-less deployment: `allowedProxyPeer` is left unset because an
+        // unpackaged caller-owned proxy has no package family name, and the
+        // identity-scoped form fails the request build with `malformed_request`.
+        process_container: contract::OptionalField::present(process_container_contract()),
+        lxc: Default::default(),
+        seatbelt: Default::default(),
+        runtime_config: match network_proxy {
+            Some(url) => contract::OptionalField::present(contract::RuntimeConfig {
+                network_proxy: contract::OptionalField::present(url),
+            }),
+            None => Default::default(),
+        },
+        telemetry: Default::default(),
+        wslc: Default::default(),
+    };
+
+    // Through the SDK's OWN one-shot contract adapter, not a struct literal: the
+    // parser is what sets the parse-derived facts a backend reads
+    // (`ui_specified`, `network_specified`, `runtime_network_proxy_specified`) and
+    // what rejects a request the SDK cannot honour. Building the model by hand
+    // would ship those flags at their defaults — and an absent UI policy is the
+    // Win32k ban this request exists to escape.
+    let mut logger = Logger::new(Mode::Buffer);
+    load_one_shot_request_from_contract(ExactOneShotContract::V1_0(Box::new(request)), &mut logger)
+        .map_err(|error| RequestError::InvalidRequest {
+            reason: error.to_string(),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2510,7 +2710,7 @@ impl<'a> MxcBackend<'a> {
     ///
     /// Returns [`RequestError`] (wrapped in [`MxcError`]) for a command line that
     /// cannot be launched; see [`build_request`].
-    pub fn request_for(&self, input: &MxcSessionInput) -> Result<ContainerRequest, MxcError> {
+    pub fn request_for(&self, input: &MxcSessionInput) -> Result<ExecutionRequest, MxcError> {
         let mut effective = input.clone();
         effective.network.proxy_port = self.proxy_port;
         // Overriding unconditionally (not `unwrap_or`): a caller-supplied token
@@ -2541,6 +2741,11 @@ impl<'a> MxcBackend<'a> {
         let source = self
             .proof
             .ok_or(MxcError::Guard(GuardError::MissingProofSource))?;
+
+        // P3.4: inherited stdio (a real console for the child) or captured pipes.
+        // Read once, here, so the spawn and the wait path cannot disagree about
+        // which one this session is.
+        let stdio = input.stdio;
 
         let request = self.request_for(input)?;
 
@@ -2591,16 +2796,32 @@ impl<'a> MxcBackend<'a> {
         // `timeout_ms` agree on when the workload is over (round 2, item 7).
         let deadline = started + self.budget.session();
         let ((exec, handshake_elapsed), proof) = run_in_epoch(source, || {
-            let process = v1::spawn(request, SpawnOptions::default()).map_err(MxcError::from)?;
+            // P3.4: the mode is a LAUNCH decision, not a request field — the
+            // normalized request has no stdio field, and the engine's own
+            // run-to-completion bridge hardcodes pipes. `spawn_with_fallback` is
+            // the public seam that takes one, and it is the same three-tier
+            // dispatcher `v1::spawn` reaches (T1 BaseContainer, T2 AppContainer +
+            // BFS, T3 AppContainer + DACL); the differences are the stdio wiring
+            // and that no denial-capture factory is attached (this request never
+            // sets `captureDenials`).
+            let mut logger = Logger::new(launch_log_mode());
+            let dispatched = spawn_with_fallback(&request, &mut logger, stdio.mode(), None)
+                .map_err(spawn_failed)?;
             // The container exists and the workload was launched: the handshake is
             // over. Everything after this point is the workload's own time.
             let handshake_elapsed = started.elapsed();
-            let exec = run_timed(process, deadline).map_err(|e| {
+            let DispatchedProcess {
+                process, warnings, ..
+            } = dispatched;
+            let mut exec = run_timed(process, deadline, stdio.captures_output()).map_err(|e| {
                 MxcError::Sdk(v1::Error::new(
                     v1::ErrorCode::BackendError,
                     format!("waiting for the sandbox to complete failed: {e}"),
                 ))
             })?;
+            // Tier-selection warnings belong in the same record as the handle's own
+            // teardown warnings.
+            exec.child.warnings.extend(warnings);
             Ok((exec, handshake_elapsed))
         })?;
         let clock = SessionClock::measured(
@@ -2666,7 +2887,7 @@ pub fn request_for_session(
     launcher: &Path,
     budget: SessionBudget,
     input: &MxcSessionInput,
-) -> Result<ContainerRequest, MxcError> {
+) -> Result<ExecutionRequest, MxcError> {
     supervisor_backend(source, proxy_port, proxy_token, launcher, budget).request_for(input)
 }
 
@@ -2753,6 +2974,7 @@ fn gate_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mxc_sdk::mxc_common::models::{ClipboardPolicy, NetworkAction};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2760,7 +2982,7 @@ mod tests {
     /// Stand-in launcher path: the mapping is pure, so it never has to exist.
     const TEST_LAUNCHER: &str = r"C:\tools\sandbox\mxc-launch.exe";
 
-    fn build(input: &MxcSessionInput) -> ContainerRequest {
+    fn build(input: &MxcSessionInput) -> ExecutionRequest {
         build_request(input, Path::new(TEST_LAUNCHER)).expect("launchable request")
     }
 
@@ -2782,6 +3004,7 @@ mod tests {
                 proxy_token: None,
             },
             timeout_ms: Some(60_000),
+            stdio: StdioSelection::Capture,
         }
     }
 
@@ -2861,9 +3084,9 @@ mod tests {
         // `networkProxy`: `input()` configures 54321 for both.
         let req = build(&input());
         assert!(
-            req.command.contains("--proxy-port 54321"),
+            req.script_code.contains("--proxy-port 54321"),
             "the port the proxy URL names must be the port the workload discovers: {}",
-            req.command
+            req.script_code
         );
     }
 
@@ -2973,42 +3196,38 @@ mod tests {
     #[test]
     fn request_carries_working_directory_and_timeout() {
         let req = build(&input());
-        assert_eq!(req.working_directory.as_deref(), Some(r"C:\work"));
-        assert_eq!(req.timeout_ms, Some(60_000));
+        assert_eq!(req.working_directory, r"C:\work");
+        assert_eq!(req.script_timeout, 60_000);
     }
 
     #[test]
     fn request_command_is_the_wrapper_not_the_workload() {
         let req = build(&input());
         assert_eq!(
-            req.command,
+            req.script_code,
             launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi", Some(54_321))
         );
-        assert_ne!(req.command, "cmd /c echo hi");
-        assert!(req.command.starts_with(TEST_LAUNCHER));
+        assert_ne!(req.script_code, "cmd /c echo hi");
+        assert!(req.script_code.starts_with(TEST_LAUNCHER));
         assert!(
-            req.command.ends_with(r#"-- "cmd /c echo hi""#),
+            req.script_code.ends_with(r#"-- "cmd /c echo hi""#),
             "the workload command line is the wrapper's single argument: {}",
-            req.command
+            req.script_code
         );
     }
 
     #[test]
     fn request_selects_process_container_without_a_proxy_peer() {
         let req = build(&input());
-        let Containment::ProcessContainer(cfg) = &req.containment else {
-            panic!(
-                "expected Containment::ProcessContainer, got {:?}",
-                req.containment
-            );
-        };
+        assert_eq!(
+            req.containment,
+            mxc_sdk::mxc_common::models::ContainmentBackend::ProcessContainer,
+            "the session must be contained by the Windows process container"
+        );
         // Identity-less deployment: allowedProxyPeer must stay unset, otherwise
         // the request is refused with `malformed_request`.
         assert!(
-            cfg.network
-                .as_ref()
-                .and_then(|n| n.allowed_proxy_peer.as_ref())
-                .is_none(),
+            req.policy.allowed_proxy_peer.is_none(),
             "allowedProxyPeer must never be set for an unpackaged proxy"
         );
     }
@@ -3016,15 +3235,18 @@ mod tests {
     #[test]
     fn request_denies_egress_by_default_and_routes_through_loopback_proxy() {
         let req = build(&input());
-        let net = req.network.as_ref().expect("network policy");
-        let egress = net.egress.as_ref().expect("egress");
-        assert_eq!(egress.default, Some(NetworkAction::Deny));
-        let ingress = net.ingress.as_ref().expect("ingress");
-        assert_eq!(ingress.default, Some(NetworkAction::Allow));
-        assert_eq!(ingress.host_loopback, Some(NetworkAction::Allow));
-        let runtime = net.runtime_config.as_ref().expect("runtime config");
+        let egress = req.policy.network_egress.as_ref().expect("egress");
+        assert_eq!(egress.default, NetworkAction::Deny);
+        let ingress = req.policy.network_ingress.as_ref().expect("ingress");
+        assert_eq!(ingress.default, NetworkAction::Allow);
+        assert_eq!(ingress.host_loopback, NetworkAction::Allow);
         assert_eq!(
-            runtime.network_proxy.as_deref(),
+            req.policy
+                .network_proxy
+                .address
+                .as_ref()
+                .map(|address| address.to_url())
+                .as_deref(),
             Some("http://127.0.0.1:54321")
         );
     }
@@ -3034,18 +3256,17 @@ mod tests {
         let mut i = input();
         i.network.proxy_port = None;
         let req = build(&i);
-        let net = req.network.as_ref().expect("network policy");
         assert_eq!(
-            net.egress.as_ref().and_then(|e| e.default),
+            req.policy
+                .network_egress
+                .as_ref()
+                .map(|egress| egress.default),
             Some(NetworkAction::Deny)
         );
-        let ingress = net.ingress.as_ref().expect("ingress");
-        assert_eq!(ingress.host_loopback, Some(NetworkAction::Deny));
+        let ingress = req.policy.network_ingress.as_ref().expect("ingress");
+        assert_eq!(ingress.host_loopback, NetworkAction::Deny);
         assert!(
-            net.runtime_config
-                .as_ref()
-                .and_then(|r| r.network_proxy.as_deref())
-                .is_none(),
+            req.policy.network_proxy.address.is_none(),
             "no proxy port => no networkProxy"
         );
     }
@@ -3090,14 +3311,20 @@ mod tests {
             ),
         ];
         let req = build(&i);
-        let env = req.environment.as_ref().expect("explicit environment list");
+        let env = req.env.as_ref().expect("explicit environment list");
         // Explicit set equality, not a re-run of the production predicate: this
         // fails for a leaked key *and* for a key the filter wrongly drops.
-        let mut surviving: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
+        let mut surviving: Vec<&str> = env
+            .iter()
+            .map(|entry| entry.split('=').next().unwrap_or(entry))
+            .collect();
         surviving.sort_unstable();
         assert_eq!(surviving, ["PATH"], "exact surviving key set: {env:?}");
         // The allow-list still carries the legitimate entry, value included.
-        assert!(env.iter().any(|(k, v)| k == "PATH" && v == r"C:\Windows"));
+        assert!(
+            env.iter().any(|entry| entry == r"PATH=C:\Windows"),
+            "the allowed entry keeps its value: {env:?}"
+        );
         assert_eq!(env.len(), 1, "only PATH should survive: {env:?}");
     }
 
@@ -3107,56 +3334,71 @@ mod tests {
         i.environment.clear();
         let req = build(&i);
         assert_eq!(
-            req.environment,
-            Some(Vec::new()),
+            req.env.as_deref(),
+            Some(&[][..]),
             "an empty allow-list must be explicit, not `None` (backend default)"
         );
         // D2: the profile default block is kept deliberately — the SDK strips
         // every proxy name from it before injecting ours.
-        assert_eq!(req.inherit_default_environment, Some(true));
+        assert!(req.inherit_default_env);
     }
 
     #[test]
     fn declared_grants_are_carried_and_the_launcher_is_granted_automatically() {
         let req = build(&input());
-        let fs = req.filesystem.as_ref().expect("filesystem policy");
-        assert_eq!(fs.readwrite_paths, vec![r"C:\work".to_string()]);
+        assert_eq!(req.policy.readwrite_paths, vec![r"C:\work".to_string()]);
         assert_eq!(
-            fs.readonly_paths,
+            req.policy.readonly_paths,
             vec![r"C:\ref".to_string(), r"C:\tools\sandbox".to_string()],
             "the caller's grants keep their order; the launcher's directory is appended"
         );
-        assert_eq!(fs.denied_paths, vec![r"C:\Users\marku\.ssh".to_string()]);
+        assert_eq!(
+            req.policy.denied_paths,
+            vec![r"C:\Users\marku\.ssh".to_string()]
+        );
     }
 
     // ---- D6: the config posture is pinned, not defaulted ------------------
 
     #[test]
     fn process_container_config_pins_every_field_explicitly() {
-        let cfg = process_container_config();
-        assert!(!cfg.learning_mode);
-        assert!(cfg.capabilities.is_empty());
-        assert!(cfg.capture_denials.is_none());
-        assert!(cfg.filesystem.is_none());
-        assert!(cfg.network.is_none());
+        let cfg = process_container_contract();
+        assert_eq!(cfg.least_privilege.as_ref(), Some(&false));
+        assert!(
+            cfg.learning_mode.as_ref().is_none(),
+            "learning mode is a discovery tool, not a containment posture"
+        );
+        assert_eq!(cfg.capabilities.as_ref(), Some(&Vec::new()));
+        assert!(cfg.capture_denials.as_ref().is_none());
+        assert!(cfg.filesystem.as_ref().is_none());
+        assert!(cfg.network.as_ref().is_none());
 
-        let ui = cfg.ui.expect("the ui posture is always stated");
-        assert_eq!(ui.isolation, ProcessContainerUiIsolation::Container);
-        assert!(!ui.desktop_system_control);
-        assert_eq!(ui.system_settings, ProcessContainerSystemSettings::None);
-        assert!(!ui.ime);
+        let ui = cfg.ui.as_ref().expect("the ui posture is always stated");
+        assert_eq!(
+            format!("{:?}", ui.isolation.as_ref()),
+            "Some(Container)",
+            "the desktop is isolated at the container level"
+        );
+        assert_eq!(ui.desktop_system_control.as_ref(), Some(&false));
+        assert_eq!(ui.system_settings.as_ref(), Some(&"none".to_string()));
+        assert_eq!(ui.ime.as_ref(), Some(&false));
     }
 
-    /// Drift alarm, not a tautology: it fails when a patch bump changes a
-    /// `#[non_exhaustive]` default we pinned, which is the moment to re-decide
-    /// the posture instead of silently inheriting the new one.
+    /// Drift alarm, not a tautology: the pinned posture is asserted against the
+    /// request that actually ships, so a parser change that silently substituted
+    /// one of these values fails here.
     #[test]
-    fn pinned_ui_fields_match_the_sdk_default_they_were_taken_from() {
-        let sdk = ProcessContainerConfig::default();
-        let pinned = process_container_config();
-        assert_eq!(pinned.ui, sdk.ui);
-        assert_eq!(pinned.capabilities, sdk.capabilities);
-        assert_eq!(pinned.capture_denials, sdk.capture_denials);
+    fn the_shipped_request_carries_the_pinned_process_container_posture() {
+        let request = build(&input());
+        let ui = &request.policy.base_process_ui;
+        assert_eq!(ui.isolation, "container");
+        assert!(!ui.desktop_system_control);
+        assert_eq!(ui.system_settings, "none");
+        assert!(!ui.ime);
+        assert!(!request.policy.least_privilege_mode);
+        assert!(request.policy.capabilities.is_empty());
+        assert!(request.policy.capture_denials.is_none());
+        assert!(request.policy.enumerate_paths.is_empty());
     }
 
     // ---- P3: the Win32k ban is a UI field, and its default is the trap -----
@@ -3171,9 +3413,7 @@ mod tests {
     #[test]
     fn build_request_permits_win32k_but_keeps_clipboard_and_injection_closed() {
         let request = build(&input());
-        let ui = request
-            .ui
-            .expect("the UI policy is stated on the request, not inherited");
+        let ui = &request.policy.ui;
         assert!(
             !ui.disable,
             "a Win32k ban makes every child that loads user32/gdi32/ole32 die at load"
@@ -3183,9 +3423,11 @@ mod tests {
             ClipboardPolicy::None,
             "clipboard stays default-deny"
         );
+        assert!(!ui.injection, "input injection stays default-deny");
         assert!(
-            !ui.allow_input_injection,
-            "input injection stays default-deny"
+            request.policy.ui_specified,
+            "the section must be SUPPLIED, not merely equal to the default: an absent ui is the \
+             Win32k ban"
         );
     }
 
@@ -3201,9 +3443,40 @@ mod tests {
     #[test]
     fn sdk_ui_policy_default_is_still_the_win32k_ban_we_explicitly_escape() {
         assert!(
-            UiPolicy::default().disable,
+            mxc_sdk::v1::UiPolicy::default().disable,
             "mxc-sdk changed UiPolicy::default() to disable = false: delete this canary and the \
              explicit request.ui in build_request"
+        );
+    }
+
+    // ---- P3.4 (A): the stdio selection is data, and it maps 1:1 ----------
+
+    /// The selection is a closed two-value decision, and each value names exactly
+    /// one SDK mode. Pinned because the failure mode is silent: a session that
+    /// asks for `Inherit` and gets pipes runs, exits 0, and cannot show a TUI.
+    #[test]
+    fn the_stdio_selection_names_the_sdk_mode_it_asks_for() {
+        assert_eq!(StdioSelection::Capture.mode(), StdioMode::Pipes);
+        assert_eq!(StdioSelection::Inherit.mode(), StdioMode::Inherit);
+        assert!(StdioSelection::Capture.captures_output());
+        assert!(
+            !StdioSelection::Inherit.captures_output(),
+            "inherited stdio has no streams to read: the launch must not build a capture path"
+        );
+    }
+
+    /// The default is the CAPTURED mode, not the interactive one.
+    ///
+    /// Every pre-P3.4 caller (and every test fixture) leaves the field out, and a
+    /// default of `Inherit` would silently move the child's output to a console
+    /// nobody reads — the failure would be a missing `stdout`, not an error.
+    #[test]
+    fn a_session_input_defaults_to_captured_stdio() {
+        assert_eq!(MxcSessionInput::default().stdio, StdioSelection::Capture);
+        assert_eq!(
+            build(&input()).script_code,
+            build(&input()).script_code,
+            "the request is stdio-independent: the mode is a launch decision"
         );
     }
 
@@ -3817,14 +4090,11 @@ mod tests {
 
         let req = backend.request_for(&i).expect("launchable request");
         assert_eq!(
-            req.network
-                .as_ref()
-                .and_then(|n| n.runtime_config.as_ref())
-                .and_then(|r| r.network_proxy.as_deref()),
+            network_proxy(&req).as_deref(),
             Some("http://127.0.0.1:49152"),
             "the request must point at the proxy this backend proves"
         );
-        assert_eq!(req.timeout_ms, Some(1_000), "the backend's budget wins");
+        assert_eq!(req.script_timeout, 1_000, "the backend's budget wins");
         assert_eq!(backend.budget(), budget);
         assert_eq!(backend.proxy_port(), Some(49_152));
         assert_eq!(backend.launcher(), Path::new(TEST_LAUNCHER));
@@ -3853,8 +4123,7 @@ mod tests {
         let whole = PROMPT_BUDGET + WORKLOAD_BUDGET + SESSION_SLACK;
         let whole_ms = u32::try_from(whole.as_millis()).expect("budget fits u32 ms");
         assert_eq!(
-            req.timeout_ms,
-            Some(whole_ms),
+            req.script_timeout, whole_ms,
             "an unbounded session must be impossible from the supervisor path"
         );
         // Not vacuous: the value is the SUM, so no single term can be mistaken for
@@ -4511,8 +4780,8 @@ mod tests {
         assert_eq!(seam.budget(), budget);
         let request = seam.request_for(&input()).expect("request");
         assert_eq!(
-            request.timeout_ms,
-            Some(budget.timeout_ms()),
+            request.script_timeout,
+            budget.timeout_ms(),
             "the container's deadline is the resolved budget, never a default"
         );
     }
@@ -4543,8 +4812,8 @@ mod tests {
         )
         .expect("the session's request");
 
-        assert_eq!(request.timeout_ms, Some(budget.timeout_ms()));
-        let network = format!("{:?}", request.network.expect("a network policy"));
+        assert_eq!(request.script_timeout, budget.timeout_ms());
+        let network = format!("{:?}", request.policy.network_proxy);
         assert!(
             network.contains("49001"),
             "the request must name the port the proof counts: {network}"
@@ -4561,45 +4830,99 @@ mod tests {
             budget,
         );
         assert_eq!(
-            request.command,
-            seam.request_for(&input).expect("the same request").command,
+            request.script_code,
+            seam.request_for(&input)
+                .expect("the same request")
+                .script_code,
             "the same launcher command line, byte for byte"
         );
     }
 
-    /// P3.0 decision 9: a writable grant the workspace-only posture cannot honour
-    /// is NAMED, never dropped.
-    ///
-    /// Dropping it is the silent narrowing: the workload would run with a subset of
-    /// the filesystem the operator asked for, and nothing would say so.
+    /// **P3.4 replaced P3.0 decision 9.** A writable grant outside the workspace
+    /// is now ACCEPTED (it is the operator's explicit grant, and a tool that keeps
+    /// state in the profile cannot run without it), and the workspace itself is not
+    /// granted twice however it is spelled.
     #[test]
-    fn a_writable_grant_outside_the_workspace_is_reported_not_dropped() {
+    fn a_writable_grant_outside_the_workspace_is_accepted_and_not_refused() {
         let cwd = Path::new(r"C:\work\repo");
-        let writable = [
-            PathBuf::from(r"C:\work\repo"),
-            PathBuf::from(r"C:\data\datasets"),
-        ];
+        for spelling in [r"c:\WORK\repo\", r"C:\work\.\repo", r"C:\work\sub\..\repo"] {
+            let fs = filesystem_policy(
+                cwd,
+                &[PathBuf::from(spelling), PathBuf::from(r"C:\data\datasets")],
+                &[],
+                &[],
+                None,
+                Path::new(TEST_LAUNCHER),
+            )
+            .expect("a writable grant outside the workspace is honoured");
+            assert_eq!(
+                fs.readwrite_paths,
+                vec![r"C:\work\repo".to_string(), r"C:\data\datasets".to_string()],
+                "{spelling} names the workspace and must not be granted twice"
+            );
+        }
+    }
+
+    /// The profile-shaped case this item exists for: opencode's own state
+    /// directories, granted writable, on top of the workspace.
+    #[test]
+    fn profile_state_directories_become_writable_grants() {
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[
+                PathBuf::from(r"C:\Users\marku\.local\share\opencode"),
+                PathBuf::from(r"C:\Users\marku\.cache\opencode"),
+                PathBuf::from(r"C:\Users\marku\.config\opencode"),
+                PathBuf::from(r"C:\Users\marku\.local\state\opencode"),
+            ],
+            &[],
+            &[],
+            Some(Path::new(PROFILE)),
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("none of these grants is covered by a deny");
         assert_eq!(
-            writable_grants_outside_workspace(cwd, &writable),
-            vec![r"C:\data\datasets".to_string()]
+            fs.readwrite_paths,
+            vec![
+                r"C:\work\repo".to_string(),
+                r"C:\Users\marku\.local\share\opencode".to_string(),
+                r"C:\Users\marku\.cache\opencode".to_string(),
+                r"C:\Users\marku\.config\opencode".to_string(),
+                r"C:\Users\marku\.local\state\opencode".to_string(),
+            ],
+            "the workspace plus every explicit grant, in the order the operator named them"
         );
         assert!(
-            writable_grants_outside_workspace(cwd, &writable[..1]).is_empty(),
-            "the workspace itself is the grant the posture allows"
+            fs.denied_paths
+                .iter()
+                .any(|deny| deny == &format!(r"{PROFILE}\.ssh")),
+            "the credential denies stay in force beside the grants: {:?}",
+            fs.denied_paths
         );
     }
 
-    /// The workspace match has to survive the spellings a profile can produce:
-    /// trailing separator, different case, a `.` segment.
+    /// A grant the operator made is still SUBORDINATE to a deny that covers it:
+    /// the session is refused, and the message says which grant to narrow.
     #[test]
-    fn the_workspace_grant_is_recognised_however_it_is_spelled() {
-        let cwd = Path::new(r"C:\work\repo");
-        for spelling in [r"c:\WORK\repo\", r"C:\work\.\repo", r"C:\work\sub\..\repo"] {
-            assert!(
-                writable_grants_outside_workspace(cwd, &[PathBuf::from(spelling)]).is_empty(),
-                "{spelling} names the workspace"
-            );
-        }
+    fn a_deny_that_covers_a_writable_grant_refuses_the_session() {
+        let err = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[PathBuf::from(r"C:\Users\marku\.local\share\opencode")],
+            &[],
+            &[r"C:\Users\marku\.local".to_string()],
+            None,
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect_err("a deny above a writable grant cannot be honoured");
+        let message = err.to_string();
+        assert!(
+            message.contains(r"C:\Users\marku\.local\share\opencode"),
+            "the refusal must name the GRANT to narrow: {message}"
+        );
+        assert!(
+            message.contains("Deny the specific subdirectory"),
+            "the refusal must say how to resolve it: {message}"
+        );
     }
 
     /// P3.0: the wrapper must be found *beside the supervisor*, and its absence
@@ -4757,9 +5080,8 @@ mod tests {
         i.filesystem.readonly_paths.clear();
 
         let req = backend.request_for(&i).expect("launchable request");
-        let fs = req.filesystem.as_ref().expect("filesystem policy");
         assert_eq!(
-            fs.readonly_paths,
+            req.policy.readonly_paths,
             vec![r"C:\tools\sandbox".to_string()],
             "without this grant the container cannot execute the launcher and the launch fails \
              with an opaque policy denial"
@@ -4779,6 +5101,34 @@ mod tests {
         assert_eq!(fs.readonly_paths.len(), 1);
     }
 
+    /// The protection P3.4 had to keep: with the whole profile granted writable,
+    /// `.ssh` is a *descendant* deny and still ships — the grant must not swallow
+    /// the credential directories.
+    #[test]
+    fn granting_the_profile_writable_keeps_the_secret_directories_denied() {
+        let fs = filesystem_policy(
+            Path::new(TEST_WORKSPACE),
+            &[PathBuf::from(PROFILE)],
+            &[],
+            &[],
+            Some(Path::new(PROFILE)),
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("a descendant deny is expressible");
+        assert!(
+            fs.readwrite_paths.contains(&PROFILE.to_string()),
+            "the profile is granted as asked: {:?}",
+            fs.readwrite_paths
+        );
+        for dir in PROFILE_SECRET_DIRS {
+            assert!(
+                fs.denied_paths.contains(&format!(r"{PROFILE}\{dir}")),
+                "{dir} must stay denied even inside a writable grant: {:?}",
+                fs.denied_paths
+            );
+        }
+    }
+
     #[test]
     fn a_bare_launcher_file_name_adds_no_grant() {
         let mut fs = MxcFilesystemInput::default();
@@ -4789,7 +5139,7 @@ mod tests {
         );
     }
 
-    // ---- P1 wave 2 C: filesystem policy (workspace-only posture) ---------
+    // ---- P1 wave 2 C: filesystem policy (workspace + operator grants) ----
 
     const TEST_WORKSPACE: &str = r"C:\work";
     const PROFILE: &str = r"C:\Users\marku";
@@ -4799,6 +5149,7 @@ mod tests {
     fn policy() -> MxcFilesystemInput {
         filesystem_policy(
             Path::new(TEST_WORKSPACE),
+            &[],
             &[r"C:\ref".to_string()],
             &[r"C:\secrets".to_string()],
             Some(Path::new(PROFILE)),
@@ -4840,6 +5191,7 @@ mod tests {
         let fs = filesystem_policy(
             Path::new(TEST_WORKSPACE),
             &[],
+            &[],
             &[
                 r"C:\secrets".to_string(),
                 r"c:\SECRETS\".to_string(),
@@ -4868,6 +5220,7 @@ mod tests {
         let err = filesystem_policy(
             Path::new(TEST_WORKSPACE),
             &[],
+            &[],
             &[r"c:/WORK/".to_string()],
             None,
             Path::new(TEST_LAUNCHER),
@@ -4890,6 +5243,7 @@ mod tests {
         let workspace = format!(r"{PROFILE}\work");
         let err = filesystem_policy(
             Path::new(&workspace),
+            &[],
             &[],
             &[PROFILE.to_string()],
             Some(Path::new(PROFILE)),
@@ -4921,6 +5275,7 @@ mod tests {
         let fs = filesystem_policy(
             Path::new(PROFILE),
             &[],
+            &[],
             &[format!(r"{PROFILE}\.ssh"), format!(r"{PROFILE}\Documents")],
             Some(Path::new(PROFILE)),
             Path::new(TEST_LAUNCHER),
@@ -4943,6 +5298,7 @@ mod tests {
     fn a_deny_unrelated_to_every_grant_is_kept() {
         let fs = filesystem_policy(
             Path::new(TEST_WORKSPACE),
+            &[],
             &[],
             &[r"D:\secrets".to_string(), r"C:\work2".to_string()],
             None,
@@ -4968,6 +5324,7 @@ mod tests {
         let err = filesystem_policy(
             Path::new(TEST_WORKSPACE),
             &[],
+            &[],
             &[PROFILE.to_string()],
             Some(Path::new(PROFILE)),
             Path::new(&launcher),
@@ -4992,6 +5349,7 @@ mod tests {
         let launcher = format!(r"{PROFILE}\tools\sandbox\{LAUNCHER_EXE_NAME}");
         let fs = filesystem_policy(
             Path::new(TEST_WORKSPACE),
+            &[],
             &[],
             &[],
             Some(Path::new(PROFILE)),
@@ -5026,6 +5384,7 @@ mod tests {
         let err = filesystem_policy(
             Path::new(TEST_WORKSPACE),
             &[],
+            &[],
             &[here.display().to_string()],
             None,
             Path::new(r"tools\sandbox\mxc-launch.exe"),
@@ -5047,14 +5406,21 @@ mod tests {
     #[test]
     fn a_relative_cwd_behaves_like_its_absolute_form() {
         let here = std::env::current_dir().expect("current directory");
-        let relative = filesystem_policy(Path::new("."), &[], &[], None, Path::new(TEST_LAUNCHER))
-            .expect("`.` resolves to the current directory");
+        let relative = filesystem_policy(
+            Path::new("."),
+            &[],
+            &[],
+            &[],
+            None,
+            Path::new(TEST_LAUNCHER),
+        )
+        .expect("`.` resolves to the current directory");
         assert_eq!(
             relative.readwrite_paths,
             vec![here.display().to_string()],
             "the grant must be the resolved directory, not `.`"
         );
-        let absolute = filesystem_policy(&here, &[], &[], None, Path::new(TEST_LAUNCHER))
+        let absolute = filesystem_policy(&here, &[], &[], &[], None, Path::new(TEST_LAUNCHER))
             .expect("the absolute spelling of the same workspace");
         assert_eq!(
             relative.readwrite_paths, absolute.readwrite_paths,
@@ -5063,6 +5429,7 @@ mod tests {
 
         let err = filesystem_policy(
             Path::new("."),
+            &[],
             &[],
             &[here.display().to_string()],
             None,
@@ -5082,7 +5449,7 @@ mod tests {
     /// named refusal rather than a guess that voids the guard.
     #[test]
     fn a_path_that_cannot_be_made_absolute_is_a_named_refusal() {
-        let err = filesystem_policy(Path::new(""), &[], &[], None, Path::new(TEST_LAUNCHER))
+        let err = filesystem_policy(Path::new(""), &[], &[], &[], None, Path::new(TEST_LAUNCHER))
             .expect_err("an empty cwd has no key to compare");
         assert_eq!(
             err,
@@ -5119,17 +5486,18 @@ mod tests {
             .expect("a relative launcher resolves");
         let resolved_dir = here.join("bin").display().to_string();
         assert!(
-            request.command.contains(&resolved_dir),
+            request.script_code.contains(&resolved_dir),
             "the command line must name the absolute launcher directory: {:?}",
-            request.command
+            request.script_code
         );
-        let fs = request.filesystem.as_ref().expect("filesystem policy");
         assert!(
-            fs.readonly_paths
+            request
+                .policy
+                .readonly_paths
                 .iter()
                 .any(|g| path_key(g) == path_key(&resolved_dir)),
             "the grant must be the resolved directory: {:?}",
-            fs.readonly_paths
+            request.policy.readonly_paths
         );
     }
 
@@ -5142,6 +5510,7 @@ mod tests {
             let workspace = format!(r"{PROFILE}\{dir}\work");
             let err = filesystem_policy(
                 Path::new(&workspace),
+                &[],
                 &[],
                 &[],
                 Some(Path::new(PROFILE)),
@@ -5292,6 +5661,7 @@ mod tests {
             let err = filesystem_policy(
                 Path::new(workspace),
                 &[],
+                &[],
                 &[deny.to_string()],
                 None,
                 Path::new(TEST_LAUNCHER),
@@ -5383,14 +5753,13 @@ mod tests {
 
     // ---- P1 wave 2 D8: the token rides the proxy URL ---------------------
 
-    fn network_proxy(request: &ContainerRequest) -> Option<String> {
+    fn network_proxy(request: &ExecutionRequest) -> Option<String> {
         request
-            .network
-            .as_ref()?
-            .runtime_config
-            .as_ref()?
+            .policy
             .network_proxy
-            .clone()
+            .address
+            .as_ref()
+            .map(|address| address.to_url())
     }
 
     #[test]
@@ -5605,6 +5974,7 @@ mod live {
         DialogFn, DialogRequest, DialogUnavailable, PromptConfig, PromptCoordinator, PromptPolicy,
         PromptResult,
     };
+    use crate::net::proxy::LaunchCounters;
     use crate::net::proxy::LaunchProofCounters;
     use crate::net::token::RunToken;
     use base64::Engine as _;
@@ -5918,6 +6288,8 @@ mod live {
                 proxy_port: Some(port),
                 proxy_token: None,
             },
+            // The live legs read the child's output, so they capture it.
+            stdio: StdioSelection::Capture,
             timeout_ms: None,
         }
     }
@@ -6395,6 +6767,503 @@ mod live {
         counters.close_launch(epoch);
     }
 
+    // ---- P3.4 (A): console passthrough -----------------------------------
+
+    /// **P3.4 (A): an interactive session runs with inherited stdio.**
+    ///
+    /// The briefed shape: the child inherits this process's stdio, so there is
+    /// nothing to capture, and the assertion is the EXIT CODE plus an empty
+    /// `stdout` — with inherited stdio the workload's bytes went to the console, not
+    /// into the supervisor's buffer. That is the mode's whole point, and for a TUI
+    /// it is the same shape: the console is the display and the supervisor waits.
+    ///
+    /// The control arm is the same child with `Capture`: exit 0 AND the marker in
+    /// `stdout`. Without it, "stdout is empty" would also hold for a launch that
+    /// simply dropped the output.
+    ///
+    /// **Which SDK mode the request asks for is pinned by the UNIT test**
+    /// (`the_stdio_selection_names_the_sdk_mode_it_asks_for`), not here: this
+    /// harness's own stdout is a pipe (`cargo test` captures it), so the child of an
+    /// `Inherit` launch legitimately sees a redirected stdout too — the mode is
+    /// "a TTY exactly when WE have one", and `[Console]::IsOutputRedirected` reports
+    /// the same value in both arms here. The probe is printed, not asserted, so a
+    /// reader can see the harness condition rather than mistake it for a finding.
+    #[test]
+    #[ignore]
+    fn an_interactive_session_inherits_the_console_and_still_reports_its_exit_code() {
+        let launcher = launcher_under_test();
+        let workspace = Scratch::plain("live-inherit");
+        let marker = "HELLO-FROM-THE-CONTAINER";
+
+        let run = |stdio: StdioSelection, label: &str| {
+            let mut input = live_input(
+                0,
+                workspace.path(),
+                &launcher,
+                format!("cmd /c echo {marker}"),
+            );
+            input.stdio = stdio;
+            input.network.proxy_port = None;
+            let outcome = launch_session(
+                LaunchCounters::new().as_ref(),
+                None,
+                None,
+                &launcher,
+                SessionBudget::default(),
+                &input,
+            )
+            .expect("a proxy-less session needs no proof beyond `MustBeAbsent`");
+            println!(
+                "EVIDENCE {label} exit={:?} stdout={:?} stderr={:?} captured_stdout_is_empty={}",
+                outcome.exit_code,
+                stdout_of(&outcome).trim(),
+                stderr_of(&outcome).trim(),
+                outcome.stdout.is_empty()
+            );
+            outcome
+        };
+
+        // ---- the interactive arm ------------------------------------------
+        let inherited = run(StdioSelection::Inherit, "stdio_inherit");
+        assert_eq!(
+            inherited.exit_code,
+            Some(0),
+            "the child must run to completion with inherited stdio: {inherited:?}"
+        );
+        assert!(
+            inherited.stdout.is_empty(),
+            "inherited stdio is NOT captured — that is the point of the mode: {:?}",
+            stdout_of(&inherited)
+        );
+
+        // ---- the control arm: the same child, captured --------------------
+        let captured = run(StdioSelection::Capture, "stdio_capture");
+        assert_eq!(
+            captured.exit_code,
+            Some(0),
+            "the captured mode is unchanged for every existing caller: {captured:?}"
+        );
+        assert!(
+            stdout_of(&captured).contains(marker),
+            "the captured mode still hands the supervisor the child's output: {:?}",
+            stdout_of(&captured)
+        );
+
+        // ---- recorded, not asserted: the harness's own stdio ---------------
+        //
+        // `[Console]::IsOutputRedirected` inside the child, in the CAPTURED arm.
+        // `True` here is `cargo test`'s own pipe, not the sandbox: the suite runs
+        // with a redirected stdout, so an inherited child inherits a pipe too — the
+        // rule is "a TTY exactly when we have one".
+        let probe = workspace.path().join("console-probe.bat");
+        std::fs::write(
+            &probe,
+            "@echo off\r\npowershell.exe -NoProfile -Command \"[Console]::IsOutputRedirected\"\r\n",
+        )
+        .expect("write the console probe");
+        let mut input = live_input(
+            0,
+            workspace.path(),
+            &launcher,
+            format!("cmd /c \"{}\"", probe.display()),
+        );
+        input.stdio = StdioSelection::Capture;
+        input.network.proxy_port = None;
+        let observed = launch_session(
+            LaunchCounters::new().as_ref(),
+            None,
+            None,
+            &launcher,
+            SessionBudget::default(),
+            &input,
+        )
+        .expect("the probe session must run");
+        println!(
+            "EVIDENCE console_probe exit={:?} is_output_redirected={:?}",
+            observed.exit_code,
+            stdout_of(&observed).trim()
+        );
+    }
+
+    /// **P3.4 (B): a writable grant outside the workspace is honoured.**
+    ///
+    /// Before P3.4 this session was refused by name (a second writable grant had
+    /// "no honest mapping"), which made every tool that keeps state in the profile
+    /// unrunnable. The control half matters as much as the positive one: a write
+    /// to a directory that was NOT granted must still fail, or the leg would pass
+    /// on a container whose filesystem policy does nothing.
+    #[test]
+    #[ignore]
+    fn a_writable_grant_outside_the_workspace_is_honoured_on_a_real_launch() {
+        let launcher = launcher_under_test();
+        let workspace = Scratch::plain("live-grant-workspace");
+        let state = Scratch::plain("live-grant-state");
+        let ungranted = Scratch::plain("live-grant-ungranted");
+        let written = state.path().join("written-by-the-child.txt");
+        let refused = ungranted.path().join("must-not-exist.txt");
+
+        let counters = LaunchCounters::new();
+        let mut input = live_input(0, workspace.path(), &launcher, String::new());
+        input.filesystem = filesystem_policy(
+            workspace.path(),
+            &[state.path().to_path_buf()],
+            &[
+                launcher_grant(&launcher).expect("launcher directory"),
+                // The workload is System32-resident.
+                r"C:\Windows".to_string(),
+            ],
+            &[],
+            None,
+            &launcher,
+        )
+        .expect("no deny in this session covers a grant");
+        input.network.proxy_port = None;
+        input.command = format!(
+            "cmd /c echo GRANT-OK> \"{}\" & echo NO> \"{}\" & echo TAIL",
+            written.display(),
+            refused.display()
+        );
+
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            SessionBudget::default(),
+            &input,
+        )
+        .expect("a proxy-less session needs no proof beyond `MustBeAbsent`");
+
+        let body = std::fs::read_to_string(&written).unwrap_or_default();
+        println!(
+            "EVIDENCE writable_grant exit={:?} written={:?} ungranted_exists={} proof={:?}",
+            outcome.exit_code,
+            body.trim(),
+            refused.exists(),
+            outcome.proxy_proof
+        );
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "the session must run: {outcome:?} stderr={:?}",
+            stderr_of(&outcome)
+        );
+        assert!(
+            body.contains("GRANT-OK"),
+            "the child must be able to WRITE inside the extra root: {body:?}"
+        );
+        assert!(
+            !refused.exists(),
+            "a directory that was not granted stays unwritable, or the policy is not doing anything: {}",
+            refused.display()
+        );
+    }
+
+    /// **P3.4 (B), the protection that had to survive: a credential directory.**
+    ///
+    /// The profile itself is granted read-write (that is what makes a tool with
+    /// profile state work), and `~/.ssh` inside it is still denied by
+    /// [`PROFILE_SECRET_DIRS`]. The synthetic profile keeps the test out of the
+    /// real one; the mechanism is the same deny list, added by the same
+    /// `profile_dir` argument.
+    #[test]
+    #[ignore]
+    fn a_secret_directory_inside_a_writable_grant_is_still_denied() {
+        let launcher = launcher_under_test();
+        let workspace = Scratch::plain("live-secret-workspace");
+        let profile = Scratch::plain("live-secret-profile");
+        std::fs::create_dir_all(profile.path().join(".ssh")).expect("create .ssh");
+        std::fs::create_dir_all(profile.path().join("state")).expect("create state");
+        let allowed = profile.path().join("state").join("written.txt");
+        let forbidden = profile.path().join(".ssh").join("must-not-exist.txt");
+
+        let counters = LaunchCounters::new();
+        let mut input = live_input(0, workspace.path(), &launcher, String::new());
+        input.filesystem = filesystem_policy(
+            workspace.path(),
+            &[profile.path().to_path_buf()],
+            &[
+                launcher_grant(&launcher).expect("launcher directory"),
+                r"C:\Windows".to_string(),
+            ],
+            &[],
+            Some(profile.path()),
+            &launcher,
+        )
+        .expect("a deny BESIDE the grant is expressible");
+        input.network.proxy_port = None;
+        input.command = format!(
+            "cmd /c echo STATE-OK> \"{}\" & echo NO> \"{}\" & echo TAIL",
+            allowed.display(),
+            forbidden.display()
+        );
+
+        let outcome = launch_session(
+            counters.as_ref(),
+            None,
+            None,
+            &launcher,
+            SessionBudget::default(),
+            &input,
+        )
+        .expect("a proxy-less session needs no proof beyond `MustBeAbsent`");
+
+        println!(
+            "EVIDENCE secret_dir exit={:?} state_written={} ssh_written={} policy={:?}",
+            outcome.exit_code,
+            allowed.exists(),
+            forbidden.exists(),
+            input.filesystem.denied_paths
+        );
+        assert!(
+            allowed.exists(),
+            "the granted tree must be usable, or the deny is not the thing being measured"
+        );
+        assert!(
+            !forbidden.exists(),
+            "`~/.ssh` must stay denied even when its PARENT is granted writable: {}",
+            forbidden.display()
+        );
+    }
+
+    /// **P3.4 (C), MEASURED: a stat of an ANCESTOR of a grant is DENIED, and a
+    /// read-only ancestor grant is the workaround that works.**
+    ///
+    /// opencode `lstat`s `C:\Users\<user>` at startup and only holds a grant
+    /// deeper inside that tree. Two launches answer the question:
+    ///
+    /// 1. **Grant only** — a write inside the grant SUCCEEDS (traversal through the
+    ///    ancestors is implicit in the policy model) while `if exist` on the
+    ///    ancestor and on an intermediate directory is DENIED. `if exist` is
+    ///    `GetFileAttributes`, i.e. exactly the `lstat` opencode performs.
+    /// 2. **Grant + the ancestor read-only** — the ancestor and the intermediate
+    ///    directory are statable, and the credential directories stay unreadable
+    ///    because a deny that is a DESCENDANT of the grant is kept (`~/.ssh` etc.).
+    ///
+    /// **This is a blocker of the SDK's policy vocabulary, not of this mapping.**
+    /// PSEC — and the contract above it — express four path classes: read-write,
+    /// read-only, deny, and enumerate-without-read (`base_container_helpers.rs:59-63`,
+    /// `fs_read_write`/`fs_read_only`/`fs_deny`/`fs_enumerate`). None of them means
+    /// "traverse and read attributes, without listing or reading": a read-only
+    /// ancestor is the NARROWEST expressible grant that makes the stat work, and it
+    /// is still a widening (the ancestor becomes listable and readable). So the
+    /// supervisor does not grant ancestors automatically; the operator's documented
+    /// remedy is an explicit `--allow <path>:read`, and the built-in credential
+    /// denies keep the credentials out of it.
+    ///
+    /// The probe is a `.bat` written into the granted workspace: one command per
+    /// line, results appended to a file the test reads. Shell chaining was NOT
+    /// trustworthy here — `%ERRORLEVEL%` inside a `( … & echo %ERRORLEVEL% )` block
+    /// is expanded at parse time, and a `&&`/`||` chain after a redirect stopped
+    /// reporting, both of which read as "denied" for the wrong reason.
+    #[test]
+    #[ignore]
+    fn an_ancestor_of_a_writable_grant_cannot_be_statted_but_a_readonly_ancestor_works() {
+        let launcher = launcher_under_test();
+        let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
+            panic!("this leg needs USERPROFILE: it is about the REAL profile chain");
+        };
+        let workspace = Scratch::plain("live-ancestor-workspace");
+        let deep = profile.join(".local").join("share").join(format!(
+            "sbox-ancestor-{}-{}",
+            std::process::id(),
+            {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            }
+        ));
+        std::fs::create_dir_all(&deep).expect("create the deep grant");
+
+        /// Remove the deep grant whatever the assertions do.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(deep.clone());
+
+        let script = workspace.path().join("probe.bat");
+        let results = workspace.path().join("probe.out");
+        let written = deep.join("written-by-the-child.txt");
+        let script_body = format!(
+            "@echo off\r\n\
+             echo PROFILE-VAR=[%USERPROFILE%]\r\n\
+             if exist \"{profile}\" (echo ANCESTOR-STAT-OK>>\"{results}\") else (echo ANCESTOR-STAT-DENIED>>\"{results}\")\r\n\
+             if exist \"C:\\Windows\" (echo WINDIR-STAT-OK>>\"{results}\") else (echo WINDIR-STAT-DENIED>>\"{results}\")
+\
+             if exist \"{profile}\\.local\" (echo MID-STAT-OK>>\"{results}\") else (echo MID-STAT-DENIED>>\"{results}\")\r\n\
+             attrib \"{profile}\" >nul 2>&1\r\n\
+             if errorlevel 1 (echo ATTRIB-DENIED>>\"{results}\") else (echo ATTRIB-OK>>\"{results}\")\r\n\
+             dir /b \"{profile}\" >nul 2>&1\r\n\
+             if errorlevel 1 (echo ANCESTOR-LIST-DENIED>>\"{results}\") else (echo ANCESTOR-LIST-OK>>\"{results}\")\r\n\
+             dir /b \"{profile}\\.ssh\" >nul 2>&1\r\n\
+             if errorlevel 1 (echo SECRET-LIST-DENIED>>\"{results}\") else (echo SECRET-LIST-OK>>\"{results}\")\r\n\
+             type \"{profile}\\.ssh\\config\" >nul 2>&1\r\n\
+             if errorlevel 1 (echo SECRET-READ-DENIED>>\"{results}\") else (echo SECRET-READ-OK>>\"{results}\")\r\n\
+             echo DEEP-OK>\"{written}\"\r\n",
+            profile = profile.display(),
+            results = results.display(),
+            written = written.display()
+        );
+        std::fs::write(&script, script_body).expect("write the probe script");
+
+        let base_readonly = vec![
+            launcher_grant(&launcher).expect("launcher directory"),
+            // The workload is System32-resident.
+            r"C:\Windows".to_string(),
+        ];
+
+        let run =
+            |readonly: Vec<String>, profile_dir: Option<&Path>, deep_grant: bool, label: &str| {
+                let mut input = live_input(
+                    0,
+                    workspace.path(),
+                    &launcher,
+                    format!("cmd /c \"{}\"", script.display()),
+                );
+                let writable: Vec<PathBuf> = if deep_grant {
+                    vec![deep.clone()]
+                } else {
+                    Vec::new()
+                };
+                input.filesystem = filesystem_policy(
+                    workspace.path(),
+                    &writable,
+                    &readonly,
+                    &[],
+                    profile_dir,
+                    &launcher,
+                )
+                .expect("no deny covers the deep grant");
+                input.network.proxy_port = None;
+                let _ = std::fs::remove_file(&results);
+                let _ = std::fs::remove_file(&written);
+                let outcome = launch_session(
+                    LaunchCounters::new().as_ref(),
+                    None,
+                    None,
+                    &launcher,
+                    SessionBudget::default(),
+                    &input,
+                )
+                .expect("a proxy-less session needs no proof beyond `MustBeAbsent`");
+                let probe = std::fs::read_to_string(&results).unwrap_or_default();
+                println!(
+                    "EVIDENCE {label} exit={:?} deep_written={} results={:?} stdout={:?}",
+                    outcome.exit_code,
+                    written.exists(),
+                    probe.trim(),
+                    stdout_of(&outcome).trim()
+                );
+                (outcome.exit_code, probe, written.exists())
+            };
+
+        // ---- launch 1: the grant alone ------------------------------------
+        let (code, probe, deep_written) = run(
+            base_readonly.clone(),
+            Some(&profile),
+            true,
+            "ancestor_grant_only",
+        );
+        assert_eq!(code, Some(0), "the session must run: {probe:?}");
+        assert!(
+            deep_written,
+            "the deep grant must be writable, or nothing below measures the ancestor: {probe:?}"
+        );
+        assert!(
+            probe.contains("ANCESTOR-STAT-DENIED"),
+            "MEASURED BEHAVIOUR: mxc-sdk 1.0.1 does not grant read-attributes on an ancestor of a \
+             grant, so the `lstat` opencode performs at startup fails. If this assertion starts \
+             failing, the SDK gained ancestor traversal — promote it into ADR-0004 and delete the \
+             workaround note. {probe:?}"
+        );
+        assert!(
+            probe.contains("SECRET-LIST-DENIED"),
+            "nothing was granted above the deep directory, so `.ssh` must be unreadable: {probe:?}"
+        );
+
+        // ---- launch 2: the ancestor read-only -----------------------------
+        let mut readonly = base_readonly;
+        readonly.push(profile.display().to_string());
+        let (code, probe, deep_written) =
+            run(readonly.clone(), Some(&profile), true, "ancestor_readonly");
+        assert_eq!(code, Some(0), "the session must run: {probe:?}");
+        assert!(deep_written, "the grant stays writable: {probe:?}");
+        // MEASURED, and not what the first draft of this leg assumed: granting the
+        // home root read-only makes its CHILDREN statable and the root listable,
+        // but the root's OWN `if exist` is still refused — while `Windows` (also a
+        // read-only grant, with no deny under it) answers OK in the same session.
+        assert!(
+            probe.contains("ANCESTOR-STAT-DENIED"),
+            "MEASURED: a read-only grant of the home root does NOT make the root itself \
+             statable while a credential deny sits under it: {probe:?}"
+        );
+        assert!(
+            probe.contains("MID-STAT-OK"),
+            "the children of a read-only grant ARE statable (`.local` answers OK in the same \
+             session), which is what isolates the failure to the granted root itself: {probe:?}"
+        );
+        assert!(
+            probe.contains("WINDIR-STAT-OK"),
+            "a read-only grant with no deny under it IS statable (`C:\\Windows`), so `if exist` \
+             on a directory is not the problem: {probe:?}"
+        );
+        assert!(
+            probe.contains("SECRET-READ-DENIED"),
+            "widening the ancestor to read-only must NOT make the credentials READABLE — the deny \
+             that sits inside it still wins: {probe:?}"
+        );
+        assert!(
+            probe.contains("SECRET-LIST-OK"),
+            "and the LIST result is recorded as measured: a read-only grant of the profile makes \
+             `.ssh` NAMES visible (content stays denied) — a widening worth stating: {probe:?}"
+        );
+
+        // ---- launch 3: the same grant without the credential denies ---------
+        //
+        // The arm that isolates the mechanism: with the profile granted read-only
+        // and NO deny inside it, the home root becomes statable. That proves the
+        // ancestor refusal is caused by a DENY SITTING UNDER THE GRANT (the
+        // credentials), not by the grant being the ancestor of a readwrite path.
+        let (code, probe, deep_written) =
+            run(readonly.clone(), None, true, "ancestor_readonly_no_denies");
+        assert_eq!(code, Some(0), "the session must run: {probe:?}");
+        assert!(deep_written, "the grant stays writable: {probe:?}");
+        assert!(
+            probe.contains("ANCESTOR-STAT-DENIED"),
+            "MEASURED: the refusal is not caused by the credential denies — it survives with none \
+             of them in the policy: {probe:?}"
+        );
+
+        // ---- launch 4: the ancestor read-only, nothing granted beneath it ---
+        //
+        // The last arm isolates WHY the granted root itself is refused: with no
+        // deeper grant under the profile, a read-only grant of it IS statable. That
+        // makes the mechanism a GRANT BENEATH the granted root (the nested grant a
+        // profile-state tool needs), not the root being special.
+        let (code, probe, deep_written) =
+            run(readonly, Some(&profile), false, "ancestor_readonly_flat");
+        assert!(
+            !deep_written,
+            "this arm grants no deep directory, so nothing may be written there: {probe:?}"
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "the probe script's last line writes into an ungranted directory, so the session \
+             exits non-zero — that is the arm working, not failing: {probe:?}"
+        );
+        assert!(
+            probe.contains("ANCESTOR-STAT-DENIED"),
+            "MEASURED: the home root's own stat is still refused with a read-only grant and no deny \
+             under it. The one grant that still sits beneath it is the LAUNCHER's directory (the \
+             wrapper lives under `~\\tools`), so the standing hypothesis is 'a grant beneath the \
+             granted root refuses the root's own stat' — NOT tested further here, because a \
+             profile-state tool always has such a grant: {probe:?}"
+        );
+    }
+
     /// **P3.2a, the other direction: a policy denial is NOT a misconfiguration.**
     /// A launch whose workload authenticated and was then DENIED must still PASS -
     /// the credential path worked, the denial is the guardrail doing its job.
@@ -6697,6 +7566,7 @@ mod live {
         let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
         let filesystem = filesystem_policy(
             scratch,
+            &[],
             // System32-resident workloads (cmd/curl) need the system directory.
             &[r"C:\Windows".to_string()],
             denies,
@@ -6716,6 +7586,8 @@ mod live {
             // An explicit budget: `None` means no deadline at all (D5), which is
             // wrong for a test that could otherwise hang.
             timeout_ms: Some(180_000),
+            // These sessions read the child's output, so they capture it.
+            stdio: StdioSelection::Capture,
         }
     }
 
@@ -7038,6 +7910,7 @@ mod live {
         );
         let policy = filesystem_policy(
             &scratch_dir,
+            &[],
             &[r"C:\Windows".to_string()],
             &denies,
             std::env::var_os("USERPROFILE")
