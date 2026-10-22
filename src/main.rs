@@ -921,6 +921,15 @@ fn run_mxc_session(
         .complete(endpoint)?;
 
     emit_child_output(&outcome);
+    // Guardrail 1's evidence, in the operator's own transcript: since the
+    // 2026-10-22 amendment the gate is satisfied by the wrapper's pre-flight
+    // probe, and a counter the operator cannot see is a gate nobody can audit
+    // after the fact. One line, on stderr, beside the warnings and the timeout
+    // reason.
+    eprintln!(
+        "[sandbox] mxc: guardrail 1 proof probes={} accepted={} tunnels={}",
+        outcome.proxy_proof.probes, outcome.proxy_proof.accepted, outcome.proxy_proof.tunnels
+    );
     for warning in &outcome.warnings {
         eprintln!("[sandbox] mxc: warning: {warning}");
     }
@@ -1381,7 +1390,7 @@ mod tests {
         let probed = base_container_record();
 
         // Guardrail 1, pre-run shape.
-        let guard = MxcError::Guard(GuardError::SessionNotAccepted);
+        let guard = MxcError::Guard(GuardError::ProbeUnmet);
         let (facts, refusal) = refusal_for(&guard, &probed).expect("guardrail 1 is recorded");
         assert_eq!(
             facts.tier.as_deref(),
@@ -1396,7 +1405,7 @@ mod tests {
         // Guardrail 1, post-run shape: same reason, and the one that carries the
         // workload's own output into the transcript.
         let unproven = MxcError::Unproven(Box::new(net::mxc::Unproven {
-            error: GuardError::TunnelNotEstablished,
+            error: GuardError::ProbeUnmet,
             outcome: finished_outcome(Some(0), None),
         }));
         let (facts, refusal) = refusal_for(&unproven, &probed).expect("guardrail 1 is recorded");

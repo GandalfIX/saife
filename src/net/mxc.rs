@@ -798,24 +798,48 @@ fn push_deny(
 
 /// The supervisor's own count of what its proxy saw for one launch epoch.
 ///
-/// `accepted` counts **proxy consultations** — connections the proxy handled as
-/// a proxy (`CONNECT`, or an absolute-form request) — in the epoch; `tunnels`
-/// counts those whose origin dial succeeded (i.e. a real `200 Connection
-/// Established` was sent). Both are needed: the spike proved that a proxy
-/// 502/403 (unresolvable target, loopback target) and a silently misconfigured
-/// container both give `accepted >= 1, tunnels == 0`, and that a container that
-/// never reached the proxy gives `accepted == 0` while still exiting 0 with
-/// `warnings: []`.
+/// **`probes` is the evidence** (ADR-0004 guardrail 1, amended 2026-10-22): the
+/// wrapper's own `GET /sandbox/probe` to this listener, sent before the payload
+/// starts. The two counters below it are **recorded detail** — what the session
+/// actually did over the proxy — and no longer decide the gate.
 ///
-/// Deliberately *not* counted: a direct, origin-form request to one of our own
-/// loopback endpoints (the D-4 intent endpoints). Serving an endpoint is not a
-/// proxy consultation, and counting it would make
+/// * `accepted` counts **proxy consultations** — connections the proxy handled
+///   as a proxy (`CONNECT`, or an absolute-form request naming another origin).
+/// * `tunnels` counts those whose origin dial succeeded (a real `200 Connection
+///   Established`, or a plain-HTTP forward whose upstream came up). The spike
+///   proved that a proxy 502/403 gives `accepted >= 1, tunnels == 0`, and that a
+///   container that never reached the proxy gives `accepted == 0` while still
+///   exiting 0 with `warnings: []`.
+///
+/// Why they cannot be the gate (2026-10-22): both are **workload** events. A
+/// session whose workload makes no request at all — an intent roundtrip, a
+/// `cmd /c echo`, a raw 407 probe — produces `{accepted: 0, tunnels: 0}` while
+/// its proxy path is perfectly healthy, so a `tunnels >= 1` rule refused
+/// sessions that did nothing wrong (four P3.1 scenarios: S-55, S-77, S-86,
+/// S-91). A gate must prove the PATH, never the workload's use of it.
+///
+/// Deliberately *not* counted as either: a direct, origin-form request to one of
+/// our own loopback endpoints (the D-4 intent endpoints, and the probe itself).
+/// Serving an endpoint is not a proxy consultation, and counting it would make
 /// [`ProofExpectation::MustBeAbsent`] unsatisfiable for exactly the sessions it
 /// exists for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProxyProof {
     pub accepted: u64,
     pub tunnels: u64,
+    /// Pre-flight probes the WRAPPER reported to this listener's own control
+    /// plane in the epoch (`GET /sandbox/probe`).
+    ///
+    /// This is guardrail 1's evidence (amended 2026-10-22): the supervisor asks
+    /// the child's side to prove its path to *this* listener BEFORE the payload
+    /// starts, and records the answer where the workload cannot reach it. A
+    /// workload-derived count can never distinguish "made no request" from
+    /// "could not make any"; a probe can, because it runs whether or not the
+    /// workload ever opens a socket.
+    ///
+    /// `accepted` and `tunnels` stay recorded as coverage — they say what the
+    /// session actually did over the proxy — but they no longer decide.
+    pub probes: u64,
 }
 
 /// What guardrail 1 must observe for this launch (plan decision D3).
@@ -823,8 +847,8 @@ pub struct ProxyProof {
 /// Both legs are hard gates, and the caller **must** supply the right one:
 ///
 /// * [`ProofExpectation::Required`] for a network session (a proxy port is
-///   configured): the child must have reached the proxy *and* the proxy must
-///   have established at least one tunnel. Derive it with
+///   configured): the wrapper's pre-flight probe must have reached THIS
+///   listener in the launch's epoch. Derive it with
 ///   [`ProofExpectation::for_network`].
 /// * [`ProofExpectation::MustBeAbsent`] for a blocked / proxy-less session: the
 ///   proxy must never have been consulted, which is the only positive evidence
@@ -833,7 +857,9 @@ pub struct ProxyProof {
 /// Choosing the wrong leg is itself a hard failure — never a skipped check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofExpectation {
-    /// `accepted >= 1 && tunnels >= 1`.
+    /// `probes >= 1`: the child's path to the listener works (ADR-0004
+    /// guardrail 1, amended 2026-10-22). `accepted`/`tunnels` are recorded, not
+    /// required — they are workload events.
     Required,
     /// `accepted == 0 && tunnels == 0`.
     MustBeAbsent,
@@ -858,14 +884,13 @@ pub enum GuardError {
     /// `Required` was requested for a session with no proxy port: no launch can
     /// ever satisfy it, so it is refused before the child starts.
     RequiredWithoutProxy,
-    /// The child never reached the proxy in this launch's epoch.
-    SessionNotAccepted,
-    /// The proxy accepted a connection but never established a tunnel (502/403
-    /// or a loopback/HostLoopback misconfiguration).
-    TunnelNotEstablished,
     /// `MustBeAbsent` was requested but the proxy *was* consulted for this
     /// launch — a session that was supposed to stay offline went out.
     ProxyConsultedUnexpectedly,
+    /// The wrapper's pre-flight probe never reached this listener in this
+    /// launch's epoch: the child's path to the proxy — a live loopback
+    /// listener that accepts the session's own credential — was never proven.
+    ProbeUnmet,
 }
 
 impl fmt::Display for GuardError {
@@ -879,16 +904,14 @@ impl fmt::Display for GuardError {
                 "guardrail 1: a network session was expected but the request configures no proxy, \
                  so no launch could ever prove the child reached one"
             }
-            Self::SessionNotAccepted => {
-                "guardrail 1: no proxy session was accepted in this launch's epoch — the child \
-                 never reached the proxy"
-            }
-            Self::TunnelNotEstablished => {
-                "guardrail 1: the proxy accepted a session but established no CONNECT tunnel"
-            }
             Self::ProxyConsultedUnexpectedly => {
                 "guardrail 1: the proxy was consulted for a session that must never reach it — \
                  the workload is expected to be blocked"
+            }
+            Self::ProbeUnmet => {
+                "guardrail 1: proxy_probe_unmet — the wrapper's pre-flight probe never reached \
+                 this listener, so the child's path to the proxy is unproven (dead listener, \
+                 blocked loopback, or a credential it does not accept)"
             }
         };
         f.write_str(msg)
@@ -899,19 +922,32 @@ impl std::error::Error for GuardError {}
 
 /// The hard gate, in both legs.
 ///
-/// `Required` demands `accepted >= 1 && tunnels >= 1`; `MustBeAbsent` demands
-/// `accepted == 0 && tunnels == 0`. Anything else fails the launch.
+/// `Required` demands `probes >= 1` — the wrapper's pre-flight probe reached
+/// this listener in the epoch. `MustBeAbsent` demands `accepted == 0 && tunnels
+/// == 0` (a proxy-less session cannot probe at all: the wrapper only probes
+/// when `--proxy-port` names a listener). Anything else fails the launch.
+///
+/// **Why `Required` no longer looks at `accepted`/`tunnels` (2026-10-22).**
+/// Both are produced by the workload, so a gate keyed on them answers "did the
+/// workload use the proxy?" and reads a no-op workload as a broken path — S-55,
+/// S-77, S-86 and S-91 were refused for exactly that. The probe is produced by
+/// the wrapper before the payload, so its absence means the path itself is
+/// broken: dead listener, blocked loopback, or a credential this listener does
+/// not accept. The property the old rule was reaching for — *this* listener,
+/// *this* run, *this* launch's window — is preserved: the probe is token-gated
+/// like every control-plane request and counted per epoch.
 pub fn verify_proxy_proof(
     proof: ProxyProof,
     expectation: ProofExpectation,
 ) -> Result<(), GuardError> {
     match expectation {
         ProofExpectation::Required => {
-            if proof.accepted == 0 {
-                return Err(GuardError::SessionNotAccepted);
-            }
-            if proof.tunnels == 0 {
-                return Err(GuardError::TunnelNotEstablished);
+            // The probe, and only the probe, decides. `accepted`/`tunnels` are
+            // carried in the same struct as coverage and printed in every
+            // `EVIDENCE` line, but a workload that made no request must not be
+            // able to fail this gate.
+            if proof.probes == 0 {
+                return Err(GuardError::ProbeUnmet);
             }
             Ok(())
         }
@@ -938,6 +974,11 @@ pub fn verify_proxy_proof(
 /// will hold this across `await` points.
 ///
 /// # Counting rules (normative — guardrail 1 is only as honest as these)
+///
+/// `probes` counts **pre-flight probes**: an authenticated, origin-form
+/// `GET /sandbox/probe` this listener served inside the epoch. It is the gate's
+/// evidence (see [`verify_proxy_proof`]); a foreign or absent credential answers
+/// `407` before routing and counts nowhere.
 ///
 /// `accepted` counts **proxy consultations** only: a `CONNECT` whose target
 /// parsed, or an absolute-form request naming another origin, that reached this
@@ -1027,6 +1068,7 @@ impl ProxyProofSource for crate::net::proxy::LaunchCounters {
             Some(counters) => ProxyProof {
                 accepted: counters.consultations,
                 tunnels: counters.upstream_established,
+                probes: counters.probes,
             },
             // An unknown epoch has no counters. Zeros make the gate fail closed
             // instead of reporting traffic that belongs to someone else.
@@ -1522,7 +1564,7 @@ impl SessionOutcome {
 /// network produced **no output at all** — the supervisor showed one line about a
 /// proxy and left the operator with nothing to act on, while the same command
 /// under `--block-net` printed everything. The session is still refused (a
-/// `SessionNotAccepted` launch is not a contained session) and `success()` on the
+/// `proxy_probe_unmet` launch is not a contained session) and `success()` on the
 /// carried outcome is still `false`; what changes is that the transcript keeps the
 /// workload's own evidence.
 #[derive(Debug, Clone)]
@@ -2694,10 +2736,12 @@ mod tests {
         }
     }
 
+    /// A launch whose wrapper probed and whose workload then did real work.
     fn proven() -> ProxyProof {
         ProxyProof {
             accepted: 1,
             tunnels: 1,
+            probes: 1,
         }
     }
 
@@ -2705,6 +2749,7 @@ mod tests {
         ProxyProof {
             accepted: 0,
             tunnels: 0,
+            probes: 0,
         }
     }
 
@@ -3089,39 +3134,63 @@ mod tests {
 
     // ---- P0.3 / D3: guardrail 1, both legs -------------------------------
 
-    /// `Required` + pass.
+    /// `Required` passes on the wrapper's probe ALONE.
+    ///
+    /// This is the S-77/S-86/S-91 shape (2026-10-22): a network-enabled session
+    /// whose workload makes no request at all — an intent roundtrip, a
+    /// `cmd /c echo`, a raw 407 probe. `accepted == 0` and `tunnels == 0` there
+    /// are not a missing path, they are a workload that never opened a socket,
+    /// and refusing it refused a user who did nothing wrong.
     #[test]
-    fn required_passes_when_the_child_reached_the_proxy_and_a_tunnel_was_established() {
-        verify_proxy_proof(proven(), ProofExpectation::Required).expect("accepted=1 tunnels=1");
+    fn required_passes_on_the_wrapper_probe_alone() {
         verify_proxy_proof(
             ProxyProof {
-                accepted: 3,
-                tunnels: 2,
+                accepted: 0,
+                tunnels: 0,
+                probes: 1,
             },
             ProofExpectation::Required,
         )
-        .expect("more traffic than the minimum is fine");
+        .expect("a probe of the listener's own control plane IS the evidence");
+        // Traffic is recorded detail, never the gate: it does not replace the
+        // probe, and it does not have to be there.
+        verify_proxy_proof(proven(), ProofExpectation::Required)
+            .expect("probe + traffic is the same proof plus coverage");
     }
 
-    /// `Required` + fail (two distinct shapes, two distinct errors).
+    /// `Required` fails when the probe never arrived — however much traffic the
+    /// epoch saw.
+    ///
+    /// A tunnel is a workload event: it can only exist if the child made a
+    /// request, so it cannot answer "is the path broken?" for a child that made
+    /// none. The probe is issued by the wrapper before the payload, so its
+    /// absence means the path itself is broken (listener dead, loopback blocked,
+    /// credential refused).
     #[test]
-    fn required_fails_without_an_accepted_session_or_without_a_tunnel() {
+    fn required_fails_when_the_probe_never_arrived() {
         assert_eq!(
-            verify_proxy_proof(untouched(), ProofExpectation::Required).expect_err("accepted=0"),
-            GuardError::SessionNotAccepted
+            verify_proxy_proof(untouched(), ProofExpectation::Required).expect_err("probes=0"),
+            GuardError::ProbeUnmet
         );
-        // The structural case the spike proved matters: proxy 502 (unresolvable
-        // target) and loopback-denied both give accepted=1, tunnels=0.
         assert_eq!(
             verify_proxy_proof(
                 ProxyProof {
-                    accepted: 1,
-                    tunnels: 0,
+                    accepted: 5,
+                    tunnels: 2,
+                    probes: 0,
                 },
                 ProofExpectation::Required
             )
-            .expect_err("tunnels=0"),
-            GuardError::TunnelNotEstablished
+            .expect_err("probes=0"),
+            GuardError::ProbeUnmet,
+            "recorded traffic must not stand in for the probe"
+        );
+        assert!(
+            GuardError::ProbeUnmet
+                .to_string()
+                .contains("proxy_probe_unmet"),
+            "the refusal must name its own reason: {}",
+            GuardError::ProbeUnmet
         );
     }
 
@@ -3139,10 +3208,12 @@ mod tests {
             ProxyProof {
                 accepted: 1,
                 tunnels: 0,
+                probes: 0,
             },
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 0,
             },
         ] {
             assert_eq!(
@@ -3173,11 +3244,22 @@ mod tests {
         // required+pass, required+fail, absent+pass, absent+fail.
         let cases = [
             (ProofExpectation::Required, proven(), true),
+            // The S-77 shape: probed, and the workload made no request.
+            (
+                ProofExpectation::Required,
+                ProxyProof {
+                    accepted: 0,
+                    tunnels: 0,
+                    probes: 1,
+                },
+                true,
+            ),
             (
                 ProofExpectation::Required,
                 ProxyProof {
                     accepted: 1,
-                    tunnels: 0,
+                    tunnels: 1,
+                    probes: 0,
                 },
                 false,
             ),
@@ -3187,6 +3269,7 @@ mod tests {
                 ProxyProof {
                     accepted: 0,
                     tunnels: 1,
+                    probes: 0,
                 },
                 false,
             ),
@@ -3203,15 +3286,17 @@ mod tests {
     }
 
     /// The silent-misconfiguration case: the SDK reported exit 0 with no
-    /// warnings, yet no tunnel was established. Success must be impossible.
+    /// warnings, yet the probe never arrived. Success must be impossible —
+    /// and so is `accepted` traffic standing in for the probe.
     #[test]
-    fn exited_zero_without_a_tunnel_is_an_error() {
+    fn exited_zero_without_a_probe_is_an_error() {
         let err = gate_outcome(
             tier(),
             child(WaitResult::Exited(0)),
             ProxyProof {
                 accepted: 1,
-                tunnels: 0,
+                tunnels: 1,
+                probes: 0,
             },
             ProofExpectation::Required,
             clock(),
@@ -3219,7 +3304,7 @@ mod tests {
         .expect_err("exit 0 must not mask a failed proof");
         assert!(matches!(
             err,
-            MxcError::Unproven(ref refused) if refused.error == GuardError::TunnelNotEstablished
+            MxcError::Unproven(ref refused) if refused.error == GuardError::ProbeUnmet
         ));
         // P3.0: the refusal still carries what the child did, so a refused session
         // is not a silent one.
@@ -3281,6 +3366,7 @@ mod tests {
                 ProxyProof {
                     accepted: 1,
                     tunnels: 0,
+                    probes: 0,
                 },
             ),
             (
@@ -3288,6 +3374,7 @@ mod tests {
                 ProxyProof {
                     accepted: 1,
                     tunnels: 0,
+                    probes: 0,
                 },
             ),
         ];
@@ -3359,7 +3446,7 @@ mod tests {
         .expect_err("proof gate applies to every outcome");
         assert!(matches!(
             err,
-            MxcError::Unproven(ref refused) if refused.error == GuardError::SessionNotAccepted
+            MxcError::Unproven(ref refused) if refused.error == GuardError::ProbeUnmet
         ));
         // The timeout label survives the refusal: a killed child is still labelled.
         let MxcError::Unproven(refused) = err else {
@@ -3466,13 +3553,10 @@ mod tests {
     fn a_failed_run_still_closes_the_epoch() {
         let source = RecordingSource::default();
         let err = run_in_epoch(&source, || {
-            Err::<(), _>(MxcError::Guard(GuardError::SessionNotAccepted))
+            Err::<(), _>(MxcError::Guard(GuardError::ProbeUnmet))
         })
         .expect_err("body failed");
-        assert!(matches!(
-            err,
-            MxcError::Guard(GuardError::SessionNotAccepted)
-        ));
+        assert!(matches!(err, MxcError::Guard(GuardError::ProbeUnmet)));
         assert_eq!(source.epochs(), vec![1], "the epoch was opened");
         assert_eq!(
             source.closes().len(),
@@ -5335,6 +5419,7 @@ mod tests {
         let counters = crate::net::proxy::LaunchCounters::new();
 
         let first = counters.begin_launch().expect("the first launch's window");
+        counters.note_probe();
         counters.note_consultation();
         counters.note_upstream_established();
         assert_eq!(
@@ -5342,6 +5427,7 @@ mod tests {
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 1,
             }
         );
         counters.close_launch(first);
@@ -5353,6 +5439,7 @@ mod tests {
         // A plain-HTTP forward: consulted and upstream established, with no
         // CONNECT anywhere. `tunnels >= 1` must hold or `Required` would fail a
         // working session.
+        counters.note_probe();
         counters.note_consultation();
         counters.note_upstream_established();
         assert_eq!(
@@ -5360,8 +5447,9 @@ mod tests {
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 1,
             },
-            "a plain-HTTP-only session must satisfy Required"
+            "a plain-HTTP-only session carries both the probe and its coverage"
         );
         // The closed epoch keeps its frozen numbers.
         assert_eq!(
@@ -5369,6 +5457,7 @@ mod tests {
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 1,
             }
         );
         // An epoch nobody opened proves nothing.
@@ -5604,6 +5693,16 @@ mod live {
         let line = head.lines().next().unwrap_or("").trim().to_string();
         let epoch = shared.epoch.load(Ordering::SeqCst);
         let target = line.split_whitespace().nth(1).unwrap_or("").to_string();
+
+        // The control-plane probe, mirrored from the real listener: it is the
+        // launch's evidence since the 2026-10-22 amendment, and a fake that did
+        // not record it would make a `Required` launch fail for a reason the
+        // product never produces.
+        if target == "/sandbox/probe" {
+            bump(shared, epoch, |proof| proof.probes += 1);
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+            return;
+        }
 
         // A proxy consultation is anything a proxy must handle: a CONNECT or an
         // absolute-form request. Both are refused for loopback exactly as the
@@ -5963,6 +6062,97 @@ mod live {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 
+    // ---- ADR-0004 guardrail 1 (amended 2026-10-22): attributable evidence ----
+
+    /// One `GET /sandbox/probe` carrying a CHOSEN credential (or none).
+    ///
+    /// A container can only present its own run's token (it rides its proxy URL),
+    /// so "somebody else's credential" needs a raw socket — which is exactly the
+    /// adversary this pins: any local process, or a session holding a stale token.
+    fn probe_with(port: u16, token: Option<&str>) -> String {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect the listener");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let auth = match token {
+            Some(token) => {
+                let creds =
+                    base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+                format!("Proxy-Authorization: Basic {creds}\r\n")
+            }
+            None => String::new(),
+        };
+        let req = format!("GET /sandbox/probe HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}\r\n");
+        sock.write_all(req.as_bytes()).expect("write the probe");
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 256];
+        while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// **The property the gate exists for.** A session whose ONLY listener contact
+    /// used a foreign credential is REFUSED.
+    ///
+    /// The listener answers the same `407` it gives a credential-less request and
+    /// records nothing, so the launch's epoch has `probes == 0` and guardrail 1
+    /// refuses with `proxy_probe_unmet`. The positive control in the same epoch
+    /// (this listener's own credential, `204` and counted) is what makes the
+    /// refusal mean something: without it a dead listener would look identical.
+    ///
+    /// Not `#[ignore]`d: no container is involved — this is the real listener,
+    /// the real counters and the real gate.
+    #[test]
+    fn a_session_whose_only_listener_contact_used_a_foreign_credential_is_refused() {
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let epoch = counters.begin_launch().expect("the launch's epoch");
+
+        // 1. Somebody else's token: refused like a missing one, and uncounted.
+        let foreign = probe_with(proxy.port(), Some("a-different-runs-token"));
+        println!(
+            "EVIDENCE foreign_probe status={:?} proof={:?}",
+            foreign.lines().next(),
+            counters.proof(epoch)
+        );
+        assert!(
+            foreign.starts_with("HTTP/1.1 407"),
+            "a foreign credential must be refused exactly like a missing one: {foreign:?}"
+        );
+        assert_eq!(
+            counters.proof(epoch).probes,
+            0,
+            "a refused probe must leave no observation, or any local process could satisfy \
+             guardrail 1 for a session whose own path is broken: {:?}",
+            counters.proof(epoch)
+        );
+        assert_eq!(
+            verify_proxy_proof(counters.proof(epoch), ProofExpectation::Required)
+                .expect_err("a foreign-credential probe must not satisfy the gate"),
+            GuardError::ProbeUnmet
+        );
+
+        // 2. Positive control, same epoch: this listener's own credential counts.
+        let own = probe_with(proxy.port(), Some(proxy.token().value()));
+        println!(
+            "EVIDENCE own_probe status={:?} proof={:?}",
+            own.lines().next(),
+            counters.proof(epoch)
+        );
+        assert!(
+            own.starts_with("HTTP/1.1 204"),
+            "the session's own credential must be served: {own:?}"
+        );
+        assert_eq!(counters.proof(epoch).probes, 1, "exactly one observation");
+        verify_proxy_proof(counters.proof(epoch), ProofExpectation::Required)
+            .expect("the same session, probed with its own credential, is proven");
+
+        counters.close_launch(epoch);
+    }
+
     /// A real session proxy (`127.0.0.1:0`, this process's own listener) plus the
     /// audit/learned scaffolding it needs.
     struct LiveProxy {
@@ -6283,30 +6473,62 @@ mod live {
             r#"{CURL} -sS -f --noproxy "" --max-time 20 {}"#,
             endpoint.url()
         );
-        let err = backend
+        // Amended 2026-10-22: this launch now SUCCEEDS, and that is the point.
+        // Its wrapper probed, so its path to the listener is proven; the refused
+        // loopback CONNECT is recorded detail (`tunnels == 0`), no longer the
+        // gate. What the leg still proves is the A/B it exists for: with
+        // NO_PROXY ignored the child's request reached the PROXY (and was refused
+        // there as a loopback target) instead of the endpoint.
+        let outcome = backend
             .launch(
                 &live_input(endpoint.port, &scratch_dir, &launcher, command),
                 ProofExpectation::Required,
             )
-            .expect_err("a proxied loopback request must fail guardrail 1");
+            .expect("a session whose probe arrived passes, whatever its workload then did");
         let epoch = proof.last_epoch();
         println!(
-            "EVIDENCE ab_control epoch={epoch} err={err} proxy_consultations={:?} \
+            "EVIDENCE ab_control epoch={epoch} success={} proof={:?} proxy_consultations={:?} \
              origin_requests={:?}",
+            outcome.success(),
+            outcome.proxy_proof,
             endpoint.proxy_consultations(epoch),
             endpoint.origin_requests(epoch)
         );
-        assert!(
-            matches!(err, MxcError::Unproven(ref refused) if refused.error == GuardError::TunnelNotEstablished),
-            "expected a proxy consultation without a tunnel, got {err:?}"
+        assert_eq!(
+            outcome.proxy_proof.probes, 1,
+            "the wrapper's own probe is the launch's evidence: {:?}",
+            outcome.proxy_proof
         );
         assert!(
             !endpoint.proxy_consultations(epoch).is_empty(),
             "with NO_PROXY ignored, the request must reach the proxy"
         );
+        assert_eq!(
+            outcome.proxy_proof.tunnels, 0,
+            "a loopback target is refused by the proxy, so nothing is established upstream: \
+             {:?}",
+            outcome.proxy_proof
+        );
         assert!(
-            endpoint.origin_requests(epoch).is_empty(),
-            "with NO_PROXY ignored, nothing may reach the endpoint directly"
+            !endpoint
+                .origin_requests(epoch)
+                .iter()
+                .any(|line| line.contains("/sandbox/intent")),
+            "with NO_PROXY ignored, no intent request may reach the endpoint directly: {:?}",
+            endpoint.origin_requests(epoch)
+        );
+        // The GATE passed (this launch returned `Ok`), which is what the leg is
+        // about. `success()` also demands exit 0 and must NOT: `curl -f` exits 22
+        // because the proxy refused the request with 403 — the A/B's whole point.
+        assert_eq!(
+            outcome.exit_code,
+            Some(22),
+            "curl must report the proxy's 403 as its own failure: {outcome:?}"
+        );
+        assert!(
+            verify_proxy_proof(outcome.proxy_proof, outcome.expectation).is_ok(),
+            "guardrail 1 must pass on the probe, whatever the workload's request got: {:?}",
+            outcome.proxy_proof
         );
 
         // ---- 4. the workload's own exit code is propagated unchanged ----
@@ -7155,6 +7377,7 @@ mod live {
             proxy_proof: ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 1,
             },
             expectation: ProofExpectation::Required,
             clock: SessionClock::default(),
@@ -7356,16 +7579,18 @@ mod live {
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 1,
             },
-            "run A's proof must count only run A's consultation"
+            "run A's proof must count only run A's consultation and its own probe"
         );
         assert_eq!(
             out_b.proxy_proof,
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
+                probes: 1,
             },
-            "run B's proof must count only run B's consultation"
+            "run B's proof must count only run B's consultation and its own probe"
         );
         // The body each session printed must be the nonce of the origin that
         // session was allowed to reach - and not the other one's (P1.6(f)).
@@ -7970,7 +8195,8 @@ exit /b 0
     ///    credential is 407 (`the control plane is not an unauthenticated
     ///    oracle`);
     /// 6. none of the eight calls is a proxy consultation: the listener's own
-    ///    counters stay `{accepted: 0, tunnels: 0}`, which is what
+    ///    counters stay `{accepted: 0, tunnels: 0}` plus the wrapper's one
+    ///    probe, which is what
     ///    `ProofExpectation::MustBeAbsent` refuses the launch over;
     /// 7. the only audit leaf the launch writes is the wrong credential's
     ///    `foreign_token` refusal (`host: "<unknown>"`), and nothing names a host
@@ -8257,9 +8483,14 @@ exit /b 0
         );
         assert_eq!(
             outcome.proxy_proof,
-            ProxyProof::default(),
-            "an intent call is served on the listener but is NOT a proxy consultation: the \
-             counters must be {{accepted: 0, tunnels: 0}} across the whole roundtrip: {outcome:?}"
+            ProxyProof {
+                accepted: 0,
+                tunnels: 0,
+                // The wrapper's pre-flight probe, and nothing else: an intent call
+                // served on the listener is NOT a proxy consultation.
+                probes: 1,
+            },
+            "the roundtrip must record the probe and zero proxy traffic: {outcome:?}"
         );
 
         let leaves = audit_leaves(&proxy.sid);
@@ -8369,8 +8600,16 @@ exit /b 0
             )
             .expect_err("the CONNECT must reach the proxy, so guardrail 1 must refuse the launch");
         println!("EVIDENCE consult_guard={err}");
+        // P3.0 shape: a refusal raised AFTER the child ran is `Unproven` and
+        // carries the outcome; the refused LEG is what this asserts. (Written
+        // for the pre-P3.0 `Guard` shape, so this line was red until the
+        // 2026-10-22 pass — the gate itself never changed.)
         assert!(
-            matches!(err, MxcError::Guard(GuardError::ProxyConsultedUnexpectedly)),
+            matches!(
+                err,
+                MxcError::Unproven(ref refused)
+                    if refused.error == GuardError::ProxyConsultedUnexpectedly
+            ),
             "the CONNECT must have been counted as a real consultation, not skipped: {err:?}"
         );
 
@@ -8425,31 +8664,26 @@ exit /b 0
     }
 
     // =====================================================================
-    // P2.4: guardrail 1's NEGATIVE leg — no proof means no successful session
+    // P2.4 / ADR-0004 guardrail 1 (amended 2026-10-22): the pre-flight probe
     // =====================================================================
     //
-    // ADR-0004, verbatim: "`warnings: []` is NOT evidence; a session MUST NOT be
-    // reported as successful unless the supervisor can prove the child reached
-    // the proxy. Failure => fail the session, do not warn-and-continue."
+    // ADR-0004: "`warnings: []` is NOT evidence; a session MUST NOT be reported
+    // as successful unless the supervisor can prove the child reached the
+    // proxy." The evidence is now the WRAPPER's own probe of this listener,
+    // issued before the payload starts and counted on the listener's side, in
+    // the launch's epoch — because the old `>= 1 tunnel` rule demanded a
+    // WORKLOAD event, so every network session whose workload made no request
+    // was refused while its proxy path was fine (S-55, S-77, S-86, S-91).
     //
-    // The `MustBeAbsent` direction is pinned live by P2.2 (a launch that was
-    // supposed to stay offline is refused when the proxy IS consulted). This leg
-    // is the other direction, and it is the one the guardrail exists for: a
-    // session that EXPECTS proof (`Required`, i.e. a network session) and gets
-    // none must be refused, with an error that names the missing proof. `exit 0`
-    // and an empty `warnings` list from the container are exactly the signals
-    // that must NOT be allowed to stand in for it.
-    //
-    // What only a live leg can add: `verify_proxy_proof` is unit-tested, but this
-    // shows the PRODUCT path runs it after a real container launch — the child
-    // really started, really exited 0, really wrote its marker, and the launch
-    // still produced no `SessionOutcome`.
+    // What a live leg adds that a unit test cannot: `verify_proxy_proof` is
+    // tested pure, but these two show the PRODUCT path running it around a real
+    // ProcessContainer — the wrapper really probed, or really could not.
 
-    /// The negative leg's workload: prove it RAN (a marker file in the granted
+    /// The live leg's workload: prove it RAN (a marker file in the granted
     /// workspace), touch no network at all, exit 0.
     ///
     /// A refusal for a child that failed to start would prove nothing about the
-    /// gate, so the marker is the leg's positive control.
+    /// gate, so the marker is each leg's positive control.
     const P24_SILENT_BODY: &str =
         "> p24-ran.txt echo MARK workload=completed-no-network\r\nexit /b 0\r\n";
 
@@ -8457,7 +8691,7 @@ exit /b 0
     /// command line that runs it.
     ///
     /// The P2.2 helper's D-4 prelude is deliberately not reused: this workload
-    /// must do *nothing* except print its marker, so it cannot consults the proxy
+    /// must do *nothing* except print its marker, so it cannot consult the proxy
     /// by accident and turn a gate test into a networking test.
     fn p24_script(dir: &Path, name: &str, body: &str) -> String {
         let path = dir.join(format!("{name}.bat"));
@@ -8469,13 +8703,20 @@ exit /b 0
         format!("cmd /c \"{}\"", path.display())
     }
 
+    /// **The S-77/S-86/S-91 shape, live.** A network session whose workload
+    /// makes NO request succeeds, because the wrapper's probe reached the
+    /// listener: `probes == 1` with `accepted == 0, tunnels == 0`.
+    ///
+    /// This is the leg that was refused before the amendment, and refusing it is
+    /// a product cliff: `sandbox run --allow-domain api.anthropic.com -- echo hi`
+    /// failed a user who did nothing wrong.
     #[test]
     #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
-    fn a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful() {
+    fn a_launch_whose_workload_makes_no_request_passes_on_the_wrapper_probe() {
         let launcher = launcher_under_test();
         let proxy = LiveProxy::start(&[]);
         let counters = proxy.counters();
-        let scratch = Scratch::plain("p24-silent");
+        let scratch = Scratch::plain("p24-probe-ok");
         let dir = scratch.path().to_path_buf();
         let backend = supervisor_backend(
             counters.as_ref(),
@@ -8497,8 +8738,6 @@ exit /b 0
             proxy.port(),
             proxy.sid
         );
-        // The window must be shut before the launch, or "the epoch closed" below
-        // could be somebody else's close.
         assert_eq!(
             counters.active_epoch(),
             None,
@@ -8507,57 +8746,48 @@ exit /b 0
 
         let command = p24_script(&dir, "p24-silent", P24_SILENT_BODY);
         println!("EVIDENCE silent_command={command:?}");
-        let err = backend
+        let outcome = backend
             .launch(
                 &live_input(proxy.port(), &dir, &launcher, command),
-                // A network session's leg (`ProofExpectation::for_network(Some(p))`).
                 ProofExpectation::Required,
             )
-            .expect_err(
-                "a session that expects proof and gets none must be REFUSED, never reported \
-                 successful on `warnings: []` or on the child's exit code",
+            .expect(
+                "a network session whose wrapper probed MUST pass guardrail 1, even though its \
+                 workload never opened a socket",
             );
-        println!("EVIDENCE silent_guard={err}");
+        println!(
+            "EVIDENCE silent_workload exit={:?} success={} proof={:?} tier={:?}",
+            outcome.exit_code,
+            outcome.success(),
+            outcome.proxy_proof,
+            outcome.tier.tier
+        );
 
-        // ---- 1. the refusal, and what it names ------------------------------
-        assert!(
-            matches!(err, MxcError::Unproven(ref refused) if refused.error == GuardError::SessionNotAccepted),
-            "the missing proof must be reported as SessionNotAccepted — not as a generic \
-             failure, and certainly not as a success: {err:?}"
-        );
-        assert_eq!(
-            err.to_string(),
-            "guardrail 1: no proxy session was accepted in this launch's epoch — the child \
-             never reached the proxy",
-            "the operator-facing refusal must name the proof that was missing"
-        );
-        assert!(
-            matches!(
-                std::error::Error::source(&err),
-                Some(source) if source.to_string() == err.to_string()
-            ),
-            "the typed error must be reachable through `source`, so a caller can match on it: \
-             {err:?}"
-        );
-        println!("EVIDENCE silent_display={:?}", err.to_string());
-
-        // ---- 2. the child really ran ---------------------------------------
+        // ---- 1. the session really ran -------------------------------------
+        assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+        assert!(outcome.success(), "a probed launch is a successful session");
         let ran = std::fs::read_to_string(dir.join("p24-ran.txt")).unwrap_or_default();
         println!("EVIDENCE silent_workload marker={ran:?}");
         assert!(
             ran.contains("MARK workload=completed-no-network"),
-            "the workload must have run to completion and written its marker, so the refusal is \
-             about the missing proof rather than about a child that never started: {ran:?}"
+            "the workload must have run to completion: {ran:?}"
         );
 
-        // ---- 3. the proof counters -----------------------------------------
-        // Read from the LISTENER's own counters — the real proof source, not a
-        // fake. `counters(1)` returning `Some` is the positive control: `proof()`
-        // answers zeros for an epoch it never saw, so "zero" on its own would also
-        // describe a launch that never opened a window at all.
+        // ---- 2. the probe is the evidence, read from the LISTENER ----------
+        assert_eq!(
+            outcome.proxy_proof.probes, 1,
+            "the wrapper's probe must be counted exactly once: {:?}",
+            outcome.proxy_proof
+        );
+        assert_eq!(
+            (outcome.proxy_proof.accepted, outcome.proxy_proof.tunnels),
+            (0, 0),
+            "this workload made no request, so there is no traffic to record: {:?}",
+            outcome.proxy_proof
+        );
         let epoch1 = counters.counters(1).expect(
-            "this launch must have opened epoch 1 (a listener numbers its first epoch 1); an \
-             absent epoch reports the same zeros, so Some is the part that means anything",
+            "this launch must have opened epoch 1: an absent epoch reports the same \
+                     numbers, so `Some` is the part that means anything",
         );
         println!(
             "EVIDENCE silent_proof epoch=1 counters={epoch1:?} proof={:?} active={:?}",
@@ -8569,14 +8799,143 @@ exit /b 0
             LaunchProofCounters {
                 consultations: 0,
                 upstream_established: 0,
+                probes: 1,
             },
-            "nothing may have consulted the proxy: a counted consultation would mean the child \
-             reached it and the refusal came from somewhere else"
+            "a probe is neither a consultation nor an upstream connection"
         );
         assert_eq!(
+            counters.active_epoch(),
+            None,
+            "the launch path must close the epoch it opened"
+        );
+
+        // ---- 3. nothing claims a proxy event that never happened -----------
+        let leaves = audit_leaves(&proxy.sid);
+        println!(
+            "EVIDENCE silent_audit leaves={} connect_leaves={}",
+            leaves.len(),
+            connect_leaves(&proxy.sid)
+        );
+        assert_eq!(
+            connect_leaves(&proxy.sid),
+            0,
+            "a workload that made no request must leave no CONNECT leaf: {leaves:?}"
+        );
+
+        println!(
+            "EVIDENCE done: a network session whose workload made no request passed on the \
+             wrapper's probe (probes=1, accepted=0, tunnels=0)"
+        );
+    }
+
+    /// **The refusal, live, with the real mechanism.** The wrapper is pointed at
+    /// a port nothing listens on, so its probe never arrives: the session is
+    /// refused with `proxy_probe_unmet`, even though the workload exited 0.
+    ///
+    /// The proof source is a REAL listener (a `LiveProxy`), so the zeros below
+    /// are that listener's own epoch, opened for this launch and never probed —
+    /// not a fake that cannot count.
+    #[test]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    fn a_launch_whose_probe_never_arrives_is_refused_with_proxy_probe_unmet() {
+        let launcher = launcher_under_test();
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        // A port that is nobody's listener: bound, then closed. The wrapper's
+        // probe gets a refused connection, which it swallows — the gate, not the
+        // wrapper, is what refuses the session.
+        let dead_port = {
+            let probe_listener = TcpListener::bind("127.0.0.1:0").expect("bind a port to abandon");
+            let port = probe_listener
+                .local_addr()
+                .expect("abandoned address")
+                .port();
+            drop(probe_listener);
+            port
+        };
+        let scratch = Scratch::plain("p24-probe-dead");
+        let dir = scratch.path().to_path_buf();
+        let backend = supervisor_backend(
+            counters.as_ref(),
+            Some(dead_port),
+            Some(proxy.token().value()),
+            &launcher,
+            SessionBudget::default(),
+        )
+        .with_budget(SessionBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(80),
+            Duration::from_secs(10),
+        ));
+
+        println!(
+            "EVIDENCE elevated={} launcher={} dead_proxy_port={dead_port} live_listener_port={} \
+             expectation=Required sid={}",
+            process_is_elevated(),
+            launcher.display(),
+            proxy.port(),
+            proxy.sid
+        );
+
+        let command = p24_script(&dir, "p24-silent", P24_SILENT_BODY);
+        println!("EVIDENCE silent_command={command:?}");
+        let err = backend
+            .launch(
+                &live_input(dead_port, &dir, &launcher, command),
+                ProofExpectation::Required,
+            )
+            .expect_err(
+                "a session whose probe never arrived must be REFUSED, never reported successful \
+                 on `warnings: []` or on the child's exit code",
+            );
+        println!("EVIDENCE silent_guard={err}");
+
+        // ---- 1. the refusal names the missing evidence ---------------------
+        assert!(
+            matches!(err, MxcError::Unproven(ref refused) if refused.error == GuardError::ProbeUnmet),
+            "the missing probe must be reported as ProbeUnmet — not as a generic failure, and \
+             certainly not as a success: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("proxy_probe_unmet"),
+            "the operator-facing refusal must carry the reason token: {err}"
+        );
+        assert!(
+            err.to_string().contains("probe"),
+            "the refusal must name the evidence that was missing: {err}"
+        );
+        assert!(
+            matches!(
+                std::error::Error::source(&err),
+                Some(source) if source.to_string() == err.to_string()
+            ),
+            "the typed error must be reachable through `source`, so a caller can match on it: \
+             {err:?}"
+        );
+
+        // ---- 2. the child really ran ---------------------------------------
+        let ran = std::fs::read_to_string(dir.join("p24-ran.txt")).unwrap_or_default();
+        println!("EVIDENCE silent_workload marker={ran:?}");
+        assert!(
+            ran.contains("MARK workload=completed-no-network"),
+            "the workload must have run to completion, so the refusal is about the missing probe \
+             rather than about a child that never started: {ran:?}"
+        );
+
+        // ---- 3. the listener's own epoch: opened, empty, closed -------------
+        let epoch1 = counters
+            .counters(1)
+            .expect("this launch must have opened epoch 1 on the live listener");
+        println!(
+            "EVIDENCE silent_proof epoch=1 counters={epoch1:?} proof={:?} active={:?}",
             counters.proof(1),
-            ProxyProof::default(),
-            "the supervisor's own read of the epoch must be the zeros above"
+            counters.active_epoch()
+        );
+        assert_eq!(
+            epoch1,
+            LaunchProofCounters::default(),
+            "nothing may have probed or consulted this listener: the wrapper was pointed at a \
+             dead port"
         );
         assert_eq!(
             counters.active_epoch(),
@@ -8584,37 +8943,17 @@ exit /b 0
             "the refusal path must close the epoch too (no window left open on an error)"
         );
 
-        // ---- 4. the audit chain --------------------------------------------
-        let path = crate::audit::audit_log_path(&proxy.sid);
+        // ---- 4. no leaf claims a decision -----------------------------------
         let leaves = audit_leaves(&proxy.sid);
-        println!(
-            "EVIDENCE silent_audit path={} exists={} leaves={} connect_leaves={}",
-            path.display(),
-            path.exists(),
-            leaves.len(),
-            connect_leaves(&proxy.sid)
-        );
-        // No leaf may claim a decision: a CONNECT leaf with a host, an allow, or
-        // a refusal would each be a proxy event this launch never had. The file
-        // need not exist — the writer is non-strict and creates nothing until the
-        // first append — which is why the count, not the file, is asserted; that
-        // this very writer does append on a decision is pinned by the P2.2 legs.
         assert_eq!(
             connect_leaves(&proxy.sid),
             0,
             "the refused launch must leave no CONNECT-shaped leaf: {leaves:?}"
         );
-        assert!(
-            leaves
-                .iter()
-                .all(|leaf| leaf["disposition"] != "allow" && leaf["host"] == "<unknown>"),
-            "no leaf may claim a decision about a host: {leaves:?}"
-        );
 
         println!(
-            "EVIDENCE done: a launch that expected proof and never reached the proxy was refused \
-             with SessionNotAccepted, its workload had already exited 0, and nothing claimed a \
-             decision"
+            "EVIDENCE done: a launch whose probe never arrived was refused with \
+             proxy_probe_unmet, its workload had already exited 0, and nothing claimed a decision"
         );
     }
 }

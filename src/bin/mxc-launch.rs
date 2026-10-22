@@ -45,6 +45,22 @@
 //!   would have meant as the container command itself (same argument parsing,
 //!   same PATH search, no shell).
 //!
+//! ## The pre-flight probe (ADR-0004 guardrail 1, amended 2026-10-22)
+//!
+//! Before it starts the payload, and only when `--proxy-port` names a listener,
+//! the wrapper sends ONE origin-form `GET /sandbox/probe` to
+//! `127.0.0.1:<port>` with the `Basic` credential it reads out of its **own**
+//! `HTTP_PROXY` (the container backend injected it) — never out of a
+//! command-line flag, because the wrapper's command line is part of the child's,
+//! where a token would be visible to anything that can list processes.
+//!
+//! This is the launch's guardrail-1 evidence: the supervisor counts an
+//! authenticated probe on its own listener, so "the child's path to the proxy
+//! works" is provable for a session whose workload makes no request at all. The
+//! probe is **best effort and bounded** ([`PROBE_TIMEOUT`]): every failure is
+//! silent, and a probe that never arrives is the supervisor's refusal to make,
+//! not the wrapper's.
+//!
 //! The wrapper always sets `NO_PROXY` and `no_proxy` to
 //! [`LOOPBACK_NO_PROXY`], and `SANDBOX_PROXY_PORT` to the port named by
 //! `--proxy-port` (empty when it names none), before starting the workload. This
@@ -294,6 +310,94 @@ pub fn added_env(proxy_port: Option<u16>) -> Vec<(String, String)> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0004 guardrail 1 (amended 2026-10-22): the pre-flight probe
+// ---------------------------------------------------------------------------
+
+/// The control-plane path that records one probe observation, served by the
+/// supervisor's own listener beside the D-4 intent endpoints.
+pub const PROBE_PATH: &str = "/sandbox/probe";
+
+/// Bound on the whole probe, connect included.
+///
+/// Generous for a loopback round trip (microseconds) and short against any
+/// budget the supervisor sets: the probe is a proof, not a health check, and a
+/// wedged listener may cost the workload at most this much.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The `user:password` userinfo of a proxy URL, if it carries one.
+///
+/// Read from this process's environment (`HTTP_PROXY`, injected by the container
+/// backend), never from a command-line flag: the wrapper's command line becomes
+/// part of the child's, where a token is visible to anything that can list
+/// processes.
+///
+/// Hand-rolled rather than a URL parser because the wrapper links no URL crate,
+/// and the only shapes it can receive are the backend's
+/// `http://[user:pass@]host:port` (the same reason `ProxyUrl` in
+/// `src/net/upstream.rs` is hand-rolled).
+pub fn probe_credential(proxy_url: &str) -> Option<String> {
+    let (_, rest) = proxy_url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // The separator is the LAST `@`: a password may contain one.
+    let (userinfo, _) = authority.rsplit_once('@')?;
+    (!userinfo.is_empty()).then(|| userinfo.to_string())
+}
+
+/// The exact bytes of the probe: one origin-form request to the control plane.
+///
+/// `credential` is `user:password`. `None` sends no `Proxy-Authorization` header
+/// at all — the listener then answers `407` and counts nothing, and the
+/// supervisor refuses the session. The wrapper must never pre-empt that
+/// decision by refusing to launch.
+pub fn probe_request(port: u16, credential: Option<&str>) -> String {
+    use base64::Engine as _;
+
+    let auth = match credential {
+        Some(credential) => format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64::engine::general_purpose::STANDARD.encode(credential)
+        ),
+        None => String::new(),
+    };
+    format!(
+        "GET {PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Connection: close\r\n\r\n"
+    )
+}
+
+/// Send the probe and return the listener's status line, if one arrived.
+///
+/// Best effort by contract: a refused connection, a blocked loopback, a timeout,
+/// a listener that says nothing — every one of them is a silent `None`. The
+/// wrapper must never fail a launch over its own probe; "the probe never
+/// arrived" is exactly what guardrail 1 exists to catch, and the supervisor is
+/// the one that decides.
+pub fn probe_status_line(port: u16, credential: Option<&str>) -> Option<String> {
+    use std::io::{Read, Write};
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut sock = std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
+    sock.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    sock.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    sock.write_all(probe_request(port, credential).as_bytes())
+        .ok()?;
+
+    // The status line only: the answer is a `204` with no body, and a listener
+    // that sends anything else is described by its first line.
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.len() < 256 && !line.ends_with(b"\r\n") {
+        match sock.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => line.push(byte[0]),
+        }
+    }
+    if line.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&line).trim_end().to_string())
+}
+
 fn main() {
     let plan = match unicode_args(std::env::args_os())
         .and_then(|argv| parse_args(argv.into_iter().skip(1)))
@@ -315,6 +419,22 @@ fn main() {
         // SAFETY: single-threaded here — this runs before any worker thread is
         // created, so no other thread can be reading the environment.
         unsafe { std::env::set_var(name, value) };
+    }
+
+    // ADR-0004 guardrail 1 (amended 2026-10-22): report this launch's probe
+    // BEFORE the payload starts, so the supervisor's gate has the evidence even
+    // when the workload makes no request at all. Only a session with a listener
+    // probes — a `--block-net` session has none, and expects none.
+    //
+    // Silent by design: no `?`, no exit, and no diagnostic on the workload's own
+    // streams (a probe line would corrupt an environment dump or a scenario's
+    // stdout assertion). The supervisor decides what a missing probe means.
+    if let Some(port) = plan.proxy_port {
+        let proxy_url = std::env::var("HTTP_PROXY")
+            .or_else(|_| std::env::var("http_proxy"))
+            .ok();
+        let credential = proxy_url.as_deref().and_then(probe_credential);
+        let _ = probe_status_line(port, credential.as_deref());
     }
 
     match spawn_and_wait(&plan.command) {
@@ -665,5 +785,151 @@ mod tests {
         );
         assert_eq!(first_token("cmd /c echo hi"), "cmd");
         assert_eq!(first_token(""), "");
+    }
+
+    // ---- ADR-0004 guardrail 1 (amended 2026-10-22): the pre-flight probe ----
+
+    /// The credential comes from the wrapper's OWN environment (the SDK's
+    /// `HTTP_PROXY` userinfo), never from a new command-line flag: a token on the
+    /// command line is visible in the child's command line.
+    #[test]
+    fn derives_the_probe_credential_from_the_proxy_url() {
+        assert_eq!(
+            probe_credential("http://sandbox:tok123@127.0.0.1:49152").as_deref(),
+            Some("sandbox:tok123")
+        );
+        // Trailing path/query must not become part of the credential.
+        assert_eq!(
+            probe_credential("http://sandbox:tok123@127.0.0.1:49152/").as_deref(),
+            Some("sandbox:tok123")
+        );
+        // No userinfo: no credential. The probe still goes out (uncounted, a 407),
+        // which is exactly the case the gate must catch — the wrapper must not
+        // refuse to launch over it.
+        assert_eq!(probe_credential("http://127.0.0.1:49152"), None);
+        assert_eq!(probe_credential("127.0.0.1:49152"), None);
+        assert_eq!(probe_credential(""), None);
+        // A password may contain `@`; the separator is the LAST one (RFC 3986).
+        assert_eq!(
+            probe_credential("http://sandbox:a@b@127.0.0.1:49152").as_deref(),
+            Some("sandbox:a@b")
+        );
+    }
+
+    /// The request is origin-form, single-purpose, and carries the `Basic`
+    /// credential the listener gates every control-plane path on.
+    #[test]
+    fn the_probe_request_is_origin_form_and_carries_the_basic_credential() {
+        let req = probe_request(49_152, Some("sandbox:tok123"));
+        let want = format!("Basic {}", b64(b"sandbox:tok123"));
+        assert!(
+            req.starts_with("GET /sandbox/probe HTTP/1.1\r\n"),
+            "origin-form, the control plane's path: {req:?}"
+        );
+        assert!(req.contains(&want), "the credential must travel: {req:?}");
+        assert!(
+            req.contains("Host: 127.0.0.1:49152\r\n"),
+            "a Host header, as every control-plane request here sends: {req:?}"
+        );
+        assert!(req.ends_with("\r\n\r\n"), "a complete head: {req:?}");
+
+        // No credential, no header: the listener answers 407 and counts nothing,
+        // and the SUPERVISOR decides — the wrapper never refuses on its own.
+        let bare = probe_request(49_152, None);
+        assert!(!bare.contains("Proxy-Authorization"), "{bare:?}");
+        assert!(bare.starts_with("GET /sandbox/probe HTTP/1.1\r\n"));
+    }
+
+    /// End to end against a real socket: the listener sees exactly this request
+    /// and its status line is what comes back.
+    #[test]
+    fn the_probe_reaches_a_listener_and_reads_its_status_line() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the probe target");
+        let port = listener.local_addr().expect("probe address").port();
+        let seen = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("one probe");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let status = probe_status_line(port, Some("sandbox:tok123"));
+        let head = seen.join().expect("the probe thread");
+        println!("EVIDENCE probe_head={head:?} status={status:?}");
+        assert_eq!(
+            status.as_deref(),
+            Some("HTTP/1.1 204 No Content"),
+            "the wrapper must read the listener's answer, not infer it"
+        );
+        assert_eq!(
+            head,
+            probe_request(port, Some("sandbox:tok123")),
+            "the bytes on the wire must be the request this module builds"
+        );
+    }
+
+    /// A probe that cannot connect is NOT an error for the launch: it returns
+    /// `None`, promptly, and the supervisor's gate refuses the session.
+    #[test]
+    fn a_probe_that_cannot_connect_reports_nothing_and_never_blocks_the_launch() {
+        // A port that is nobody's listener: bound, then closed.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port to abandon");
+            let p = l.local_addr().expect("abandoned address").port();
+            drop(l);
+            p
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(probe_status_line(port, Some("sandbox:tok123")), None);
+        assert!(
+            started.elapsed() < PROBE_TIMEOUT * 2,
+            "a refused connection must return at once, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A listener that accepts and then says nothing must not hold the workload
+    /// hostage: the probe is bounded by `PROBE_TIMEOUT`.
+    #[test]
+    fn a_silent_listener_is_bounded_by_the_probe_timeout() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a silent listener");
+        let port = listener.local_addr().expect("silent address").port();
+        // Hold the connection open, answer nothing, then let it go.
+        let held = std::thread::spawn(move || {
+            let (_sock, _) = listener.accept().expect("one probe");
+            std::thread::sleep(PROBE_TIMEOUT + std::time::Duration::from_millis(500));
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            probe_status_line(port, Some("sandbox:tok123")),
+            None,
+            "no status line arrived, so there is nothing to report"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= PROBE_TIMEOUT - std::time::Duration::from_millis(200)
+                && elapsed < PROBE_TIMEOUT * 3,
+            "the probe must wait its bound and no longer, took {elapsed:?}"
+        );
+        held.join().expect("the silent listener thread");
+    }
+
+    /// The base64 the `Basic` scheme needs, as the tests assert it.
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 }

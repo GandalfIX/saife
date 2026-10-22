@@ -411,10 +411,19 @@ fn emit_connect(
 /// the origin succeeded — a `200 Connection Established` after the dial, or a
 /// plain-HTTP forward whose upstream connection came up. Serving an
 /// origin-form request for one of our own endpoints is **not** a consultation.
+///
+/// `probes` counts **pre-flight probes** (ADR-0004 guardrail 1, amended
+/// 2026-10-22): the wrapper's own `GET /sandbox/probe`, reported before it
+/// starts the payload. A probe is neither a consultation nor an upstream
+/// connection — it proves the child's PATH to this listener works, which is
+/// what the gate needs for a workload that makes no request of its own, and
+/// counting it as either would respectively make `MustBeAbsent` unsatisfiable
+/// or claim a dial nobody made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchProofCounters {
     pub consultations: u64,
     pub upstream_established: u64,
+    pub probes: u64,
 }
 
 /// Closed epochs kept for after-the-fact reading.
@@ -674,6 +683,20 @@ impl LaunchCounters {
     /// from a status code.
     pub fn note_upstream_established(&self) {
         self.bump(|counters| counters.upstream_established += 1);
+    }
+
+    /// Count one **pre-flight probe** (ADR-0004 guardrail 1, amended
+    /// 2026-10-22).
+    ///
+    /// The wrapper dials this listener's own control plane
+    /// (`GET /sandbox/probe`) and reports back BEFORE the payload starts. It is
+    /// recorded here, on the listener, rather than anywhere the workload can
+    /// reach: a marker file or a counter in the container is forgeable, this is
+    /// not. Only an authenticated probe reaches it — the token gate in
+    /// `handle_conn` answers `407` before routing — so a probe under a foreign
+    /// credential leaves no observation that could stand in for a broken path.
+    pub fn note_probe(&self) {
+        self.bump(|counters| counters.probes += 1);
     }
 
     fn bump(&self, f: impl FnOnce(&mut LaunchProofCounters)) {
@@ -1021,6 +1044,19 @@ enum AuthVerdict {
 
 /// The one `407` body both refusal arms send, so they answer byte-identically.
 const AUTH_REQUIRED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"sandbox\"\r\nContent-Length: 0\r\n\r\n";
+
+/// `GET /sandbox/probe`: the wrapper's pre-flight probe (ADR-0004
+/// guardrail 1, amended 2026-10-22).
+///
+/// Origin-form like the D-4 intent endpoints, behind the same
+/// `Proxy-Authorization` gate, and it records ONE probe observation in
+/// the current launch epoch. It is deliberately not a second proxy: it
+/// answers `204` and touches nothing else.
+const PROBE_PATH: &str = "/sandbox/probe";
+
+/// The one answer the probe endpoint gives: `204`, no body, and therefore no
+/// `Content-Length` (RFC 9110 15.3.5 forbids a body on a 204).
+const PROBE_NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
 
 /// Classify `Proxy-Authorization: Basic base64("sandbox:<token>")` against this
 /// listener's own run token ([`RunToken::matches`], which is constant-time).
@@ -2248,6 +2284,24 @@ async fn intent_explain(
     Ok(())
 }
 
+/// `GET /sandbox/probe`: the wrapper's pre-flight probe (ADR-0004 guardrail 1,
+/// amended 2026-10-22).
+///
+/// Records ONE probe observation in the launch epoch that is active — the
+/// wrapper runs before the payload, so "the child's path to this listener" is
+/// proven for every network session, including one whose workload makes no
+/// request. It answers `204`: nothing is disclosed, no policy runs, and the
+/// response itself is not evidence (the counter is).
+///
+/// Ordered like every other record-then-answer path here: the observation is
+/// taken before the `204` goes out, so whoever observes the answer can already
+/// see the count.
+async fn probe_report(sock: &mut TcpStream, ctx: &ConnCtx) -> Result<()> {
+    ctx.counters.note_probe();
+    let _ = sock.write_all(PROBE_NO_CONTENT).await;
+    Ok(())
+}
+
 /// GET /sandbox/intent?host=<host>: is the agent's intent for the host
 /// known? 200 with the live entry, 404 otherwise. Both outcomes
 /// observe (and consume) the one-shot explain-more hint ([G-26, G-57]).
@@ -3194,8 +3248,9 @@ async fn handle_forward(
 ///   carry TLS.
 /// * **Origin-form** (`GET /sandbox/intent`): the client dialled us
 ///   directly, so it is the D-4 control plane. Only `/sandbox/*` exists
-///   there; anything else is a 400 ([G-7, G-38]), because this listener is
-///   not a reverse proxy for anyone.
+///   there — the D-4 intent endpoints and, since ADR-0004 guardrail 1's
+///   2026-10-22 amendment, `GET /sandbox/probe`; anything else is a 400
+///   ([G-7, G-38]), because this listener is not a reverse proxy for anyone.
 async fn handle_non_connect(
     mut sock: TcpStream,
     ctx: Arc<ConnCtx>,
@@ -3230,6 +3285,13 @@ async fn handle_non_connect(
                     "",
                 )
                 .await;
+                Ok(())
+            }
+        },
+        PROBE_PATH => match method {
+            "GET" => probe_report(&mut sock, &ctx).await,
+            _ => {
+                write_response(&mut sock, "405 Method Not Allowed", "Allow: GET\r\n", "").await;
                 Ok(())
             }
         },
@@ -5178,6 +5240,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             }),
             "a denied forward is an accepted consultation with no upstream"
         );
@@ -6152,6 +6215,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 2,
                 upstream_established: 0,
+                probes: 0,
             }),
             "both reached us as a proxy; neither established anything upstream"
         );
@@ -6173,6 +6237,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             }),
             "the second epoch must not inherit the first one's traffic"
         );
@@ -6181,6 +6246,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 2,
                 upstream_established: 0,
+                probes: 0,
             }),
             "a closed epoch keeps its frozen counters"
         );
@@ -6193,6 +6259,84 @@ mod tests {
             !counters.close_epoch(9_999),
             "closing an unknown epoch is a no-op"
         );
+    }
+
+    // ---- ADR-0004 guardrail 1, amended 2026-10-22: the pre-flight probe ----
+
+    /// `GET /sandbox/probe` records ONE probe observation and answers `204`.
+    ///
+    /// A probe is neither a policy consultation nor an upstream connection: it
+    /// is the wrapper's own report that the child's path to THIS listener
+    /// works, which is what guardrail 1 gates on now. Counting it as a
+    /// consultation would make `MustBeAbsent` unsatisfiable for the sessions
+    /// it exists for (the same reason serving an intent endpoint is not one);
+    /// counting it as an upstream connection would claim a dial nobody made.
+    #[test]
+    fn a_probe_is_recorded_as_a_probe_and_answers_204() {
+        let (dialog, calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("probe", &[], &[], dialog);
+        let counters = t.handle.counters();
+        let epoch = counters.begin_epoch().expect("the launch's window");
+
+        let resp = exchange(t.port, &get_req(PROBE_PATH));
+        assert!(resp.starts_with("HTTP/1.1 204"), "got: {resp}");
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+                probes: 1,
+            }),
+            "the probe must be its own observation - not a consultation, and not an \
+             upstream connection"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a probe is not a policy question: it must never reach the dialog"
+        );
+    }
+
+    /// The property the gate exists for: evidence must be ATTRIBUTABLE.
+    ///
+    /// A probe under a credential this listener does not own is refused with the
+    /// same `407` as every other control-plane request and leaves NO observation
+    /// behind, so it can never satisfy guardrail 1 for a session whose own proxy
+    /// path is broken (dead listener, blocked loopback, wrong credential).
+    #[test]
+    fn a_probe_without_the_run_credential_is_407_and_is_not_counted() {
+        let (dialog, _c) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("probe-cred", &[], &[], dialog);
+        let counters = t.handle.counters();
+        let epoch = counters.begin_epoch().expect("the launch's window");
+
+        let c = crlf();
+        let absent = format!("GET {PROBE_PATH} HTTP/1.1{c}{c}");
+        let foreign = probe_req_with("not-this-runs-token");
+        for (label, req) in [("absent", absent), ("foreign", foreign)] {
+            let resp = exchange(t.port, &req);
+            assert!(
+                resp.starts_with("HTTP/1.1 407"),
+                "{label}: the probe must be gated like every other control-plane \
+                 request: {resp}"
+            );
+            assert!(
+                resp.contains("Proxy-Authenticate: Basic"),
+                "{label}: the refusal must carry the challenge: {resp}"
+            );
+        }
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters::default()),
+            "a refused probe must leave no observation: it cannot stand in for the \
+             session's own proxy path"
+        );
+    }
+
+    /// One probe under a CHOSEN credential (this listener must refuse it).
+    fn probe_req_with(token: &str) -> String {
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{token}"));
+        let c = crlf();
+        format!("GET {PROBE_PATH} HTTP/1.1{c}Proxy-Authorization: Basic {creds}{c}{c}")
     }
 
     /// A handler that panicked while holding the counter lock must not make the
@@ -6219,6 +6363,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             })
         );
         assert!(counters.close_epoch(epoch));
@@ -6328,6 +6473,7 @@ mod tests {
         let one_consultation = Some(LaunchProofCounters {
             consultations: 1,
             upstream_established: 0,
+            probes: 0,
         });
 
         // (i) A's own token at A's listener is served and counted.
@@ -6977,6 +7123,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             }),
             "a refused launch must not steal or reset the open window"
         );
@@ -6999,6 +7146,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             })
         );
     }
@@ -7069,6 +7217,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             }),
             "the surviving window still holds the live launch's traffic"
         );
@@ -7097,6 +7246,7 @@ mod tests {
             Some(LaunchProofCounters {
                 consultations: 1,
                 upstream_established: 0,
+                probes: 0,
             }),
             "the newest window is still readable"
         );
