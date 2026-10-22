@@ -471,15 +471,28 @@ fn proxy_url(port: u16, token: Option<&str>) -> Result<String, RequestError> {
     Ok(format!("http://sandbox:{token}@127.0.0.1:{port}"))
 }
 
-/// The container command: the wrapper launcher, with the real workload command
-/// line as its single argument.
+/// The container command: the wrapper launcher, the port it must publish, and the
+/// real workload command line as its single argument.
 ///
 /// The workload's command line travels as **one** argument and the wrapper hands
 /// it to `CreateProcessW` verbatim, so it keeps exactly the meaning it would
 /// have had as the container command itself.
-pub fn launcher_command(launcher: &Path, real_command: &str) -> String {
+///
+/// `--proxy-port` (P2.4) is the supervisor's bound port, which the wrapper writes
+/// to the child as `SANDBOX_PROXY_PORT` — the D-0.3 discovery variable the
+/// AppContainer path has always injected (`src/sandbox/appcontainer.rs:1007`).
+/// Without it a workload written to D-0.3 could not find the D-4 intent endpoint
+/// under this backend at all. The port is the value from the same
+/// `input.network.proxy_port` that becomes the request's `networkProxy`, so the
+/// variable and the proxy URL cannot disagree; `None` (proxy-less session) omits
+/// the flag and the wrapper writes the name empty.
+pub fn launcher_command(launcher: &Path, real_command: &str, proxy_port: Option<u16>) -> String {
+    let port_flag = match proxy_port {
+        Some(port) => format!(" --proxy-port {port}"),
+        None => String::new(),
+    };
     format!(
-        "{} -- {}",
+        "{}{port_flag} -- {}",
         quote_windows_arg(&launcher.to_string_lossy()),
         quote_windows_arg(real_command)
     )
@@ -1712,7 +1725,13 @@ pub fn build_request(
         },
     };
 
-    let mut request = ContainerRequest::new(launcher_command(&launcher, &input.command));
+    // Same `proxy_port` that became `networkProxy` above, so the workload's
+    // discovery variable and the proxy URL cannot name different listeners.
+    let mut request = ContainerRequest::new(launcher_command(
+        &launcher,
+        &input.command,
+        input.network.proxy_port,
+    ));
     request.filesystem = Some(FilesystemPolicy {
         readwrite_paths: filesystem.readwrite_paths,
         readonly_paths: filesystem.readonly_paths,
@@ -2570,7 +2589,7 @@ mod tests {
 
     #[test]
     fn launcher_command_puts_the_real_command_line_behind_the_wrapper() {
-        let command = launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi");
+        let command = launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi", None);
         assert_eq!(
             command,
             format!(r#"{TEST_LAUNCHER} -- "cmd /c echo hi""#),
@@ -2578,16 +2597,47 @@ mod tests {
         );
     }
 
+    /// P2.4: the discovery port rides the command line, before the `--`, so it is
+    /// never part of the workload's single command-line argument.
+    ///
+    /// A proxy-less session omits the flag entirely (the wrapper then writes the
+    /// variable empty rather than leaving an inherited value in place), which is
+    /// the only shape that differs — the workload argument is unchanged.
+    #[test]
+    fn launcher_command_publishes_the_proxy_port_only_when_there_is_one() {
+        assert_eq!(
+            launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi", Some(49_152)),
+            format!(r#"{TEST_LAUNCHER} --proxy-port 49152 -- "cmd /c echo hi""#),
+        );
+        assert_eq!(
+            launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi", None),
+            format!(r#"{TEST_LAUNCHER} -- "cmd /c echo hi""#),
+            "no flag means the wrapper writes SANDBOX_PROXY_PORT empty"
+        );
+        // The request's own command carries the port it will also put in
+        // `networkProxy`: `input()` configures 54321 for both.
+        let req = build(&input());
+        assert!(
+            req.command.contains("--proxy-port 54321"),
+            "the port the proxy URL names must be the port the workload discovers: {}",
+            req.command
+        );
+    }
+
     #[test]
     fn launcher_command_quotes_a_launcher_path_with_spaces() {
-        let command = launcher_command(Path::new(r"C:\Program Files\sb\mxc-launch.exe"), "x.exe");
+        let command = launcher_command(
+            Path::new(r"C:\Program Files\sb\mxc-launch.exe"),
+            "x.exe",
+            None,
+        );
         assert_eq!(command, r#""C:\Program Files\sb\mxc-launch.exe" -- x.exe"#);
     }
 
     #[test]
     fn launcher_command_survives_a_command_line_that_contains_quotes() {
         let real = r#"powershell.exe -Command "Start-Sleep -Seconds 1""#;
-        let command = launcher_command(Path::new(TEST_LAUNCHER), real);
+        let command = launcher_command(Path::new(TEST_LAUNCHER), real, None);
         assert_eq!(
             command,
             format!(r#"{TEST_LAUNCHER} -- "powershell.exe -Command \"Start-Sleep -Seconds 1\"""#)
@@ -2689,7 +2739,7 @@ mod tests {
         let req = build(&input());
         assert_eq!(
             req.command,
-            launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi")
+            launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi", Some(54_321))
         );
         assert_ne!(req.command, "cmd /c echo hi");
         assert!(req.command.starts_with(TEST_LAUNCHER));
@@ -7477,10 +7527,14 @@ mod live {
     ///
     /// This is done the way a real workload has to do it, because it is part of
     /// what the leg proves. The MXC launcher injects
-    /// `HTTP_PROXY=http://sandbox:<token>@127.0.0.1:<port>` and
-    /// `NO_PROXY=localhost,127.0.0.1,::1`; nothing else names the endpoint —
-    /// the AppContainer path's `SANDBOX_PROXY_PORT` is *not* injected here
-    /// (recorded as a parity gap in the plan's P2.2 note). `cmd.exe` cannot
+    /// `HTTP_PROXY=http://sandbox:<token>@127.0.0.1:<port>`,
+    /// `NO_PROXY=localhost,127.0.0.1,::1` and — since P2.4 —
+    /// `SANDBOX_PROXY_PORT=<port>`, the D-0.3 discovery variable the
+    /// AppContainer path has always injected. The script below deliberately keeps
+    /// deriving the endpoint from `HTTP_PROXY` rather than reading the discovery
+    /// variable: the env leg asserts that the two agree (`SANDBOX_PROXY_PORT` ==
+    /// this listener's port), and a second, independent derivation is what makes
+    /// that agreement evidence instead of a tautology. `cmd.exe` cannot
     /// base64, so the credential comes from `certutil`: one PEM block whose
     /// payload lines are concatenated (a 64-hex run token makes the payload wrap
     /// at 64 columns, and using only the first line produced a truncated
@@ -7669,8 +7723,21 @@ exit /b 0
             .find(|line| line.to_ascii_uppercase().starts_with("HTTP_PROXY="))
             .map(|line| line.trim().to_string())
             .unwrap_or_default();
+        // P2.4: the D-0.3 **discovery** contract, not just the proxy URL. The
+        // AppContainer path injects `SANDBOX_PROXY_PORT`
+        // (`src/sandbox/appcontainer.rs:1007`); until P2.4 the MXC launcher did
+        // not, so a workload written to D-0.3 (`GET
+        // http://127.0.0.1:$SANDBOX_PROXY_PORT/sandbox/intent`) could not find
+        // the endpoint at all under this backend. The value must be THIS
+        // listener's port: an inherited or stale number would point the
+        // workload at a socket the supervisor does not own.
+        let proxy_port_var = env_dump
+            .lines()
+            .find(|line| line.starts_with("SANDBOX_PROXY_PORT="))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default();
         println!(
-            "EVIDENCE child_env {no_proxy:?} {http_proxy:?} proof={:?}",
+            "EVIDENCE child_env {no_proxy:?} {http_proxy:?} {proxy_port_var:?} proof={:?}",
             outcome.proxy_proof
         );
         let no_proxy_value = no_proxy
@@ -7697,6 +7764,19 @@ exit /b 0
                 proxy.port()
             )),
             "the child's proxy variable must carry the session token: {http_proxy:?}"
+        );
+        // The D-0.3 contract: a workload discovers the control plane from this
+        // variable, so it must exist AND name this listener.
+        let port_var_value = proxy_port_var
+            .split_once('=')
+            .map(|(_, value)| value.trim())
+            .unwrap_or_default();
+        assert_eq!(
+            port_var_value,
+            proxy.port().to_string(),
+            "the child must carry SANDBOX_PROXY_PORT naming this listener's port \
+             (D-0.3 discovery); absent or a different port makes the D-4 endpoint \
+             undiscoverable by a workload that only knows that contract: {proxy_port_var:?}"
         );
 
         // ---- 2. the roundtrip, the one-shot and the negative cases ----------
@@ -8041,6 +8121,199 @@ exit /b 0
         println!(
             "EVIDENCE done: the container's declared reason reached the prompt, and the \
              consultation was counted"
+        );
+    }
+
+    // =====================================================================
+    // P2.4: guardrail 1's NEGATIVE leg — no proof means no successful session
+    // =====================================================================
+    //
+    // ADR-0004, verbatim: "`warnings: []` is NOT evidence; a session MUST NOT be
+    // reported as successful unless the supervisor can prove the child reached
+    // the proxy. Failure => fail the session, do not warn-and-continue."
+    //
+    // The `MustBeAbsent` direction is pinned live by P2.2 (a launch that was
+    // supposed to stay offline is refused when the proxy IS consulted). This leg
+    // is the other direction, and it is the one the guardrail exists for: a
+    // session that EXPECTS proof (`Required`, i.e. a network session) and gets
+    // none must be refused, with an error that names the missing proof. `exit 0`
+    // and an empty `warnings` list from the container are exactly the signals
+    // that must NOT be allowed to stand in for it.
+    //
+    // What only a live leg can add: `verify_proxy_proof` is unit-tested, but this
+    // shows the PRODUCT path runs it after a real container launch — the child
+    // really started, really exited 0, really wrote its marker, and the launch
+    // still produced no `SessionOutcome`.
+
+    /// The negative leg's workload: prove it RAN (a marker file in the granted
+    /// workspace), touch no network at all, exit 0.
+    ///
+    /// A refusal for a child that failed to start would prove nothing about the
+    /// gate, so the marker is the leg's positive control.
+    const P24_SILENT_BODY: &str =
+        "> p24-ran.txt echo MARK workload=completed-no-network\r\nexit /b 0\r\n";
+
+    /// Write one CRLF batch file into the container's workspace and return the
+    /// command line that runs it.
+    ///
+    /// The P2.2 helper's D-4 prelude is deliberately not reused: this workload
+    /// must do *nothing* except print its marker, so it cannot consults the proxy
+    /// by accident and turn a gate test into a networking test.
+    fn p24_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(format!("{name}.bat"));
+        // CRLF before it reaches cmd.exe, independently of the source file's own
+        // line endings (a batch file with bare LF loses its lines).
+        let script = body.replace("\r\n", "\n").replace('\n', "\r\n");
+        std::fs::write(&path, script.as_bytes())
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        format!("cmd /c \"{}\"", path.display())
+    }
+
+    #[test]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    fn a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful() {
+        let launcher = launcher_under_test();
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let scratch = Scratch::plain("p24-silent");
+        let dir = scratch.path().to_path_buf();
+        let backend = supervisor_backend(
+            counters.as_ref(),
+            Some(proxy.port()),
+            Some(proxy.token().value()),
+            &launcher,
+        )
+        .with_budget(SessionBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(80),
+            Duration::from_secs(10),
+        ));
+
+        println!(
+            "EVIDENCE elevated={} launcher={} proxy_port={} expectation=Required sid={}",
+            process_is_elevated(),
+            launcher.display(),
+            proxy.port(),
+            proxy.sid
+        );
+        // The window must be shut before the launch, or "the epoch closed" below
+        // could be somebody else's close.
+        assert_eq!(
+            counters.active_epoch(),
+            None,
+            "no launch epoch may be open before this one starts"
+        );
+
+        let command = p24_script(&dir, "p24-silent", P24_SILENT_BODY);
+        println!("EVIDENCE silent_command={command:?}");
+        let err = backend
+            .launch(
+                &live_input(proxy.port(), &dir, &launcher, command),
+                // A network session's leg (`ProofExpectation::for_network(Some(p))`).
+                ProofExpectation::Required,
+            )
+            .expect_err(
+                "a session that expects proof and gets none must be REFUSED, never reported \
+                 successful on `warnings: []` or on the child's exit code",
+            );
+        println!("EVIDENCE silent_guard={err}");
+
+        // ---- 1. the refusal, and what it names ------------------------------
+        assert!(
+            matches!(err, MxcError::Guard(GuardError::SessionNotAccepted)),
+            "the missing proof must be reported as SessionNotAccepted — not as a generic \
+             failure, and certainly not as a success: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "guardrail 1: no proxy session was accepted in this launch's epoch — the child \
+             never reached the proxy",
+            "the operator-facing refusal must name the proof that was missing"
+        );
+        assert!(
+            matches!(
+                std::error::Error::source(&err),
+                Some(source) if source.to_string() == err.to_string()
+            ),
+            "the typed error must be reachable through `source`, so a caller can match on it: \
+             {err:?}"
+        );
+        println!("EVIDENCE silent_display={:?}", err.to_string());
+
+        // ---- 2. the child really ran ---------------------------------------
+        let ran = std::fs::read_to_string(dir.join("p24-ran.txt")).unwrap_or_default();
+        println!("EVIDENCE silent_workload marker={ran:?}");
+        assert!(
+            ran.contains("MARK workload=completed-no-network"),
+            "the workload must have run to completion and written its marker, so the refusal is \
+             about the missing proof rather than about a child that never started: {ran:?}"
+        );
+
+        // ---- 3. the proof counters -----------------------------------------
+        // Read from the LISTENER's own counters — the real proof source, not a
+        // fake. `counters(1)` returning `Some` is the positive control: `proof()`
+        // answers zeros for an epoch it never saw, so "zero" on its own would also
+        // describe a launch that never opened a window at all.
+        let epoch1 = counters.counters(1).expect(
+            "this launch must have opened epoch 1 (a listener numbers its first epoch 1); an \
+             absent epoch reports the same zeros, so Some is the part that means anything",
+        );
+        println!(
+            "EVIDENCE silent_proof epoch=1 counters={epoch1:?} proof={:?} active={:?}",
+            counters.proof(1),
+            counters.active_epoch()
+        );
+        assert_eq!(
+            epoch1,
+            LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+            },
+            "nothing may have consulted the proxy: a counted consultation would mean the child \
+             reached it and the refusal came from somewhere else"
+        );
+        assert_eq!(
+            counters.proof(1),
+            ProxyProof::default(),
+            "the supervisor's own read of the epoch must be the zeros above"
+        );
+        assert_eq!(
+            counters.active_epoch(),
+            None,
+            "the refusal path must close the epoch too (no window left open on an error)"
+        );
+
+        // ---- 4. the audit chain --------------------------------------------
+        let path = crate::audit::audit_log_path(&proxy.sid);
+        let leaves = audit_leaves(&proxy.sid);
+        println!(
+            "EVIDENCE silent_audit path={} exists={} leaves={} connect_leaves={}",
+            path.display(),
+            path.exists(),
+            leaves.len(),
+            connect_leaves(&proxy.sid)
+        );
+        // No leaf may claim a decision: a CONNECT leaf with a host, an allow, or
+        // a refusal would each be a proxy event this launch never had. The file
+        // need not exist — the writer is non-strict and creates nothing until the
+        // first append — which is why the count, not the file, is asserted; that
+        // this very writer does append on a decision is pinned by the P2.2 legs.
+        assert_eq!(
+            connect_leaves(&proxy.sid),
+            0,
+            "the refused launch must leave no CONNECT-shaped leaf: {leaves:?}"
+        );
+        assert!(
+            leaves
+                .iter()
+                .all(|leaf| leaf["disposition"] != "allow" && leaf["host"] == "<unknown>"),
+            "no leaf may claim a decision about a host: {leaves:?}"
+        );
+
+        println!(
+            "EVIDENCE done: a launch that expected proof and never reached the proxy was refused \
+             with SessionNotAccepted, its workload had already exited 0, and nothing claimed a \
+             decision"
         );
     }
 }

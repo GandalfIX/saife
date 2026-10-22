@@ -53,6 +53,22 @@
   and S-92 (plan S-89) prompt_overload is a MANUAL scenario. Plan slots
   S-84..S-89 became S-87..S-92 because S-84..S-86 were already taken on this
   branch - see the numbering note above the S-72 section.
+  S-94 (P2.4) proves the session-start leaf does not lie about elevation: a real
+  session must SUCCEED (exit 0 + marker on stdout) AND its SESSION_START leaf's
+  `elevated` must equal the elevation this harness process's own token reports
+  (GetTokenInformation/TokenElevation - the call src/setup.rs::is_elevated makes,
+  which is what main.rs writes into the leaf). It is deliberately NOT asserted as
+  `elevated=false`: in the VM guest the harness is an admin (true==true), on an
+  unelevated host lane false==false, and a constant would fail in the guest while
+  passing for the wrong reason on the host.
+  S-93 has NO harness form yet, on purpose: it is guardrail 1's negative case
+  (ADR-0004), guardrail 1 exists only in the MXC backend, and the lane cannot
+  select that backend before P3.1, so a scenario today would exercise the
+  AppContainer backend. The number is reserved out of the run (it is not a
+  skipping scenario); the property is pinned meanwhile by the ignored live leg
+  `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful` in
+  src/net/mxc.rs, and its harness form lands with P3.1. Suite total: 93
+  scenarios in 1..=94 with 93 reserved.
 .PARAMETER SandboxExe
   Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
 .PARAMETER Cwd
@@ -313,6 +329,82 @@ function Invoke-ConnectProbe {
 }
 
 function Get-Python { $py = Get-Command python -ErrorAction SilentlyContinue; if (-not $py) { return $null }; return $py.Source }
+
+# The elevation the SUPERVISOR will record on its session-start leaf (P2.4).
+#
+# `src/setup.rs::is_elevated` — the one function `main.rs` feeds into
+# `SessionStartFacts::appcontainer_dacl` — asks
+# GetTokenInformation(.., TokenElevation, ..) about its OWN process token. A child
+# inherits its parent's token, so this asks the same question about this process
+# and gets the value the supervisor must write.
+#
+# Why not the two tempting substitutes:
+#   * `sandbox setup --check-only` reports the feature matrix (build, capability,
+#     drive-root grant, signing key) and NOT elevation, so it cannot answer this.
+#   * `[WindowsPrincipal]::IsInRole(Administrator)` reads GROUP MEMBERSHIP, a
+#     different signal (it is the filtered token's view, not TOKEN_ELEVATION).
+# The P/Invoke below is that exact call: TOKEN_QUERY (0x0008), TokenElevation
+# (20), TOKEN_ELEVATION (one DWORD). Add-Type compiles managed C#, so no native
+# command is involved.
+#
+# Returns $true / $false, or $null when the query itself failed (the reason is
+# left in $script:TokenElevationError so a scenario's Detail can name it).
+function Get-TokenElevation {
+    if ($script:TokenElevationQueried) { return $script:TokenElevation }
+    $script:TokenElevationQueried = $true
+    $source = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class SbxToken
+{
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(IntPtr token, int infoClass, out int info, int infoLength, out int returned);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static bool IsElevated()
+    {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out token))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken");
+        }
+        try
+        {
+            int elevated;
+            int returned;
+            if (!GetTokenInformation(token, 20, out elevated, 4, out returned))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation");
+            }
+            return elevated != 0;
+        }
+        finally
+        {
+            CloseHandle(token);
+        }
+    }
+}
+'@
+    try {
+        if (-not ('SbxToken' -as [type])) { Add-Type -TypeDefinition $source -ErrorAction Stop }
+        $script:TokenElevation = [bool][SbxToken]::IsElevated()
+        $script:TokenElevationError = $null
+    } catch {
+        $script:TokenElevation = $null
+        $script:TokenElevationError = $_.Exception.Message
+    }
+    return $script:TokenElevation
+}
 
 # Detached supervisor launch for the long-running-session scenarios
 # (S-11, S-55, S-74). Start-Process is avoided on purpose: its
@@ -3049,6 +3141,69 @@ function Invoke-Scenario-S92 {
         Detail='MANUAL APPROVAL required - 8 dialogs must be counted by eye (plan Task 3.8 Checkpoint 3 item 7). Recipe: ONE session with the prompt ENABLED (no --no-prompt) and --allow-domain api.anthropic.com; inside it run: curl --parallel --parallel-max 9 -s -m 40 -o NUL <nine https URLs, n1.example.com..n9.example.com> (repeat -o NUL once per URL). Expect exactly 8 dialogs and the 9th request denied; confirm with sandbox audit show <sid> --json -> one CONNECT leaf with source=prompt_overload, disposition=deny. The DENIED HOST IS WHICHEVER REQUEST LOSES THE RACE, not necessarily n9, so a different denied host is NOT a failure: the invariant is exactly 8 dialogs + exactly one prompt_overload leaf (source=prompt_overload)' }
 }
 
+# S-94 (P2.4): a real session SUCCEEDS, and its SESSION_START leaf reports the
+# elevation the supervisor actually had.
+#
+# Why equality and not `elevated=false`: the leaf's value is
+# `src/setup.rs::is_elevated()` on the supervisor's own token, so it is TRUE in
+# the VM guest (the harness there is an admin) and FALSE on an unelevated host
+# lane. Asserting a constant would fail in the guest and, worse, pass on the host
+# for the wrong reason (a leaf that always wrote `false` would satisfy it). The
+# harness reads its own token with the SAME call (Get-TokenElevation) — the
+# supervisor inherits that token — and asserts the two agree.
+#
+# `--print-sid` returns before the leaf is armed (main.rs prints the id and
+# returns), so the id comes from a run that writes nothing and the SESSION_START
+# leaf below belongs to the real run. No network is involved, so this scenario
+# carries no loopback-probe guard and must not skip.
+function Invoke-Scenario-S94 {
+    $name = 'S-94 (P2.4 session-start leaf elevation)'
+    $harnessElevation = Get-TokenElevation
+    if ($null -eq $harnessElevation) {
+        return @{ Num=94; Name=$name; Passed=$true; Skipped=$true
+            Detail = "TokenElevation query failed ($script:TokenElevationError) - the leaf's value cannot be compared with the supervisor's token, and asserting a constant instead would be a lie in one of the two lanes (guest admin vs unelevated host)" }
+    }
+    $d = New-ScenarioDir 94
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) {
+        return @{ Num=94; Name=$name; Passed=$false; Skipped=$false
+            Detail = "print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" }
+    }
+    $sid = ($psid.Stdout -join '').Trim()
+    if (-not $sid) {
+        return @{ Num=94; Name=$name; Passed=$false; Skipped=$false; Detail='print-sid produced no session id' }
+    }
+    $marker = 'S94-SESSION-WORKED'
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','echo',$marker) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    # (a) the session worked: exit 0 AND the marker on stdout (an exit code alone
+    # would also be 0 for a child whose output never arrived).
+    $worked = ($r.ExitCode -eq 0) -and ($out -match [regex]::Escape($marker))
+    # (b) the leaf tells the truth about elevation.
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    $leaf = $null
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'SESSION_START') { $leaf = $o; break }
+    }
+    $hasLeaf = ($null -ne $leaf)
+    # `$leaf.elevated` on a leaf that lacks the key is $null, and [bool]$null is
+    # $false - which would equal an unelevated harness for the wrong reason. The
+    # property must EXIST and be a JSON boolean.
+    $hasElevation = $hasLeaf -and (@($leaf.PSObject.Properties.Name) -contains 'elevated')
+    $leafElevation = if ($hasElevation) { $leaf.elevated } else { $null }
+    $isBoolean = $hasElevation -and ($leafElevation -is [bool])
+    $leafSidMatches = $hasLeaf -and ($leaf.sid -eq $sid)
+    $elevationMatches = $isBoolean -and ([bool]$leafElevation -eq [bool]$harnessElevation)
+    $passed = $worked -and $hasLeaf -and $leafSidMatches -and $elevationMatches
+    return @{ Num=94; Name=$name; Passed=$passed; Skipped=$false
+        Detail = if ($passed) {
+            "session exit 0 + marker '$marker'; SESSION_START leaf seq=$($leaf.seq) op=SESSION_START tier=$($leaf.tier) disposition=$($leaf.disposition) reports elevated=$leafElevation, equal to this harness process's TokenElevation (GetTokenInformation/TokenElevation, the same call src/setup.rs::is_elevated makes); sid=$sid"
+        } else {
+            "exit=$($r.ExitCode) marker=$worked sidOk=$leafSidMatches leaf=$hasLeaf elevationKey=$hasElevation isBool=$isBoolean leafElevated=$leafElevation harnessTokenElevation=$harnessElevation sessionStdout=$(Get-LineHead -Lines @($out) -Max 120) auditErr=$(Get-LineHead -Lines $s.Stderr -Max 120)"
+        } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -3082,7 +3237,22 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 92
+$script:MaxScenario = 94
+# S-93 is RESERVED, and deliberately not registered at all (P2.4).
+#
+# It is the harness form of guardrail 1's NEGATIVE case (ADR-0004: a session must
+# not be reported successful without proof the child reached the proxy). That
+# guardrail exists only in the MXC backend, and the VM lane cannot select it
+# before P3.1 (`main.rs` refuses `--backend mxc`), so a scenario today would run
+# the AppContainer backend and could only pass for the wrong reason. Registering
+# it as a permanently-skipping scenario would also make the suite's skip count
+# carry a slot that never executes, which is how a coverage hole gets counted as
+# coverage. So the number is reserved OUT of the run: `Select-ScenarioNumbers`
+# drops it, the total stays 93 real scenarios, and `-Only 93` matches nothing.
+# The property is pinned meanwhile by the ignored live leg
+# `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful` in
+# `src/net/mxc.rs`; S-93's harness form lands with P3.1.
+$script:ReservedScenarioNumbers = @(93)
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
     73 = { Invoke-Scenario-S73 }
@@ -3105,6 +3275,7 @@ $script:ScenarioFunctions = @{
     90 = { Invoke-Scenario-S90 }
     91 = { Invoke-Scenario-S91 }
     92 = { Invoke-Scenario-S92 }
+    94 = { Invoke-Scenario-S94 }
 }
 
 function Invoke-Scenario { param([int]$Number)
@@ -3121,6 +3292,11 @@ function Select-ScenarioNumbers {
     $nums = 1..$script:MaxScenario
     if ($Only -and $Only.Count -gt 0) { $nums = $nums | Where-Object { $Only -contains $_ } }
     if ($Skip -and $Skip.Count -gt 0) { $nums = $nums | Where-Object { $Skip -notcontains $_ } }
+    # Reserved numbers are excluded, not skipped: a slot that never executes must
+    # not appear in the summary's total (see $script:ReservedScenarioNumbers).
+    if ($script:ReservedScenarioNumbers -and $script:ReservedScenarioNumbers.Count -gt 0) {
+        $nums = $nums | Where-Object { $script:ReservedScenarioNumbers -notcontains $_ }
+    }
     return $nums
 }
 

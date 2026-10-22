@@ -22,24 +22,34 @@
 //! `src/net/mxc.rs::launcher_command`)
 //!
 //! ```text
-//! mxc-launch.exe [--env NAME=VALUE]... -- <real command line>
+//! mxc-launch.exe [--proxy-port <port>] [--env NAME=VALUE]... -- <real command line>
 //! ```
 //!
+//! * `--proxy-port <port>` is the loopback port the supervisor's proxy (and,
+//!   on the same listener, its D-4 intent endpoints) listens on for this
+//!   session. The wrapper writes it to the child as `SANDBOX_PROXY_PORT`, the
+//!   D-0.3 discovery variable (`src/sandbox/appcontainer.rs:1007` is the
+//!   AppContainer injector of the same name). Omitting the flag — a session
+//!   with no proxy — still writes the name, EMPTY, so a value inherited from
+//!   the container's profile environment cannot point the workload at a socket
+//!   nobody is listening on.
 //! * `--env NAME=VALUE` (repeatable) sets or overrides one variable in the
 //!   environment the workload starts with. Reserve it for names the SDK
 //!   scrubs — every other variable belongs in `ContainerRequest::environment`.
 //!   A later `--env` for the same name wins. The proxy-variable family
-//!   (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, any case) is
-//!   refused with [`EXIT_USAGE`]: see [`RESERVED_ENV_NAMES`].
+//!   (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`,
+//!   `SANDBOX_PROXY_PORT`, any case) is refused with [`EXIT_USAGE`]: see
+//!   [`RESERVED_ENV_NAMES`].
 //! * Everything after `--` is **one** argument: the workload's command line.
 //!   It is handed verbatim to `CreateProcessW`, so it means exactly what it
 //!   would have meant as the container command itself (same argument parsing,
 //!   same PATH search, no shell).
 //!
 //! The wrapper always sets `NO_PROXY` and `no_proxy` to
-//! [`LOOPBACK_NO_PROXY`] before starting the workload. This does not widen
-//! egress containment: every non-loopback destination still goes to the
-//! supervisor's proxy, and loopback reachability comes from the request's
+//! [`LOOPBACK_NO_PROXY`], and `SANDBOX_PROXY_PORT` to the port named by
+//! `--proxy-port` (empty when it names none), before starting the workload. This
+//! does not widen egress containment: every non-loopback destination still goes
+//! to the supervisor's proxy, and loopback reachability comes from the request's
 //! `network.ingress.hostLoopback = allow` (which proxy-only egress requires
 //! anyway), not from `NO_PROXY`.
 //!
@@ -92,14 +102,24 @@ pub const LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,::1";
 /// The wrapper exists (plan decision **D1**) precisely because *it* owns
 /// `NO_PROXY`: `--env NO_PROXY=evil` would overwrite the loopback value it
 /// installs moments later, so a proxy-honouring client would send the loopback
-/// intent request into the supervisor's proxy and lose the endpoint. The other
+/// intent request into the supervisor's proxy and lose the endpoint. The next
 /// three are the SDK's — `HTTP_PROXY`/`HTTPS_PROXY` point at the supervisor's
 /// proxy and `ALL_PROXY` is scrubbed for the same reason (plan invariant 5) — so
 /// a caller-set value would either bypass the proxy guardrail 1 proves or
-/// silently disable it.
+/// silently disable it. `SANDBOX_PROXY_PORT` is the wrapper's too (P2.4): it is
+/// the D-0.3 discovery variable, so a caller-set value would point a workload's
+/// intent POST at a port the supervisor does not own while everything else
+/// looked correct. The endpoint comes from `--proxy-port`, which only the
+/// supervisor's own `build_request` writes.
 ///
 /// Matching is ASCII case-insensitive because Windows environment names are.
-pub const RESERVED_ENV_NAMES: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"];
+pub const RESERVED_ENV_NAMES: [&str; 5] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SANDBOX_PROXY_PORT",
+];
 
 /// Whether `name` belongs to the proxy-variable family that `--env` may not set.
 pub fn is_reserved_env_name(name: &str) -> bool {
@@ -128,6 +148,9 @@ pub struct LaunchPlan {
     /// Variables to set in the wrapper's own environment before spawning, in
     /// command-line order (later entries win).
     pub env: Vec<(String, String)>,
+    /// The supervisor's proxy port for this session (`--proxy-port`), written to
+    /// the workload as `SANDBOX_PROXY_PORT`. `None` for a session with no proxy.
+    pub proxy_port: Option<u16>,
     /// The workload's command line, verbatim.
     pub command: String,
 }
@@ -158,6 +181,7 @@ fn unicode_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Vec<String>
 /// Parse the wrapper's arguments (i.e. `std::env::args().skip(1)`).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchPlan, String> {
     let mut env: Vec<(String, String)> = Vec::new();
+    let mut proxy_port: Option<u16> = None;
     let mut iter = args.into_iter();
     loop {
         match iter.next() {
@@ -176,7 +200,32 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchPlan,
                 if command.trim().is_empty() {
                     return Err("the workload command line after `--` is empty".to_string());
                 }
-                return Ok(LaunchPlan { env, command });
+                return Ok(LaunchPlan {
+                    env,
+                    proxy_port,
+                    command,
+                });
+            }
+            Some(flag) if flag == "--proxy-port" => {
+                // A second value would be a silent coin toss, and the two values
+                // name different listeners.
+                if proxy_port.is_some() {
+                    return Err("`--proxy-port` was given more than once".to_string());
+                }
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "`--proxy-port` requires a port number".to_string())?;
+                // Refuse anything that is not a dialable port. `--` here would
+                // otherwise be swallowed as the value and the workload's command
+                // line would silently become the next token; 0 names no listener.
+                let port = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| {
+                        format!("`--proxy-port {value}` is not a port number (1..=65535)")
+                    })?;
+                proxy_port = Some(port);
             }
             Some(flag) if flag == "--env" => {
                 let entry = iter
@@ -196,9 +245,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchPlan,
                 if is_reserved_env_name(name) {
                     return Err(format!(
                         "`--env {name}=...` is reserved: the wrapper and the container \
-                         backend own HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY, and an \
-                         override would defeat the loopback NO_PROXY that keeps the intent \
-                         endpoint reachable"
+                         backend own HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY/\
+                         SANDBOX_PROXY_PORT, and an override would defeat the loopback \
+                         NO_PROXY that keeps the intent endpoint reachable (the port comes \
+                         from `--proxy-port`)"
                     ));
                 }
                 env.push((name.to_string(), value.to_string()));
@@ -218,11 +268,29 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchPlan,
 /// The environment the wrapper adds on top of the container's own block:
 /// `NO_PROXY` in both spellings (Windows variable names are case-insensitive,
 /// so both names reach the same slot; a case-sensitive POSIX-emulation client
-/// inside the container reads the lowercase spelling literally).
-pub fn added_env() -> Vec<(String, String)> {
+/// inside the container reads the lowercase spelling literally) and
+/// `SANDBOX_PROXY_PORT`, the D-0.3 discovery variable for the D-4 intent
+/// endpoints (P2.4).
+///
+/// The port is passed in from the command line rather than parsed out of
+/// `HTTP_PROXY`: the supervisor knows which port it bound, and a launcher that
+/// re-derived it from the SDK's injected URL would break the moment that URL's
+/// shape changed — silently, and only for workloads that use the discovery
+/// contract.
+///
+/// `None` (no proxy for this session) still writes the name, empty. The
+/// AppContainer path's `None` arm does the same for all four of its proxy
+/// variables, and for the same reason: the child inherits the container's
+/// profile environment, so a stale value there would otherwise survive into a
+/// session that has no listener at all.
+pub fn added_env(proxy_port: Option<u16>) -> Vec<(String, String)> {
     vec![
         ("NO_PROXY".to_string(), LOOPBACK_NO_PROXY.to_string()),
         ("no_proxy".to_string(), LOOPBACK_NO_PROXY.to_string()),
+        (
+            "SANDBOX_PROXY_PORT".to_string(),
+            proxy_port.map(|port| port.to_string()).unwrap_or_default(),
+        ),
     ]
 }
 
@@ -241,7 +309,7 @@ fn main() {
         }
     };
 
-    let mut env = added_env();
+    let mut env = added_env(plan.proxy_port);
     env.extend(plan.env.iter().cloned());
     for (name, value) in &env {
         // SAFETY: single-threaded here — this runs before any worker thread is
@@ -450,6 +518,11 @@ mod tests {
             "https_proxy=http://evil:8080",
             "ALL_PROXY=socks5://evil:1080",
             "all_proxy=socks5://evil:1080",
+            // P2.4: the discovery variable is the wrapper's own fact. A caller
+            // value would name a port the supervisor does not own, so the
+            // workload would send its intent to somebody else's socket.
+            "SANDBOX_PROXY_PORT=1",
+            "sandbox_proxy_port=1",
         ] {
             let err = parse_args(args(&["--env", entry, "--", "run.exe"]))
                 .expect_err("a proxy variable must be refused");
@@ -501,15 +574,87 @@ mod tests {
 
     #[test]
     fn sets_both_no_proxy_spellings() {
-        let env = added_env();
+        let env = added_env(None);
         assert_eq!(
             env,
             vec![
                 ("NO_PROXY".to_string(), LOOPBACK_NO_PROXY.to_string()),
                 ("no_proxy".to_string(), LOOPBACK_NO_PROXY.to_string()),
+                // P2.4: present even when the session has no proxy, and empty —
+                // see `added_env`'s note on inherited values.
+                ("SANDBOX_PROXY_PORT".to_string(), String::new()),
             ]
         );
         assert_eq!(LOOPBACK_NO_PROXY, "localhost,127.0.0.1,::1");
+    }
+
+    /// P2.4: the D-0.3 **discovery** contract.
+    ///
+    /// A workload written to D-0.3 finds the D-4 control plane from
+    /// `SANDBOX_PROXY_PORT` and nowhere else; the AppContainer path has injected
+    /// it since Task 1.3 (`src/sandbox/appcontainer.rs:1007`), while this
+    /// launcher did not, so under MXC the endpoint existed and was
+    /// undiscoverable. The value is the supervisor's own bound port, so it must
+    /// come from the command line — never be derived here from `HTTP_PROXY`,
+    /// which would make the discovery contract depend on the SDK's URL shape.
+    #[test]
+    fn injects_the_sandbox_proxy_port_the_workload_discovers() {
+        let env = added_env(Some(49_152));
+        assert!(
+            env.contains(&("SANDBOX_PROXY_PORT".to_string(), "49152".to_string())),
+            "the workload must be able to discover the listener: {env:?}"
+        );
+        // Exactly three entries: the SDK owns HTTP_PROXY/HTTPS_PROXY (it strips
+        // and re-injects them from the request's proxy URL) and this wrapper
+        // must not invent a second, contradictory copy.
+        assert_eq!(env.len(), 3, "{env:?}");
+        assert!(env.contains(&("NO_PROXY".to_string(), LOOPBACK_NO_PROXY.to_string())));
+        assert!(env.contains(&("no_proxy".to_string(), LOOPBACK_NO_PROXY.to_string())));
+    }
+
+    /// The proxy-less arm, matching the AppContainer path's `None` branch: the
+    /// name is still written, EMPTY, so a value inherited from the container's
+    /// profile environment cannot point a workload at a port nobody listens on.
+    #[test]
+    fn clears_the_port_when_the_session_has_no_proxy() {
+        let env = added_env(None);
+        assert!(
+            env.contains(&("SANDBOX_PROXY_PORT".to_string(), String::new())),
+            "{env:?}"
+        );
+    }
+
+    #[test]
+    fn takes_the_proxy_port_from_its_own_flag() {
+        let plan = parse_args(args(&["--proxy-port", "49152", "--", "run.exe"])).expect("valid");
+        assert_eq!(plan.proxy_port, Some(49_152));
+        assert!(plan.env.is_empty(), "the flag is not an --env entry");
+
+        // Absent means no proxy: the workload gets an empty discovery variable.
+        let plan = parse_args(args(&["--env", "A=1", "--", "run.exe"])).expect("valid");
+        assert_eq!(plan.proxy_port, None);
+        assert_eq!(plan.env.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_malformed_or_duplicated_proxy_port() {
+        for argv in [
+            // A separator consumed as the value would silently drop the
+            // workload's command line.
+            vec!["--proxy-port", "--", "x.exe"],
+            vec!["--proxy-port", "0", "--", "x.exe"],
+            vec!["--proxy-port", "65536", "--", "x.exe"],
+            vec!["--proxy-port", "http", "--", "x.exe"],
+            vec!["--proxy-port", "", "--", "x.exe"],
+            // Two values: one of them would win silently.
+            vec!["--proxy-port", "1", "--proxy-port", "2", "--", "x.exe"],
+        ] {
+            let err = match parse_args(args(&argv)) {
+                Ok(plan) => panic!("a bad --proxy-port must be refused: {argv:?} -> {plan:?}"),
+                Err(err) => err,
+            };
+            assert!(err.contains("proxy-port"), "{argv:?}: got {err}");
+        }
     }
 
     #[test]
