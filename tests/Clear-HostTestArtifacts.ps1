@@ -136,7 +136,13 @@ if ($corrupt.Count -gt 0) {
 
 # --- 5. temp directories ---------------------------------------------------
 Write-Step 'test temp directories'
-$patterns = @('sandbox-test-*', 'sandbox-mxc-*', 'c4-*', 'sandbox-p1-*', 'p18-*')
+$patterns = @(
+    'sandbox-test-*', 'sandbox-mxc-*', 'sandbox-p1-*',
+    'sandbox-mxc-legs-*', 'c4-*', 'p15-*', 'p18-*',
+    # VM-lane staging (the smoke run left 862 MB here). Deliberately narrow:
+    # no bare `sbx-*`, which would also match unrelated user directories.
+    'sbx-repo-stage-*', 'sbx-repo-*.zip'
+)
 $removed = 0
 foreach ($pattern in $patterns) {
     foreach ($dir in @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter $pattern -ErrorAction SilentlyContinue)) {
@@ -150,6 +156,15 @@ foreach ($pattern in $patterns) {
     }
 }
 Write-Host "  removed $removed directory(ies)"
+
+# The staging archive is a FILE, not a directory - Get-ChildItem -Directory
+# never matches it, so it gets its own pass.
+$removedZips = 0
+foreach ($zip in @(Get-ChildItem -LiteralPath $env:TEMP -File -Filter 'sbx-repo-*.zip' -ErrorAction SilentlyContinue)) {
+    try { Remove-Item -LiteralPath $zip.FullName -Force -ErrorAction Stop; $removedZips++ }
+    catch { Add-Problem "could not remove $($zip.FullName)" }
+}
+if ($removedZips -gt 0) { Write-Host "  removed $removedZips staging archive(s)" }
 
 # --- 6. session + audit state ----------------------------------------------
 Write-Step 'session and audit state'
