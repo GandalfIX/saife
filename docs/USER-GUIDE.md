@@ -177,7 +177,13 @@ from a subdirectory it reads the parent's `.git` and `.opencode`, which the
 container denies: the failure is `Error: Unexpected server error. Check server
 logs for details.` (exit 1) with nothing in opencode's own log, because it dies
 in the client before its server starts. Running it at the root of the same
-repository works — measured both ways with the same binary and profile.
+repository works, and so does staying in the subdirectory if the repository root
+is granted read-only — measured all three ways with the same binary and profile:
+
+```powershell
+# from a subdirectory: let it see the repository root, read-only
+sandbox run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
+```
 
 Two grants make that work, and the shipped `profiles/opencode.json` carries
 both:
