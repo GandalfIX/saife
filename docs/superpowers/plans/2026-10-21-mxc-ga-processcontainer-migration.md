@@ -398,8 +398,43 @@ forward (`respond_deny` is shared) — recorded, not fixed.
   new `network.workloadTimeoutSecs` knob (default 1800 s, validated `1..=86400`) —
   a longer build must raise it, because the workload term is the tool's first-ever
   session bound. Evidence: PROGRESS row P2.1 and its Event Log entry.
-- [ ] **P2.2** D-4 endpoints under MXC (NO_PROXY verified end-to-end); S-77
-  parity.
+- [x] **P2.2** D-4 endpoints under MXC (NO_PROXY verified end-to-end); S-77
+  parity. **Proven by live legs, not by the VM suite** (coverage note below
+  P2.4). `d4_intent_roundtrip_from_inside_the_container_is_proven` runs one real
+  ProcessContainer, unelevated, against the supervisor's real listener:
+  `POST /sandbox/intent` 204 -> `GET ?host=` 200 with the declared reason and an
+  RFC3339 `ts` -> `POST /sandbox/intent/explain` 204 -> the next GET reports
+  `"hint":"explain-more"` -> the GET after that reports `"hint":"declared"`, so
+  the one-shot flag was consumed (the `hint` field is the only observable this
+  API has for it); a wrong credential is 407, an undeclared host 404 and a
+  malformed body 400. The child carries `NO_PROXY=localhost,127.0.0.1,::1` (each
+  of the three spellings asserted, not just the joined string) and derives both
+  the endpoint and its own `Basic` credential from the session's `HTTP_PROXY`, so
+  no argument is handed to it by the test. The listener's own counters stay
+  `{accepted: 0, tunnels: 0}` across all eight calls — `MustBeAbsent` is the gate
+  that would otherwise refuse the launch — and the chain holds exactly one leaf,
+  the wrong credential's `foreign_token` refusal at `host: "<unknown>"`, never a
+  decision about a host. `a_declared_intent_is_the_prompt_reason_from_inside_the_container`
+  closes D-4's actual point across the container boundary: the child declares the
+  intent and then CONNECTs the host, the dialog seam receives
+  `("p22-prompt.example", Some("reason-declared-from-inside-the-container"))`, and
+  guardrail 1 fails `ProxyConsultedUnexpectedly` — the proof the consultation
+  really reached `decide()`; `prompt_default` reading
+  `ctx.prompt.intent.lookup_host(host)` is pinned in-process by
+  `prompt_receives_declared_intent_reason`. **S-77 parity, item by item:** S-77
+  asserts POST 204, GET 200, the reason, the normalized host,
+  `hint: "declared"` and the child's exit 0, with the credential taken from
+  `SANDBOX_PROXY_PORT` + the `HTTPS_PROXY` userinfo and a direct dial enforced by
+  `UseProxy = $false`; the new leg reproduces every one of those except
+  `SANDBOX_PROXY_PORT`, which the MXC launcher does not inject (recorded gap: a
+  workload that only knows the D-0.3 contract cannot discover the endpoint under
+  MXC until P3), and it adds what S-77 does not check — the explain one-shot, the
+  404/400/407 negatives, the three NO_PROXY spellings, the counter proof and the
+  audit-chain check. What it cannot reproduce is what only the VM harness
+  supplies: the AppContainer baseline itself, the CLI/`Invoke-Sandbox` session
+  shape, S-77's loopback-probe precondition and its `--allow-domain/--no-prompt`
+  flags, and a second Windows image. Evidence: PROGRESS row P2.2 and its Event
+  Log entry (EVIDENCE lines from the run).
 - [x] **P2.3** The session-start leaf (`SESSION_START`) carries the tier facts
   under **ADR-0004's** names — `tier`, `tier_source`,
   `tier_needs_dacl_augmentation` (this plan said `needs_dacl_augmentation`; the
@@ -436,6 +471,17 @@ forward (`respond_deny` is shared) — recorded, not fixed.
 - [ ] **P2.4** Harness: add S-93 (silent-misconfig must fail the session, i.e.
   the guardrail's negative case) and S-94 (unelevated launch: assert the
   supervisor reports `elevated=false` and the session still works).
+
+  **COVERAGE NOTE (standing, P2.2 + P2.4):** until the wiring lands (P3), no VM
+  scenario exercises MXC — `main.rs` refuses `--backend mxc` (`MXC_SESSION_WIRED
+  = false`, and `cli::route_backend` refuses it before anything is spawned) and
+  the harness never passes `--backend` at all (`tests/run-tests.ps1`: zero
+  occurrences) — so P2.2 and the MXC half of P2.4 are proven by in-process live
+  legs only, unelevated, on this host; the VM suite remains an AppContainer
+  baseline. Consequently: no scenario result in `tests/run-tests.ps1` may be
+  cited as MXC coverage before P3.1, S-77 stays the AppContainer scenario it is,
+  and P2.4's S-93/S-94 (like any VM scenario) cannot be evidence about this
+  backend until the wiring and the `--backend mxc` selection exist.
 
 **Acceptance:** S-75/S-76/S-77/S-87…S-92 pass under MXC; audit chain verify OK;
 S-93/S-94 pass; no scenario depends on elevation.
