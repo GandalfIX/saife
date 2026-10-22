@@ -155,16 +155,27 @@ try {
     # -----------------------------------------------------------------------
     $stage = Join-Path $env:TEMP 'sbx-repo-stage'
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-    Write-Host "[vm-copy] staging repo (excluding target, .git, .sandbox, VM artifacts)..." -ForegroundColor Gray
-    robocopy $repoRoot $stage /E /XD `
-        (Join-Path $repoRoot 'target') `
-        'target' `
-        '.git' `
-        '.sandbox' `
-        (Join-Path $repoRoot 'tests\vm\vms') `
-        (Join-Path $repoRoot 'tests\vm\results') `
-        (Join-Path $repoRoot 'tests\vm\templates') `
-        /XF vm-settings.json | Out-Null
+    Write-Host "[vm-copy] staging repo (excluding every target dir, .git, .sandbox, VM artifacts)..." -ForegroundColor Gray
+    # Exclude nested build directories too: the spike crates keep their own
+    # `target` trees (2.5 GB), and a BARE /XD name is resolved relative to the
+    # DESTINATION by robocopy, so 'target' silently excluded nothing. Discover
+    # every `target` directory and pass absolute paths.
+    $excludedDirs = @(
+        (Join-Path $repoRoot 'target'),
+        (Join-Path $repoRoot '.git'),
+        (Join-Path $repoRoot '.sandbox'),
+        (Join-Path $repoRoot 'tests\vm\vms'),
+        (Join-Path $repoRoot 'tests\vm\results'),
+        (Join-Path $repoRoot 'tests\vm\templates')
+    )
+    $nestedTargets = @(Get-ChildItem -LiteralPath $repoRoot -Directory -Recurse -Filter 'target' -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName |
+            Where-Object { $excludedDirs -notcontains $_ })
+    $excludedDirs += $nestedTargets
+    if ($nestedTargets.Count -gt 0) {
+        Write-Host ("[vm-copy] excluding {0} nested target dir(s): {1}" -f $nestedTargets.Count, (($nestedTargets | ForEach-Object { $_.Substring($repoRoot.Length).TrimStart('\') }) -join ', ')) -ForegroundColor DarkGray
+    }
+    & robocopy $repoRoot $stage /E /XD @excludedDirs /XF vm-settings.json | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
     $stageCount = @(Get-ChildItem -LiteralPath $stage -Recurse -File).Count
     Write-Host "[vm-copy] staged $stageCount files under $stage" -ForegroundColor Green
