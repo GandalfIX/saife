@@ -4,7 +4,7 @@
 > (MIT, PowerShell). Sources: README, `docs/threat-model.md`, **and full code
 > review** of all 14 scripts (setup, launcher, checker, attack-surface test,
 > removal, bootstrap, wrappers, managed settings, surface canary) at commit
-> `359769b` (2026-09-15). Our side: `agent.md`, README, PRD, and
+> `359769b` (2026-09-15). Our side: `AGENTS.md`, README, PRD, and
 > `critical-review.md`.
 >
 > Code-level verification results are in
