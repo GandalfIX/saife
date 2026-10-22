@@ -24,6 +24,13 @@ runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
 See `docs/prd/prd-sandbox.md` for the full product requirements and
 `docs/critical-review.md` for a critical review of the chosen mechanism.
 
+## Where to start
+
+**`docs/DEVELOPERS.md`** is the architecture and workflow map: repository layout,
+how a run works on both backends, the audit model, test gates, recipes for adding
+a scenario/audit field/flag, and the invariants a change must keep. This file
+holds the rules; that one holds the map.
+
 ## Backends, privileges and the default
 
 Two containment backends, selected with `--backend`:

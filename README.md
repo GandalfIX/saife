@@ -274,6 +274,11 @@ rule in `docs/testing-principles.md`.
 
 ## Documentation
 
+- **`docs/DEVELOPERS.md` — start here to change the code**: repository map, how a
+  run works on both backends, the audit model, build/test gates, recipes and the
+  invariants a change must keep. `AGENTS.md` holds the house rules for agents.
+- `docs/adr/` — accepted decisions (0001 network hardening, 0002 MXC integration
+  surface, 0003 base-container enforcement, 0004 GA unelevated egress).
 - `docs/prd/prd-sandbox.md` — full product requirements.
 - `docs/specs/us-3-network-exfiltration-blocked/spec.md` — US-3 spec
   (including the loopback-exemption deferral finding).
@@ -281,7 +286,6 @@ rule in `docs/testing-principles.md`.
   — US-3 implementation plan.
 - `docs/critical-review.md` — critical review of the chosen mechanism.
 - `docs/future-ideas.md` — deferred roadmap (F-1..F-25; F-25 is superseded for egress by ADR-0004).
-- `agent.md` — high-level project overview.
 - `docs/testing-principles.md` — testing philosophy for the project.
 - `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` — VM-01:
   disposable-VM test harness (binding default for Tier 2/3 tests).
