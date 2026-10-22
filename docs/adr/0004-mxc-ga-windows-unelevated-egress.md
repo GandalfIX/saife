@@ -7,6 +7,14 @@
   not `>= 1 tunnel`. The superseded rule is quoted as history in §"Prototype
   evidence for the guardrails"; the normative consequences of the relaxation and
   what is still proven are stated there.
+  **Amended a second time 2026-10-22 (P3.2a):** the probe is **necessary but not
+  sufficient**. A session with a proxy PASSES only if the probe arrived **and**
+  nothing in the container was left reaching the proxy *without* the run
+  credential (`probes >= 1` and no unanswered unauthenticated attempt). Without
+  that second leg the probe amendment re-opened the silent-misconfiguration class
+  it was meant to catch: a GUI / system-proxy workload reaches the listener, never
+  authenticates, and the session passed with no egress. Refusal reason:
+  `workload_cannot_authenticate` (distinct from `proxy_probe_unmet`).
 - **Date:** 2026-10-21
 - **Supersedes:** nothing. Amends the premise of ADR-0002 §"platform" (MXC
   required an Insider build) and leaves ADR-0003's enforcement posture intact.
@@ -210,6 +218,60 @@ it is not always the file's `seq 0` (the listener is bound first, and a reused
   has none. A refused launch carries a distinct reason, `proxy_probe_unmet`
   (the audit leaf's `reason` field remains `proxy_proof_unmet`: it names the
   gate, not the leg).
+
+  **Amended a second time 2026-10-22 (P3.2a) — the evidence is TWO-PART.**
+  The paragraph above proved the child's path to the listener, not that the
+  *workload* used it. A GUI / system-proxy client (WinINet, Windows PowerShell
+  5.1 — measured in P1.5 and P1.8) is forced to the proxy by the container's
+  egress rules, never sends a `Proxy-Authorization`, and gets `407` for ever:
+  `probes=1, tunnels=0` PASSED such a session while the application silently had
+  no egress — the silent-misconfiguration class this guardrail exists for,
+  re-opened by the probe amendment itself.
+
+  The gate now requires, for a session **with** a proxy:
+
+  1. `probes >= 1` — unchanged: the wrapper's pre-flight probe reached THIS
+     listener in this launch's epoch; **and**
+  2. **no unanswered unauthenticated attempt** — the epoch's
+     `unauthenticated` counter (credential-less `no_token` **and**
+     `foreign_token` refusals, both refusal arms, counted per epoch on the
+     listener) must not be left standing while **nothing** in the epoch ever
+     authenticated (`unauthenticated == 0`, or `accepted >= 1`).
+     `probes >= 1` with only unauthenticated contact is REFUSED with
+     `workload_cannot_authenticate`.
+
+  NORMATIVE consequences of the second amendment:
+
+  1. **The counter is per EPOCH, not per listener.** It is a proof counter like
+   `probes`, zeroed with the epoch (a fresh `LaunchProofCounters` per
+   `begin_epoch`), and deliberately NOT the listener-lifetime
+   `no_token`/`foreign_token` leaf budgets: those must survive launches to bound
+   leaf volume, and reusing them would refuse launch N+1 on launch N's refusals.
+   The probe authenticates with the run token, so it can never trip this leg.
+  2. **A policy denial is NOT a misconfiguration.** A workload that authenticates
+   and is then denied (403), or whose tunnel dial fails (502), PASSES: it used
+   the proxy correctly. The same holds for the intent / control-plane calls.
+  3. **The `407`-then-retry handshake is NOT a misconfiguration.** .NET 8 and
+   pwsh 7 make one credential-less attempt per connection and authenticate only
+   after the `Proxy-Authenticate: Basic` challenge (P1.8), so the leg reads
+   `unauthenticated` **with** `accepted`: `unauthenticated > 0` plus an
+   authenticated consultation is the handshake working. The refusing shape is
+   "attempted and nothing ever authenticated".
+  4. **`--block-net` is unchanged.** A proxy-less session has no listener to
+   authenticate to; `MustBeAbsent` (`accepted == 0 && tunnels == 0`) still fails a
+   session that was supposed to stay offline and went out, and the new counter
+   cannot affect it.
+  5. The CLI proof line carries the new counter
+   (`guardrail 1 proof probes=… accepted=… tunnels=… unauthenticated=…`), so a
+   pass and a refusal are both auditable after the fact.
+
+  **What this leg does NOT prove — stated so it cannot be read as more:** (a) a
+  workload that never attempts anything is unproven either way; the gate detects
+  "tried and could not authenticate", never "chose not to use the network"; (b) a
+  **mixed** session (one client that authenticates plus a GUI stack that cannot)
+  is not caught, because one authenticated consultation satisfies the leg —
+  catching that needs a per-client signal (peer SID / WFP attestation) that this
+  pin does not provide.
 - **Guardrail 2 implemented.** The tier is taken from `v1::probe()` on the exact
   request being launched (not a lookalike, not the backend ceiling), recorded as
   `tier=base-container`, `tier_source=probe`, `tier_needs_dacl_augmentation=false`,

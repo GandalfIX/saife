@@ -560,6 +560,27 @@ baseline. Never read a green VM run as MXC coverage.
   stderr proof line, so no MXC scenario may assert empty stderr.
   **Elevation caveat stands:** every VM session runs with the guest's elevated token, so this is
   product-logic coverage, not unelevated coverage - that claim rests on host live legs.
+- [x] **P3.2a (2026-10-22) Two-part guardrail 1: refuse a session whose epoch saw only
+  unauthenticated proxy attempts.** The P3.1 probe amendment proves the child's *path* to the
+  listener, not that the workload *used* it: a GUI / system-proxy client (WinINet, Windows
+  PowerShell 5.1 — P1.5/P1.8) reaches the proxy, never sends a credential, and yielded
+  `probes=1, tunnels=0` — a PASS with no egress, i.e. the silent-misconfiguration class
+  guardrail 1 exists for, re-opened by the amendment. The listener now counts BOTH refusal arms
+  (`no_token` + `foreign_token`) in a new **per-epoch** proof counter `unauthenticated`
+  (`LaunchProofCounters::note_unauthenticated`; epoch-scoped like every proof counter, and
+  deliberately NOT the listener-lifetime leaf budgets). `ProofExpectation::Required` = `probes >= 1`
+  **AND** `!(unauthenticated > 0 && accepted == 0)`, refused with the new
+  `GuardError::WorkloadCannotAuthenticate` / reason token `workload_cannot_authenticate`
+  (distinct from `proxy_probe_unmet`). Authenticated-but-denied (403) and 502 sessions still PASS,
+  and so does the `407`-then-retry handshake every supported managed client uses (P1.8) — the leg
+  refuses "attempted and nothing ever authenticated", not "made a credential-less attempt".
+  `--block-net` (`MustBeAbsent`) unchanged. CLI proof line now prints `unauthenticated=…`.
+  **What stays outside the gate:** a workload that never attempts anything (unproven either way),
+  and a MIXED session whose working client masks a GUI stack that cannot authenticate — that needs
+  per-client attestation (peer SID / WFP), which this pin does not provide.
+  **This closes P3.2's open item** ("a network session whose workload makes no request fails
+  guardrail 1 by design") from both sides: a no-request workload passes, a cannot-authenticate one
+  is refused by name.
 - [ ] **P3.2** Flip the default to `mxc`; keep `--backend appcontainer` as an
   escape hatch for one release.
 - [ ] **P3.3** Docs: `AGENTS.md` (the "run tests elevated" rules become
