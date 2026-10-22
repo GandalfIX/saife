@@ -176,7 +176,10 @@ now runs absolute-form `http://` through the same D-1 pipeline as CONNECT
 - An origin `407`/`Proxy-Authenticate` is rewritten to **502** so an honest
   client never re-sends the proxy credential to an origin.
 - The audit leaf still says `op: CONNECT` for a forward; the taxonomy question is
-  P2.3's, recorded so a D-5 consumer is not silently wrong.
+  P2.3's, recorded so a D-5 consumer is not silently wrong. **P2.3 did not answer
+  it** (it extended `SESSION_START` only, and changing a forward's `op` would
+  break every `op=CONNECT` count in the harness), so it stays open with the
+  dispatch question it belongs to.
 
 This is a NEW egress surface whose only gate is D-1 — the same trust boundary as
 CONNECT, now also carrying cleartext HTTP.
@@ -226,7 +229,7 @@ this a green launch. P3's gate therefore needs an explicit managed-workload leg.
   `accepted >= 1 && tunnels >= 1`; failure ⇒ session error, never a warning.
 - [ ] **P0.4** Guardrail 2 in code: `v1::probe(Some(&request))` on the exact
   request → `tier`, `tier_source`, `needs_dacl_augmentation`; persist into the
-  session record (leaf wiring lands in P2.3).
+  session record (the audit-leaf wiring landed in P2.3).
 - [ ] **P0.5** CLI `--backend <appcontainer|mxc>` (default `appcontainer`);
   `--backend mxc` refuses `--concurrency > 1` with a clear message until the concurrency fan-out lands (P3): P1.4 gives every run its own listener, port and token, but the supervisor still runs one session per process, so the refusal must not claim attribution is unimplemented.
 
@@ -397,9 +400,39 @@ forward (`respond_deny` is shared) — recorded, not fixed.
   session bound. Evidence: PROGRESS row P2.1 and its Event Log entry.
 - [ ] **P2.2** D-4 endpoints under MXC (NO_PROXY verified end-to-end); S-77
   parity.
-- [ ] **P2.3** `session.start` audit leaf extended with `tier`, `tier_source`,
-  `needs_dacl_augmentation`, `elevated`, `proxy_endpoint`; `audit verify` still
-  validates the chain; a wrong tier is a refused session with no CONNECT leaves.
+- [x] **P2.3** The session-start leaf (`SESSION_START`) carries the tier facts
+  under **ADR-0004's** names — `tier`, `tier_source`,
+  `tier_needs_dacl_augmentation` (this plan said `needs_dacl_augmentation`; the
+  ADR is the accepted decision, so the ADR's spelling won and the plan is
+  corrected here), `elevated`, `proxy_endpoint`. **Ordering:** the leaf is armed
+  the moment the writer exists (carrying the facts already known: the backend's
+  tier identity and `elevated`) and written once the listener has bound — still
+  before the child, so nothing the child causes can precede it — and an RAII guard
+  writes the armed facts with a `null` endpoint if the run unwinds first. So
+  `verify` keeps a root under `--block-net` and on an early error.
+  **Scope (P2.3 review): one root per RUN, guaranteed against the child — not
+  "always the genesis leaf".** The listener is bound before the root is written
+  (`src/main.rs:717` vs `:748`), so a local connection in that window is audited
+  first and the root lands at `seq > 0`; and a reused `--sid` continues the
+  existing chain, so a second run appends a second root at `seq > 0`. A hard kill
+  lands no root, and a non-strict writer swallows a failed root write
+  (`--audit-strict` is the fail-closed mode). `tier_source` gains a third value,
+  **`structural`**, for a backend that *is* the tier by construction: the AppContainer path records
+  `appcontainer-dacl` / `structural` / `tier_needs_dacl_augmentation: true`, where
+  `probe`/`unavailable` would claim a dispatch decision nobody made (documented in
+  d-5.1). `proxy_endpoint` is `127.0.0.1:<port>` and nothing else: a
+  `LoopbackEndpoint` newtype over a private `u16` whose only constructor takes a
+  port, inside a `SessionStartFacts` with private fields and no `Default` — so the
+  child's `http://sandbox:<token>@…` credential cannot be written into the field at
+  all (P2.3 review: the previous all-public struct allowed exactly that literal).
+  **A wrong tier is a refused session:** guardrail 2 is now hard
+  (`TierExpectation` + `verify_tier` → `MxcError::Tier`), the expectation is a
+  **required constructor argument** (no default, no setter — P2.3 review's security
+  HIGH), and the check runs before the launch epoch opens, so the refused session
+  has no CONNECT leaf — its chain is the root (naming the tier actually dispatched
+  **and already marked `disposition: deny`**) plus one `SESSION_REFUSED` leaf.
+  `audit verify` still validates the whole chain, and the five new keys (plus
+  `expected_tier`) are filterable, including `=null` for a fact nobody established.
 - [ ] **P2.4** Harness: add S-93 (silent-misconfig must fail the session, i.e.
   the guardrail's negative case) and S-94 (unelevated launch: assert the
   supervisor reports `elevated=false` and the session still works).

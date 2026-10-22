@@ -120,6 +120,20 @@ not per-request — the D-5 taxonomy already carries `source`), together with th
 request's containment posture. A degraded tier must be visible after the fact
 even though it cannot be prevented before execution.
 
+**Amended 2026-10-22 (P2.3):** `tier_source` carries **three** values — `probe`
+and `unavailable` describe the MXC probe, `structural` says the backend *is* the
+tier by construction (AppContainer: `appcontainer-dacl` + `structural` +
+`tier_needs_dacl_augmentation: true`); `null` means *absence*, not a fourth case,
+and consumers compare `tier`. The hard half is `TierExpectation` +
+`verify_tier` (`MxcError::Tier`), checked **before** the launch epoch, so "a wrong
+tier is a refused session with no CONNECT leaves" is structural; the requirement
+is a **required constructor argument** of the backend (P2.3 review), so no session
+path can be built without stating it, and a refused session's root leaf carries
+`disposition: deny`. The leaf is one root **per run**, written before the child:
+it is not always the file's `seq 0` (the listener is bound first, and a reused
+`--sid` continues the chain). Vocabulary:
+`tasks/adr-0001/d-5.1-connect-source-field.md`.
+
 ### Prototype evidence for the guardrails (2026-10-21, same host, unelevated)
 
 - **Real HTTPS through a forwarding proxy: PASS.** Inside an unelevated
