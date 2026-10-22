@@ -274,6 +274,9 @@ rule in `docs/testing-principles.md`.
 
 ## Documentation
 
+- **`docs/USER-GUIDE.md` — start here to USE it**: running commands and toolchains,
+  filesystem grants, network allow/deny and the prompt, profiles, reading the proof
+  line and the audit log, plus a troubleshooting table. Every example was executed.
 - **`docs/DEVELOPERS.md` — start here to change the code**: repository map, how a
   run works on both backends, the audit model, build/test gates, recipes and the
   invariants a change must keep. `AGENTS.md` holds the house rules for agents.

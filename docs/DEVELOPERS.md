@@ -5,7 +5,8 @@ true. It is the map for someone changing the code; the user-facing description
 lives in `README.md`, the rules an agent must follow in `AGENTS.md`, and the
 decisions in `docs/adr/`.
 
-Read this first, then `docs/adr/0004-mxc-ga-windows-unelevated-egress.md` (the
+Task-oriented usage (running commands, grants, network, profiles, audit) is in
+`docs/USER-GUIDE.md`. Read this first, then `docs/adr/0004-mxc-ga-windows-unelevated-egress.md` (the
 backend you will work on by default) and the current plan under
 `docs/superpowers/plans/`.
 
