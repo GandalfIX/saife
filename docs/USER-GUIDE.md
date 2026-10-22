@@ -138,10 +138,67 @@ sandbox run --allow-cwd --read-only C:\data -- powershell -NoProfile -Command "S
 # UnauthorizedAccessException: Access to the path 'C:\data\new.txt' is denied.
 ```
 
-> On the default `mxc` backend a **writable** grant outside the workspace is
-> refused outright (`cannot honour a writable grant outside the workspace ...`),
-> because that backend's policy is additive over the workspace only. Use
-> `:read`, or `--backend appcontainer`, if you need a second writable root.
+A **writable** grant outside the workspace is honoured on both backends
+(P3.4). That is what makes a tool which keeps state in your profile usable —
+opencode, for instance, writes `~/.local/share/opencode`, `~/.cache/opencode`,
+`~/.config/opencode` and `~/.local/state/opencode`:
+
+```powershell
+sandbox run --profile opencode --allow $HOME\.local\share\opencode `
+            --allow $HOME\.cache\opencode --allow $HOME\.config\opencode `
+            --allow $HOME\.local\state\opencode -- opencode
+```
+
+The grants are a closed set — the workspace plus what you name — and they do
+**not** weaken the two protections on top of them:
+
+* the profile's credential directories (`~/.ssh`, `~/.aws`, `~/.azure`,
+  `~/.gnupg`) stay denied even when their parent is granted writable, so a
+  workload cannot read your keys through a generous grant; and
+* a `deny` that **covers** a grant (the same path, or a parent of it) refuses
+  the session with `denied path ... contains the granted path ...` rather than
+  being dropped silently. Narrow the deny to a subdirectory, or move the grant,
+  and the session starts.
+
+### 3.1 Interactive tools (TUIs)
+
+A session whose **stdin and stdout are both terminals** hands the workload this
+console, so an interactive tool renders and reads keys exactly as it would
+outside the sandbox:
+
+```powershell
+sandbox run --profile opencode -- opencode
+```
+
+Two consequences worth knowing:
+
+* The child's output goes straight to your terminal, so the supervisor has no
+  copy of it: a refused session still shows you what your command printed, but
+  there is no captured `stdout` to inspect afterwards.
+* `--no-interactive` forces the captured mode. Use it in scripts, schedulers and
+  CI, where stdin/stdout are redirected anyway — the flag exists so a pipeline
+  that reads the session's output never has it disappear onto a console.
+
+When either stream is redirected, the captured mode is chosen automatically and
+nothing changes for existing callers.
+
+> **Known limitation (mxc-sdk 1.0.1): a stat of an ANCESTOR of a granted path is
+> refused.** A tool that probes its way up the tree — opencode `lstat`s
+> `C:\Users\<you>` at startup — fails there, because the container's policy
+> grants the granted directories and nothing else. Writing *inside* a grant works
+> (path resolution through the ancestors is implicit); reading their attributes
+> is not.
+>
+> There is no clean fix to configure: the SDK's policy has four path classes
+> (read-write, read-only, deny, enumerate-without-read) and none means "traverse
+> and read attributes, without listing or reading". `--allow $HOME:read` is the
+> closest, and it is **partial** — measured, it makes the home directory's
+> entries statable and the directory listable, but the directory's own `lstat`
+> is still refused, so a tool that insists on that exact call still fails. It
+> also makes the rest of your profile readable (the credential directories stay
+> denied: `~/.ssh` names become visible, their contents do not). Granting
+> ancestors automatically is therefore not done — it would be a silent
+> over-grant — and this is recorded as an SDK-level blocker in ADR-0004.
 
 ---
 
@@ -310,7 +367,7 @@ sandbox learned clear
 | Symptom | Cause | Fix |
 |---|---|---|
 | `failed to start '<tool>': ... file not found` | the tool's directory is not granted, so the path is invisible | `--read-only <dir>` and/or an absolute path |
-| `cannot honour a writable grant outside the workspace` | `mxc` policy is workspace-only | use `<path>:read`, or `--backend appcontainer` |
+| `denied path ... contains the granted path` | a `deny` in the profile covers a writable grant | deny a subdirectory instead of the whole tree, or move the grant |
 | `workload_cannot_authenticate` | the workload's client stack cannot use a proxy (WinINet, PS 5.1) | `--backend appcontainer` |
 | `proxy_probe_unmet` | the child never reached the proxy (loopback blocked, dead listener, wrong credential) | check the run is unelevated/loopback is reachable; report with the leaf |
 | The run seems to hang on an unlisted host | a prompt is waiting in a context with no dialog | `--no-prompt`, or set `onUnavailable` |

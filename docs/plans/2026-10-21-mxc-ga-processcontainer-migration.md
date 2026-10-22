@@ -620,6 +620,30 @@ explained, and a capability table that states what that build cannot do.
   `--features mxc-backend` build, AppContainer with a one-line notice otherwise - a hard
   constant would make every `run` on a feature-less build refuse. The escape hatch is now
   also the remedy named by guardrail 1's `workload_cannot_authenticate` refusal.
+- [x] **P3.4** Interactive tools under the default backend. Two changes, both
+  already expressible in `mxc-sdk 1.0.1`:
+  (a) **Console passthrough.** The launch requests `StdioMode::Inherit` when the
+  supervisor's stdin and stdout are both terminals, and `Pipes` otherwise (and
+  always under `--no-interactive`). The mode is a LAUNCH decision, not a request
+  field — the normalized request has no stdio field — so the launch goes through
+  `process_container_common::dispatcher::spawn_with_fallback`, the same
+  three-tier dispatcher `v1::spawn` reaches; `run_timed` skips the capture
+  readers when there is nothing to tee and keeps the deadline, kill and
+  exit-code semantics. The decision is `cli::inherit_console` (pure,
+  table-tested); no caller changes behaviour, because the default is capture.
+  (b) **Operator writable grants.** `filesystem_policy` grants read-write the
+  workspace **plus** every explicit grant (profile `filesystem.allow` and each
+  `--allow <path>` that is not `:read`), and P3.0 decision 9's refusal — and its
+  message — are deleted. `PROFILE_SECRET_DIRS` stay denied on every launch, and
+  a deny that **covers** a grant still refuses the session, now naming the grant
+  to narrow.
+  **Deliberately NOT done, recorded as a blocker:** an ancestor of a grant cannot
+  be statted (opencode `lstat`s `C:\Users\<user>` at startup). The SDK's policy
+  has four path classes and none means "traverse + read attributes without list
+  or content", so there is no minimal fix to wire; four measured arms are in
+  ADR-0004's 2026-10-22 amendment. Operator remedy: `--allow <home>:read`, whose
+  cost (and whose safety: `~/.ssh` contents stay denied) is documented in
+  `docs/USER-GUIDE.md`.
 - [x] **P3.3** Docs: README (requirements, backends/privileges, the two obsolete blocks replaced),
   `AGENTS.md` (backends + test lanes), `sandbox-next-step.md`; the broker design is superseded -
   `docs/notes/future-ideas.md` had two sections numbered F-21, and the elevation-free one is now **F-25**

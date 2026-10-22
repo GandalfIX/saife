@@ -38,7 +38,7 @@ The tool is bin-only: there is no library target, so every test run is
 | `src/cli.rs` | clap surface, `resolve_backend` / `route_backend` / `default_backend`, refusal constants |
 | `src/net/mod.rs` | network config resolution, `session_budget()`, `ProxyEnv` |
 | `src/net/proxy.rs` | the listener: CONNECT, absolute-form forward, control-plane endpoints, decisions, counters, refusal budgets |
-| `src/net/mxc.rs` | the only module that talks to `mxc-sdk`: request building, launch, tier gate, proof gate, session clock |
+| `src/net/mxc.rs` | the only module that talks to `mxc-sdk`: request building (the SDK's `1.0.0` one-shot contract), launch (including the stdio mode), tier gate, proof gate, session clock |
 | `src/net/prompt.rs` | interactive dialog, coordinator, slots, headless fast-fail |
 | `src/net/token.rs` | `RunToken` (one per run, constant-time compare, redacted Debug) |
 | `src/net/matcher.rs` | hard-deny sets, allow/deny matching (pure) |
@@ -71,6 +71,18 @@ The tool is bin-only: there is no library target, so every test run is
 1. Bind the proxy listener on `127.0.0.1:0`; mint one `RunToken`.
 2. Build the session request (`request_for_session`) and **probe the tier** of
    that exact request (`probe_tier`).
+
+   The request is the SDK's **normalized model** (`mxc_common::models::
+   ExecutionRequest`), not a `ContainerRequest`, because the stdio mode lives
+   only on the normalized spawn path: `build_request` assembles the published
+   `1.0.0` one-shot contract (`mxc_contract::published::v1_0_0::OneShotRequest`)
+   and runs it through the SDK's own adapter
+   (`config_parser::load_one_shot_request_from_contract`), so the parse-derived
+   facts a backend reads (`ui_specified`, `network_specified`,
+   `runtime_network_proxy_specified`) are set by the SDK rather than by us. The
+   probe is `mxc_engine::probe_execution_request` on that same value — the
+   function `v1::probe` calls after normalizing — so the tier still describes
+   the request that launches.
 3. Apply guardrail 2: `TierExpectation::Exactly("base-container")`. A degraded
    or unnamed tier → root(`deny`) + `SESSION_REFUSED(tier_mismatch)`, no child.
 4. **Write the session-start root now** — before the child can run — with
@@ -79,12 +91,41 @@ The tool is bin-only: there is no library target, so every test run is
    A supervisor kill after this point leaves a readable chain that `verify`
    reports as `INCOMPLETE`.
 5. Launch through `launch_session` (wrapper runs its probe, then the payload).
+   The launch dispatches with `process_container_common::dispatcher::
+   spawn_with_fallback` — the same three-tier dispatcher `v1::spawn` reaches
+   (T1 BaseContainer, T2 AppContainer+BFS, T3 AppContainer+DACL) — because it is
+   the only public seam that takes a `StdioMode`. `cli::inherit_console` chooses
+   it: `Inherit` when the supervisor's stdin and stdout are both terminals and
+   `--no-interactive` was not passed, `Pipes` otherwise. With `Inherit` there are
+   no streams to tee, so `run_timed` skips the capture readers; the deadline
+   poll, `kill_for_timeout`, warnings and exit-code mapping are identical.
 6. Guardrail 1 on the epoch: `probes >= 1` **and not**
    (`unauthenticated > 0 && accepted == 0`). Otherwise refuse
    (exit 126, `proxy_probe_unmet` / `workload_cannot_authenticate`).
 7. Mirror the child's exit code; report `124` for a deadline kill with the
    `TimeoutReason` (`workload_budget_exceeded`, `prompt_budget_exhausted`,
    `session_handshake_timeout`, `session_teardown_timeout`).
+
+**Filesystem posture (P3.4).** `filesystem_policy` grants read-write the
+workspace **plus every explicit operator grant** — the profile's
+`filesystem.allow` and each `--allow <path>` whose mode is not `:read` — and
+read-only the declared read-only grants plus the launcher's directory.
+`PROFILE_SECRET_DIRS` (`.ssh`, `.aws`, `.azure`, `.gnupg`) are denies on every
+launch, configured denies are added, and a deny that **covers** any grant is
+`RequestError::DenyCoversGrant` (refused, never dropped). There is no longer a
+"writable grant outside the workspace" refusal: that path and its message are
+deleted.
+
+**Recorded blocker.** An *ancestor* of a grant cannot be statted inside the
+container (opencode `lstat`s `C:\Users\<user>` at startup and fails). PSEC —
+and the contract above it — express only `readwritePaths`, `readonlyPaths`,
+`deniedPaths` and `enumeratePaths` (`base_container_helpers.rs:59-63`); none
+means "traverse + read attributes without list or content", so there is no
+minimal fix to wire; the closest, a read-only grant of the ancestor, is
+measured to be PARTIAL (children statable, the root's own `lstat` still
+refused) as well as an over-grant. The measured matrix (four arms) is in
+ADR-0004's 2026-10-22 P3.4 amendment and in the live leg
+`an_ancestor_of_a_writable_grant_cannot_be_statted_but_a_readonly_ancestor_works`.
 
 ### 3.3 AppContainer path
 

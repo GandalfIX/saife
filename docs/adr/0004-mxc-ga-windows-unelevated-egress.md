@@ -369,3 +369,77 @@ that provably comes from this run's container (peer SID / WFP attribution)
 instead of a bearer token - would remove the round trip AND the benign
 `no_token` leaf each managed connection currently emits, but it trades away
 P1.4's per-run token, so it needs its own decision.
+
+## Posture amendment 2026-10-22 (P3.4): operator grants, and the console
+
+Two changes, both of which widen what a session can DO and neither of which
+widens who may do it. They replace P1.3's "the workspace is the only writable
+grant" and P3.0 decision 9's refusal, which together made every tool that keeps
+state in the user profile unrunnable under this backend.
+
+**1. The posture is now "workspace + explicit operator grants".** Writable
+grants named by the resolved profile's `filesystem.allow` and by
+`--allow <path>` (whose default mode is `readwrite`) are added to
+`readwritePaths` instead of being refused by name. The refusal path and its
+message are deleted, not bypassed: there is no code path left that refuses a
+second writable root, and the CLI's `--allow` documentation says so.
+
+The protections that make that bounded are NORMATIVE and each has a test:
+
+- `PROFILE_SECRET_DIRS` (`.ssh`, `.aws`, `.azure`, `.gnupg`) are denies on
+  **every** launch. A grant of their parent does not remove them: they are
+  descendants of the grant, which is the expressible case, and a live leg
+  proves that a write into `~/.ssh` is still refused with the profile granted
+  writable (`a_secret_directory_inside_a_writable_grant_is_still_denied`).
+- A configure `deny` that **covers** a grant (the same path, or an ancestor of
+  it) still REFUSES the session (`RequestError::DenyCoversGrant`) instead of
+  being dropped, and now names the grant to narrow as well
+  (`a_deny_that_covers_a_writable_grant_refuses_the_session`). Denies win; no
+  silent narrowing.
+- The grant set is closed and reviewable: the workspace, what the operator
+  wrote, and the launcher's directory. Nothing derives a grant from a
+  convention or from the environment.
+
+Measured, unelevated, on this host:
+`a_writable_grant_outside_the_workspace_is_honoured_on_a_real_launch` grants an
+extra root beside the workspace, writes inside it (`GRANT-OK` on disk) and
+proves that an ungranted sibling stays unwritable, so the leg cannot pass on a
+policy that does nothing.
+
+**2. An interactive session inherits the console.** When the supervisor's stdin
+and stdout are both terminals, the launch requests `StdioMode::Inherit`, so the
+child sees a TTY exactly when we do and a TUI (opencode's) can run; otherwise —
+and always under `--no-interactive` — it requests `StdioMode::Pipes` and
+captures, which is what every pre-P3.4 session did. The launch adapts: inherited
+stdio has no streams to tee, so the wait path runs without the capture threads
+(deadline, kill-for-timeout and the exit code are unchanged), and the gate,
+audit leaves and exit-code semantics are identical either way. The selection is
+a pure, table-tested function (`cli::inherit_console`) and the default is the
+captured mode, so no existing caller changes behaviour.
+
+**3. Recorded blocker: an ANCESTOR of a grant cannot be statted.** opencode
+`lstat`s `C:\Users\<user>` at startup; inside the container that call is
+refused, because the SDK's policy grants the granted subtree and nothing else.
+Four measured arms (`an_ancestor_of_a_writable_grant_cannot_be_statted_but_a_readonly_ancestor_works`):
+with only the deep grant, `if exist` on the home root and on an intermediate
+directory is refused while a write *inside* the grant succeeds (traversal is
+implicit); granting the home root `readonly` makes its CHILDREN statable and the
+root listable but **not** the root's own stat; the same holds with the
+credential denies removed from the policy, and with no deeper grant beneath it
+(the launcher's own directory is still there). `C:\Windows`, granted read-only
+with nothing under it, IS statable in the same session, so `if exist` on a
+directory is not the defect.
+
+The SDK (and PSEC under it) expresses exactly four path classes —
+`readwritePaths`, `readonlyPaths`, `deniedPaths`, `enumeratePaths`
+(`base_container_helpers.rs:59-63`) — and **none of them means "traverse and
+read attributes without list or content"**. So there is no minimal fix to wire:
+the narrowest expressible widening is a read-only grant, which is a real
+over-grant (the whole ancestor becomes listable and readable) and, per the
+measurements above, does not even rescue the home root's own stat in the shape
+this backend runs in. The supervisor therefore does not grant ancestors
+automatically; the operator's remedy is `--allow <home>:read`, documented with
+its cost in `docs/USER-GUIDE.md` (and with the measured fact that `~/.ssh`
+CONTENTS stay denied even then). Closing this needs an upstream change — an
+attribute-only traversal grant, or a policy that implies traversal for ancestors
+the way the OS does.
