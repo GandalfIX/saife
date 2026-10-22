@@ -550,8 +550,14 @@ baseline. Never read a green VM run as MXC coverage.
   tier. Writable-grant-outside-workspace, missing launcher and deny-covers-grant are refused by name.
   **Open for P3.2:** a network-enabled session whose workload makes no request fails guardrail 1 by design.
 
-- [ ] **P3.1** Full 92-scenario suite against `--backend mxc` in the VM on **both
-  images**, unelevated.
+- [ ] **P3.1** Full suite (93 scenarios) against `--backend mxc` in the VM on **both
+  images**. The harness can select the backend (`-Backend mxc`); 18 AppContainer-only scenarios
+  SKIP with a named reason. **Blocker (2026-10-22): the standard-user lane is parked** - no
+  non-interactive second-account launch works from a PS-Direct session (CreateProcessWithLogonW ->
+  87, Task Scheduler -> 206, both against a re-baked image with a real profile); see the P3.1
+  blocker entry in PROGRESS.md for the evidence and the two untried mechanisms. Until it lands,
+  every VM session runs with an elevated guest token, so the VM proves product logic, NOT elevation;
+  the unelevated claim is carried by host live legs.
 - [ ] **P3.2** Flip the default to `mxc`; keep `--backend appcontainer` as an
   escape hatch for one release.
 - [ ] **P3.3** Docs: `AGENTS.md` (the "run tests elevated" rules become
