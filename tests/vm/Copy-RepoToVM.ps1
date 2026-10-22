@@ -158,8 +158,9 @@ try {
     Write-Host "[vm-copy] staging repo (excluding target, .git, .sandbox, VM artifacts)..." -ForegroundColor Gray
     robocopy $repoRoot $stage /E /XD `
         (Join-Path $repoRoot 'target') `
-        (Join-Path $repoRoot '.git') `
-        (Join-Path $repoRoot '.sandbox') `
+        'target' `
+        '.git' `
+        '.sandbox' `
         (Join-Path $repoRoot 'tests\vm\vms') `
         (Join-Path $repoRoot 'tests\vm\results') `
         (Join-Path $repoRoot 'tests\vm\templates') `
