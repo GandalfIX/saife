@@ -581,8 +581,11 @@ baseline. Never read a green VM run as MXC coverage.
   **This closes P3.2's open item** ("a network session whose workload makes no request fails
   guardrail 1 by design") from both sides: a no-request workload passes, a cannot-authenticate one
   is refused by name.
-- [ ] **P3.2** Flip the default to `mxc`; keep `--backend appcontainer` as an
-  escape hatch for one release.
+- [x] **P3.2** Flip the default to `mxc`; keep `--backend appcontainer` as an escape hatch.
+  Implemented as a FEATURE-CONDITIONAL default (`cli::default_backend`): `mxc` in a
+  `--features mxc-backend` build, AppContainer with a one-line notice otherwise - a hard
+  constant would make every `run` on a feature-less build refuse. The escape hatch is now
+  also the remedy named by guardrail 1's `workload_cannot_authenticate` refusal.
 - [ ] **P3.3** Docs: `AGENTS.md` (the "run tests elevated" rules become
   MXC-specific), README, `sandbox-next-step.md`, supersede F-21 (the broker
   design is no longer needed).
