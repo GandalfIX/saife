@@ -337,9 +337,36 @@ worth checking with `sandbox audit show <sid> --filter 'op=SESSION_START'`.
 
 ```powershell
 sandbox profile list
-sandbox profile show demo      # resolved contents, including inherited fields
+sandbox profile show demo                # the file as written
+sandbox profile show demo --expanded     # extends flattened, variables expanded
 sandbox run --profile demo --allow-cwd -- cmd /c C:\Users\you\.cargo\bin\cargo.exe --version
 ```
+
+### 5.0 Composing profiles
+
+`--profile` takes exactly **one** name (or a file path). Composition is done with
+`extends`, not with repeated flags:
+
+```json
+{
+  "meta": { "name": "node-jvm", "version": "1.0.0", "schema_version": 1 },
+  "extends": "node",
+  "filesystem": { "allow": ["$USERPROFILE/.gradle"] },
+  "network": { "allow_domain": ["repo.maven.apache.org"] }
+}
+```
+
+A child inherits its parent's entries, arrays are concatenated (deduplicated) and
+scalars are overridden by the child; chains are resolved recursively, and a cycle
+is refused. `extends` names a **single** parent, so combining two unrelated
+profiles means either chaining them (`c` extends `b` extends `a`) or adding the
+second one's paths to the child. CLI flags (`--allow`, `--read-only`,
+`--allow-domain`, `--deny-domain`) append on top of whatever the profile says, so
+a one-off extra grant does not need a profile at all.
+
+Verified: a child that extends `node` and adds `$USERPROFILE/.gradle` produced a
+session whose audited `fs_readwrite` contained the workspace, `npm-cache`,
+`AppData\Roaming\npm` **and** `.gradle`.
 
 Session deadline is `promptTimeoutSecs + workloadTimeoutSecs + slack`
 (defaults 60 s + 30 min + 2 min). If a build or download legitimately runs
