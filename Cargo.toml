@@ -68,10 +68,14 @@ base64 = "0.22"
 mxc-sdk = { version = "=1.0.1", optional = true }
 
 [features]
-# Opt-in feature, but since P3.2 it SELECTS the default backend: a build with it runs
-# `mxc` unless --backend appcontainer is passed, a build without it falls back to
-# AppContainer and says so. Kept non-default so the binary that needs no SDK can
-# still be built (bootstrap, CI without the vendored crate).
+# ON BY DEFAULT (2026-10-22). The feature SELECTS the default backend: a build with
+# it runs `mxc` unless --backend appcontainer is passed. It shipped opt-in while the
+# migration was in progress, which meant the plain `cargo build --release` every
+# reader runs produced an AppContainer-only binary - the default backend missing
+# from the default build. Opt out explicitly with
+#   cargo build --release --no-default-features
+# which still builds a working AppContainer binary and says so at startup.
+default = ["mxc-backend"]
 mxc-backend = ["dep:mxc-sdk"]
 
 [profile.release]

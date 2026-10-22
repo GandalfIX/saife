@@ -92,9 +92,10 @@ pub fn default_backend(feature_enabled: bool) -> Backend {
 
 /// Printed once when a build without `mxc-backend` falls back to the
 /// AppContainer backend, so "why is this still asking for admin?" has an answer.
-pub const MXC_FEATURE_FALLBACK: &str = "this build has no `mxc-backend` feature: \
-falling back to --backend appcontainer (which needs administrator rights for \
-network sessions). Build with `--features mxc-backend` for the unelevated path.";
+pub const MXC_FEATURE_FALLBACK: &str = "this build was made with \
+--no-default-features (`mxc-backend` off): falling back to --backend appcontainer, \
+which needs administrator rights for network sessions. Rebuild without \
+--no-default-features for the unelevated default backend.";
 
 pub fn resolve_backend(
     backend: Backend,
@@ -517,7 +518,7 @@ mod tests {
         assert_eq!(default_backend(false), Backend::AppContainer);
         // The fallback message names the flag a user would pass, not the feature.
         assert!(MXC_FEATURE_FALLBACK.contains("--backend appcontainer"));
-        assert!(MXC_FEATURE_FALLBACK.contains("--features mxc-backend"));
+        assert!(MXC_FEATURE_FALLBACK.contains("--no-default-features"));
     }
 
     #[test]

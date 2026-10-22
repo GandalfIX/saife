@@ -314,7 +314,7 @@ sandbox learned clear
 | `workload_cannot_authenticate` | the workload's client stack cannot use a proxy (WinINet, PS 5.1) | `--backend appcontainer` |
 | `proxy_probe_unmet` | the child never reached the proxy (loopback blocked, dead listener, wrong credential) | check the run is unelevated/loopback is reachable; report with the leaf |
 | The run seems to hang on an unlisted host | a prompt is waiting in a context with no dialog | `--no-prompt`, or set `onUnavailable` |
-| `this build has no 'mxc-backend' feature: falling back ...` | the binary was built without the feature | rebuild with `--features mxc-backend` |
+| `this build was made with --no-default-features ... falling back` | the binary was built without the default backend | rebuild without `--no-default-features` |
 | `audit verify` says `INCOMPLETE` | the session did not end cleanly | expected after a kill; the leaves are still valid evidence |
 | PowerShell prints `InitializeDefaultDrives ... provider "FileSystem"` | PS 5.1 startup noise in the container's filesystem view | ignore |
 

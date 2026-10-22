@@ -35,7 +35,7 @@ holds the rules; that one holds the map.
 
 Two containment backends, selected with `--backend`:
 
-- **`mxc`** (default in a build with `--features mxc-backend`, since P3.2) - the
+- **`mxc`** (the DEFAULT in every build since 2026-10-22; `mxc-backend` is a default feature) - the
   MXC `processcontainer` backend. **Network sessions run UNELEVATED**: the proxy
   is this process's own listener and the SDK gives the container no other route
   out. Guardrail 1 proves the child reached that listener before the session is

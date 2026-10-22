@@ -122,15 +122,20 @@ to `502` (`docs/adr/0001`, D9).
 ## 4. Build and test
 
 ```bash
-cargo build --release                          # no feature: AppContainer only
-cargo build --release --features mxc-backend   # the shipped configuration
-cargo test  --bin sandbox                      # 490 tests
-cargo test  --bin sandbox --features mxc-backend   # 611 + 10 ignored
-cargo test  --bin mxc-launch --features mxc-backend # 19
-cargo clippy --all-targets [--features mxc-backend] # must be 0 warnings
+cargo build --release                        # default: mxc + mxc-launch
+cargo build --release --no-default-features  # AppContainer only (says so at startup)
+cargo test  --bin sandbox                    # 611 + 10 ignored  (default)
+cargo test  --bin sandbox --no-default-features  # 490
+cargo test  --bin mxc-launch                 # 19 (default build only)
+cargo clippy --all-targets [--no-default-features] # must be 0 warnings
 ```
 
-Gates for any change: both feature states green, clippy 0 in dev and release,
+`mxc-backend` is a **default feature**: the plain build everyone runs contains the
+default backend and the wrapper binary. Opting out is explicit
+(`--no-default-features`) and the resulting binary prints a notice instead of
+silently behaving differently.
+
+Gates for any change: both feature states green (default and `--no-default-features`), clippy 0 in dev and release,
 `cargo build --release` 0 warnings, touched files `rustfmt`-clean, CRLF
 preserved (byte counts, not `grep`: this host's `grep` hides CR).
 

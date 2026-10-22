@@ -48,7 +48,7 @@ deferred roadmap.
 
 ## Backends and privileges
 
-`--backend mxc` (default in a build with `--features mxc-backend`) runs the
+`--backend mxc` (the default) runs the
 workload in an MXC process container: filesystem policy is additive over the
 workspace, egress is forced through this process's own proxy listener, and no
 DACLs, no loopback exemption, no admin rights are involved.
@@ -82,6 +82,19 @@ profile for long builds or downloads; there is no unlimited mode.
 cargo build --release
 .\target\release\sandbox.exe setup --check-only
 ```
+
+The default build includes the `mxc-backend` feature, so `sandbox run` starts the
+unelevated MXC backend (and builds `mxc-launch.exe` beside it). To build an
+AppContainer-only binary — bootstrap without the SDK, or a host older than
+Windows 11 24H2 — opt out explicitly:
+
+```powershell
+cargo build --release --no-default-features   # prints a notice at startup
+```
+
+Gates: `cargo test --bin sandbox` is 611 tests in the default build and 490 with
+`--no-default-features`; `cargo clippy --all-targets` must be warning-free in
+both.
 
 `setup --check-only` reports the host build number, AppContainer
 availability, Job Object availability, and the network proxy status. It
