@@ -13,10 +13,18 @@ use clap::Parser;
 use cli::Cli;
 use cli::Cmd;
 
-/// Whether the MXC backend is wired into the session path. P0 lands the seam
-/// only; until the launch path routes through it, `--backend mxc` is refused
-/// rather than falling back to `appcontainer` (`cli::route_backend`).
-const MXC_SESSION_WIRED: bool = false;
+/// Whether the MXC backend is wired into the session path.
+///
+/// P3.0 wires it: [`run_inner`] routes `--backend mxc` to [`run_mxc_session`],
+/// which launches through [`net::mxc::launch_session`]. Until this flipped, the
+/// flag was refused rather than falling back to `appcontainer`
+/// ([`cli::route_backend`]) — the refusal still exists and still fires for a
+/// binary built without the feature.
+///
+/// **The default backend is unchanged** ([`cli::Backend::AppContainer`]): putting
+/// MXC on the default path is P3.2 and a separate decision, because it changes
+/// what every existing invocation gets.
+const MXC_SESSION_WIRED: bool = true;
 
 /// Serializes the tests that read or mutate process-wide environment variables
 /// (`USERPROFILE` in particular). Those tests share one global process state, so
@@ -463,20 +471,17 @@ fn run_cmd(
                 return 2;
             }
         };
-    if backend == cli::Backend::Mxc {
-        // Only reachable once `MXC_SESSION_WIRED` flips: this function has no MXC
-        // session path, so refuse instead of running an AppContainer session
-        // under a backend name that promised otherwise.
-        eprintln!("[sandbox] {}", cli::MXC_NOT_WIRED);
-        return 2;
-    }
-
+    // No blanket `--backend mxc` refusal here any more (P3.0): the routed backend
+    // is carried into `run_inner`, which has a session path for both. A binary
+    // without the feature never reaches this point (`route_backend` refuses), and
+    // `run_inner` re-states that refusal rather than falling back.
     if let Err(e) = setup::check_runtime() {
         eprintln!("[sandbox] {e:#}");
         return 1;
     }
 
     match run_inner(
+        backend,
         profile.as_deref(),
         allow_cwd,
         &allow,
@@ -501,6 +506,10 @@ fn run_cmd(
 
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
+    // P3.0: the backend `cli::route_backend` already approved. `AppContainer`
+    // keeps the code path below byte for byte; `Mxc` branches out after the
+    // shared resolution and never comes back through it.
+    backend: cli::Backend,
     profile_name: Option<&str>,
     allow_cwd: bool,
     allow: &[String],
@@ -540,6 +549,34 @@ fn run_inner(
         Some(s) => s.to_string(),
         None => new_session_id(),
     };
+
+    // P3.0: `--backend mxc` runs its own session. Placed here — after the shared
+    // resolution (profile, network, filesystem, sid) and BEFORE the DACL journal,
+    // the per-session install dirs and every AppContainer call — so the MXC path
+    // never touches host ACL state it does not use, and the AppContainer path
+    // below is exactly what it was.
+    if backend == cli::Backend::Mxc {
+        #[cfg(feature = "mxc-backend")]
+        {
+            return run_mxc_session(
+                &sid,
+                &cwd,
+                &net_cfg_resolved,
+                &fs,
+                audit_strict,
+                print_sid,
+                cmd,
+            );
+        }
+        // Unreachable through the CLI: `route_backend` refuses `mxc` in a binary
+        // without the feature. Spelled as the same refusal rather than an
+        // `unreachable!()` so a future caller that skips the router still fails
+        // closed and says why.
+        #[cfg(not(feature = "mxc-backend"))]
+        {
+            anyhow::bail!("{}", cli::MXC_FEATURE_MISSING);
+        }
+    }
 
     // MXC F-C/F-D: before any host-DACL mutation, reap journals of dead
     // owners (restore their entries, quarantine corrupt ones). Then open
@@ -617,15 +654,412 @@ fn run_inner(
         );
     }
 
-    // Start the proxy (if not blocked) and hold the handle until the child
-    // exits. The handle MUST outlive `sandbox::spawn` below so the proxy
-    // stays up while the child runs.
-    let proxy_env: Option<net::ProxyEnv>;
-    let _proxy_handle: Option<net::proxy::ProxyHandle> = match &net_cfg {
-        net::NetworkConfig::Blocked => {
-            proxy_env = None;
-            None
+    // Start the proxy (if not blocked) and hold the handle until the child exits:
+    // the handle MUST outlive `sandbox::spawn` below, so the proxy stays up while
+    // the child runs. Extracted in P3.0 so the MXC path starts the *same* listener
+    // with the same policy instead of a second implementation of it.
+    let proxy = start_session_proxy(&net_cfg, &sid, audit_writer.clone())?;
+    let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
+
+    // P2.3: the listener exists only now, so that is the one fact `complete`
+    // adds — the leaf is written here, still before the child exists, and the
+    // guard is disarmed. Every `?` above this point returned through the guard's
+    // `Drop`, which wrote the same leaf with the armed tier/elevation and a null
+    // endpoint.
+    //
+    // Note the ordering honestly: the listener is bound at `net::proxy::spawn`
+    // above, so a local connection that reaches it in this window is audited by
+    // the proxy thread first, and this leaf then lands at `seq > 0`. The guarantee
+    // is one root per run, before the child — not "always seq 0".
+    session_start.complete(proxy_port.map(audit::session_start::LoopbackEndpoint::new))?;
+
+    // Build the full allow-list (Option E per-session dirs + resolved profile entries).
+    let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
+
+    if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries, run_journal.as_ref()) {
+        eprintln!("[sandbox] warning: some ACL grants failed: {e}");
+    }
+
+    let env_block = sandbox::build_env_block(&sid, &cwd, proxy.as_ref().map(|(_, env)| env));
+
+    let cmdline = join_cmdline(cmd);
+
+    let job = sandbox::Job::create().context("create Job Object")?;
+
+    let exit_code = sandbox::spawn(
+        &session,
+        &job,
+        &cwd,
+        env_block,
+        &cmdline,
+        !net_cfg.is_blocked(),
+    )
+    .context("spawn sandboxed process")?;
+
+    seal_audit(audit_writer, proxy.map(|(handle, _)| handle), &sid);
+
+    // MXC F-C/F-D teardown order matters: restore host DACLs BEFORE deleting
+    // the profile (a crash between the two leaves restorable journal state,
+    // not re-derivable grants). Journal file is removed ONLY on success.
+    if let Some(j) = &run_journal {
+        let ok = sandbox::appcontainer::restore_or_warn(j);
+        if ok {
+            j.remove_file();
         }
+    }
+    sandbox::appcontainer::delete_profile(&session.ac_name);
+
+    Ok(exit_code as i32)
+}
+
+// ---------------------------------------------------------------------------
+// P3.0: the MXC session path
+// ---------------------------------------------------------------------------
+
+/// Exit code for a session that hit its budget (`timeout(1)`'s convention).
+#[cfg(feature = "mxc-backend")]
+const EXIT_TIMEOUT: i32 = 124;
+
+/// Exit code for a session a guardrail refused.
+///
+/// `126` is `timeout(1)`'s "found but could not be executed", which is what a
+/// refusal means here: the workload may well have run, but this session is not a
+/// contained, proven session and its result is not evidence.
+#[cfg(feature = "mxc-backend")]
+const EXIT_REFUSED: i32 = 126;
+
+/// Run one session through the MXC `processcontainer` backend (P3.0).
+///
+/// Same resolved inputs as the AppContainer path, on the parts MXC can express,
+/// and a named refusal on the ones it cannot:
+///
+/// * **filesystem** — the workspace read-write, declared read-only grants
+///   read-only, profile secret dirs and configured denies denied
+///   ([`net::mxc::filesystem_policy`], P1.3). A **second writable** grant is
+///   refused ([`cli::mxc_writable_grant_unsupported`]) rather than silently
+///   narrowed: the workspace-only posture is ADR-0004's decision, not an omission.
+/// * **network** — the same in-process listener with a fresh per-run token, or
+///   nothing at all under `--block-net`.
+/// * **budget** — the resolved [`net::NetworkConfig::session_budget`], so the
+///   container's deadline is *this* profile's prompt + workload + slack.
+/// * **proof** — [`net::mxc::launch_session`] derives the guardrail leg from the
+///   port (`Required` with a proxy, `MustBeAbsent` without) and carries
+///   `TierExpectation::Exactly(REQUIRED_TIER)`. A launch that cannot prove the
+///   child reached the proxy **fails the session** (exit 126) instead of warning.
+///
+/// What it deliberately does NOT do: create an AppContainer profile, grant host
+/// DACLs, open a DACL journal, register a loopback exemption or create the
+/// per-session install dirs. MXC needs none of them — that is the migration's
+/// whole point (no elevation) — and doing them would mutate host state for a
+/// session that never uses it.
+#[cfg(feature = "mxc-backend")]
+fn run_mxc_session(
+    sid: &str,
+    cwd: &std::path::Path,
+    net_cfg: &net::NetworkConfig,
+    fs: &profile::FilesystemSlice,
+    audit_strict: bool,
+    print_sid: bool,
+    cmd: &[String],
+) -> Result<i32> {
+    // (1) Decision 9. Refused by NAME, before a container, a listener or a leaf
+    //     exists. Dropping such a grant instead would run the workload on a
+    //     narrower filesystem than the operator asked for, silently.
+    if let Some(path) = net::mxc::writable_grants_outside_workspace(cwd, &fs.allow).first() {
+        eprintln!("[sandbox] {}", cli::mxc_writable_grant_unsupported(path));
+        return Ok(2);
+    }
+
+    // Decision 7: `--print-sid` yields the id and returns, exactly as the
+    // AppContainer path does — nothing is launched, so nothing needs a launcher.
+    if print_sid {
+        println!("{sid}");
+        return Ok(0);
+    }
+    if cmd.is_empty() {
+        return Ok(0);
+    }
+
+    // (2) D1's wrapper. The container runs `mxc-launch.exe`, and that wrapper is
+    //     the only way `NO_PROXY` and `SANDBOX_PROXY_PORT` reach the child
+    //     (mxc-sdk 1.0.1 strips both from `request.environment`).
+    let supervisor = std::env::current_exe().context("locate this supervisor binary")?;
+    let Some(launcher) = net::mxc::launcher_beside(&supervisor) else {
+        eprintln!("[sandbox] {}", cli::MXC_LAUNCHER_MISSING);
+        return Ok(2);
+    };
+
+    // (3) Filesystem policy (P1.3). A deny that covers a grant is named by
+    //     `filesystem_policy` itself (`DenyCoversGrant`) — refused, never dropped.
+    let readonly: Vec<String> = fs
+        .read_only
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let denies: Vec<String> = fs.deny.iter().map(|p| p.display().to_string()).collect();
+    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+    let filesystem =
+        match net::mxc::filesystem_policy(cwd, &readonly, &denies, home.as_deref(), &launcher) {
+            Ok(policy) => policy,
+            Err(e) => {
+                eprintln!("[sandbox] mxc: {e}");
+                return Ok(2);
+            }
+        };
+
+    // (4) The audit writer and the ARMED root. The tier is deliberately not known
+    //     here — it comes from `v1::probe` of the exact request, which the launch
+    //     decides — so the guard is armed with this process's elevation and the
+    //     tier is supplied just before the leaf is written. Every `?` between here
+    //     and that write returns through `Drop`, which writes the armed root: one
+    //     root per run, even for a session that dies in setup.
+    let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(sid, audit_strict)?);
+    let session_start = audit::session_start::SessionStart::arm(
+        audit_writer.clone(),
+        sid,
+        cmd.join(" "),
+        audit::session_start::SessionStartFacts::measured(
+            audit::session_start::TierFacts::default(),
+            Some(setup::is_elevated()),
+        ),
+    );
+
+    // (5) The SAME listener the AppContainer path starts, with its own per-run
+    //     token; nothing at all under `--block-net`. No loopback exemption is
+    //     registered: this backend's ingress policy allows host loopback, which is
+    //     why the migration needs no elevation.
+    let proxy = start_session_proxy(net_cfg, sid, audit_writer.clone())?;
+    let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
+    let token = proxy.as_ref().map(|(_, env)| env.token.value());
+
+    // (6) Guardrail 1's proof source. With a proxy it is that listener — the one
+    //     the child is pointed at, so the proof cannot come from a different
+    //     socket. Under `--block-net` nothing binds and the registry is
+    //     unattached: its proof is structurally zero because the session has no
+    //     proxy to consult, which is what `MustBeAbsent` asserts.
+    let counters = match &proxy {
+        Some((handle, _)) => handle.counters(),
+        None => net::proxy::LaunchCounters::new(),
+    };
+
+    // (7) The request, and the tier it dispatches to — both known BEFORE the
+    //     launch, because a refused launch carries no `SessionOutcome` to read the
+    //     tier from and a leaf that says `tier: null` for a session that
+    //     dispatched to `base-container` is the omission guardrail 2 exists to
+    //     prevent.
+    let input = net::mxc::MxcSessionInput {
+        command: join_cmdline(cmd),
+        working_directory: Some(cwd.display().to_string()),
+        // The one env marker both backends inject. The rest of the AppContainer
+        // block is AppContainer-specific: its `PATH`/`PYTHONPATH` shims point into
+        // `.sandbox/<sid>` (which MXC does not use), and the proxy variables come
+        // from the SDK's `runtimeConfig.networkProxy`.
+        environment: vec![("SANDBOX_SESSION_SID".to_string(), sid.to_string())],
+        filesystem,
+        network: net::mxc::MxcNetworkInput {
+            proxy_port,
+            // The backend overrides this with its own run token; a caller value
+            // could not authenticate against this listener anyway.
+            proxy_token: None,
+        },
+        // The backend always writes `Some(budget.timeout_ms())`; never trusted here.
+        timeout_ms: None,
+    };
+    // Decision 3: the deadline is the RESOLVED profile's terms, never the defaults.
+    let budget = net_cfg.session_budget();
+    let request = net::mxc::request_for_session(
+        counters.as_ref(),
+        proxy_port,
+        token,
+        &launcher,
+        budget,
+        &input,
+    )?;
+    let probed = net::mxc::probe_tier(&request)?;
+    let session_start = session_start.with_tier(probed.audit_facts());
+    let endpoint = proxy_port.map(audit::session_start::LoopbackEndpoint::new);
+
+    // (8) The launch. `launch_session` derives the guardrail leg from the port and
+    //     builds its backend with `TierExpectation::Exactly(REQUIRED_TIER)`.
+    let outcome = match net::mxc::launch_session(
+        counters.as_ref(),
+        proxy_port,
+        token,
+        &launcher,
+        budget,
+        &input,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => match refusal_for(&e, &probed) {
+            Some((facts, refusal)) => {
+                // A guardrail-1 refusal happens AFTER the child ran, and the refusal
+                // carries its result: print what the workload did first, so the
+                // operator sees their own command's output next to the reason the
+                // session was refused. Losing it made a refused session
+                // indistinguishable from one that never started.
+                if let net::mxc::MxcError::Unproven(unproven) = &e {
+                    emit_child_output(&unproven.outcome);
+                }
+                // Decision 5: a refused session is refused IN THE CHAIN — the root
+                // says `deny` and names the tier that was dispatched, and the next
+                // leaf says why. Both are written before the chain is sealed.
+                session_start.with_tier(facts).refuse(endpoint, refusal)?;
+                seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
+                eprintln!("[sandbox] mxc: {e}");
+                return Ok(launch_failure_exit(&e));
+            }
+            // Nothing was established (no request, no container, no epoch): the
+            // armed root from `Drop` is the whole record and `run_cmd` reports.
+            None => return Err(e.into()),
+        },
+    };
+
+    // (9) The launch record is authoritative for the tier — it is the record the
+    //     gate actually applied. `complete` adds the endpoint and writes the leaf.
+    session_start
+        .with_tier(outcome.tier.audit_facts())
+        .complete(endpoint)?;
+
+    emit_child_output(&outcome);
+    for warning in &outcome.warnings {
+        eprintln!("[sandbox] mxc: warning: {warning}");
+    }
+    if let Some(reason) = outcome.timeout {
+        // Decision 6: the reason token says whether the operator's command or the
+        // supervisor ran the clock out — the two have different remedies.
+        eprintln!(
+            "[sandbox] mxc: session ended at its deadline ({} ms = prompt {} s + workload {} s \
+             + slack {} s) — reason {reason}",
+            budget.session().as_millis(),
+            budget.prompt.as_secs(),
+            budget.workload.as_secs(),
+            budget.slack.as_secs(),
+        );
+    }
+
+    seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
+    Ok(session_exit_code(&outcome))
+}
+
+/// How a failed MXC launch is recorded in the chain (P3.0 decision 5).
+///
+/// `Some((facts, refusal))` means the session reached a state a reader must be
+/// able to select on: a root with `disposition: deny` carrying the tier that was
+/// dispatched, followed by a `SESSION_REFUSED` leaf naming the reason. That is
+/// both of ADR-0004's guardrails — the tier gate (refused before the child exists)
+/// and the proof gate (refused after it ran).
+///
+/// `None` means nothing was established (a request that could not be built, an SDK
+/// error, a second concurrent launch): the armed `Drop` root is the whole record,
+/// and no refusal leaf is written — a refusal leaf would claim a gate ran when none
+/// did.
+#[cfg(feature = "mxc-backend")]
+fn refusal_for(
+    err: &net::mxc::MxcError,
+    probed: &net::mxc::TierRecord,
+) -> Option<(
+    audit::session_start::TierFacts,
+    audit::session_start::TierRefusal<'static>,
+)> {
+    use audit::session_start::{TierFacts, TierRefusal};
+    use net::mxc::{MxcError, REQUIRED_TIER};
+    match err {
+        // Guardrail 1, both shapes of it: `Guard` is the pre-run refusal (no proof
+        // source, `Required` without a proxy) and `Unproven` the post-run one. The
+        // tier is the one the probe of the exact request named, and the launch gated
+        // on that same decision, so the root still answers "which containment did
+        // this get?" even when the session is refused.
+        MxcError::Guard(_) | MxcError::Unproven(_) => Some((
+            probed.audit_facts(),
+            TierRefusal::proof_unmet(REQUIRED_TIER),
+        )),
+        // Guardrail 2: refused before the child existed. The mismatch carries what
+        // was dispatched INSTEAD — the value the leaf must show, never the
+        // requirement, whose own value is the refusal's `expected_tier`.
+        MxcError::Tier(mismatch) => Some((
+            TierFacts {
+                tier: mismatch.observed.clone(),
+                tier_source: Some(mismatch.source),
+                // The mismatch does not carry it, and `TierFacts` is explicit that
+                // "nothing stated it" is `None` rather than a narrowed `false`.
+                needs_dacl_augmentation: None,
+            },
+            TierRefusal::tier_mismatch(mismatch.expected),
+        )),
+        MxcError::Request(_) | MxcError::Sdk(_) | MxcError::Concurrency(_) => None,
+    }
+}
+
+/// The exit code a refused MXC session ends with (P3.0 decision 6).
+///
+/// A child's own code is not distinguishable by value alone — a child may exit 124
+/// or 126 itself — so the named reason on stderr is the discriminator. These codes
+/// exist so a *script* can tell "the session was refused" from "the command failed"
+/// without parsing prose.
+#[cfg(feature = "mxc-backend")]
+fn launch_failure_exit(err: &net::mxc::MxcError) -> i32 {
+    match err {
+        net::mxc::MxcError::Guard(_)
+        | net::mxc::MxcError::Unproven(_)
+        | net::mxc::MxcError::Tier(_) => EXIT_REFUSED,
+        _ => 1,
+    }
+}
+
+/// The exit code a finished MXC session ends with (P3.0 decision 6).
+///
+/// Mirrors the AppContainer contract — a child that exits `N` returns `N` — except
+/// for a kill at the deadline, which is the supervisor's verdict and not the
+/// command's, and therefore gets its own code instead of `None`-as-`0`.
+#[cfg(feature = "mxc-backend")]
+fn session_exit_code(outcome: &net::mxc::SessionOutcome) -> i32 {
+    match (outcome.timeout, outcome.exit_code) {
+        (Some(_), _) => EXIT_TIMEOUT,
+        (None, Some(code)) => code,
+        // Neither a code nor a timeout: the SDK gave neither, which is not success.
+        (None, None) => 1,
+    }
+}
+
+/// Replay the child's captured streams for an MXC session.
+///
+/// The AppContainer path hands the child the console handles directly, so its
+/// output is already on our stdout. MXC captures both streams inside the SDK, so
+/// the supervisor replays them — before its own verdict line, so a transcript reads
+/// "what the command did" and then "what the session concluded".
+#[cfg(feature = "mxc-backend")]
+fn emit_child_output(outcome: &net::mxc::SessionOutcome) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&outcome.stdout);
+    let _ = out.flush();
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(&outcome.stderr);
+    let _ = err.flush();
+}
+
+/// Start this run's proxy listener, if its network posture has one.
+///
+/// Extracted from [`run_inner`] **unchanged** in P3.0: the two session paths must
+/// not be able to drift on the parts that have to agree — one credential per run
+/// (P1.4), the learned policy loaded before the listener starts ([G-5] — a corrupt
+/// file is a hard error), the D-4 registry and prompt coordinator, the [G-10]
+/// upstream precedence with its inherited `NO_PROXY`, and the ungated degradation
+/// warning for an unusable upstream URL.
+///
+/// `Ok(None)` for a blocked session: nothing binds, so nothing can be proven, and
+/// the guardrail leg is [`net::mxc::ProofExpectation::MustBeAbsent`]. Otherwise the
+/// listener plus the child's [`net::ProxyEnv`] — the caller MUST hold the handle
+/// until the child has exited.
+fn start_session_proxy(
+    net_cfg: &net::NetworkConfig,
+    sid: &str,
+    writer: std::sync::Arc<audit::AuditWriter>,
+) -> Result<Option<(net::proxy::ProxyHandle, net::ProxyEnv)>> {
+    // The listener MUST outlive the child: the caller holds the handle until the
+    // child has exited (see `seal_audit`).
+    Ok(match net_cfg {
+        net::NetworkConfig::Blocked => None,
         net::NetworkConfig::Allow {
             allow_domain,
             deny_domain,
@@ -715,65 +1149,37 @@ fn run_inner(
                 None => None,
             };
             let handle = net::proxy::spawn(net::proxy::ProxyConfig {
-                session_id: sid.clone(),
+                session_id: sid.to_string(),
                 token: token.clone(),
                 allow_domain: allow_domain.clone(),
                 deny_domain: deny_domain.clone(),
                 upstream,
-                writer: audit_writer.clone(),
+                writer: writer.clone(),
                 prompt,
             })
             .context("start localhost proxy")?;
-            proxy_env = Some(net::ProxyEnv {
+            let proxy_env = net::ProxyEnv {
                 port: handle.port,
                 // The child's copy of this run's credential; the listener holds
                 // the same value and refuses every other. Cloning the `RunToken`
                 // (rather than its `String`) keeps the env edge typed (P1.6(c)).
                 token: token.clone(),
-            });
-            Some(handle)
+            };
+            Some((handle, proxy_env))
         }
-    };
+    })
+}
 
-    // P2.3: the listener exists only now, so that is the one fact `complete`
-    // adds — the leaf is written here, still before the child exists, and the
-    // guard is disarmed. Every `?` above this point returned through the guard's
-    // `Drop`, which wrote the same leaf with the armed tier/elevation and a null
-    // endpoint.
-    //
-    // Note the ordering honestly: the listener is bound at `net::proxy::spawn`
-    // above, so a local connection that reaches it in this window is audited by
-    // the proxy thread first, and this leaf then lands at `seq > 0`. The guarantee
-    // is one root per run, before the child — not "always seq 0".
-    session_start.complete(
-        proxy_env
-            .as_ref()
-            .map(|env| audit::session_start::LoopbackEndpoint::new(env.port)),
-    )?;
-
-    // Build the full allow-list (Option E per-session dirs + resolved profile entries).
-    let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
-
-    if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries, run_journal.as_ref()) {
-        eprintln!("[sandbox] warning: some ACL grants failed: {e}");
-    }
-
-    let env_block = sandbox::build_env_block(&sid, &cwd, proxy_env.as_ref());
-
-    let cmdline = join_cmdline(cmd);
-
-    let job = sandbox::Job::create().context("create Job Object")?;
-
-    let exit_code = sandbox::spawn(
-        &session,
-        &job,
-        &cwd,
-        env_block,
-        &cmdline,
-        !net_cfg.is_blocked(),
-    )
-    .context("spawn sandboxed process")?;
-
+/// Commit this run's audit root + signature and release the writer (US-4a).
+///
+/// Extracted from [`run_inner`] in P3.0 so **both** session paths seal the chain
+/// the same way. The ordering below is the entire content of the function and is
+/// load-bearing; see its comments.
+fn seal_audit(
+    writer: std::sync::Arc<audit::AuditWriter>,
+    proxy: Option<net::proxy::ProxyHandle>,
+    sid: &str,
+) {
     // US-4a: commit the audit root + signature on clean child exit.
     //
     // IMPORTANT — ProxyHandle::drop does NOT join the proxy thread (it cancels
@@ -789,13 +1195,13 @@ fn run_inner(
     // We then drop the proxy handle + our Arc<AuditWriter> (releasing the file
     // handle) and write the root+sig using the captured root string. No reopen
     // needed.
-    let captured_root = audit_writer.current_root();
+    let captured_root = writer.current_root();
 
     // Drop the proxy handle (cancels token, detaches the task — non-blocking).
     // The proxy thread may still be mid-`append` to the file, but the in-memory
     // `last_hash` is already captured above. We sleep briefly to let the proxy
     // thread finish its in-flight file writes after cancellation.
-    drop(_proxy_handle);
+    drop(proxy);
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Drop our Arc<AuditWriter>. The proxy thread's Arc may still be alive (it
@@ -803,27 +1209,14 @@ fn run_inner(
     // `OpenOptions::append(true).create(true)` per call (no long-lived handle),
     // so dropping the Arc just releases the in-memory state. The file on disk
     // is already consistent up to the last `append`.
-    drop(audit_writer);
+    drop(writer);
 
     if let Some(root) = captured_root
-        && let Err(e) = commit_audit_root(&sid, &root)
+        && let Err(e) = commit_audit_root(sid, &root)
     {
         eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
         // The log is still readable; verify will report INCOMPLETE.
     }
-
-    // MXC F-C/F-D teardown order matters: restore host DACLs BEFORE deleting
-    // the profile (a crash between the two leaves restorable journal state,
-    // not re-derivable grants). Journal file is removed ONLY on success.
-    if let Some(j) = &run_journal {
-        let ok = sandbox::appcontainer::restore_or_warn(j);
-        if ok {
-            j.remove_file();
-        }
-    }
-    sandbox::appcontainer::delete_profile(&session.ac_name);
-
-    Ok(exit_code as i32)
 }
 
 fn new_session_id() -> String {
@@ -917,6 +1310,122 @@ mod tests {
         );
         assert_eq!(join_cmdline(&["echo".into(), "".into()]), "echo \"\"");
         assert_eq!(join_cmdline(&["a".into()]), "a");
+    }
+
+    /// A finished MXC session, for the exit-code and refusal tests: what the two
+    /// functions read, plus whatever `SessionOutcome` requires.
+    #[cfg(feature = "mxc-backend")]
+    fn finished_outcome(
+        exit_code: Option<i32>,
+        timeout: Option<net::mxc::TimeoutReason>,
+    ) -> net::mxc::SessionOutcome {
+        net::mxc::SessionOutcome {
+            exit_code,
+            timeout,
+            stdout: b"out".to_vec(),
+            stderr: b"err".to_vec(),
+            warnings: Vec::new(),
+            tier: base_container_record(),
+            proxy_proof: net::mxc::ProxyProof::default(),
+            expectation: net::mxc::ProofExpectation::MustBeAbsent,
+            clock: net::mxc::SessionClock::measured(
+                net::mxc::SessionBudget::default(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+            ),
+        }
+    }
+
+    #[cfg(feature = "mxc-backend")]
+    fn base_container_record() -> net::mxc::TierRecord {
+        net::mxc::tier_record(net::mxc::ProbeView {
+            tier: Some(net::mxc::REQUIRED_TIER),
+            needs_dacl_augmentation: Some(false),
+        })
+    }
+
+    /// P3.0 decision 6: the AppContainer contract is mirrored for a child that
+    /// exits `N` (return `N`), and a kill at the deadline is **not** that code — it
+    /// gets its own, so "my command exited 124" and "the supervisor killed it at its
+    /// budget" are distinguishable to a script. The `TimeoutReason` token beside the
+    /// code says which term spent the clock.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn a_child_exit_code_is_mirrored_and_a_timeout_has_its_own() {
+        assert_eq!(session_exit_code(&finished_outcome(Some(3), None)), 3);
+        assert_eq!(session_exit_code(&finished_outcome(Some(0), None)), 0);
+        let timed_out =
+            finished_outcome(None, Some(net::mxc::TimeoutReason::WorkloadBudgetExceeded));
+        assert_eq!(session_exit_code(&timed_out), EXIT_TIMEOUT);
+        assert_eq!(
+            timed_out.timeout.map(|reason| reason.as_str()),
+            Some("workload_budget_exceeded"),
+            "the operator is told which term ran the clock out"
+        );
+        assert_ne!(
+            EXIT_TIMEOUT, EXIT_REFUSED,
+            "a kill and a refusal must differ"
+        );
+    }
+
+    /// P3.0 decision 5: only a **gate** refusal is written into the chain (root
+    /// `deny` + `SESSION_REFUSED`). A failure that established nothing gets the
+    /// armed root from `Drop` and no refusal leaf — a refusal leaf would claim a gate
+    /// ran when none did.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn only_a_gate_refusal_reaches_the_chain() {
+        use net::mxc::{GuardError, MxcError, REQUIRED_TIER, RequestError, TierMismatch};
+
+        let probed = base_container_record();
+
+        // Guardrail 1, pre-run shape.
+        let guard = MxcError::Guard(GuardError::SessionNotAccepted);
+        let (facts, refusal) = refusal_for(&guard, &probed).expect("guardrail 1 is recorded");
+        assert_eq!(
+            facts.tier.as_deref(),
+            Some(REQUIRED_TIER),
+            "the dispatched tier"
+        );
+        assert_eq!(facts.tier_source, Some("probe"));
+        assert_eq!(refusal.expected, REQUIRED_TIER);
+        assert_eq!(refusal.reason, audit::session_start::REASON_PROOF_UNMET);
+        assert_eq!(launch_failure_exit(&guard), EXIT_REFUSED);
+
+        // Guardrail 1, post-run shape: same reason, and the one that carries the
+        // workload's own output into the transcript.
+        let unproven = MxcError::Unproven(Box::new(net::mxc::Unproven {
+            error: GuardError::TunnelNotEstablished,
+            outcome: finished_outcome(Some(0), None),
+        }));
+        let (facts, refusal) = refusal_for(&unproven, &probed).expect("guardrail 1 is recorded");
+        assert_eq!(facts.tier.as_deref(), Some(REQUIRED_TIER));
+        assert_eq!(refusal.reason, audit::session_start::REASON_PROOF_UNMET);
+        assert_eq!(launch_failure_exit(&unproven), EXIT_REFUSED);
+
+        // Guardrail 2: the root names what was dispatched INSTEAD, never the
+        // requirement, and "the probe said nothing" stays `None`.
+        let degraded = MxcError::Tier(TierMismatch {
+            expected: REQUIRED_TIER,
+            observed: Some("appcontainer-dacl".to_string()),
+            source: "probe",
+        });
+        let (facts, refusal) = refusal_for(&degraded, &probed).expect("guardrail 2 is recorded");
+        assert_eq!(facts.tier.as_deref(), Some("appcontainer-dacl"));
+        assert_eq!(
+            facts.needs_dacl_augmentation, None,
+            "unknown is not `false`"
+        );
+        assert_eq!(refusal.reason, audit::session_start::REASON_TIER_MISMATCH);
+
+        // Nothing established: the armed root is the whole record.
+        let unbuilt = MxcError::Request(RequestError::EmptyCommand);
+        assert!(
+            refusal_for(&unbuilt, &probed).is_none(),
+            "a request that could not be built refused nothing"
+        );
+        assert_eq!(launch_failure_exit(&unbuilt), 1);
     }
 
     /// Unique temp dir per test (learned.rs's pattern) so the learned-CLI

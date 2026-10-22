@@ -33,6 +33,39 @@ landed in P1.4)";
 pub const MXC_NOT_WIRED: &str = "`--backend mxc` is not wired into the session path yet (plan P1); \
 refusing rather than falling back to `appcontainer`";
 
+/// Refusal when the resolved session asks for a writable grant the MXC backend
+/// cannot honour (P3.0, decision 9).
+///
+/// MXC's filesystem policy is **workspace-only by design** (ADR-0004 P1.3):
+/// [`net::mxc::filesystem_policy`] grants read-write exactly the workspace and
+/// takes only *read-only* extras. A second **writable** grant therefore has no
+/// launch it could describe, and dropping it would run the workload with a
+/// narrower filesystem than the operator asked for — silently. Read-only extras
+/// are expressible, so the message names that alternative instead of leaving the
+/// operator to guess.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub fn mxc_writable_grant_unsupported(path: &str) -> String {
+    format!(
+        "`--backend mxc` cannot honour a writable grant outside the workspace: {path} — MXC \
+         filesystem policy is workspace-only (ADR-0004 P1.3), so a second writable grant has no \
+         honest mapping; grant it read-only (`--allow <path>:read`) or run `--backend appcontainer`"
+    )
+}
+
+/// Refusal when `mxc-launch.exe` does not sit beside the supervisor binary.
+///
+/// `#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]`: the only caller
+/// is the MXC session path.
+///
+/// The wrapper is not optional: mxc-sdk 1.0.1 strips `NO_PROXY` from
+/// `request.environment` and re-injects only the proxy URL, so without the
+/// launcher the child cannot reach the D-4 control plane on loopback — the
+/// reason D1 exists at all.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub const MXC_LAUNCHER_MISSING: &str = "`--backend mxc` needs `mxc-launch.exe` beside the \
+sandbox binary: rebuild with `cargo build --release --features mxc-backend` (the wrapper is a \
+required bin of that feature)";
+
 /// Decide whether a run may use the selected backend, or explain the refusal.
 ///
 /// Pure on purpose: `feature_enabled` is a parameter rather than a `cfg!` read,
@@ -589,6 +622,45 @@ mod tests {
         assert!(
             !MXC_CONCURRENCY_REFUSED.contains("plan P"),
             "the concurrency refusal must not cite an internal plan: {MXC_CONCURRENCY_REFUSED}"
+        );
+    }
+
+    /// P3.0: the session path routes through the MXC backend, so the *shipped*
+    /// wiring constant must let `--backend mxc` through. Asserted through
+    /// [`route_backend`] rather than on the constant itself: the constant is an
+    /// input to the decision, and it is the decision that has to change.
+    ///
+    /// Feature-gated because without the feature the cell is `FeatureMissing`
+    /// forever — that refusal is pinned by the matrix test above.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn the_mxc_backend_is_wired_into_the_session_path() {
+        assert_eq!(
+            route_backend(Backend::Mxc, true, crate::MXC_SESSION_WIRED),
+            Ok(Backend::Mxc),
+            "MXC_SESSION_WIRED must be true now that run_inner routes --backend mxc"
+        );
+    }
+
+    /// P3.0 decision 9: a capability with no honest MXC mapping is refused by
+    /// name — the message has to say WHICH flag, WHICH path, and what to do
+    /// instead, because "unsupported" without a workaround is a dead end.
+    #[test]
+    fn the_writable_grant_refusal_names_the_flag_the_path_and_the_alternative() {
+        let msg = mxc_writable_grant_unsupported(r"C:\data\datasets");
+        assert!(msg.contains("--backend mxc"), "{msg}");
+        assert!(msg.contains(r"C:\data\datasets"), "{msg}");
+        assert!(
+            msg.contains(":read"),
+            "must name the read-only alternative: {msg}"
+        );
+        assert!(
+            msg.contains("appcontainer"),
+            "must name the other backend: {msg}"
+        );
+        assert!(
+            !msg.contains("plan P"),
+            "no internal plan references: {msg}"
         );
     }
 

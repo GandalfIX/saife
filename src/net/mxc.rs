@@ -498,6 +498,51 @@ pub fn launcher_command(launcher: &Path, real_command: &str, proxy_port: Option<
     )
 }
 
+/// The wrapper launcher that must ship beside the supervisor binary (P3.0).
+///
+/// D1 makes `mxc-launch.exe` the command the container actually runs, and the
+/// release build puts every bin in the same directory, so "beside this exe" is
+/// where it is. `None` when it is not there: the caller refuses by name
+/// ([`crate::cli::MXC_LAUNCHER_MISSING`]) rather than launching a session whose
+/// wrapper — and therefore whose `NO_PROXY` and D-0.3 discovery variable — would
+/// be missing.
+pub fn launcher_beside(supervisor_exe: &Path) -> Option<PathBuf> {
+    let candidate = supervisor_exe.parent()?.join(LAUNCHER_EXE_NAME);
+    candidate.is_file().then_some(candidate)
+}
+
+/// The writable grants [`filesystem_policy`] cannot honour (P3.0 decision 9).
+///
+/// [`filesystem_policy`] grants read-write **exactly the workspace** and takes only
+/// *read-only* extras: the workspace-only posture is ADR-0004 P1.3's decision, not
+/// an omission, and a launch that widened it would be a second filesystem policy
+/// nobody reviewed. So any other writable path a resolved profile asks for — a
+/// profile's `filesystem.allow`, or a `--allow <path>` without `:read` — has no
+/// launch it could describe.
+///
+/// Returned rather than dropped. Dropping is what this function exists to prevent:
+/// the workload would run with a narrower filesystem than the operator asked for,
+/// and nothing in the transcript, the audit chain or the exit code would say so.
+/// The caller refuses by name, naming the path and the read-only alternative
+/// ([`crate::cli::mxc_writable_grant_unsupported`]).
+///
+/// Compared on [`path_key`]s, so the workspace matches however it is spelled (a
+/// trailing separator, a case difference, a `.` segment). A workspace that cannot
+/// be made absolute is reported as *no* offending grant here: [`filesystem_policy`]
+/// names that condition itself, and refusing every grant because the comparison
+/// failed would blame the wrong input.
+pub fn writable_grants_outside_workspace(cwd: &Path, writable: &[PathBuf]) -> Vec<String> {
+    let workspace = match absolute_path("workspace directory", cwd) {
+        Ok(path) => path_key(&path.display().to_string()),
+        Err(_) => return Vec::new(),
+    };
+    writable
+        .iter()
+        .filter(|grant| path_key(&grant.display().to_string()) != workspace)
+        .map(|grant| grant.display().to_string())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Input: our resolved session data (plain, no SDK types)
 // ---------------------------------------------------------------------------
@@ -1332,8 +1377,16 @@ impl std::error::Error for RequestError {}
 /// An MXC launch failure.
 #[derive(Debug)]
 pub enum MxcError {
-    /// Guardrail 1 refused the launch.
+    /// Guardrail 1 refused the launch **before the child existed**: no proof
+    /// source was supplied, or a `Required` leg was demanded of a session with no
+    /// proxy, which no launch could ever satisfy.
     Guard(GuardError),
+    /// Guardrail 1 refused a launch that **ran** (P3.0): the child finished and the
+    /// listener never proved it reached the proxy. Boxed because the carried
+    /// outcome is large, and separate from [`MxcError::Guard`] so the supervisor can
+    /// tell "refused, nothing happened" from "refused, and here is what the workload
+    /// printed" without inspecting a side channel.
+    Unproven(Box<Unproven>),
     /// Guardrail 2 refused the launch: the tier the request dispatched to is not
     /// the tier the session requires (P2.3). Refused before the child started, so
     /// no CONNECT leaf can exist for this session.
@@ -1353,6 +1406,10 @@ impl fmt::Display for MxcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Guard(e) => write!(f, "{e}"),
+            // Same text as the pre-run refusal: the leg that failed is what the
+            // operator needs to read, and the message must not change shape
+            // because the refusal happened later.
+            Self::Unproven(e) => write!(f, "{}", e.error),
             Self::Tier(e) => write!(f, "{e}"),
             Self::Request(e) => write!(f, "{e}"),
             Self::Sdk(e) => write!(f, "mxc-sdk: {e}"),
@@ -1365,6 +1422,7 @@ impl std::error::Error for MxcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Guard(e) => Some(e),
+            Self::Unproven(e) => Some(&e.error),
             Self::Tier(e) => Some(e),
             Self::Request(e) => Some(e),
             Self::Sdk(e) => Some(e),
@@ -1449,6 +1507,31 @@ impl SessionOutcome {
     pub fn timed_out(&self) -> bool {
         self.timeout.is_some()
     }
+}
+
+/// A launch that **ran** and failed guardrail 1 (P3.0).
+///
+/// Distinct from [`MxcError::Guard`], which refuses a launch *before* the child
+/// exists (no proof source, or a `Required` leg with no proxy). This one is the
+/// post-run refusal, and it carries the finished [`SessionOutcome`] for one
+/// reason: guardrail 1 refuses the SESSION, not the operator's right to see what
+/// their command did.
+///
+/// Losing that output was a real defect, not a cosmetic one. A workload that
+/// printed `curl: (2) no URL specified`, or its own error, and never touched the
+/// network produced **no output at all** — the supervisor showed one line about a
+/// proxy and left the operator with nothing to act on, while the same command
+/// under `--block-net` printed everything. The session is still refused (a
+/// `SessionNotAccepted` launch is not a contained session) and `success()` on the
+/// carried outcome is still `false`; what changes is that the transcript keeps the
+/// workload's own evidence.
+#[derive(Debug, Clone)]
+pub struct Unproven {
+    /// Which leg of guardrail 1 refused the session.
+    pub error: GuardError,
+    /// What the child did before the session was refused. `success()` on this is
+    /// `false` by construction — the proof it re-checks is the failed one.
+    pub outcome: SessionOutcome,
 }
 
 /// The child's result, before the guardrail is applied.
@@ -2439,10 +2522,37 @@ pub fn launch_session(
     proxy_port: Option<u16>,
     proxy_token: Option<&str>,
     launcher: &Path,
+    budget: SessionBudget,
     input: &MxcSessionInput,
 ) -> Result<SessionOutcome, MxcError> {
-    let backend = supervisor_backend(source, proxy_port, proxy_token, launcher);
+    let backend = supervisor_backend(source, proxy_port, proxy_token, launcher, budget);
     backend.launch(input, ProofExpectation::for_network(proxy_port))
+}
+
+/// The request [`launch_session`] would dispatch for this session (P3.0).
+///
+/// The session-start leaf has to name the tier of the **exact** request before the
+/// launch, because a refused launch carries no [`SessionOutcome`] to read it from —
+/// and a leaf armed with `tier: null` for a session that dispatched to
+/// `base-container` is the omission ADR-0004 guardrail 2 exists to prevent. Both
+/// this function and [`launch_session`] build their backend through
+/// [`supervisor_backend`], so the request probed here and the request launched
+/// there cannot differ: same port, same token, same budget, same launcher.
+///
+/// Probing is a second `v1::probe` of the same request (the launch probes again,
+/// for its own gate). That cost is deliberate: the alternative is either a leaf
+/// with no tier on every refusal, or teaching the launch to hand its tier back
+/// through the error, which would make the gate's record optional at the call
+/// site — the shape [`TierExpectation`] was made a required argument to remove.
+pub fn request_for_session(
+    source: &dyn ProxyProofSource,
+    proxy_port: Option<u16>,
+    proxy_token: Option<&str>,
+    launcher: &Path,
+    budget: SessionBudget,
+    input: &MxcSessionInput,
+) -> Result<ContainerRequest, MxcError> {
+    supervisor_backend(source, proxy_port, proxy_token, launcher, budget).request_for(input)
 }
 
 /// The backend [`launch_session`] builds — the supervisor's own construction, as a
@@ -2459,6 +2569,7 @@ fn supervisor_backend<'a>(
     proxy_port: Option<u16>,
     proxy_token: Option<&str>,
     launcher: &Path,
+    budget: SessionBudget,
 ) -> MxcBackend<'a> {
     let mut backend = MxcBackend::new(
         source,
@@ -2471,7 +2582,14 @@ fn supervisor_backend<'a>(
     if let Some(token) = proxy_token {
         backend = backend.with_proxy_token(token);
     }
-    backend
+    // P3.0 decision 3: the deadline comes from the **resolved** configuration
+    // (`NetworkConfig::session_budget`, which resolves `promptTimeoutSecs` and
+    // `workloadTimeoutSecs` from the profile). Leaving it at
+    // `SessionBudget::default()` here would size the container's deadline from the
+    // config DEFAULTS while the dialog gate gets the profile's value — the
+    // under-reservation that killed a legitimate dialog plus a full workload, and
+    // reported the wrong term for it (P2.1 review, item 6).
+    backend.with_budget(budget)
 }
 
 /// Apply guardrail 1 to a finished child and map it into a [`SessionOutcome`].
@@ -2486,10 +2604,6 @@ fn gate_outcome(
     expectation: ProofExpectation,
     clock: SessionClock,
 ) -> Result<SessionOutcome, MxcError> {
-    // Guardrail 1 first and unconditionally: `warnings: []` and exit 0 are not
-    // evidence, so a failed proof poisons every outcome, timeout included.
-    verify_proxy_proof(proof, expectation)?;
-
     // P2.1: a kill at the deadline is attributed to the term that spent the time,
     // from measurements the supervisor and the listener took — never guessed from
     // the fact that a timeout happened.
@@ -2498,7 +2612,7 @@ fn gate_outcome(
         WaitResult::TimedOut => (None, Some(clock.timeout_reason())),
     };
 
-    Ok(SessionOutcome {
+    let outcome = SessionOutcome {
         exit_code,
         timeout,
         stdout: child.stdout,
@@ -2509,7 +2623,16 @@ fn gate_outcome(
         expectation,
         // The label above is derived from exactly these numbers (P2.1 review).
         clock,
-    })
+    };
+
+    // Guardrail 1 first and unconditionally: `warnings: []` and exit 0 are not
+    // evidence, so a failed proof poisons every outcome, timeout included. The
+    // outcome is built first only so the refusal can CARRY it (P3.0): the session
+    // is refused either way, and the workload's own output stays visible.
+    if let Err(error) = verify_proxy_proof(proof, expectation) {
+        return Err(MxcError::Unproven(Box::new(Unproven { error, outcome })));
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -3096,8 +3219,18 @@ mod tests {
         .expect_err("exit 0 must not mask a failed proof");
         assert!(matches!(
             err,
-            MxcError::Guard(GuardError::TunnelNotEstablished)
+            MxcError::Unproven(ref refused) if refused.error == GuardError::TunnelNotEstablished
         ));
+        // P3.0: the refusal still carries what the child did, so a refused session
+        // is not a silent one.
+        let MxcError::Unproven(refused) = err else {
+            unreachable!("matched above")
+        };
+        assert_eq!(refused.outcome.exit_code, Some(0));
+        assert!(
+            !refused.outcome.success(),
+            "an unproven outcome is not a success"
+        );
     }
 
     #[test]
@@ -3226,8 +3359,16 @@ mod tests {
         .expect_err("proof gate applies to every outcome");
         assert!(matches!(
             err,
-            MxcError::Guard(GuardError::SessionNotAccepted)
+            MxcError::Unproven(ref refused) if refused.error == GuardError::SessionNotAccepted
         ));
+        // The timeout label survives the refusal: a killed child is still labelled.
+        let MxcError::Unproven(refused) = err else {
+            unreachable!("matched above")
+        };
+        assert!(
+            refused.outcome.timed_out(),
+            "the carried outcome keeps its label"
+        );
     }
 
     #[test]
@@ -4168,6 +4309,152 @@ mod tests {
         );
     }
 
+    /// P3.0 decision 3: the seam the supervisor calls carries the **resolved**
+    /// budget, not [`SessionBudget::default`].
+    ///
+    /// Red before the fix: a `launch_session` that built its backend without a
+    /// budget shipped the config DEFAULTS, so a profile with a longer
+    /// `promptTimeoutSecs`/`workloadTimeoutSecs` got a container deadline that
+    /// under-reserved it — the very kill P2.1 exists to prevent, reported against
+    /// the wrong term. The assertion is equality against a budget that differs
+    /// from the default in every field, so "the default happened to match" cannot
+    /// pass it.
+    #[test]
+    fn the_supervisor_seam_carries_the_resolved_budget() {
+        let source = RecordingSource::default();
+        let budget = SessionBudget::new(
+            Duration::from_secs(7),
+            Duration::from_secs(11),
+            Duration::from_secs(3),
+        );
+        assert_ne!(
+            budget,
+            SessionBudget::default(),
+            "the fixture must differ from the default or this test cannot fail"
+        );
+        let seam = supervisor_backend(
+            &source,
+            Some(49_152),
+            Some("token"),
+            Path::new(TEST_LAUNCHER),
+            budget,
+        );
+        assert_eq!(seam.budget(), budget);
+        let request = seam.request_for(&input()).expect("request");
+        assert_eq!(
+            request.timeout_ms,
+            Some(budget.timeout_ms()),
+            "the container's deadline is the resolved budget, never a default"
+        );
+    }
+
+    /// P3.0 decision 3 (the other half): [`request_for_session`] describes the
+    /// request the launch will dispatch, so the tier the leaf is armed with is the
+    /// tier of the request that runs.
+    ///
+    /// A lookalike request would still *pass* guardrail 2 locally while the leaf
+    /// named a tier the launched request never dispatched to — which is why the
+    /// probe must come from this function and not from a hand-built request.
+    #[test]
+    fn request_for_session_is_the_request_the_launch_will_dispatch() {
+        let source = RecordingSource::default();
+        let budget = SessionBudget::new(
+            Duration::from_secs(5),
+            Duration::from_secs(9),
+            Duration::from_secs(1),
+        );
+        let input = input();
+        let request = request_for_session(
+            &source,
+            Some(49_001),
+            Some("run-token"),
+            Path::new(TEST_LAUNCHER),
+            budget,
+            &input,
+        )
+        .expect("the session's request");
+
+        assert_eq!(request.timeout_ms, Some(budget.timeout_ms()));
+        let network = format!("{:?}", request.network.expect("a network policy"));
+        assert!(
+            network.contains("49001"),
+            "the request must name the port the proof counts: {network}"
+        );
+        assert!(
+            network.contains("run-token"),
+            "the request must carry the run's credential: {network}"
+        );
+        let seam = supervisor_backend(
+            &source,
+            Some(49_001),
+            Some("run-token"),
+            Path::new(TEST_LAUNCHER),
+            budget,
+        );
+        assert_eq!(
+            request.command,
+            seam.request_for(&input).expect("the same request").command,
+            "the same launcher command line, byte for byte"
+        );
+    }
+
+    /// P3.0 decision 9: a writable grant the workspace-only posture cannot honour
+    /// is NAMED, never dropped.
+    ///
+    /// Dropping it is the silent narrowing: the workload would run with a subset of
+    /// the filesystem the operator asked for, and nothing would say so.
+    #[test]
+    fn a_writable_grant_outside_the_workspace_is_reported_not_dropped() {
+        let cwd = Path::new(r"C:\work\repo");
+        let writable = [
+            PathBuf::from(r"C:\work\repo"),
+            PathBuf::from(r"C:\data\datasets"),
+        ];
+        assert_eq!(
+            writable_grants_outside_workspace(cwd, &writable),
+            vec![r"C:\data\datasets".to_string()]
+        );
+        assert!(
+            writable_grants_outside_workspace(cwd, &writable[..1]).is_empty(),
+            "the workspace itself is the grant the posture allows"
+        );
+    }
+
+    /// The workspace match has to survive the spellings a profile can produce:
+    /// trailing separator, different case, a `.` segment.
+    #[test]
+    fn the_workspace_grant_is_recognised_however_it_is_spelled() {
+        let cwd = Path::new(r"C:\work\repo");
+        for spelling in [r"c:\WORK\repo\", r"C:\work\.\repo", r"C:\work\sub\..\repo"] {
+            assert!(
+                writable_grants_outside_workspace(cwd, &[PathBuf::from(spelling)]).is_empty(),
+                "{spelling} names the workspace"
+            );
+        }
+    }
+
+    /// P3.0: the wrapper must be found *beside the supervisor*, and its absence
+    /// must be observable rather than assumed — Docker-style PATH lookups are not
+    /// something this binary does.
+    #[test]
+    fn launcher_beside_requires_the_wrapper_next_to_the_supervisor() {
+        let dir = std::env::temp_dir().join(format!(
+            "sb-p30-launcher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let supervisor = dir.join("sandbox.exe");
+        assert_eq!(launcher_beside(&supervisor), None, "nothing is written yet");
+        let launcher = dir.join(LAUNCHER_EXE_NAME);
+        std::fs::write(&launcher, b"stub").expect("stub launcher");
+        assert_eq!(launcher_beside(&supervisor), Some(launcher));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// P2.3 review (item 1) — **the finding itself**: the supervisor seam must not
     /// run un-gated.
     ///
@@ -4192,6 +4479,7 @@ mod tests {
             Some(49_152),
             Some("token"),
             Path::new(TEST_LAUNCHER),
+            SessionBudget::default(),
         );
         let refusal = seam.tier_gate(&degraded).expect_err(
             "the seam launch_session builds must require `base-container`, \
@@ -6009,7 +6297,7 @@ mod live {
             endpoint.origin_requests(epoch)
         );
         assert!(
-            matches!(err, MxcError::Guard(GuardError::TunnelNotEstablished)),
+            matches!(err, MxcError::Unproven(ref refused) if refused.error == GuardError::TunnelNotEstablished),
             "expected a proxy consultation without a tunnel, got {err:?}"
         );
         assert!(
@@ -6165,6 +6453,7 @@ mod live {
             Some(proxy.port()),
             Some(proxy.token().value()),
             &launcher,
+            SessionBudget::default(),
             &session_input(
                 &scratch_dir,
                 &launcher,
@@ -6234,6 +6523,7 @@ mod live {
             Some(proxy.port()),
             Some(proxy.token().value()),
             &launcher,
+            SessionBudget::default(),
             &session_input(
                 &scratch_dir,
                 &launcher,
@@ -6321,6 +6611,7 @@ mod live {
             None,
             None,
             &launcher,
+            SessionBudget::default(),
             &session_input(&scratch_dir, &launcher, &denies, command, None),
         )
         .expect("a blocked session that stayed offline passes MustBeAbsent");
@@ -6365,6 +6656,7 @@ mod live {
             None,
             None,
             &launcher,
+            SessionBudget::default(),
             &session_input(&scratch_dir, &launcher, &denies, command, None),
         )
         .expect("the workspace write leg must launch");
@@ -6394,6 +6686,7 @@ mod live {
             None,
             None,
             &launcher,
+            SessionBudget::default(),
             &session_input(&scratch_dir, &launcher, &denies, command, None),
         )
         .expect("the denied-read leg must launch");
@@ -6426,6 +6719,7 @@ mod live {
             None,
             None,
             &launcher,
+            SessionBudget::default(),
             &session_input(&scratch_dir, &launcher, &denies, command, None),
         )
         .expect("the denied-write leg must launch");
@@ -6455,6 +6749,7 @@ mod live {
             None,
             None,
             &launcher,
+            SessionBudget::default(),
             &session_input(&scratch_dir, &launcher, &denies, command, None),
         )
         .expect("the ungranted-write leg must launch");
@@ -6485,6 +6780,7 @@ mod live {
                 None,
                 None,
                 &launcher,
+                SessionBudget::default(),
                 &session_input(&scratch_dir, &launcher, &denies, command, None),
             )
             .expect("the system-dir caveat leg must launch");
@@ -6964,6 +7260,7 @@ mod live {
                         Some(a.port()),
                         Some(a.token().value()),
                         &launcher,
+                        SessionBudget::default(),
                         &input_a,
                     );
                     (began, launched_at.elapsed(), outcome)
@@ -6976,6 +7273,7 @@ mod live {
                         Some(b.port()),
                         Some(b.token().value()),
                         &launcher,
+                        SessionBudget::default(),
                         &input_b,
                     );
                     (began, launched_at.elapsed(), outcome)
@@ -7690,6 +7988,7 @@ exit /b 0
             Some(proxy.port()),
             Some(proxy.token().value()),
             &launcher,
+            SessionBudget::default(),
         )
         .with_budget(SessionBudget::new(
             Duration::from_secs(30),
@@ -8039,6 +8338,7 @@ exit /b 0
             Some(proxy.port()),
             Some(proxy.token().value()),
             &launcher,
+            SessionBudget::default(),
         )
         .with_budget(SessionBudget::new(
             Duration::from_secs(30),
@@ -8182,6 +8482,7 @@ exit /b 0
             Some(proxy.port()),
             Some(proxy.token().value()),
             &launcher,
+            SessionBudget::default(),
         )
         .with_budget(SessionBudget::new(
             Duration::from_secs(30),
@@ -8220,7 +8521,7 @@ exit /b 0
 
         // ---- 1. the refusal, and what it names ------------------------------
         assert!(
-            matches!(err, MxcError::Guard(GuardError::SessionNotAccepted)),
+            matches!(err, MxcError::Unproven(ref refused) if refused.error == GuardError::SessionNotAccepted),
             "the missing proof must be reported as SessionNotAccepted — not as a generic \
              failure, and certainly not as a success: {err:?}"
         );

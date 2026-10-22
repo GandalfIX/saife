@@ -40,6 +40,27 @@
 //!   `SESSION_START` root at `seq > 0`. `verify` accepts it: the chain still
 //!   links, it just carries one root per run.
 //!
+//! ## The MXC session path (P3.0) writes the root *after* the launch
+//!
+//! The AppContainer path knows its tier by construction, so it writes the root
+//! before the child. The MXC path cannot: the tier comes from `v1::probe` of the
+//! exact request, and guardrail 1's verdict only exists once the child has run.
+//! Writing the root before the launch would therefore have to state a tier it did
+//! not know and a `disposition: allow` that the very next leaf could contradict —
+//! the exact two lies [`Disposition`] exists to prevent.
+//!
+//! So on that path `arm` → **launch** → `complete`/`refuse`:
+//!
+//! * the root is written with the tier the launch recorded (or the one the
+//!   pre-launch probe of the same request named, on a refusal), the listener the
+//!   session bound, and `disposition` matching what actually happened;
+//! * **exactly one root per run** still holds, and it is guaranteed against the
+//!   *supervisor's own* early returns by the `Drop` guard;
+//! * what does NOT hold on that path is "the root is the genesis leaf": the child
+//!   ran before it, so any CONNECT leaf it caused precedes it (`seq > 0`). The
+//!   chain still links, and `verify` is unaffected — it recomputes hashes, it does
+//!   not require the root to be first.
+//!
 //! Two smaller limits, stated rather than papered over:
 //!
 //! * A run killed with `TerminateProcess`/abort skips `Drop` and lands no root at
@@ -74,15 +95,18 @@ use super::AuditWriter;
 /// `op` of the leaf every session writes exactly once, as its chain root.
 pub const OP_SESSION_START: &str = "SESSION_START";
 
-/// `op` of the leaf that records a guardrail refusal which ended the session
-/// before any child existed.
+/// `op` of the leaf that records a guardrail refusal which ended the session.
 ///
-/// `#[allow(dead_code)]` until the MXC session path is wired
-/// (`MXC_SESSION_WIRED = false`, P2.2/P3): [`SessionStart::refuse`] is the only
-/// writer and nothing in the binary calls it yet. A wiring gap, not rot — the
-/// tests and the future caller exercise the same code, and the precedent is
-/// `net::mxc`, whose module-level allow enumerates its own unreachable surface.
-#[allow(dead_code)]
+/// Written by [`SessionStart::refuse`], which the MXC session path calls when the
+/// launch was refused (P3.0): guardrail 2's tier mismatch refuses *before* the
+/// child exists, guardrail 1's unproven launch *after* it ran — both end the
+/// session, so both leave the chain readable as root(deny) + this leaf.
+///
+/// `#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]`: the refusal
+/// surface is reachable only from that path, so it is genuinely unreachable in a
+/// build without the feature — and enumerated as such rather than hidden behind a
+/// module-level allow.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 pub const OP_SESSION_REFUSED: &str = "SESSION_REFUSED";
 
 /// Tier name of the DACL-appcontainer tier (ADR-0004). The same value the MXC
@@ -95,10 +119,19 @@ pub const TIER_SOURCE_STRUCTURAL: &str = "structural";
 
 /// Stable `reason` token for a session refused because the tier it dispatched to
 /// was not the one it requires (ADR-0004 guardrail 2's hard half).
-///
-/// `#[allow(dead_code)]`: see [`OP_SESSION_REFUSED`].
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 pub const REASON_TIER_MISMATCH: &str = "tier_mismatch";
+
+/// Stable `reason` token for a session refused because guardrail 1 could not be
+/// satisfied (P3.0): the launch ran, but the supervisor's own proxy never proved
+/// the child reached it — or, under `--block-net`, reached anything at all.
+///
+/// Deliberately distinct from [`REASON_TIER_MISMATCH`]: the two refusals have
+/// different causes and different remedies (a broken proxy path versus a
+/// degraded containment tier), and one filterable token for both would make the
+/// chain unusable for exactly the question it is read for.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub const REASON_PROOF_UNMET: &str = "proxy_proof_unmet";
 
 /// The tier facts of a session, each independently optional.
 ///
@@ -247,10 +280,8 @@ impl SessionStartFacts {
     }
 }
 
-/// Why a guardrail refused a session before any child ran.
-///
-/// `#[allow(dead_code)]`: see [`OP_SESSION_REFUSED`].
-#[allow(dead_code)]
+/// Why a guardrail refused a session.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TierRefusal<'a> {
     /// The tier the session required (e.g. `base-container`).
@@ -259,13 +290,25 @@ pub struct TierRefusal<'a> {
     pub reason: &'static str,
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 impl<'a> TierRefusal<'a> {
     /// Guardrail 2: the dispatched tier is not the tier this session requires.
     pub fn tier_mismatch(expected: &'a str) -> Self {
         Self {
             expected,
             reason: REASON_TIER_MISMATCH,
+        }
+    }
+
+    /// Guardrail 1: the launch could not be proven to have reached the proxy.
+    ///
+    /// `expected` is the tier the session required, not the one observed: this
+    /// refusal does not question the tier, and the root it is written beside
+    /// already carries the tier the launch dispatched.
+    pub fn proof_unmet(expected: &'a str) -> Self {
+        Self {
+            expected,
+            reason: REASON_PROOF_UNMET,
         }
     }
 }
@@ -279,6 +322,9 @@ impl<'a> TierRefusal<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
     Allow,
+    // Only [`SessionStart::refuse`] produces a deny root, and that is the MXC
+    // session path's refusal (P3.0).
+    #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
     Deny,
 }
 
@@ -346,6 +392,27 @@ impl SessionStart {
         )
     }
 
+    /// Record the tier the **launch** established, before [`Self::complete`] or
+    /// [`Self::refuse`] writes it.
+    ///
+    /// The MXC path cannot know its tier when it arms: `v1::probe` runs against
+    /// the exact request, which does not exist until the launch is decided. So it
+    /// arms with what it does know (this process's elevation) and supplies the
+    /// tier here, from the probe/launch record, right before the leaf is written.
+    ///
+    /// A builder rather than a field setter: the facts stay private, so no caller
+    /// can half-fill a leaf, and the one value that must never be invented — the
+    /// dispatched tier — enters through exactly this door.
+    ///
+    /// `#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]`: the caller
+    /// is the MXC session path, which only exists with that feature. Scoping the
+    /// allow to the feature-off build keeps rot in the feature-on build visible.
+    #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+    pub fn with_tier(mut self, tier: TierFacts) -> Self {
+        self.facts.tier = tier;
+        self
+    }
+
     /// Write the root, then the refusal leaf that ends the session.
     ///
     /// The root names the tier that was **actually** dispatched, so a degraded
@@ -353,9 +420,7 @@ impl SessionStart {
     /// (ADR-0004 guardrail 2), and its `disposition` is already `deny`: the root
     /// is the leaf read first, and it must not say the session started when the
     /// next leaf says it was refused.
-    ///
-    /// `#[allow(dead_code)]`: see [`OP_SESSION_REFUSED`].
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
     pub fn refuse(
         mut self,
         endpoint: Option<LoopbackEndpoint>,
@@ -506,6 +571,93 @@ mod tests {
         assert_eq!(leaf["tier_needs_dacl_augmentation"], true);
         assert_eq!(leaf["elevated"], true);
         assert_eq!(leaf["proxy_endpoint"], "127.0.0.1:41234");
+    }
+
+    /// P3.0: the MXC path arms **before** it knows the tier (`v1::probe` runs
+    /// against the exact request, which the launch decides) and records the
+    /// launch's tier before writing. The leaf must carry THAT tier — not the
+    /// `null` it was armed with — or a real MXC session loses the
+    /// `tier=base-container, tier_source=probe` fact ADR-0004 guardrail 2 is
+    /// read for.
+    #[test]
+    fn the_mxc_leaf_takes_the_tier_the_launch_recorded() {
+        let sid = fresh_sid("mxc-tier");
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            // Armed with what the supervisor knows before the launch: this
+            // process's elevation, and no tier (the probe has not run).
+            let armed = SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo MXC-WIRED",
+                SessionStartFacts::measured(TierFacts::default(), Some(false)),
+            );
+            assert_eq!(armed.facts.tier.tier, None, "armed before the probe");
+            armed
+                .with_tier(TierFacts {
+                    tier: Some("base-container".to_string()),
+                    tier_source: Some("probe"),
+                    needs_dacl_augmentation: Some(false),
+                })
+                .complete(Some(LoopbackEndpoint::new(49_152)))
+                .unwrap();
+        }
+        let leaves = leaves(&sid);
+        cleanup(&sid);
+
+        assert_eq!(leaves.len(), 1, "one leaf, no fallback: {leaves:?}");
+        let leaf = &leaves[0];
+        assert_eq!(leaf["tier"], "base-container");
+        assert_eq!(leaf["tier_source"], "probe");
+        assert_eq!(leaf["tier_needs_dacl_augmentation"], false);
+        assert_eq!(leaf["elevated"], false);
+        assert_eq!(leaf["proxy_endpoint"], "127.0.0.1:49152");
+        assert_eq!(leaf["disposition"], "allow", "a launched session allowed");
+    }
+
+    /// P3.0 decision 5: a session refused by a guardrail is refused **in the
+    /// chain** — root(deny) naming the tier that was actually dispatched, then a
+    /// `SESSION_REFUSED` leaf carrying the reason. Two leaves, one root.
+    #[test]
+    fn a_guardrail_refusal_writes_a_deny_root_then_the_refused_leaf() {
+        let sid = fresh_sid("mxc-refused");
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo MXC-WIRED",
+                SessionStartFacts::measured(TierFacts::default(), Some(false)),
+            )
+            .with_tier(TierFacts {
+                tier: Some("base-container".to_string()),
+                tier_source: Some("probe"),
+                needs_dacl_augmentation: Some(false),
+            })
+            .refuse(
+                Some(LoopbackEndpoint::new(49_153)),
+                TierRefusal::proof_unmet("base-container"),
+            )
+            .unwrap();
+        }
+        let leaves = leaves(&sid);
+        cleanup(&sid);
+
+        assert_eq!(leaves.len(), 2, "root + refusal: {leaves:?}");
+        let root = &leaves[0];
+        assert_eq!(root["op"], OP_SESSION_START);
+        assert_eq!(
+            root["disposition"], "deny",
+            "the root must not claim a start"
+        );
+        assert_eq!(root["tier"], "base-container");
+        assert_eq!(root["tier_source"], "probe");
+        assert_eq!(root["proxy_endpoint"], "127.0.0.1:49153");
+        let refused = &leaves[1];
+        assert_eq!(refused["op"], OP_SESSION_REFUSED);
+        assert_eq!(refused["disposition"], "deny");
+        assert_eq!(refused["reason"], REASON_PROOF_UNMET);
+        assert_eq!(refused["expected_tier"], "base-container");
     }
 
     /// Acceptance 4 (P2.3) **as amended by its review (item 5)**: a run that dies
