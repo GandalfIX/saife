@@ -1332,13 +1332,18 @@ function Invoke-Scenario-S35 {
     # Invoke-Sandbox (it reads the pipes serially); the backend is carried in
     # explicitly instead. Note this scenario is AppContainer-only: the mxc
     # backend refuses more than one concurrent run by design.
+    # NOTE: the job parameters must NOT be typed [string[]]: casting the
+    # single-element wrapper array (,$backendArgs) to [string[]] FLATTENS it
+    # into one string, '--backend appcontainer', so the flag arrives as a
+    # single token and the run is misparsed (S-35 failed this way on
+    # 2026-10-22 while the same command worked directly).
     $backendArgs = Get-BackendArgs
     $jobA = Start-Job -ScriptBlock {
-        param($SandboxExe,$d,[string[]]$BackendArgs)
+        param($SandboxExe,$d,$BackendArgs)
         & $SandboxExe run @BackendArgs --allow-cwd --network-profile minimal --print-sid -- cmd /c echo init
     } -ArgumentList $SandboxExe,$d,(,$backendArgs)
     $jobB = Start-Job -ScriptBlock {
-        param($SandboxExe,$d,[string[]]$BackendArgs)
+        param($SandboxExe,$d,$BackendArgs)
         & $SandboxExe run @BackendArgs --allow-cwd --network-profile minimal --print-sid -- cmd /c echo init
     } -ArgumentList $SandboxExe,$d,(,$backendArgs)
     $rA = Receive-Job $jobA -Wait -AutoRemoveJob
