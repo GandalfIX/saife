@@ -542,6 +542,40 @@ the `#[ignore]`d live leg `a_launch_that_never_reaches_the_proxy_is_refused_not_
 proven by in-process live legs only, unelevated, on this host; the VM suite remains an AppContainer
 baseline. Never read a green VM run as MXC coverage.
 
+## P5 - Windows version matrix (FINAL step, after the implementation is done)
+
+**Decided 2026-10-22 (user).** Do this only once the migration itself is finished, not before.
+Reason it is last: each image costs 1-2 h to build and ~30 GB, and a matrix run on an unfinished
+build measures the wrong thing.
+
+Today's evidence is SINGLE-BUILD: after the 2026-10-22 re-bake both templates are guest build
+29680 (an Insider flight), so "passes on both images" means "passes twice on one build". Neither
+image is a GA servicing build, which is what users actually run.
+
+- [ ] **P5.1** Build an image per supported GA servicing build from ADR-0004's list and run the
+  suite on it, both backends, unelevated where the lane allows:
+  - **24H2 `26100.x`** - highest value: it is the OLDEST supported build AND the boundary for
+    several gated features (`JOB_OBJECT_UILIMIT_*` incl. injection `0x200` at build 26100, the
+    base-container requirement). Boundary builds are where SDK `requested & supported` gating
+    bugs live; a build-26100 host that silently loses a UI limit is the kind of finding a
+    29680-only matrix can never produce.
+  - **25H2 `26200.x`** - the mainstream GA build.
+  - **26H2 `26300.9550+`** - the newest GA servicing line (the dev host is 26300.9711).
+  - **Server 2025 (`26100` server)** - ONLY if the tool is meant to run on servers; nothing in the
+    ADRs claims that, so decide explicitly rather than adding it by habit.
+  - Keep one Insider canary (29680) for early warning; label it as canary, never as supported.
+- [ ] **P5.2** Per build, record a capability matrix: which gated features are actually available
+  and whether the sandbox's behaviour matches the gate it applies (template:
+  `docs/wbd-d02-capability-matrix.md`). A build where a limit is silently unavailable is a
+  DOCUMENTED limitation in the same way `ui.disable` was (D10), not a footnote.
+- [ ] **P5.3** Re-run the standard-user lane per build once it is unblocked (see the parked lane)
+  so "unelevated" is measured on every build in the matrix, not inherited from the host.
+- [ ] **P5.4** Record the matrix in `AGENTS.md`/README as the supported set, naming the minimum
+  build and what is refused below it.
+
+**Acceptance:** every build in the matrix runs the full suite with 0 failures, its skip set
+explained, and a capability table that states what that build cannot do.
+
 ## P3 — Default flip + full parity
 
 - [x] **P3.0 (2026-10-22)** Wire `--backend mxc` behind the flag, default unchanged. Selection branches
