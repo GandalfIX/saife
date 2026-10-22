@@ -18,6 +18,7 @@
 //! contract.
 
 pub mod filter;
+pub mod session_start;
 pub mod show;
 pub mod verify;
 

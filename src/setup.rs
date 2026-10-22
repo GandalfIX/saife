@@ -312,7 +312,10 @@ fn fixed_drive_roots() -> Result<Vec<String>> {
 }
 
 /// Is the current process elevated (running with the admin token)?
-fn is_elevated() -> bool {
+///
+/// `pub(crate)` since P2.3: the session-start leaf records it as `elevated`, and
+/// the check must be the same one `setup` gates the drive-root grant on.
+pub(crate) fn is_elevated() -> bool {
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     // TOKEN_ELEVATION, TOKEN_QUERY, GetTokenInformation, TokenElevation, and
     // TOKEN_INFORMATION_CLASS all live in Win32::Security in this windows-rs

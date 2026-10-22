@@ -26,7 +26,11 @@
 //! * Every launch owns an attribution **epoch**: opened before the child starts,
 //!   closed on the success *and* the error path ([`EpochGuard`]).
 //! * Guardrail 2 ([`probe_tier`]) records the tier of the *exact* request about
-//!   to be launched. The audit leaf that persists it lands in P2.3.
+//!   to be launched, and P2.3 gives that record a destination: the session-start
+//!   audit leaf (`crate::audit::session_start`), via [`TierRecord::audit_facts`].
+//!   Its hard half is [`TierExpectation`] + [`verify_tier`] — a session that
+//!   dispatches to a tier other than the one it requires is refused *before* the
+//!   launch epoch opens, so it can have no CONNECT leaf.
 //! * The **real** proof source is this listener's own counters:
 //!   [`LaunchCounters`](crate::net::proxy::LaunchCounters) in `src/net/proxy.rs`
 //!   implements [`ProxyProofSource`] (see the impl below), and [`launch_session`]
@@ -41,8 +45,9 @@
 //!   or an ancestor of it) is a hard [`RequestError::DenyCoversGrant`], never a
 //!   silent drop — dropping it would leave the rest of the denied tree readable.
 //!
-//! Not here, by design: the session-start audit leaf (P2.3) and the WinHTTP
-//! measurement (P1.5). The per-run token
+//! Not here, by design: the session-start audit leaf itself (`crate::audit::
+//! session_start`, P2.3 — this module only hands it a [`TierRecord`]) and the
+//! WinHTTP measurement (P1.5). The per-run token
 //! that makes concurrent sessions safe landed in P1.4 and lives where it is
 //! enforced: `net::token::RunToken` mints one credential per run and the listener
 //! accepts only its own (`net::proxy::classify_auth`). What this module owns is
@@ -76,8 +81,8 @@
 // `MxcFilesystemInput`, `MxcNetworkInput`, `MxcSessionInput`, `ProxyProof`,
 // `ProofExpectation`, `verify_proxy_proof`, `GuardError`, `ProxyProofSource`,
 // `TierRecord`, `ProbeView`, `tier_record`, `probe_tier`, `TIER_SOURCE_PROBE`,
-// `TIER_SOURCE_UNAVAILABLE`, `RequestError`, `MxcError`, `SessionOutcome`,
-// `build_request`,
+// `TIER_SOURCE_UNAVAILABLE`, `TierExpectation`, `REQUIRED_TIER`, `verify_tier`,
+// `TierMismatch`, `RequestError`, `MxcError`, `SessionOutcome`, `build_request`,
 // `process_container_config`, `MxcBackend`.
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -1117,6 +1122,99 @@ pub fn probe_tier(request: &ContainerRequest) -> Result<TierRecord, MxcError> {
     Ok(tier_record(ProbeView::from_probe(&probe)))
 }
 
+impl TierRecord {
+    /// This record in the **audit leaf's** vocabulary (P2.3).
+    ///
+    /// The adapter exists so the leaf cannot invent a tier or a source: every
+    /// value here comes from [`tier_record`], which never reports a backend
+    /// ceiling as the dispatched tier.
+    pub fn audit_facts(&self) -> crate::audit::session_start::TierFacts {
+        crate::audit::session_start::TierFacts {
+            tier: self.tier.clone(),
+            tier_source: Some(self.tier_source),
+            needs_dacl_augmentation: self.needs_dacl_augmentation,
+        }
+    }
+}
+
+/// Which tier a session **requires** (ADR-0004 guardrail 2's hard half).
+///
+/// Recording the tier is the soft half: it makes a degraded tier visible after
+/// the fact. This is the hard half, and the ADR's prototype evidence states the
+/// product rule — *a wrong tier is a refused session with no CONNECT leaves*.
+/// The check therefore runs before the launch epoch opens, so a refused session
+/// cannot have a child that reaches the proxy, and therefore cannot have a
+/// CONNECT leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierExpectation {
+    /// No requirement stated: record whatever dispatches. Used by probes,
+    /// measurements and tests — never by the product session path.
+    Recorded,
+    /// Require exactly this tier. A different tier, or a probe that named none,
+    /// refuses the session.
+    Exactly(&'static str),
+}
+
+/// The tier a networked MXC session requires.
+///
+/// `base-container` is the PSEC tier the migration exists for. The alternative,
+/// `appcontainer-dacl`, is the degraded tier: the SDK's AppContainer runner, which
+/// applies the same Win32k mitigation and needs the host DACLs augmented — i.e.
+/// the AppContainer backend's own posture, not a better one. Silently running a
+/// session on it would ship the migration's whole UAC gain away without saying so.
+pub const REQUIRED_TIER: &str = "base-container";
+
+/// Guardrail 2 refused a launch: the dispatched tier is not the required one.
+///
+/// Carries the observed tier and its source because the refusal is only
+/// actionable if it says what was dispatched instead — and `None`/`unavailable`
+/// must read as "the probe could not say", never as "no tier".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierMismatch {
+    /// The tier this session required.
+    pub expected: &'static str,
+    /// What the probe of the exact request reported (`None`: it named none).
+    pub observed: Option<String>,
+    /// [`TIER_SOURCE_PROBE`] or [`TIER_SOURCE_UNAVAILABLE`].
+    pub source: &'static str,
+}
+
+impl fmt::Display for TierMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let observed = match &self.observed {
+            Some(tier) => format!("`{tier}`"),
+            None => "no tier".to_string(),
+        };
+        write!(
+            f,
+            "guardrail 2: this session requires tier `{}`, but the probe of the exact request \
+             reported {observed} (tier_source `{}`) — refused before launch, so the workload \
+             never ran",
+            self.expected, self.source
+        )
+    }
+}
+
+impl std::error::Error for TierMismatch {}
+
+/// Apply guardrail 2's hard half to a probed tier. Pure.
+pub fn verify_tier(tier: &TierRecord, expectation: TierExpectation) -> Result<(), TierMismatch> {
+    let TierExpectation::Exactly(expected) = expectation else {
+        return Ok(());
+    };
+    // `None` is refused rather than waved through: a requirement that cannot be
+    // shown to have been met is not met, and "the probe was silent" is exactly
+    // the case where a degraded tier would slip past a literal `!=` check.
+    if tier.tier.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    Err(TierMismatch {
+        expected,
+        observed: tier.tier.clone(),
+        source: tier.tier_source,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Errors and outcome
 // ---------------------------------------------------------------------------
@@ -1223,6 +1321,10 @@ impl std::error::Error for RequestError {}
 pub enum MxcError {
     /// Guardrail 1 refused the launch.
     Guard(GuardError),
+    /// Guardrail 2 refused the launch: the tier the request dispatched to is not
+    /// the tier the session requires (P2.3). Refused before the child started, so
+    /// no CONNECT leaf can exist for this session.
+    Tier(TierMismatch),
     /// The request could not be built at all: refused before any spawn, with no
     /// container and no epoch.
     Request(RequestError),
@@ -1238,6 +1340,7 @@ impl fmt::Display for MxcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Guard(e) => write!(f, "{e}"),
+            Self::Tier(e) => write!(f, "{e}"),
             Self::Request(e) => write!(f, "{e}"),
             Self::Sdk(e) => write!(f, "mxc-sdk: {e}"),
             Self::Concurrency(e) => write!(f, "{e}"),
@@ -1249,6 +1352,7 @@ impl std::error::Error for MxcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Guard(e) => Some(e),
+            Self::Tier(e) => Some(e),
             Self::Request(e) => Some(e),
             Self::Sdk(e) => Some(e),
             Self::Concurrency(e) => Some(e),
@@ -1259,6 +1363,12 @@ impl std::error::Error for MxcError {
 impl From<GuardError> for MxcError {
     fn from(e: GuardError) -> Self {
         Self::Guard(e)
+    }
+}
+
+impl From<TierMismatch> for MxcError {
+    fn from(e: TierMismatch) -> Self {
+        Self::Tier(e)
     }
 }
 
@@ -2056,21 +2166,39 @@ pub struct MxcBackend<'a> {
     /// of "no budget" here, so that cannot be reintroduced by forgetting to call
     /// a setter.
     budget: SessionBudget,
+    /// Guardrail 2's hard half (P2.3): which tier this session requires.
+    ///
+    /// **A required constructor argument**, never a default (P2.3 review, item 1):
+    /// the field used to default to `Recorded` — the value that means "don't
+    /// enforce" — so a caller that forgot the requirement silently ran un-gated.
+    /// `Recorded` is still expressible, but only by naming it at the call site,
+    /// which makes "we are measuring, not enforcing" a decision rather than an
+    /// omission.
+    tier: TierExpectation,
     launcher: PathBuf,
 }
 
 impl<'a> MxcBackend<'a> {
-    /// A backend for one launch on `proxy_port`, proofed by `proof`.
+    /// A backend for one launch on `proxy_port`, proofed by `proof`, enforcing
+    /// `tier`.
+    ///
+    /// `tier` has no default on purpose. The product session path passes
+    /// `TierExpectation::Exactly(REQUIRED_TIER)`; a launch that dispatches to any
+    /// other tier — or to a tier the probe cannot name — is refused before the
+    /// child starts, so the refused session has no CONNECT leaf. A measurement
+    /// (probe, spike, evidence test) passes `TierExpectation::Recorded` and says so.
     pub fn new(
         proof: &'a dyn ProxyProofSource,
         proxy_port: Option<u16>,
         launcher: impl Into<PathBuf>,
+        tier: TierExpectation,
     ) -> Self {
         Self {
             proof: Some(proof),
             proxy_port,
             proxy_token: None,
             budget: SessionBudget::default(),
+            tier,
             launcher: launcher.into(),
         }
     }
@@ -2078,14 +2206,39 @@ impl<'a> MxcBackend<'a> {
     /// A backend with no proof source: every launch is refused by guardrail 1
     /// with [`GuardError::MissingProofSource`]. Exists so that refusal is
     /// expressible rather than accidental.
-    pub fn without_proof_source(proxy_port: Option<u16>, launcher: impl Into<PathBuf>) -> Self {
+    ///
+    /// Takes the tier requirement for the same reason [`MxcBackend::new`] does:
+    /// no constructor may leave the gate unstated.
+    pub fn without_proof_source(
+        proxy_port: Option<u16>,
+        launcher: impl Into<PathBuf>,
+        tier: TierExpectation,
+    ) -> Self {
         Self {
             proof: None,
             proxy_port,
             proxy_token: None,
             budget: SessionBudget::default(),
+            tier,
             launcher: launcher.into(),
         }
+    }
+
+    /// The tier requirement this backend applies (guardrail 2's hard half).
+    ///
+    /// Read-only: there is no setter, so the requirement is fixed at construction
+    /// and cannot be relaxed halfway through a session's life.
+    pub fn tier_expectation(&self) -> TierExpectation {
+        self.tier
+    }
+
+    /// Guardrail 2's decision for a probed tier, using this backend's requirement.
+    ///
+    /// The seam exists so the requirement is testable without a container: a
+    /// backend that was told it requires `base-container` must refuse a record
+    /// naming anything else, and the launch path below is the only other caller.
+    fn tier_gate(&self, tier: &TierRecord) -> Result<(), TierMismatch> {
+        verify_tier(tier, self.tier)
     }
 
     /// The session token the backend's proxy expects, embedded in the proxy URL
@@ -2185,6 +2338,13 @@ impl<'a> MxcBackend<'a> {
         // lookalike, and not the backend ceiling (which policy can lower).
         let tier = probe_tier(&request)?;
 
+        // Guardrail 2's HARD half, and it belongs here rather than in
+        // `gate_outcome`: a session that dispatches to the wrong tier is refused
+        // before the epoch opens and before the child exists, so it cannot have
+        // reached the proxy and therefore cannot have a CONNECT leaf. Checking it
+        // after the run would make "no CONNECT leaves" a hope instead of a fact.
+        self.tier_gate(&tier)?;
+
         // P2.1: the same measurement starts before the child does, so a kill at the
         // deadline can be attributed to a term instead of reported as a bare
         // timeout. `prompt_wait` comes from the listener, i.e. from the code that
@@ -2262,11 +2422,37 @@ pub fn launch_session(
     launcher: &Path,
     input: &MxcSessionInput,
 ) -> Result<SessionOutcome, MxcError> {
-    let mut backend = MxcBackend::new(source, proxy_port, launcher);
+    let backend = supervisor_backend(source, proxy_port, proxy_token, launcher);
+    backend.launch(input, ProofExpectation::for_network(proxy_port))
+}
+
+/// The backend [`launch_session`] builds — the supervisor's own construction, as a
+/// named function so guardrail 2's requirement is testable without a container.
+///
+/// P2.3 review (item 1): `launch_session` used to call `MxcBackend::new`, whose
+/// `tier` defaulted to [`TierExpectation::Recorded`] — the fail-open value — so
+/// the documented supervisor seam silently ran un-gated while the doc comment
+/// claimed it passed `Exactly(REQUIRED_TIER)`. The requirement is now a *required
+/// constructor argument*, so no caller can forget it, and this function states
+/// the product rule in the one place the product enters the module.
+fn supervisor_backend<'a>(
+    source: &'a dyn ProxyProofSource,
+    proxy_port: Option<u16>,
+    proxy_token: Option<&str>,
+    launcher: &Path,
+) -> MxcBackend<'a> {
+    let mut backend = MxcBackend::new(
+        source,
+        proxy_port,
+        launcher,
+        // The product rule, stated once, at the one place the product enters this
+        // module (P2.3 review, item 1).
+        TierExpectation::Exactly(REQUIRED_TIER),
+    );
     if let Some(token) = proxy_token {
         backend = backend.with_proxy_token(token);
     }
-    backend.launch(input, ProofExpectation::for_network(proxy_port))
+    backend
 }
 
 /// Apply guardrail 1 to a finished child and map it into a [`SessionOutcome`].
@@ -2311,8 +2497,8 @@ fn gate_outcome(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     /// Stand-in launcher path: the mapping is pure, so it never has to exist.
     const TEST_LAUNCHER: &str = r"C:\tools\sandbox\mxc-launch.exe";
@@ -2458,7 +2644,12 @@ mod tests {
     #[test]
     fn request_for_reports_a_refused_command_as_a_typed_error() {
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
         let mut i = input();
         i.command = "  ".to_string();
 
@@ -2991,9 +3182,13 @@ mod tests {
 
     #[test]
     fn launch_without_a_proof_source_is_an_error_before_the_child_starts() {
-        let err = MxcBackend::without_proof_source(Some(54_321), TEST_LAUNCHER)
-            .launch(&input(), ProofExpectation::Required)
-            .expect_err("no proof source must refuse the launch");
+        let err = MxcBackend::without_proof_source(
+            Some(54_321),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        )
+        .launch(&input(), ProofExpectation::Required)
+        .expect_err("no proof source must refuse the launch");
         assert!(
             matches!(err, MxcError::Guard(GuardError::MissingProofSource)),
             "got {err:?}"
@@ -3217,12 +3412,16 @@ mod tests {
     #[test]
     fn nothing_is_opened_when_the_launch_is_refused_up_front() {
         // No proof source at all.
-        let _ = MxcBackend::without_proof_source(Some(54_321), TEST_LAUNCHER)
-            .launch(&input(), ProofExpectation::Required);
+        let _ = MxcBackend::without_proof_source(
+            Some(54_321),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        )
+        .launch(&input(), ProofExpectation::Required);
 
         // Unsatisfiable expectation: `Required` with no proxy port.
         let source = RecordingSource::default();
-        let err = MxcBackend::new(&source, None, TEST_LAUNCHER)
+        let err = MxcBackend::new(&source, None, TEST_LAUNCHER, TierExpectation::Recorded)
             .launch(&input(), ProofExpectation::Required)
             .expect_err("Required without a proxy can never pass");
         assert!(
@@ -3245,7 +3444,13 @@ mod tests {
             Duration::from_millis(650),
             Duration::from_millis(50),
         );
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_budget(budget);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        )
+        .with_budget(budget);
         let mut i = input();
         i.network.proxy_port = Some(1); // a caller-supplied lookalike
         i.timeout_ms = Some(999_999);
@@ -3275,7 +3480,12 @@ mod tests {
     #[test]
     fn the_supervisor_session_always_carries_a_deadline() {
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
         let mut i = input();
         i.timeout_ms = None; // the shape that used to ship an infinite session
 
@@ -3760,7 +3970,7 @@ mod tests {
         fn assert_trait_object(_: &(dyn ProxyProofSource + Send + Sync)) {}
 
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(1), TEST_LAUNCHER);
+        let backend = MxcBackend::new(&source, Some(1), TEST_LAUNCHER, TierExpectation::Recorded);
         assert_send_sync(&backend);
         assert_send_sync(&source);
         assert_trait_object(&source);
@@ -3801,12 +4011,243 @@ mod tests {
         assert_eq!(record.needs_dacl_augmentation, None);
     }
 
+    // ---- P2.3: guardrail 2's hard half (tier requirement) -----------------
+
+    #[test]
+    fn a_dispatched_tier_that_matches_the_requirement_passes_the_gate() {
+        let record = tier_record(ProbeView {
+            tier: Some("base-container"),
+            needs_dacl_augmentation: Some(false),
+        });
+        assert_eq!(
+            verify_tier(&record, TierExpectation::Exactly(REQUIRED_TIER)),
+            Ok(())
+        );
+        // `Recorded` never refuses: measurements have no requirement to make.
+        assert_eq!(
+            verify_tier(&record, TierExpectation::Recorded).map_err(|e| e.observed),
+            Ok(())
+        );
+    }
+
+    /// The ADR's product rule: a wrong tier is a REFUSED session. The refusal
+    /// names both tiers and its source, because "refused" without "instead of
+    /// what" is not actionable.
+    #[test]
+    fn a_degraded_tier_is_refused_and_the_refusal_names_both_tiers() {
+        let record = tier_record(ProbeView {
+            tier: Some("appcontainer-dacl"),
+            needs_dacl_augmentation: Some(true),
+        });
+        let refusal = verify_tier(&record, TierExpectation::Exactly(REQUIRED_TIER))
+            .expect_err("a degraded tier must be refused when base-container is required");
+        assert_eq!(refusal.expected, "base-container");
+        assert_eq!(refusal.observed.as_deref(), Some("appcontainer-dacl"));
+        assert_eq!(refusal.source, "probe");
+        let text = refusal.to_string();
+        assert!(text.contains("guardrail 2"), "{text}");
+        assert!(text.contains("`base-container`"), "{text}");
+        assert!(text.contains("`appcontainer-dacl`"), "{text}");
+        // The MxcError wrapper keeps the detail reachable.
+        let err: MxcError = refusal.clone().into();
+        assert!(matches!(err, MxcError::Tier(_)), "{err:?}");
+    }
+
+    /// A requirement that cannot be shown to be met is not met. A literal
+    /// `observed != expected` check would let a silent probe through, which is the
+    /// one case a degraded dispatch is most likely to produce.
+    #[test]
+    fn a_probe_that_names_no_tier_is_refused_by_a_requirement() {
+        let record = tier_record(ProbeView {
+            tier: None,
+            needs_dacl_augmentation: None,
+        });
+        let refusal = verify_tier(&record, TierExpectation::Exactly(REQUIRED_TIER))
+            .expect_err("an unnamed tier cannot satisfy a requirement");
+        assert_eq!(refusal.observed, None);
+        assert_eq!(refusal.source, "unavailable");
+        assert!(refusal.to_string().contains("no tier"), "{refusal}");
+    }
+
+    /// The backend's requirement is what decides, not a global constant: a backend
+    /// constructed with `Exactly(REQUIRED_TIER)` refuses, and `Recorded` is a
+    /// **deliberate, named** opt-out for a measurement (P2.3 review, item 1).
+    ///
+    /// The opt-out is legitimate and narrow: a probe or a spike wants to record
+    /// what dispatched. What was not legitimate is that `Recorded` was the
+    /// *default* — see [`the_supervisor_seam_refuses_a_degraded_tier`].
+    #[test]
+    fn the_backends_declared_tier_expectation_is_what_the_gate_applies() {
+        let source = RecordingSource::default();
+        let degraded = tier_record(ProbeView {
+            tier: Some("appcontainer-dacl"),
+            needs_dacl_augmentation: Some(true),
+        });
+
+        let requiring = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Exactly(REQUIRED_TIER),
+        );
+        assert_eq!(
+            requiring.tier_expectation(),
+            TierExpectation::Exactly(REQUIRED_TIER),
+            "the constructor's argument is what the gate applies"
+        );
+        let refusal = requiring
+            .tier_gate(&degraded)
+            .expect_err("a base-container session must not accept a degraded dispatch");
+        assert_eq!(refusal.observed.as_deref(), Some("appcontainer-dacl"));
+
+        let recording = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
+        assert_eq!(
+            recording.tier_expectation(),
+            TierExpectation::Recorded,
+            "the deliberate measurement opt-out, named at the call site"
+        );
+        assert_eq!(
+            recording.tier_gate(&degraded),
+            Ok(()),
+            "a measurement states `Recorded` on purpose and is not refused"
+        );
+    }
+
+    /// P2.3 review (item 1) — **the finding itself**: the supervisor seam must not
+    /// run un-gated.
+    ///
+    /// `launch_session` is what `main` will call, and it built its backend with the
+    /// fail-open default while its doc comment claimed `Exactly(REQUIRED_TIER)`.
+    /// This drives a degraded tier through *that* construction — the same function
+    /// `launch_session` calls, not a lookalike — and requires the refusal.
+    ///
+    /// Red before the fix: `Ok(())` (the backend was built with `Recorded`), i.e.
+    /// a degraded dispatch would have launched with the migration's whole UAC gain
+    /// silently gone.
+    #[test]
+    fn the_supervisor_seam_refuses_a_degraded_tier() {
+        let source = RecordingSource::default();
+        let degraded = tier_record(ProbeView {
+            tier: Some("appcontainer-dacl"),
+            needs_dacl_augmentation: Some(true),
+        });
+
+        let seam = supervisor_backend(
+            &source,
+            Some(49_152),
+            Some("token"),
+            Path::new(TEST_LAUNCHER),
+        );
+        let refusal = seam.tier_gate(&degraded).expect_err(
+            "the seam launch_session builds must require `base-container`, \
+             not merely record what dispatched",
+        );
+        assert_eq!(refusal.expected, REQUIRED_TIER);
+        assert_eq!(refusal.observed.as_deref(), Some("appcontainer-dacl"));
+        assert_eq!(refusal.source, "probe");
+
+        // A silent probe is refused too: a requirement that cannot be shown to be
+        // met is not met, and that is the case a degraded dispatch produces.
+        let silent = tier_record(ProbeView {
+            tier: None,
+            needs_dacl_augmentation: None,
+        });
+        assert!(
+            seam.tier_gate(&silent).is_err(),
+            "the seam must not accept a tier nobody could name"
+        );
+
+        // And the exact tier it requires still passes: the gate refuses the wrong
+        // tier, not every tier.
+        let required = tier_record(ProbeView {
+            tier: Some(REQUIRED_TIER),
+            needs_dacl_augmentation: Some(false),
+        });
+        assert_eq!(seam.tier_gate(&required), Ok(()));
+    }
+
+    /// P2.3 review (item 1), the compile-level half: **no constructor yields an
+    /// un-gated backend.**
+    ///
+    /// Both constructors are coerced to `fn` pointers whose signatures include the
+    /// [`TierExpectation`]. That pins the arity *and* the parameter type at compile
+    /// time: an expression of `MxcBackend` that omits the expectation — the shape
+    /// that produced the fail-open seam — cannot be written, because there is no
+    /// constructor with that signature and the fields are private. This test does
+    /// not build if one is ever added back.
+    #[test]
+    fn no_constructor_yields_an_un_gated_backend() {
+        let _with_proof: fn(
+            &'static dyn ProxyProofSource,
+            Option<u16>,
+            &'static str,
+            TierExpectation,
+        ) -> MxcBackend<'static> = MxcBackend::new;
+        let _without_proof: fn(Option<u16>, &'static str, TierExpectation) -> MxcBackend<'static> =
+            MxcBackend::without_proof_source;
+
+        // …and the argument is not merely present but honoured by every
+        // constructor: the gate applies whatever was passed.
+        let degraded = tier_record(ProbeView {
+            tier: Some("appcontainer-dacl"),
+            needs_dacl_augmentation: Some(true),
+        });
+        assert!(MxcBackend::without_proof_source(
+            Some(1),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded
+        )
+        .tier_gate(&degraded)
+        .is_ok());
+    }
+
+    /// The audit adapter carries the record verbatim — including `None`, which
+    /// must stay "unknown" rather than become `false` on the leaf.
+    #[test]
+    fn the_tier_record_maps_into_the_leaf_vocabulary_without_inventing_a_value() {
+        let named = tier_record(ProbeView {
+            tier: Some("base-container"),
+            needs_dacl_augmentation: Some(false),
+        });
+        let facts = named.audit_facts();
+        assert_eq!(facts.tier.as_deref(), Some("base-container"));
+        assert_eq!(facts.tier_source, Some("probe"));
+        assert_eq!(facts.needs_dacl_augmentation, Some(false));
+        assert!(
+            facts.tier.is_some() && facts.tier_source.is_some(),
+            "the tier pair travels together"
+        );
+
+        let silent = tier_record(ProbeView {
+            tier: None,
+            needs_dacl_augmentation: None,
+        });
+        let facts = silent.audit_facts();
+        assert_eq!(facts.tier, None);
+        assert_eq!(facts.tier_source, Some("unavailable"));
+        assert_eq!(facts.needs_dacl_augmentation, None);
+        assert!(
+            facts.tier.is_none() && facts.tier_source.is_some(),
+            "a silent probe leaves the tier unknown but still names its source"
+        );
+    }
+
     // ---- P1 wave 2 B: the launcher grant is never the caller's job -------
 
     #[test]
     fn a_caller_that_omits_the_launcher_grant_still_gets_a_launchable_request() {
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
         let mut i = input();
         i.filesystem.readonly_paths.clear();
 
@@ -4223,7 +4664,12 @@ mod tests {
     #[test]
     fn build_request_refuses_a_hand_built_policy_that_denies_the_launcher_directory() {
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
         let mut i = input();
         i.filesystem.denied_paths = vec![TEST_LAUNCHER_DIR.to_string()];
 
@@ -4245,7 +4691,12 @@ mod tests {
     #[test]
     fn build_request_refuses_a_hand_built_policy_whose_deny_is_an_ancestor_of_the_launcher() {
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
         let mut i = input();
         i.filesystem.readonly_paths.clear();
         i.filesystem.denied_paths = vec![r"C:\tools".to_string()];
@@ -4440,8 +4891,13 @@ mod tests {
     #[test]
     fn the_request_hands_the_child_a_proxy_url_with_the_session_token() {
         let source = RecordingSource::default();
-        let backend =
-            MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_proxy_token("abc-123");
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        )
+        .with_proxy_token("abc-123");
         let request = backend.request_for(&input()).expect("launchable request");
         assert_eq!(
             network_proxy(&request).as_deref(),
@@ -4454,7 +4910,12 @@ mod tests {
     #[test]
     fn a_callers_token_cannot_stand_in_for_the_backends() {
         let source = RecordingSource::default();
-        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
+        let backend = MxcBackend::new(
+            &source,
+            Some(49_152),
+            TEST_LAUNCHER,
+            TierExpectation::Recorded,
+        );
         let mut i = input();
         i.network.proxy_token = Some("caller-lookalike".to_string());
 
@@ -4625,7 +5086,7 @@ mod live {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::net::intent::{DEFAULT_TTL, IntentRegistry};
+    use crate::net::intent::{IntentRegistry, DEFAULT_TTL};
     use crate::net::learned::LearnedStore;
     use crate::net::prompt::{
         DialogFn, DialogUnavailable, PromptConfig, PromptCoordinator, PromptPolicy,
@@ -4933,7 +5394,7 @@ mod live {
     fn process_is_elevated() -> bool {
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Security::{
-            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
         };
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         // SAFETY: the token handle is closed on every path, and the information
@@ -5153,6 +5614,9 @@ mod live {
         /// This listener's own run token: the only credential it accepts.
         token: RunToken,
         learned_base: PathBuf,
+        /// The listener's audit writer, shared so a test can write the session's
+        /// root into the same chain the listener appends CONNECT leaves to (P2.3).
+        writer: Arc<crate::audit::AuditWriter>,
     }
 
     impl LiveProxy {
@@ -5201,7 +5665,7 @@ mod live {
                 allow_domain: allow.iter().map(|s| s.to_string()).collect(),
                 deny_domain: Vec::new(),
                 upstream: None,
-                writer,
+                writer: writer.clone(),
                 prompt,
             })
             .expect("spawn the session proxy");
@@ -5210,6 +5674,7 @@ mod live {
                 sid,
                 token,
                 learned_base,
+                writer,
             }
         }
 
@@ -5300,13 +5765,20 @@ mod live {
             endpoint.port
         );
 
-        let backend = MxcBackend::new(&proof, Some(endpoint.port), &launcher)
-            .with_proxy_token(LIVE_TOKEN)
-            .with_budget(SessionBudget::new(
-                Duration::from_secs(30),
-                Duration::from_secs(80),
-                Duration::from_secs(10),
-            ));
+        // An evidence run measures what dispatched; the product rule (`Exactly`) is
+        // pinned by the unit tests and by the live refusal test.
+        let backend = MxcBackend::new(
+            &proof,
+            Some(endpoint.port),
+            &launcher,
+            TierExpectation::Recorded,
+        )
+        .with_proxy_token(LIVE_TOKEN)
+        .with_budget(SessionBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(80),
+            Duration::from_secs(10),
+        ));
 
         // ---- 1. the child sees NO_PROXY and the SDK's own proxy variables ----
         let outcome = backend
@@ -6010,6 +6482,113 @@ mod live {
             .count()
     }
 
+    /// A session's whole audit chain, parsed.
+    fn audit_leaves(sid: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(crate::audit::audit_log_path(sid))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("each leaf is one JSON object"))
+            .collect()
+    }
+
+    /// P2.3 acceptance 3: **a wrong tier is a refused session with NO CONNECT
+    /// leaves.**
+    ///
+    /// Driven against a real listener with its real audit writer, so the assertion
+    /// is about a `.ndjson` file a proxy could have appended to — not about a
+    /// hypothetical chain. The ordering is the supervisor's: arm the session-start
+    /// guard, probe, fail guardrail 2, then write the root (naming the tier that
+    /// was *actually* dispatched) and the refusal. Nothing spawns, so the
+    /// listener's own counters stay `{0,0}` — the positive evidence that no
+    /// consultation happened, which is stronger than an empty file.
+    #[test]
+    fn a_wrong_tier_refuses_the_session_with_no_connect_leaves() {
+        let proxy = LiveProxy::start(&["api.anthropic.com"]);
+
+        // The tier record exactly as `probe_tier` produces it for a degraded
+        // dispatch.
+        let observed = tier_record(ProbeView {
+            tier: Some("appcontainer-dacl"),
+            needs_dacl_augmentation: Some(true),
+        });
+        let refusal = verify_tier(&observed, TierExpectation::Exactly(REQUIRED_TIER))
+            .expect_err("a degraded tier must refuse a base-container session");
+
+        // The supervisor's own ordering (P2.3): the root carries the observed
+        // facts, the refusal follows it, and nothing else is written. The endpoint
+        // is the listener's bare authority — `LoopbackEndpoint` takes a `u16`, so
+        // the child's credential-bearing proxy URL cannot be passed here at all
+        // (P2.3 review, item 3).
+        let endpoint = crate::audit::session_start::LoopbackEndpoint::new(proxy.port());
+        let facts = crate::audit::session_start::SessionStartFacts::measured(
+            observed.audit_facts(),
+            Some(true),
+        );
+        crate::audit::session_start::SessionStart::arm(
+            proxy.writer.clone(),
+            &proxy.sid,
+            "cmd /c echo hi",
+            facts,
+        )
+        .refuse(
+            Some(endpoint),
+            crate::audit::session_start::TierRefusal::tier_mismatch(refusal.expected),
+        )
+        .expect("the refusal is audited");
+
+        // No CONNECT leaf — and none could exist: the listener never accepted a
+        // connection because no child was ever started.
+        assert_eq!(
+            connect_leaves(&proxy.sid),
+            0,
+            "a refused session must have no CONNECT leaves"
+        );
+        let counters = proxy.counters();
+        let epoch = ProxyProofSource::begin_launch(counters.as_ref()).expect("no epoch is open");
+        let proof = ProxyProofSource::proof(counters.as_ref(), epoch);
+        ProxyProofSource::close_launch(counters.as_ref(), epoch);
+        assert_eq!(
+            proof,
+            ProxyProof::default(),
+            "the listener must never have been consulted for a refused session"
+        );
+
+        let leaves = audit_leaves(&proxy.sid);
+        assert_eq!(leaves.len(), 2, "root + refusal, nothing else: {leaves:?}");
+        assert_eq!(leaves[0]["op"], "SESSION_START");
+        assert_eq!(leaves[0]["parent"], serde_json::Value::Null);
+        assert_eq!(
+            leaves[0]["tier"], "appcontainer-dacl",
+            "the refused session still records the tier it would have run on"
+        );
+        assert_eq!(leaves[0]["tier_source"], "probe");
+        assert_eq!(
+            leaves[0]["disposition"], "deny",
+            "the refusal's root must already say deny, not `allow` (P2.3 review, item 2)"
+        );
+        assert_eq!(
+            leaves[0]["proxy_endpoint"],
+            endpoint.to_string(),
+            "the bare loopback authority, never a URL"
+        );
+        assert_eq!(leaves[1]["op"], "SESSION_REFUSED");
+        assert_eq!(leaves[1]["disposition"], "deny");
+        assert_eq!(leaves[1]["reason"], "tier_mismatch");
+        assert_eq!(leaves[1]["expected_tier"], REQUIRED_TIER);
+        assert_eq!(leaves[1]["parent"], leaves[0]["hash"]);
+
+        // The chain's own credential rule (P2.3 acceptance 5) survives the refusal
+        // path: the listener's token is nowhere in the file.
+        let raw = std::fs::read_to_string(crate::audit::audit_log_path(&proxy.sid))
+            .expect("the chain exists");
+        assert!(
+            !raw.contains(proxy.token().value()),
+            "token in the chain: {raw}"
+        );
+        assert!(!raw.contains('@'), "userinfo in the chain: {raw}");
+    }
+
     /// One attempt of the concurrency test: when each launch was in flight, and
     /// what it returned.
     ///
@@ -6316,10 +6895,10 @@ mod live {
                 )
             });
             attempts.push(ConcurrencyAttempt {
-                a: (run.0.0, run.0.1),
-                b: (run.1.0, run.1.1),
-                out_a: run.0.2,
-                out_b: run.1.2,
+                a: (run.0 .0, run.0 .1),
+                b: (run.1 .0, run.1 .1),
+                out_a: run.0 .2,
+                out_b: run.1 .2,
             });
             let last = attempts.len() - 1;
             // Every attempt, outcome included - not just the one that gets used.
@@ -6636,9 +7215,16 @@ mod live {
         );
 
         let started = std::time::Instant::now();
-        let backend = MxcBackend::new(counters.as_ref(), Some(proxy.port()), &launcher)
-            .with_proxy_token(proxy.token().value())
-            .with_budget(budget);
+        // Evidence runs measure what dispatched; enforcement is the product path's
+        // (`supervisor_backend` -> `Exactly(REQUIRED_TIER)`).
+        let backend = MxcBackend::new(
+            counters.as_ref(),
+            Some(proxy.port()),
+            &launcher,
+            TierExpectation::Recorded,
+        )
+        .with_proxy_token(proxy.token().value())
+        .with_budget(budget);
         let outcome = backend
             .launch(&input, ProofExpectation::MustBeAbsent)
             .expect("a workload with no network use must leave the proxy unconsulted");
@@ -6767,13 +7353,20 @@ mod live {
         // The normal launch path, with the proof expectation stated rather than
         // derived: `launch_session` demands `Required` whenever the request
         // carries a proxy port, and this command cannot consult a proxy.
-        let backend = MxcBackend::new(counters.as_ref(), Some(proxy.port()), &launcher)
-            .with_proxy_token(proxy.token().value())
-            .with_budget(SessionBudget::new(
-                Duration::from_secs(30),
-                Duration::from_secs(80),
-                Duration::from_secs(10),
-            ));
+        // Evidence runs measure what dispatched; enforcement is the product path's
+        // (`supervisor_backend` -> `Exactly(REQUIRED_TIER)`).
+        let backend = MxcBackend::new(
+            counters.as_ref(),
+            Some(proxy.port()),
+            &launcher,
+            TierExpectation::Recorded,
+        )
+        .with_proxy_token(proxy.token().value())
+        .with_budget(SessionBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(80),
+            Duration::from_secs(10),
+        ));
         let outcome = backend
             .launch(&input, ProofExpectation::MustBeAbsent)
             .expect("a workload with no network use must leave the proxy unconsulted");

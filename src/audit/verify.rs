@@ -205,6 +205,71 @@ mod tests {
         assert!(matches!(outcome, VerifyOutcome::Ok), "got {:?}", outcome);
     }
 
+    /// P2.3 acceptance 2: the extended session-start leaf is the chain root and
+    /// `verify` still validates the whole chain around it — root, leaves, parent
+    /// links and the signed root.
+    ///
+    /// This is the regression that matters for the D-5 extension: the five new
+    /// keys go through the same `canonicalize`/`sha256` path as every other field
+    /// (field-agnostic since US-4, [G-31]), so adding them must not need a hash or
+    /// ordering change — and must not break the root that a session which never
+    /// reaches the proxy depends on.
+    #[test]
+    fn verify_accepts_an_extended_session_start_root() {
+        use crate::audit::session_start::{
+            LoopbackEndpoint, SessionStart, SessionStartFacts, TIER_APPCONTAINER_DACL,
+            TIER_SOURCE_STRUCTURAL,
+        };
+
+        let sid = fresh_sid("p23-root");
+        let root;
+        {
+            let writer = std::sync::Arc::new(AuditWriter::open(&sid, false).unwrap());
+            SessionStart::arm(
+                writer.clone(),
+                &sid,
+                "cmd /c echo hi",
+                SessionStartFacts::appcontainer_dacl(true),
+            )
+            .complete(Some(LoopbackEndpoint::new(41_234)))
+            .unwrap();
+            // A networked session appends CONNECT leaves behind that root.
+            for host in ["api.anthropic.com", "evil.example.com"] {
+                let mut e = Map::new();
+                e.insert("op".into(), json!("CONNECT"));
+                e.insert("host".into(), json!(host));
+                writer.append(e).unwrap();
+            }
+            root = writer.current_root().unwrap();
+        }
+
+        // The root itself carries the facts (a chain that verifies without them
+        // would be a leaf that silently lost ADR-0004 guardrail 2's record).
+        let content = std::fs::read_to_string(audit_log_path(&sid)).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(first["op"], "SESSION_START");
+        assert_eq!(first["seq"], 0);
+        assert_eq!(first["parent"], serde_json::Value::Null);
+        assert_eq!(first["tier"], TIER_APPCONTAINER_DACL);
+        assert_eq!(first["tier_source"], TIER_SOURCE_STRUCTURAL);
+        assert_eq!(first["tier_needs_dacl_augmentation"], true);
+        assert_eq!(first["elevated"], true);
+        assert_eq!(first["proxy_endpoint"], "127.0.0.1:41234");
+
+        // Sign + write root + sig, mimicking what run_inner does on clean exit.
+        let key = signing::KeyMaterial::ensure().unwrap();
+        let root_bytes = decode_hex(&root).unwrap();
+        let sig = key.sign_root(&root_bytes);
+        std::fs::write(audit_log_path(&sid).with_extension("root"), &root).unwrap();
+        let sig_hex: String = sig.iter().map(|b| format!("{:02x}", b)).collect();
+        std::fs::write(audit_log_path(&sid).with_extension("sig"), &sig_hex).unwrap();
+
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        assert!(matches!(outcome, VerifyOutcome::Ok), "got {:?}", outcome);
+    }
+
     #[test]
     fn verify_tampered_leaf_is_tampered() {
         let sid = fresh_sid("tampered");

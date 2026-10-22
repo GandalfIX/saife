@@ -414,6 +414,27 @@ fn upstream_parse_failure_warning(
     )
 }
 
+/// The session-start facts **known before the launch** (P2.3, review item 5).
+///
+/// `tier`/`tier_source` are the backend's **identity**, not a probe result: this
+/// backend creates the AppContainer profile and grants the host DACLs itself, so
+/// it *is* the DACL-appcontainer tier (`tier_source: "structural"`) and needs
+/// DACL augmentation by construction. `probe`/`unavailable` describe the MXC
+/// probe and would be a lie here.
+///
+/// `elevated` is THIS supervisor process's token, which is what decides whether
+/// the admin-only loopback exemption can be registered — the reason the field is
+/// on the leaf at all (ADR-0004: the MXC path removes that dependency, so a
+/// reader must be able to tell elevated runs from unelevated ones).
+///
+/// These are the facts the guard is **armed** with, so a run that dies before the
+/// listener binds still records them; `proxy_endpoint` is added by `complete`,
+/// which is the only caller that knows a port. `None` under `--block-net`, which
+/// binds nothing.
+fn appcontainer_session_facts() -> audit::session_start::SessionStartFacts {
+    audit::session_start::SessionStartFacts::appcontainer_dacl(setup::is_elevated())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cmd(
     backend: cli::Backend,
@@ -558,20 +579,20 @@ fn run_inner(
         return Ok(0);
     }
 
-    // Open the audit writer for this session and emit a SESSION_START leaf so
-    // every session has at least one audit event (ensures `verify` can always
-    // produce a root, even under --block-net where no proxy starts and
-    // thus no CONNECT events fire).
+    // Open the audit writer for this session and ARM the session-start leaf
+    // (P2.3). The leaf is what gives `verify` a root even under `--block-net`
+    // where no proxy starts and thus no CONNECT events fire — and it is armed
+    // with the facts that already exist (this backend's tier identity and this
+    // process's elevation), so a run that returns early still leaves a root a
+    // reader can select on. One root per run, and it is written before the child
+    // exists, so no leaf the child causes can precede it.
     let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid, audit_strict)?);
-    {
-        use serde_json::{Map, json};
-        let mut e = Map::new();
-        e.insert("op".into(), json!("SESSION_START"));
-        e.insert("sid".into(), json!(sid));
-        e.insert("command".into(), json!(cmd.join(" ")));
-        e.insert("disposition".into(), json!("allow"));
-        audit_writer.append(e)?;
-    }
+    let session_start = audit::session_start::SessionStart::arm(
+        audit_writer.clone(),
+        &sid,
+        cmd.join(" "),
+        appcontainer_session_facts(),
+    );
 
     let net_cfg = net_cfg_resolved.clone();
 
@@ -713,6 +734,22 @@ fn run_inner(
             Some(handle)
         }
     };
+
+    // P2.3: the listener exists only now, so that is the one fact `complete`
+    // adds — the leaf is written here, still before the child exists, and the
+    // guard is disarmed. Every `?` above this point returned through the guard's
+    // `Drop`, which wrote the same leaf with the armed tier/elevation and a null
+    // endpoint.
+    //
+    // Note the ordering honestly: the listener is bound at `net::proxy::spawn`
+    // above, so a local connection that reaches it in this window is audited by
+    // the proxy thread first, and this leaf then lands at `seq > 0`. The guarantee
+    // is one root per run, before the child — not "always seq 0".
+    session_start.complete(
+        proxy_env
+            .as_ref()
+            .map(|env| audit::session_start::LoopbackEndpoint::new(env.port)),
+    )?;
 
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
@@ -1248,5 +1285,70 @@ mod tests {
     fn host_no_proxy_missing_is_empty() {
         assert!(host_no_proxy(env_of(&[])).is_empty());
         assert!(host_no_proxy(env_of(&[("NO_PROXY", "  ")])).is_empty());
+    }
+
+    /// P2.3 acceptance 1, at the production seam: the AppContainer backend's leaf
+    /// facts are its identity (`appcontainer-dacl` / `structural`), never a probe
+    /// result, and `elevated` is always known — the one fact a reader uses to tell
+    /// an admin run from an unelevated one. Both survive an early death, because
+    /// they are the facts the guard is armed with (review item 5).
+    #[test]
+    fn appcontainer_session_facts_name_the_dacl_tier_by_construction() {
+        let facts = appcontainer_session_facts();
+        assert_eq!(
+            facts.tier().tier.as_deref(),
+            Some(audit::session_start::TIER_APPCONTAINER_DACL)
+        );
+        assert_eq!(
+            facts.tier().tier_source,
+            Some(audit::session_start::TIER_SOURCE_STRUCTURAL),
+            "this backend IS the tier; `probe` would claim a dispatch decision nobody made"
+        );
+        assert_eq!(
+            facts.tier().needs_dacl_augmentation,
+            Some(true),
+            "the AC backend grants host DACLs by definition"
+        );
+        assert_eq!(
+            facts.elevated(),
+            Some(setup::is_elevated()),
+            "`elevated` is this process's token, never guessed or defaulted"
+        );
+        assert!(
+            facts.tier().tier.is_some() && facts.tier().tier_source.is_some(),
+            "`tier` and `tier_source` travel together or not at all"
+        );
+    }
+
+    /// P2.3 acceptance 4/5, at the production seam: the endpoint is the bare
+    /// loopback authority of the listener this run bound, and `None` when
+    /// `--block-net` bound nothing.
+    ///
+    /// The child's proxy URL (`http://sandbox:<token>@127.0.0.1:<port>`) is
+    /// deliberately not what goes on the leaf: `LoopbackEndpoint` takes a `u16`
+    /// and nothing else, so a credential cannot be passed at all (review item 3).
+    #[test]
+    fn the_session_endpoint_is_the_bare_loopback_authority_or_null() {
+        let endpoint = audit::session_start::LoopbackEndpoint::new(63_123);
+        assert_eq!(endpoint.to_string(), "127.0.0.1:63123");
+
+        // What `complete` writes: the port the listener bound, or nothing.
+        assert_eq!(
+            appcontainer_session_facts()
+                .with_endpoint(endpoint)
+                .proxy_endpoint(),
+            Some(endpoint)
+        );
+        assert_eq!(
+            appcontainer_session_facts().proxy_endpoint(),
+            None,
+            "--block-net binds no listener, so there is no endpoint to record"
+        );
+        // The tier facts are recorded either way: a blocked session is still a
+        // session with a containment posture, and an early death still names it.
+        assert_eq!(
+            appcontainer_session_facts().tier().tier.as_deref(),
+            Some(audit::session_start::TIER_APPCONTAINER_DACL)
+        );
     }
 }
