@@ -8,7 +8,7 @@
 //! to *write* to the shared install.
 //!
 //! The expansion is pure logic over an injected [`EnvProbe`] so it is fully
-//! unit-testable (Tier 1 in `docs/testing-principles.md`) without touching
+//! unit-testable (Tier 1 in `docs/design/testing-principles.md`) without touching
 //! the real registry, PATH, or filesystem.
 //!
 //! `windows_common` is NOT handled here — it is force-added by

@@ -356,7 +356,7 @@ pub enum LearnedSub {
 /// Not yet wired into the supervisor: `main.rs` currently threads the parsed
 /// clap fields directly into `run_cmd` / `run_inner`. This struct exists so
 /// the US-3 plan's "Update `RunArgs` + `from_cli`" step can land without
-/// touching the clap layer. See `docs/specs/us-3-network-exfiltration-blocked/spec.md`.
+/// touching the clap layer. See `docs/design/specs/us-3-network-exfiltration-blocked/spec.md`.
 #[allow(dead_code)]
 pub struct RunArgs {
     pub profile: Option<String>,

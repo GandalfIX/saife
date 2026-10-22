@@ -6,7 +6,7 @@
 > requirements. The upstream asks (created-not-running/pre-resume, atomic require-tier) remain open; this
 > ADR's residual-exposure wording applies verbatim.
 > **Scope:** WBD ticket D-04 (`input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` line 494, criteria lines 500-508). Depends on D-03 (ADR-0002, selected surface: **mxc-sdk in-process**). Binds the product's launch gate and every D-08/control-implementation ticket.
-> **Origin:** `docs/superpowers/specs/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.3; implementation plan `docs/superpowers/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
+> **Origin:** `docs/design/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.3; implementation plan `docs/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
 > **Evidence rule:** same as ADR-0002 — fetched artifacts (SHA256-verified per run manifest) or `file:line` at pin `5d7a475a…`; blockers recorded, never waved away.
 
 ## 1. Provenance
@@ -19,7 +19,7 @@ Same canonical runs as ADR-0002 (image `sbx-base-b`, guest build 29680, pin
 - Run `20261017-130259-402` — Section C evidence (c1 adjudication-refusal variant —
   the authoritative form; c2 re-proven identically).
 - D-02 canonical `20261014-005531-844` — the adjudication-blocked form inventory
-  (`docs/wbd-d02-capability-matrix.md` §5.2) the gate is designed against.
+  (`docs/research/wbd-d02-capability-matrix.md` §5.2) the gate is designed against.
 
 Relevant artifacts: `d03-c1-launch.json`, `d03-c1-probe.json`,
 `d03-c2-env-immunity.json`, `d03-sdk-probe.json`, `d03-sdk-force-tier.json`,

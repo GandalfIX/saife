@@ -137,7 +137,7 @@ try {
         }
     }
 
-    # The recorded upstream pin (docs/mxc-source-analysis.md,
+    # The recorded upstream pin (docs/research/mxc-source-analysis.md,
     # "Pin decision (2026-10-13)": 5d7a475a9fd5626bafb55c2c857989d2e5621245),
     # normalized to its FULL SHA before any comparison: git always reports
     # 40-char SHAs, so comparing HEAD against the short literal fires a false
@@ -216,7 +216,7 @@ try {
     Set-Content -LiteralPath $baselinePath -Value $earlyBaselineJson -Encoding utf8
     Write-Host ("[wbd-capture] build {0} | mxc {1} | probe exit {2}" -f $os.BuildNumber, $mxcCommit.Substring(0, [Math]::Min(7, $mxcCommit.Length)), $probeExit)
     if ($pinnedFull -ne $mxcCommit) {
-        Write-Host "[wbd-capture] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence is still captured, but the pin decision must be revisited (docs/mxc-source-analysis.md)." -ForegroundColor Yellow
+        Write-Host "[wbd-capture] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence is still captured, but the pin decision must be revisited (docs/research/mxc-source-analysis.md)." -ForegroundColor Yellow
     }
 
     # ---------------------------------------------------------------------

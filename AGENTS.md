@@ -21,8 +21,8 @@ binary, no container runtime, no daemon, no VM.
 Out of scope for the MVP: undo/rollback, credential injection, ghost sessions,
 runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
 
-See `docs/prd/prd-sandbox.md` for the full product requirements and
-`docs/critical-review.md` for a critical review of the chosen mechanism.
+See `docs/design/prd/prd-sandbox.md` for the full product requirements and
+`docs/design/critical-review.md` for a critical review of the chosen mechanism.
 
 ## Where to start
 
@@ -74,7 +74,7 @@ So in case the test is killed and the cleanup cannot be performed the user is ab
 **VM-first rule (2026-10-04):** Tests that change anything on the host (ACLs,
 permissions, AppContainer profiles, network configuration) must be written to
 run inside the disposable test VM via `tests/vm/Invoke-TestsInVM.ps1` — see
-`docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`. For VM-run
+`docs/plans/2026-10-04-vm-test-infrastructure.md`. For VM-run
 tests, VM deletion is the rollback. For any test that still runs on the
 physical host, the rollback-script rule above remains mandatory.
 

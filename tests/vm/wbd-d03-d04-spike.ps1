@@ -125,7 +125,7 @@ try {
     $baselinePath = Join-Path $ResultsDir 'd03d04-baseline.json'
     Set-Content -LiteralPath $baselinePath -Value ($baseline | ConvertTo-Json -Depth 5) -Encoding utf8
     if ($pinnedFull -ne $mxcCommit) {
-        Write-Host "[wbd-spike] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence still captured; revisit the pin decision (docs/mxc-source-analysis.md)." -ForegroundColor Yellow
+        Write-Host "[wbd-spike] WARNING: checked-out MXC commit $mxcCommit is NOT the recorded pin $pinnedCommit - evidence still captured; revisit the pin decision (docs/research/mxc-source-analysis.md)." -ForegroundColor Yellow
     }
 
     # ---------------------------------------------------------------------

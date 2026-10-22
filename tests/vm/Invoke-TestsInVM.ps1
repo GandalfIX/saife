@@ -812,7 +812,7 @@ try {
     #            -> ERROR_FILENAME_EXCED_RANGE.
     #     The implementation below is kept intact so the work is not lost; two
     #     mechanisms remain untried and are named in
-    #     docs/superpowers/tasks/mxc-migration/PROGRESS.md (P3.1 blocker):
+    #     docs/tasks/mxc-migration/PROGRESS.md (P3.1 blocker):
     #     New-CimSession + Win32_Process.Create, and a restricted-token launch.
     #     The elevation claim is currently proven on the HOST (real unelevated
     #     sessions, elevated=false in the leaf) rather than in the VM.

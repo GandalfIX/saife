@@ -33,7 +33,7 @@ which is why `sbx-base-b` (build 29680) exists.
 Both premises have now been re-checked against upstream `main` (2026-10-21) and
 against a real SPIKE built on the published crate:
 
-1. **The Insider requirement is gone.** `docs/backends/process-container/
+1. **The Insider requirement is gone.** `docs/research/backends/process-container/
    os-version-support.md` lists GA servicing builds: 24H2 26100.9278+,
    25H2 26200.9278+, 26H2 26300.9550+, 26H1 28000.2804+. The development host
    (26300.9711) and both test images qualify.

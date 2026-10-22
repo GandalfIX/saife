@@ -21,5 +21,5 @@ binary, no container runtime, no daemon, no VM.
 Out of scope for the MVP: undo/rollback, credential injection, ghost sessions,
 runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
 
-See `docs/prd/prd-sandbox.md` for the full product requirements and
-`docs/critical-review.md` for a critical review of the chosen mechanism.
+See `docs/design/prd/prd-sandbox.md` for the full product requirements and
+`docs/design/critical-review.md` for a critical review of the chosen mechanism.

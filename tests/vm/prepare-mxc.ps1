@@ -24,7 +24,7 @@
        <MxcRoot>\mxc-build.json, and print the record.
 
   The pinned default is the analyzed upstream commit recorded in
-  docs/mxc-source-analysis.md (shallow clone 2026-09-16). Per the WBD,
+  docs/research/mxc-source-analysis.md (shallow clone 2026-09-16). Per the WBD,
   this script NEVER runs `wxc-host-prep` (flagged as a stop signal) and
   never launches a workload.
 
@@ -41,7 +41,7 @@
   Checkout location inside the VM. Default: C:\mxc (VM-01 Task 6).
 .PARAMETER Commit
   Pinned upstream commit to check out. Default: 5d7a475a9fd5626bafb55c2c857989d2e5621245
-  (the image-B pin re-decided 2026-10-13; see docs/mxc-source-analysis.md,
+  (the image-B pin re-decided 2026-10-13; see docs/research/mxc-source-analysis.md,
   "Pin decision (2026-10-13)").
 .PARAMETER SkipBuild
   Skip the release build (quick re-runs; exit 6 is then reachable if
@@ -110,7 +110,7 @@ try {
             $commitFull = (git rev-parse --verify "$Commit^{commit}" 2>$null)
         }
         if ($LASTEXITCODE -ne 0 -or -not $commitFull) {
-            Write-Host "[mxc-prep] pinned commit $Commit is not reachable in the upstream repository - the history may have been rewritten. Record the new pin decision in docs/mxc-source-analysis.md, do not guess." -ForegroundColor Red
+            Write-Host "[mxc-prep] pinned commit $Commit is not reachable in the upstream repository - the history may have been rewritten. Record the new pin decision in docs/research/mxc-source-analysis.md, do not guess." -ForegroundColor Red
             exit 4
         }
         $head = (git rev-parse HEAD 2>$null)

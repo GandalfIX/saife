@@ -86,7 +86,7 @@ function Test-RealPythonAvailable {
     # execution alias (.../Microsoft/WindowsApps/python.exe) resolves fine
     # in a normal session but degrades to the "Python was not found" stub
     # (exit 9009) for AppContainer callers - it must NOT count as installed
-    # (docs/bugs/2026-08-15-python-store-alias-unusable-in-appcontainer.md).
+    # (docs/notes/bugs/2026-08-15-python-store-alias-unusable-in-appcontainer.md).
     $cmd = Get-Command python -ErrorAction SilentlyContinue
     if (-not $cmd) { return $false }
     if ($cmd.Source -match '\\Microsoft\\WindowsApps\\') { return $false }

@@ -30,7 +30,7 @@ Default backend is `mxc` in a build with `--features mxc-backend` (P3.2);
 `--backend appcontainer` remains for workloads whose client stack cannot use a
 proxy. Out of scope for the MVP: undo/rollback, credential injection, ghost
 sessions, runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
-See `docs/prd/prd-sandbox.md` for the PRD and `docs/future-ideas.md` for the
+See `docs/design/prd/prd-sandbox.md` for the PRD and `docs/notes/future-ideas.md` for the
 deferred roadmap.
 
 ## Requirements
@@ -269,8 +269,8 @@ default is to run it hermetically inside a disposable Hyper-V VM with
 `pwsh tests\vm\Invoke-TestsInVM.ps1 -Phase all` (one-time host/image prep:
 `tests\vm\Initialize-VMHost.ps1`, `tests\vm\BUILD-BASE-IMAGE.md`). Direct
 host runs of `tests\run-tests.ps1` are for smoke only. See
-`docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` and the binding
-rule in `docs/testing-principles.md`.
+`docs/plans/2026-10-04-vm-test-infrastructure.md` and the binding
+rule in `docs/design/testing-principles.md`.
 
 ## Documentation
 
@@ -282,16 +282,16 @@ rule in `docs/testing-principles.md`.
   invariants a change must keep. `AGENTS.md` holds the house rules for agents.
 - `docs/adr/` — accepted decisions (0001 network hardening, 0002 MXC integration
   surface, 0003 base-container enforcement, 0004 GA unelevated egress).
-- `docs/prd/prd-sandbox.md` — full product requirements.
-- `docs/specs/us-3-network-exfiltration-blocked/spec.md` — US-3 spec
+- `docs/design/prd/prd-sandbox.md` — full product requirements.
+- `docs/design/specs/us-3-network-exfiltration-blocked/spec.md` — US-3 spec
   (including the loopback-exemption deferral finding).
-- `docs/superpowers/plans/2026-07-25-us-3-network-exfiltration-blocked.md`
+- `docs/plans/2026-07-25-us-3-network-exfiltration-blocked.md`
   — US-3 implementation plan.
-- `docs/critical-review.md` — critical review of the chosen mechanism.
-- `docs/future-ideas.md` — deferred roadmap (F-1..F-25; F-25 is superseded for egress by ADR-0004).
-- `docs/testing-principles.md` — testing philosophy for the project.
-- `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md` — VM-01:
+- `docs/design/critical-review.md` — critical review of the chosen mechanism.
+- `docs/notes/future-ideas.md` — deferred roadmap (F-1..F-25; F-25 is superseded for egress by ADR-0004).
+- `docs/design/testing-principles.md` — testing philosophy for the project.
+- `docs/plans/2026-10-04-vm-test-infrastructure.md` — VM-01:
   disposable-VM test harness (binding default for Tier 2/3 tests).
-- `docs/impact-analysis-windows-cli-sandbox-wbd.md` — impact analysis of the
+- `docs/research/impact-analysis-windows-cli-sandbox-wbd.md` — impact analysis of the
   external work breakdown in `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md`
   (MXC BaseContainer/PSEC track, two-track recommendation, VM amendment).

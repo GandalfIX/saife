@@ -5,8 +5,8 @@
 > ADR-0003's bounded-adapter posture, on condition of two mandatory guardrails (post-launch proxy proof
 > as a hard gate; per-session tier logging). The attestation gap itself is UNCHANGED — still absent at
 > mxc-sdk 1.0.1 — so a degraded launch is detectable, not preventable.
-> **Scope:** WBD ticket D-03 (`input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` line 474, criteria lines 480-492). Consumes D-02 (`docs/wbd-d02-capability-matrix.md`). Binds ADR-0003 (D-04) and every product launch-path implementation ticket.
-> **Origin:** `docs/superpowers/specs/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.2; implementation plan `docs/superpowers/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
+> **Scope:** WBD ticket D-03 (`input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` line 474, criteria lines 480-492). Consumes D-02 (`docs/research/wbd-d02-capability-matrix.md`). Binds ADR-0003 (D-04) and every product launch-path implementation ticket.
+> **Origin:** `docs/design/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.2; implementation plan `docs/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
 > **Evidence rule:** every claim below cites a fetched artifact (under `tests/vm/results/<run-id>/`, SHA256-verified against that run's `capture-manifest.json`) or a `file:line` at the pinned tree. Unexposed capabilities are recorded blockers, never inferences.
 
 ## 1. Provenance
@@ -15,12 +15,12 @@
 |---|---|---|
 | MXC pin | `5d7a475a9fd5626bafb55c2c857989d2e5621245` | `d03d04-baseline.json` (both runs): `commit == pinnedCommit`, `pinMatches: true` |
 | Template image | `sbx-base-b.vhdx`, SHA256 `95DAEA358027DF148620B71E247BD316632E83467E2E7A976317F4BBE202F5BE` | harness readiness output, both runs |
-| Guest OS | build 29680 (Windows 11 Enterprise Insider Preview) — identical to the D-02 canonical guest | `d03d04-baseline.json` (both runs), `docs/wbd-d02-capability-matrix.md` §1 |
+| Guest OS | build 29680 (Windows 11 Enterprise Insider Preview) — identical to the D-02 canonical guest | `d03d04-baseline.json` (both runs), `docs/research/wbd-d02-capability-matrix.md` §1 |
 | Canonical runs | run 1 `20261017-121539-354`, run 2 `20261017-130259-402` (Amendment 1 supplementary; both `VM HARNESS: PASS`, `wxc/sdk/c ran=true`, `errorCount: 0`) | `d03d04-spike.json` + `capture-manifest.json` per run (30 artifacts each hash+size verified; `testcmd.log` is the documented harness caveat — written by the harness, unmanifested) |
 | wxc-exec identity | `1.0.0+5d7a475a`, SHA256 `3FD125498803970B3FC7E63FC36307DD7A3186318FA02B83034F141731006DAC` — identical in both runs and equal to the D-02 canonical hash | `d03d04-baseline.json` both runs |
 | Spike binary | run 2 SHA256 `45633617961F7C28EFB4EEB745F33D07489E6D00274D2EC3592F92FC462178C8` (run 1 `9B239ABE…` — superseded by the Amendment-1 spike) | `d03d04-baseline.json` per run |
 | Guest tree dirty paths | 1 — identical to the D-02 canonical baseline in both runs | `d03d04-baseline.json` both runs |
-| D-02 canonical (probe evidence) | run `20261014-005531-844` | `docs/wbd-d02-capability-matrix.md` §7 |
+| D-02 canonical (probe evidence) | run `20261014-005531-844` | `docs/research/wbd-d02-capability-matrix.md` §7 |
 
 Run 1 and run 2 are **both** citable: run 1 recorded the workload-shape findings and the
 schema-parse fail-closed behavior (§6); run 2 (Amendment 1: System32-resident

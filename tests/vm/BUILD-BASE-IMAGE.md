@@ -3,7 +3,7 @@
 > **VM-01, Task 2 (image A) / Task 6 (image B).** One-time, **manual**
 > runbook per image. Fully automated
 > ISO→image builds are a documented non-goal for v1 (see
-> `docs/superpowers/plans/2026-10-04-vm-test-infrastructure.md`); likewise
+> `docs/plans/2026-10-04-vm-test-infrastructure.md`); likewise
 > unattended Windows Setup and CredSSP. The template is only ever **cloned**
 > (differencing VHDX per run), never booted directly and never reused as a
 > daily driver — so **no sysprep** is performed.
@@ -396,7 +396,7 @@ MXC fields come from `C:\mxc\mxc-build.json` inside the image
 > (`tests\scripts\run_processcontainer_probes_test.ps1 -RequireTier`) only
 > exists upstream since `e4619e7f` (2026-09-22 suite split), so the maintainer
 > re-pinned image B from `e7940f7` to `5d7a475a9fd56…` (see
-> `docs/mxc-source-analysis.md`, "Pin decision (2026-10-13)"). This re-bake
+> `docs/research/mxc-source-analysis.md`, "Pin decision (2026-10-13)"). This re-bake
 > **supersedes the first export** (template SHA256
 > `FD24D717FAA155724BFF8A3C7993390F7CE122BCD404A6678E805B8E08EE944D`,
 > 23.72 GB, wxc-exec 0.8.0+e7940f7c): the old template file was overwritten
@@ -461,7 +461,7 @@ Differences from the image-A build:
 
     `prepare-mxc.ps1` clones `microsoft/mxc` to `C:\mxc`, checks out the
     pinned commit `5d7a475a9fd5626bafb55c2c857989d2e5621245` (the image-B
-    pin re-decided 2026-10-13; recorded in `docs/mxc-source-analysis.md`,
+    pin re-decided 2026-10-13; recorded in `docs/research/mxc-source-analysis.md`,
     "Pin decision (2026-10-13)" — the script default matches), runs
     `cargo build --release` in the workspace, and records the `wxc-exec.exe`
     SHA256 + VersionInfo in `C:\mxc\mxc-build.json`. Because the build is
@@ -566,7 +566,7 @@ decisions are recorded.
   — the image has no real Python, only the Microsoft Store execution
   alias, which degrades to the "Python was not found" stub for
   AppContainer callers (see
-  `docs/bugs/2026-08-15-python-store-alias-unusable-in-appcontainer.md`).
+  `docs/notes/bugs/2026-08-15-python-store-alias-unusable-in-appcontainer.md`).
   `prepare-guest.ps1` installs a real machine-wide Python on the machine
   PATH (shadowing the alias); a missing/failed install is caught at bake
   time by the `Test-RealPythonAvailable` gate, which deliberately does
@@ -598,7 +598,7 @@ decisions are recorded.
 - **`prepare-mxc.ps1` exits 4 (commit unreachable / dirty tree)** — the
   upstream history was rewritten, or the checkout has local changes
   (never reset by the script). Record the new pin decision in
-  `docs/mxc-source-analysis.md` first, then re-run with
+  `docs/research/mxc-source-analysis.md` first, then re-run with
   `-Commit <new-pin>`.
 - **`prepare-mxc.ps1` exits 5 (cargo build)** — same toolchain causes as
   the prepare-guest cargo warm-up (see above); the full build log is at

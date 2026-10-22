@@ -1973,7 +1973,7 @@ pub fn build_request(
     // emitted. Do not "tidy" this back to the default; the canary test
     // `sdk_ui_policy_default_is_still_the_win32k_ban_we_explicitly_escape` is
     // what tells us if a bump ever moves the default out from under it.
-    // Evidence: `docs/backends/process-container/clr-startup-failure.md`.
+    // Evidence: `docs/research/backends/process-container/clr-startup-failure.md`.
     request.ui = Some(UiPolicy {
         disable: false,
         // Default-deny: the child keeps no clipboard and cannot inject input.
@@ -3194,7 +3194,7 @@ mod tests {
     /// If this ever fails, `mxc-sdk` changed the trap: `UiPolicy::default()`
     /// stopped meaning "ban Win32k". Delete this canary and the explicit
     /// `request.ui` assignment in [`build_request`], then re-read the comment
-    /// there and `docs/backends/process-container/clr-startup-failure.md` — the
+    /// there and `docs/research/backends/process-container/clr-startup-failure.md` — the
     /// explicit set would then be pinning a posture the default already gives,
     /// and the "lost containment" note would be describing a default, not a
     /// choice.

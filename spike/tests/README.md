@@ -1,7 +1,7 @@
 # spike test harness
 
 PowerShell harness that drives `spike.exe` through scenarios **S-1 … S-15**
-defined in [`../docs/spike-appcontainer-option-e.md`](../../docs/spike-appcontainer-option-e.md).
+defined in [`../docs/design/spike-appcontainer-option-e.md`](../../docs/design/spike-appcontainer-option-e.md).
 
 > **S-6 is the gate.** If S-6 fails, the spike is FAIL regardless of other
 > results. See "Pass / fail criteria" in the spike plan.

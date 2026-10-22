@@ -4,7 +4,7 @@
   Test harness for the AppContainer + RuleSet + Option E spike (S-1..S-15).
 .DESCRIPTION
   Drives spike.exe through the scenarios defined in
-  docs/spike-appcontainer-option-e.md and reports PASS/FAIL/SKIP per scenario.
+  docs/design/spike-appcontainer-option-e.md and reports PASS/FAIL/SKIP per scenario.
 
   The spike PASSES iff (per the plan):
     S-1, S-3, S-4, S-5, S-7, S-8, S-10, S-11 pass; S-6 passes; S-9 passes;

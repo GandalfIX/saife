@@ -112,7 +112,7 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
 /// intranet AND lets a listening sandboxed process accept connections from
 /// LAN peers. MXC rejects ingress-allow policies on its AppContainer tier for
 /// exactly this reason (appcontainer_runner.rs:1747). See ADR-0001 D-0,
-/// docs/mxc-source-analysis.md F-A.
+/// docs/research/mxc-source-analysis.md F-A.
 fn network_report_lines(build: u32) -> Vec<String> {
     vec![
         format!(

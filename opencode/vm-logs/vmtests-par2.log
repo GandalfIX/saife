@@ -1,0 +1,363 @@
+[vm-run] run id: 20261012-232329-381 | image: sbx-base-a | phase: all | vm: sbx-test-par2
+[vm-host] running elevated; checking host readiness...
+[vm-host] Hyper-V management tools present.
+[vm-host] directory present: C:\Users\marku\tools\sandbox\tests\vm\vms
+[vm-host] directory present: C:\Users\marku\tools\sandbox\tests\vm\results
+[vm-host] directory present: C:\Users\marku\tools\sandbox\tests\vm\templates
+[vm-host] template: sbx-base-a.vhdx (27 GB) SHA256:83DD291BA29BCA711240C8ACFF651A1AF5582D6E30ECE6DF075F235639A89AB8
+[vm-host] guest settings present: C:\Users\marku\tools\sandbox\tests\vm\vm-settings.json
+[vm-host] virtual switch(es): Default Switch
+[vm-host] free disk space on drive C: 443.1 GB.
+[vm-host] READY: sbx-base-a.vhdx
+[vm-run] template image: C:\Users\marku\tools\sandbox\tests\vm\templates\sbx-base-a.vhdx
+[vm-run] guest settings loaded (credentials are never printed).
+[vm-run] staging repo to C:\Users\marku\AppData\Local\Temp\sbx-repo-stage-20261012-232329-381 ...
+[vm-run] staged 565 files into C:\Users\marku\AppData\Local\Temp\sbx-repo-20261012-232329-381.zip (117,1 MB).
+[vm-run] differencing disk created: C:\Users\marku\tools\sandbox\tests\vm\vms\sbx-test-par2.vhdx
+[vm-run] virtual switch selected: Default Switch
+[vm-run] VM started: sbx-test-par2.
+[vm-run] waiting for PowerShell Direct readiness (timeout: 10 min, 60 s per attempt)...
+[vm-run] PowerShell Direct not ready yet; retrying in 15 s...
+[vm-run] PowerShell Direct ready (guest: DESKTOP-ET7QPKS).
+[vm-run] Windows Update disabled in the guest for the run.
+[vm-run] guest file-copy integration service enabled.
+[vm-run] repo archive copied into the guest.
+repo copy verified: 565 of 565 files present
+[vm-run] repo copy verified (file count matches).
+[vm-run] guest command: pwsh -NoProfile -Command & 'C:\sbx-repo\tests\vm\run-in-vm.ps1' -Phase 'all' -RepoDir 'C:\sbx-repo' -ResultsDir 'C:\sbx-results'
+[vm-guest] winsta AAP grant: winsta=OK desktop=OK
+[vm-guest] phase=all repo=C:\sbx-repo results=C:\sbx-results
+[vm-guest] step: cargo build --release
+[vm-guest]    Compiling proc-macro2 v1.0.107
+[vm-guest]    Compiling quote v1.0.47
+[vm-guest]    Compiling unicode-ident v1.0.24
+[vm-guest]    Compiling windows-link v0.2.1
+[vm-guest]    Compiling windows-sys v0.61.2
+[vm-guest]    Compiling version_check v0.9.5
+[vm-guest]    Compiling generic-array v0.14.7
+[vm-guest]    Compiling bytes v1.12.1
+[vm-guest]    Compiling cfg-if v1.0.4
+[vm-guest]    Compiling pin-project-lite v0.2.17
+[vm-guest]    Compiling find-msvc-tools v0.1.9
+[vm-guest]    Compiling itoa v1.0.18
+[vm-guest]    Compiling shlex v2.0.1
+[vm-guest]    Compiling syn v2.0.119
+[vm-guest]    Compiling typenum v1.20.1
+[vm-guest]    Compiling cc v1.4.0
+[vm-guest]    Compiling futures-core v0.3.33
+[vm-guest]    Compiling zeroize v1.9.0
+[vm-guest]    Compiling once_cell v1.21.4
+[vm-guest]    Compiling http v1.4.2
+[vm-guest]    Compiling ring v0.17.14
+[vm-guest]    Compiling socket2 v0.6.5
+[vm-guest]    Compiling mio v1.2.2
+[vm-guest]    Compiling windows-result v0.4.1
+[vm-guest]    Compiling windows-strings v0.5.1
+[vm-guest]    Compiling semver v1.0.28
+[vm-guest]    Compiling rustc_version v0.4.1
+[vm-guest]    Compiling tokio-macros v2.7.1
+[vm-guest]    Compiling windows-implement v0.60.2
+[vm-guest]    Compiling windows-interface v0.59.3
+[vm-guest]    Compiling crypto-common v0.1.7
+[vm-guest]    Compiling windows-core v0.62.2
+[vm-guest]    Compiling tokio v1.53.1
+[vm-guest]    Compiling block-buffer v0.10.4
+[vm-guest]    Compiling tracing-core v0.1.36
+[vm-guest]    Compiling syn v3.0.3
+[vm-guest]    Compiling equivalent v1.0.2
+[vm-guest]    Compiling once_cell_polyfill v1.70.2
+[vm-guest]    Compiling futures-sink v0.3.33
+[vm-guest]    Compiling httparse v1.10.1
+[vm-guest]    Compiling anstyle v1.0.14
+[vm-guest]    Compiling hashbrown v0.17.1
+[vm-guest]    Compiling serde_core v1.0.229
+[vm-guest]    Compiling utf8parse v0.2.2
+[vm-guest]    Compiling anstyle-parse v1.0.0
+[vm-guest]    Compiling indexmap v2.14.0
+[vm-guest]    Compiling anstyle-wincon v3.0.11
+[vm-guest]    Compiling tracing v0.1.44
+[vm-guest]    Compiling digest v0.10.7
+[vm-guest]    Compiling curve25519-dalek v4.1.3
+[vm-guest]    Compiling http-body v1.1.0
+[vm-guest]    Compiling rustls-pki-types v1.15.1
+[vm-guest]    Compiling getrandom v0.2.17
+[vm-guest]    Compiling anstyle-query v1.1.5
+[vm-guest]    Compiling subtle v2.6.1
+[vm-guest]    Compiling zmij v1.0.23
+[vm-guest]    Compiling slab v0.4.12
+[vm-guest]    Compiling colorchoice v1.0.5
+[vm-guest]    Compiling is_terminal_polyfill v1.70.2
+[vm-guest]    Compiling atomic-waker v1.1.2
+[vm-guest]    Compiling untrusted v0.9.0
+[vm-guest]    Compiling cpufeatures v0.2.17
+[vm-guest]    Compiling fnv v1.0.7
+[vm-guest]    Compiling anstream v1.0.0
+[vm-guest]    Compiling curve25519-dalek-derive v0.1.1
+[vm-guest]    Compiling futures-channel v0.3.33
+[vm-guest]    Compiling windows-threading v0.2.1
+[vm-guest]    Compiling strsim v0.11.1
+[vm-guest]    Compiling tokio-util v0.7.19
+[vm-guest]    Compiling serde v1.0.229
+[vm-guest]    Compiling serde_json v1.0.151
+[vm-guest]    Compiling heck v0.5.0
+[vm-guest]    Compiling clap_lex v1.1.0
+[vm-guest]    Compiling h2 v0.4.15
+[vm-guest]    Compiling anyhow v1.0.104
+[vm-guest]    Compiling signature v2.2.0
+[vm-guest]    Compiling httpdate v1.0.3
+[vm-guest]    Compiling rustls v0.23.42
+[vm-guest]    Compiling smallvec v1.15.2
+[vm-guest]    Compiling ed25519 v2.2.3
+[vm-guest]    Compiling clap_builder v4.6.2
+[vm-guest]    Compiling hyper v1.11.0
+[vm-guest]    Compiling clap_derive v4.6.4
+[vm-guest]    Compiling windows-future v0.3.2
+[vm-guest]    Compiling rustls-webpki v0.103.13
+[vm-guest]    Compiling sha2 v0.10.9
+[vm-guest]    Compiling serde_derive v1.0.229
+[vm-guest]    Compiling windows-numerics v0.3.1
+[vm-guest]    Compiling windows-collections v0.3.2
+[vm-guest]    Compiling schannel v0.1.29
+[vm-guest]    Compiling memchr v2.8.3
+[vm-guest]    Compiling rustls-native-certs v0.8.4
+[vm-guest]    Compiling windows v0.62.2
+[vm-guest]    Compiling ed25519-dalek v2.2.0
+[vm-guest]    Compiling clap v4.6.4
+[vm-guest]    Compiling hyper-util v0.1.20
+[vm-guest]    Compiling http-body-util v0.1.4
+[vm-guest]    Compiling sandbox v0.1.0 (C:\sbx-repo)
+[vm-guest]     Finished `release` profile [optimized] target(s) in 1m 00s
+[vm-guest] step: cargo test --release
+[vm-guest]    Compiling sandbox v0.1.0 (C:\sbx-repo)
+[vm-guest]     Finished `release` profile [optimized] target(s) in 5.17s
+[vm-guest]      Running unittests src\bin\breakaway-helper.rs (target\release\deps\breakaway_helper-39e6429c60161e03.exe)
+[vm-guest] 
+[vm-guest] running 0 tests
+[vm-guest] 
+[vm-guest] test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[vm-guest] 
+[vm-guest]      Running unittests src\bin\dirprobe.rs (target\release\deps\dirprobe-731b4526f839622d.exe)
+[vm-guest] 
+[vm-guest] running 0 tests
+[vm-guest] 
+[vm-guest] test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[vm-guest] 
+[vm-guest]      Running unittests src\main.rs (target\release\deps\sandbox-dcabc896bd782b26.exe)
+[vm-guest] 
+[vm-guest] running 108 tests
+[vm-guest] test audit::filter::tests::disposition_exact_match_case_sensitive ... ok
+[vm-guest] test audit::filter::tests::empty_filter_matches_all ... ok
+[vm-guest] test audit::filter::tests::host_substring_case_insensitive ... ok
+[vm-guest] test audit::filter::tests::malformed_filter_errors ... ok
+[vm-guest] test audit::filter::tests::missing_key_does_not_match ... ok
+[vm-guest] test audit::filter::tests::op_exact_match ... ok
+[vm-guest] test audit::filter::tests::seq_integer_compare ... ok
+[vm-guest] test audit::filter::tests::ts_gte_lexicographic ... ok
+[vm-guest] test audit::filter::tests::two_clauses_and ... ok
+[vm-guest] test audit::tests::canonicalize_is_alphabetical ... ok
+[vm-guest] test audit::tests::canonicalize_is_compact ... ok
+[vm-guest] test audit::tests::canonicalize_is_insertion_order_independent ... ok
+[vm-guest] test audit::tests::canonicalize_strips_hash_and_parent ... ok
+[vm-guest] test audit::tests::civil_from_days_known ... ok
+[vm-guest] test audit::show::tests::show_missing_session_errors ... ok
+[vm-guest] test audit::tests::hash_chain_links_correctly ... ok
+[vm-guest] test audit::tests::emit_connect_escapes_malicious_host ... ok
+[vm-guest] test audit::tests::sha256_hex_known_vector ... ok
+[vm-guest] test audit::tests::emit_connect_produces_valid_json ... ok
+[vm-guest] test audit::tests::scan_existing_recovers_state ... ok
+[vm-guest] test audit::verify::tests::verify_log_without_root_is_incomplete ... ok
+[vm-guest] test audit::verify::tests::verify_missing_log_is_incomplete ... ok
+[vm-guest] test net::matcher::tests::always_denied_dns ... ok
+[vm-guest] test net::matcher::tests::always_denied_ip_literal ... ok
+[vm-guest] test net::matcher::tests::case_insensitive_and_trailing_dot ... ok
+[vm-guest] test net::matcher::tests::check_dns_deny_reason ... ok
+[vm-guest] test net::matcher::tests::check_overrides_allow_with_cidr ... ok
+[vm-guest] test net::matcher::tests::check_unlisted_host_denied ... ok
+[vm-guest] test net::matcher::tests::exact_match ... ok
+[vm-guest] test net::matcher::tests::v4_cidr_169_254 ... ok
+[vm-guest] test net::matcher::tests::v6_link_local ... ok
+[vm-guest] test audit::verify::tests::verify_clean_session_is_ok ... ok
+[vm-guest] test net::matcher::tests::wildcard_suffix ... ok
+[vm-guest] test audit::verify::tests::verify_tampered_leaf_is_tampered ... ok
+[vm-guest] test net::profile::tests::developer_adds_registries_and_github ... ok
+[vm-guest] test net::profile::tests::minimal_covers_llm_apis ... ok
+[vm-guest] test net::profile::tests::none_is_empty ... ok
+[vm-guest] test net::profile::tests::unknown_returns_none ... ok
+[vm-guest] test net::tests::block_net_flag_wins_even_with_profile ... ok
+[vm-guest] test net::tests::block_net_in_profile_slice_blocks ... ok
+[vm-guest] test net::tests::cli_profile_name_overrides_slice_profile_name ... ok
+[vm-guest] test net::tests::empty_everything_yields_blocked ... ok
+[vm-guest] test net::tests::dedupe_is_case_insensitive ... ok
+[vm-guest] test net::tests::json_allow_domain_only_propagates ... ok
+[vm-guest] test net::tests::minimal_profile_plus_cli_allow_domain_merges ... ok
+[vm-guest] test net::tests::none_profile_via_cli_blocks ... ok
+[vm-guest] test net::tests::none_profile_via_profile_name_blocks ... ok
+[vm-guest] test net::tests::unknown_profile_does_not_crash ... ok
+[vm-guest] test net::token::tests::token_is_64_hex_chars ... ok
+[vm-guest] test net::token::tests::tokens_differ ... ok
+[vm-guest] test profile::tests::cycle_message_matches_spec_format ... ok
+[vm-guest] test profile::tests::cycle_message_three_deep ... ok
+[vm-guest] test profile::tests::dedupe_paths_case_insensitive ... ok
+[vm-guest] test profile::tests::expand_basic ... ok
+[vm-guest] test profile::tests::expand_multiple ... ok
+[vm-guest] test profile::tests::expanded_profile_flattens_extends_and_expands_groups ... ok
+[vm-guest] test profile::tests::merge_extends_arrays_concat ... ok
+[vm-guest] test audit::verify::tests::verify_forged_root_is_bad_signature ... ok
+[vm-guest] test profile::tests::merge_extends_child_overrides_meta ... ok
+[vm-guest] test profile::tests::no_cycle_when_name_not_seen ... ok
+[vm-guest] test profile::tests::parse_allow_bad_mode ... ok
+[vm-guest] test profile::tests::parse_allow_default_mode ... ok
+[vm-guest] test profile::tests::parse_allow_with_mode ... ok
+[vm-guest] test profile::tests::schema_version_absent_is_treated_as_error ... ok
+[vm-guest] test profile::tests::schema_version_supported_passes ... ok
+[vm-guest] test profile::tests::schema_version_unsupported_errors ... ok
+[vm-guest] test profile::tests::suggest_closest_known_key ... ok
+[vm-guest] test profile::tests::unknown_key_no_close_match_still_rejects ... ok
+[vm-guest] test profile::tests::unknown_top_level_key_is_rejected_with_suggestion ... ok
+[vm-guest] test profile::tests::wrong_type_carries_line_col ... ok
+[vm-guest] test profile::tests::list_profiles_returns_user_global_json_files ... ok
+[vm-guest] test sandbox::allowlist::tests::collect_ancestors_stops_at_user_profile_root ... ok
+[vm-guest] test sandbox::allowlist::tests::allowlist_contains_python_shim_grant ... ok
+[vm-guest] test sandbox::allowlist::tests::ancestor_entries_are_non_inheritable ... ok
+[vm-guest] test sandbox::allowlist::tests::paths_eq_ci_matches_case_insensitively ... ok
+[vm-guest] test sandbox::allowlist::tests::windows_common_system32_always_in_allowlist ... ok
+[vm-guest] test sandbox::appcontainer::env_block_tests::env_block_prepends_path_and_clears_proxy_vars ... ok
+[vm-guest] test sandbox::appcontainer::propagation_tests::should_propagate_matches_entry_semantics ... ok
+[vm-guest] test sandbox::appcontainer::propagation_tests::propagation_respects_cap_and_reports_truncation ... ok
+[vm-guest] test sandbox::allowlist::tests::ensure_session_dirs_writes_python_shim ... ok
+[vm-guest] test sandbox::dacl_journal::tests::orphans_of_dead_owners_are_reaped_and_live_journals_kept ... ok
+[vm-guest] test sandbox::dacl_journal::tests::unparseable_journal_is_quarantined_not_dropped ... ok
+[vm-guest] test security_groups::tests::dotnet_runtime_resolves_dotnet_exe_and_nuget_cache ... ok
+[vm-guest] test security_groups::tests::dotnet_runtime_skips_when_dotnet_missing ... ok
+[vm-guest] test sandbox::appcontainer::propagation_tests::grant_propagates_to_pre_existing_descendants_and_stops_at_protected ... ok
+[vm-guest] test security_groups::tests::empty_groups_yields_nothing ... ok
+[vm-guest] test security_groups::tests::git_runtime_resolves_git_exe_and_config ... ok
+[vm-guest] test sandbox::dacl_journal::tests::record_many_roundtrips_batch_in_order ... ok
+[vm-guest] test security_groups::tests::git_runtime_skips_when_git_not_installed ... ok
+[vm-guest] test security_groups::tests::java_runtime_resolves_java_home_and_gradle ... ok
+[vm-guest] test security_groups::tests::java_runtime_skips_when_java_home_unset ... ok
+[vm-guest] test security_groups::tests::multiple_groups_concatenate ... ok
+[vm-guest] test security_groups::tests::node_runtime_resolves_node_and_caches ... ok
+[vm-guest] test security_groups::tests::path_search_is_left_to_right ... ok
+[vm-guest] test security_groups::tests::python_runtime_python_not_on_path_is_silent ... ok
+[vm-guest] test security_groups::tests::python_runtime_resolves_python_on_path ... ok
+[vm-guest] test security_groups::tests::python_runtime_skips_missing_dirs ... ok
+[vm-guest] test sandbox::dacl_journal::tests::record_before_apply_roundtrip ... ok
+[vm-guest] test security_groups::tests::rust_runtime_resolves_cargo_and_rustup ... ok
+[vm-guest] test security_groups::tests::unknown_group_is_silently_skipped ... ok
+[vm-guest] test security_groups::tests::rust_runtime_skips_when_cargo_missing ... ok
+[vm-guest] test security_groups::tests::windows_common_is_noop_when_listed_in_profile ... ok
+[vm-guest] test signing::tests::key_path_is_under_localappdata ... ok
+[vm-guest] test signing::tests::sign_and_verify_roundtrip ... ok
+[vm-guest] test tests::join_cmdline_quotes_spaces ... ok
+[vm-guest] test tests::chrono_basic ... ok
+[vm-guest] test tests::session_id_format ... ok
+[vm-guest] test signing::tests::dpapi_roundtrip ... ok
+[vm-guest] 
+[vm-guest] test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+[vm-guest] 
+[vm-guest] unit tests passed.
+[vm-guest] step: pwsh -NoProfile -ExecutionPolicy Bypass -Command & 'C:\sbx-repo\tests\run-tests.ps1'
+[vm-guest] sandbox test harness
+[vm-guest]   SandboxExe : C:\sbx-repo\target\release\sandbox.exe
+[vm-guest]   Cwd        : C:\Users\sbxadmin\AppData\Local\Temp\sandbox-test-98d73ec2e40c454587bdb30922a0b619
+[vm-guest]   Keep       : False
+[vm-guest] 
+[vm-guest] [PASS] S-1
+[vm-guest] [PASS] S-2
+[vm-guest] [PASS] S-3
+[vm-guest] [PASS] S-4
+[vm-guest] [PASS] S-5
+[vm-guest] [PASS] S-6 (GATE)
+[vm-guest] [PASS] S-7
+[vm-guest] [PASS] S-8
+[vm-guest] [PASS] S-9
+[vm-guest] [PASS] S-10
+[vm-guest] [PASS] S-11
+[vm-guest] [PASS] S-12 (AC-2.5)
+[vm-guest] [PASS] S-13
+[vm-guest] [SKIP] S-14: persist/reuse not implemented in this slice
+[vm-guest] [SKIP] S-15: manual observation required
+[vm-guest] [PASS] S-16
+[vm-guest] [PASS] S-17
+[vm-guest] [PASS] S-18
+[vm-guest] [PASS] S-19 (AC-2.9 py)
+[vm-guest] [SKIP] S-20: node not on PATH
+[vm-guest] [PASS] S-21 (AC-2.6)
+[vm-guest] [SKIP] S-22: AC-2.3 gradle scenario deferred (needs java + gradle fixture)
+[vm-guest] [SKIP] S-23: reserved
+[vm-guest] [PASS] S-24 (AC-2.8)
+[vm-guest] [PASS] S-25 (AC-3.1)
+[vm-guest] [PASS] S-26 (AC-3.2)
+[vm-guest] [SKIP] S-27 (AC-3.3): deferred: --allow-domain loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-28 (AC-3.4): deferred: --allow-domain loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-29 (AC-3.5): deferred: --allow-domain loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-30 (AC-3.6): deferred: --allow-domain loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-31 (AC-3.7): deferred: --allow-domain loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-32 (AC-3.8): deferred: --network-profile loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-33 (AC-3.9): deferred: --network-profile loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-34 (AC-3.10): deferred: --allow-domain loopback mechanism pending (admin-only API)
+[vm-guest] [PASS] S-35 (AC-3.11)
+[vm-guest] [SKIP] S-36 (AC-3.12): deferred: proxy/loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-37 (AC-3.13): deferred: --allow-domain exits with a slice-deferral warning before the child runs (US-3)
+[vm-guest] [SKIP] S-38 (AC-3.14): deferred: proxy/loopback mechanism pending (admin-only API)
+[vm-guest] [SKIP] S-39 (AC-3.15): deferred to F-6 (WFP callout driver)
+[vm-guest] [SKIP] S-40 (KI-1.1 cmd dir): drive root 'C:\' not granted; run 'sandbox setup --grant-drive-root' (admin)
+[vm-guest] [SKIP] S-41 (KI-1.1 PS gci): drive root 'C:\' not granted; run 'sandbox setup --grant-drive-root' (admin)
+[vm-guest] [PASS] S-42 (KI-1.1 sibling)
+[vm-guest] [PASS] S-43 (AC-4.1)
+[vm-guest] [PASS] S-44 (AC-4.2)
+[vm-guest] [PASS] S-45 (AC-4.3)
+[vm-guest] [SKIP] S-46 (AC-4.6): requires --allow-domain (US-3 loopback deferral)
+[vm-guest] [PASS] S-47 (AC-4.8)
+[vm-guest] [PASS] S-48 (AC-4.9)
+[vm-guest] [SKIP] S-49 (AC-4.10): log has 1 line(s); need >=2 to truncate-test (SESSION_START-only session). Enable with US-4b EXEC/FILE_* events.
+[vm-guest] [PASS] S-50 (AC-4.11)
+[vm-guest] [PASS] S-51 (AC-4.12)
+[vm-guest] [PASS] S-52 (AC-4.13)
+[vm-guest] [PASS] S-53 (AC-4.14)
+[vm-guest] [PASS] S-54 (AC-4.15)
+[vm-guest] [PASS] S-55 (AC-4.17)
+[vm-guest] [SKIP] S-56 (AC-4.16): deferred to US-4b (audit fidelity reporting)
+[vm-guest] [PASS] S-57 (AC-5.16)
+[vm-guest] [PASS] S-58 (AC-5.12)
+[vm-guest] [PASS] S-59 (AC-5.13)
+[vm-guest] [PASS] S-60 (AC-5.7)
+[vm-guest] [SKIP] S-61 (AC-5.7): dotnet not on PATH
+[vm-guest] [PASS] S-62 (AC-5.6)
+[vm-guest] [PASS] S-63 (AC-5.14)
+[vm-guest] [PASS] S-64 (AC-5.15)
+[vm-guest] [PASS] S-65 (expanded)
+[vm-guest] [PASS] S-66 (AC-5.3)
+[vm-guest] [PASS] S-67 (AC-5.5)
+[vm-guest] [PASS] S-68 (AC-5.8)
+[vm-guest] [PASS] S-69 (AC-5.9)
+[vm-guest] [PASS] S-70 (AC-5.10)
+[vm-guest] [PASS] S-71 (AC-5.17)
+[vm-guest] [SKIP] S-72 (reserved): scenario number reserved (owned by another branch)
+[vm-guest] [PASS] S-73 (journal teardown restore)
+[vm-guest] [SKIP] S-74 (journal crash recovery): session ACE missing after grant phase - DACL writes unavailable here
+[vm-guest] 
+[vm-guest] Summary: total=74 pass=49 fail=0 skip=25
+[vm-guest] SANDBOX: PASS
+[vm-guest] integration verdict: SANDBOX: PASS
+[vm-guest] summary written: C:\sbx-results\summary.json
+[vm-guest] VM RUN: PASS
+[vm-run] guest suite finished (exit 0).
+[vm-run] fetched build.log (3255 bytes).
+[vm-run] fetched unit.log (7774 bytes).
+[vm-run] fetched integration.log (3280 bytes).
+[vm-run] fetched guest-metrics.log (14020 bytes).
+[vm-run] fetched summary.json (723 bytes).
+[vm-run] artifacts fetched to C:\Users\marku\tools\sandbox\tests\vm\results\20261012-232329-381 (summary.json last).
+[vm-run] differencing disk deleted: C:\Users\marku\tools\sandbox\tests\vm\vms\sbx-test-par2.vhdx
+[vm-run] VM destroyed: sbx-test-par2
+[vm-run] ---------------- run summary ----------------
+[vm-run] phase:         all
+[vm-run] build ok:      True
+[vm-run] unit exit:     0
+[vm-run] integration:   pass=49 fail=0 skip=25
+[vm-run] verdict:       SANDBOX: PASS
+[vm-run] guest osBuild: 26340
+[vm-run] artifacts:     C:\Users\marku\tools\sandbox\tests\vm\results\20261012-232329-381
+VM HARNESS: PASS

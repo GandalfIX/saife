@@ -1,7 +1,7 @@
 //! Crash-safe journal for host-DACL mutations (MXC filesystem_dacl.rs pattern).
 //! Every ACE is journaled BEFORE the Win32 apply call; teardown replays the
 //! journal to restore the host; startup reaps journals orphaned by dead
-//! owners. See docs/mxc-source-analysis.md F-C/F-D.
+//! owners. See docs/research/mxc-source-analysis.md F-C/F-D.
 //!
 //! Wired into run(): `main.rs` opens the journal per run and calls
 //! `recover_orphans` at startup; `appcontainer::restore_all` re-applies the

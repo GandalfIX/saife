@@ -8,7 +8,7 @@ decisions in `docs/adr/`.
 Task-oriented usage (running commands, grants, network, profiles, audit) is in
 `docs/USER-GUIDE.md`. Read this first, then `docs/adr/0004-mxc-ga-windows-unelevated-egress.md` (the
 backend you will work on by default) and the current plan under
-`docs/superpowers/plans/`.
+`docs/plans/`.
 
 ---
 
@@ -52,7 +52,7 @@ The tool is bin-only: there is no library target, so every test run is
 | `tests/run-tests.ps1` | the integration suite (93 scenarios), `-Backend` switch |
 | `tests/vm/` | disposable-VM lane (stages the repo, runs the suite in a guest) |
 | `tests/Clear-HostTestArtifacts.ps1` | host cleanup gate (`HOST-CLEAN` / `HOST-DIRTY`) |
-| `docs/adr/`, `docs/superpowers/plans/`, `docs/superpowers/tasks/*/PROGRESS.md` | decisions, plan, per-task record |
+| `docs/adr/`, `docs/plans/`, `docs/tasks/*/PROGRESS.md` | decisions, plan, per-task record |
 
 ---
 
@@ -167,7 +167,7 @@ transport failure". Parse-check the file (`[Parser]::ParseFile`) before running.
 `audit::filter`'s `KNOWN_KEYS` (plus `BOOL_KEYS`/`ENUM_KEYS` when it is not a
 free string, so `=true` and `=null` behave), keep `verify` untouched (it is
 field-agnostic), and document the field where the rest of the taxonomy lives
-(`docs/superpowers/tasks/adr-0001/d-5.1-*.md`).
+(`docs/tasks/adr-0001/d-5.1-*.md`).
 
 **Add a CLI flag.** `cli.rs` (with a doc comment stating the default and the
 refusal behaviour) → `run_inner` → `README.md` if user-visible.
@@ -202,12 +202,19 @@ refuse, and the legitimate case it must not.
 
 ## 7. Where decisions are recorded
 
-`docs/adr/` holds the accepted decisions (0001 network hardening, 0002 MXC
-integration surface, 0003 base-container enforcement, 0004 GA unelevated
-egress). Plans and their per-task records live under
-`docs/superpowers/plans/` and `docs/superpowers/tasks/<task>/PROGRESS.md`; the
-row tables there are the status of record, with review verdicts and the commit
-that landed each task.
+Folder layout under `docs/` (the two guides are the only files at its root):
+
+| Folder | Contents |
+|---|---|
+| `adr/` | accepted decisions (0001 network hardening, 0002 MXC integration surface, 0003 base-container enforcement, 0004 GA unelevated egress) |
+| `design/` | requirements (`design/prd/`, `design/specs/`), critical review, comparison, spikes, testing principles, plan-design docs |
+| `research/` | external-source analysis, impact analysis, capability matrices, backend findings (`research/backends/process-container/`) |
+| `plans/` | implementation plans, one per task or phase |
+| `tasks/` | per-task records: `PROGRESS.md` row tables, review verdicts, commit references |
+| `notes/` | future ideas and bug write-ups |
+
+The row tables under `tasks/<task>/PROGRESS.md` are the status of record: per
+task, the review verdicts and the commit that landed it.
 
 When evidence moves, amend the ADR in place and keep the superseded rule
 visible; never leave two documents contradicting each other and never relax a
