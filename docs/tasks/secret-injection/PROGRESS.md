@@ -62,3 +62,12 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
   `curl.exe https://www.tngtech.com/` is still denied. NOT delivered: secrets, non-GET methods,
   per-operation enforcement by the supervisor, AppContainer wiring, job object, `SIDECAR` leaf,
   `plugin list/show`.
+- 2026-10-23 — discovery is documentation, not an API (user decision): the sandbox will not
+  advertise mounts, so **every sidecar ships one skill per agent** under
+  `plugins/<mount>/agents/<agent>/SKILL.md`. The first one, `plugins/tngtech/agents/opencode/SKILL.md`,
+  is installed at `%USERPROFILE%\.config\opencode\skills\sidecar-tngtech\SKILL.md` and opencode
+  confirms it (`opencode debug skill` lists `sidecar-tngtech` with that location). The skill states the
+  URL shape (`http://<mount>.sandbox.invalid/`, plain HTTP), that the real host is denied by design,
+  and the failure vocabulary (404 unknown mount = session started without `--plugin`; 403 = HTTPS
+  attempted; 502 = upstream unreachable). Convention + install paths for opencode, Claude Code and
+  agent-compatible layouts are in `plugins/README.md`.

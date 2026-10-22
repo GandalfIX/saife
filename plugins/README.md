@@ -92,6 +92,40 @@ the internet, which is the entire point (the container cannot). It is therefore 
   `%LOCALAPPDATA%\sandbox\sidecar-logs\<sid>-<mount>.log`. No secret value may
   be written there (the POC passes none).
 
+## Agent skills: how an agent learns a sidecar exists
+
+The sandbox does not advertise mounts to the workload, so discovery is documentation: **every
+sidecar ships one skill per agent**, and the agent loads it when the task mentions that service.
+
+Layout, inside the plugin directory:
+
+```
+plugins/<mount>/agents/<agent>/SKILL.md
+plugins/tngtech/agents/opencode/SKILL.md
+```
+
+Install it where that agent looks for global skills:
+
+| agent | install path | verify |
+|---|---|---|
+| opencode | `%USERPROFILE%\.config\opencode\skills\<skill-name>\SKILL.md` | `opencode debug skill` |
+| Claude Code | `%USERPROFILE%\.claude\skills\<skill-name>\SKILL.md` | its `/skills` view |
+| agent-compatible (Codex, others) | `%USERPROFILE%\.agents\skills\<skill-name>\SKILL.md` | the agent's skill list |
+
+Rules that make a skill load at all (opencode rejects otherwise, silently): `SKILL.md` in all caps,
+frontmatter with `name` and `description`, `name` matching the containing directory, and the name
+being lowercase words joined by single hyphens.
+
+The skill itself carries the three things an agent cannot guess:
+
+1. the URL shape — `http://<mount>.sandbox.invalid/`, plain HTTP, never the real host;
+2. that the real host is denied **by design** and retrying it is pointless;
+3. the failure vocabulary (`404 facade_unknown_mount` = the session was started without
+   `--plugin <mount>`, `403 facade_requires_http` = you tried HTTPS, `502` = upstream unreachable).
+
+Example (installed): `%USERPROFILE%\.config\opencode\skills\sidecar-tngtech\SKILL.md`, which
+`opencode debug skill` lists as `sidecar-tngtech`.
+
 ## Lifecycle
 
 1. the session proxy binds;
