@@ -23,16 +23,17 @@
 //! ## One root per run — and why that is the honest scope
 //!
 //! The guarantee is **one root per run**, and it is guaranteed *against the
-//! child*: the root is written before the child is spawned (`src/main.rs:748`
-//! versus `:767`), so no leaf the child causes can precede it, and every early
-//! return between `arm` and `complete` writes it from `Drop`.
+//! child*: the root is written before the child is spawned (`src/main.rs:674`
+//! versus `:689`, and on the MXC path `:912` versus its launch at `:916`), so no
+//! leaf the child causes can precede it, and every early return between `arm` and
+//! `complete` writes it from `Drop`.
 //!
 //! It is **not** true that the root is always the genesis leaf (`seq: 0`,
 //! `parent: null`) of the file. Two cases the earlier wording of this comment
 //! missed, both reproduced by the P2.3 reviewers:
 //!
-//! * The listener is bound *before* the root is written — `src/main.rs:717`
-//!   starts the proxy, `:748` writes the leaf — so a local connection that
+//! * The listener is bound *before* the root is written — `src/main.rs:661`
+//!   starts the proxy, `:674` writes the leaf — so a local connection that
 //!   reaches that listener inside the window is audited by the proxy thread
 //!   first, and the run's root then lands at `seq > 0`.
 //! * A reused `--sid` opens the *existing* chain (`AuditWriter::open` continues
@@ -40,32 +41,42 @@
 //!   `SESSION_START` root at `seq > 0`. `verify` accepts it: the chain still
 //!   links, it just carries one root per run.
 //!
-//! ## The MXC session path (P3.0) writes the root *after* the launch
+//! ## The MXC session path writes the root **before** the launch (P3.1, S-55)
 //!
-//! The AppContainer path knows its tier by construction, so it writes the root
-//! before the child. The MXC path cannot: the tier comes from `v1::probe` of the
-//! exact request, and guardrail 1's verdict only exists once the child has run.
-//! Writing the root before the launch would therefore have to state a tier it did
-//! not know and a `disposition: allow` that the very next leaf could contradict —
-//! the exact two lies [`Disposition`] exists to prevent.
+//! P3.0 wrote it *after* `launch_session` returned, taking the tier from the
+//! launch record. That made S-55 fail on the MXC path: a supervisor
+//! `TerminateProcess`ed two seconds into a session left **no log at all**, so
+//! `audit show` failed and `verify` had nothing to report INCOMPLETE on — a
+//! regression of the guarantee the backend MXC replaces provides. The ordering is
+//! now the AppContainer path's, because every one of the five facts is knowable
+//! before the child exists:
 //!
-//! So on that path `arm` → **launch** → `complete`/`refuse`:
+//! * `tier` / `tier_source` / `tier_needs_dacl_augmentation` — from `probe_tier`
+//!   of the **exact** request `launch_session` dispatches
+//!   (`request_for_session` builds it through the same `supervisor_backend`);
+//! * `proxy_endpoint` — the port `start_session_proxy` has already bound;
+//! * `elevated` — this supervisor process's token.
 //!
-//! * the root is written with the tier the launch recorded (or the one the
-//!   pre-launch probe of the same request named, on a refusal), the listener the
-//!   session bound, and `disposition` matching what actually happened;
-//! * **exactly one root per run** still holds, and it is guaranteed against the
-//!   *supervisor's own* early returns by the `Drop` guard;
-//! * what does NOT hold on that path is "the root is the genesis leaf": the child
-//!   ran before it, so any CONNECT leaf it caused precedes it (`seq > 0`). The
-//!   chain still links, and `verify` is unaffected — it recomputes hashes, it does
-//!   not require the root to be first.
+//! So the root is written before the launch, and the launch record is only a
+//! **confirmation**: a record that disagrees with what the root already claims is
+//! a guardrail-2 violation and refuses the session — the root is never rewritten,
+//! and there is still exactly one root per run.
+//!
+//! What cannot be known before the child runs is guardrail 1's verdict. A
+//! `proxy_proof_unmet` refusal therefore appends its `SESSION_REFUSED` leaf to a
+//! root that already says `allow`: the session *was* started and then refused,
+//! which is what happened, and the refusal leaf says so. The tier-mismatch
+//! refusal needs no such concession — it is decided from the same probe that fills
+//! the root, before anything is launched, so it is still written as
+//! root(`deny`) + `SESSION_REFUSED` and the root is still the first leaf.
 //!
 //! Two smaller limits, stated rather than papered over:
 //!
-//! * A run killed with `TerminateProcess`/abort skips `Drop` and lands no root at
-//!   all — the one path the guard cannot cover, and the reason the window between
-//!   `arm` and `complete` is kept to the supervisor's own setup.
+//! * A run killed with `TerminateProcess`/abort before the root is written —
+//!   between `arm` and `complete`, i.e. during the listener bind, the request
+//!   build or the probe — skips `Drop` and lands no root at all. That window is
+//!   the supervisor's own setup, and keeping the leaf as early as the facts allow
+//!   is the whole of what closes it.
 //! * A **non-strict** writer swallows a failed write: `AuditWriter::append`
 //!   returns `Ok(())` when the file cannot be opened or written, so "one root"
 //!   holds *except* when the sink refuses, and then the run proceeds with no root
@@ -375,7 +386,10 @@ impl SessionStart {
     /// Add the listener fact, write the leaf and disarm.
     ///
     /// Called once the listener is bound and always before the child is spawned —
-    /// that ordering is what makes the root a root *for the child*.
+    /// that ordering is what makes the root a root *for the child*, on both
+    /// session paths: the AppContainer path calls it after the proxy bind, and the
+    /// MXC path calls it after the proxy bind **and** the tier probe of the exact
+    /// request, with the launch still ahead of it (P3.1, S-55).
     ///
     /// Disarms **before** writing: a failed write must not be followed by a
     /// second leaf from `Drop` — in strict mode the error propagates and ends the
@@ -392,13 +406,15 @@ impl SessionStart {
         )
     }
 
-    /// Record the tier the **launch** established, before [`Self::complete`] or
-    /// [`Self::refuse`] writes it.
+    /// Record the tier the **probe of the exact request** named, before
+    /// [`Self::complete`] or [`Self::refuse`] writes it.
     ///
     /// The MXC path cannot know its tier when it arms: `v1::probe` runs against
-    /// the exact request, which does not exist until the launch is decided. So it
-    /// arms with what it does know (this process's elevation) and supplies the
-    /// tier here, from the probe/launch record, right before the leaf is written.
+    /// the exact request, which does not exist until the listener is bound and the
+    /// request is built. So it arms with what it does know (this process's
+    /// elevation) and supplies the tier here, from that probe, **before the
+    /// launch** (P3.1, S-55) — not from the launch record, which would put the
+    /// root after the child.
     ///
     /// A builder rather than a field setter: the facts stay private, so no caller
     /// can half-fill a leaf, and the one value that must never be invented — the
@@ -420,6 +436,13 @@ impl SessionStart {
     /// (ADR-0004 guardrail 2), and its `disposition` is already `deny`: the root
     /// is the leaf read first, and it must not say the session started when the
     /// next leaf says it was refused.
+    ///
+    /// **This is the pre-launch shape only** (P3.1, S-55): the caller refuses
+    /// before anything runs — guardrail 2's tier mismatch, decided from the same
+    /// probe that fills this root. A refusal decided *after* the launch (guardrail
+    /// 1, whose verdict needs the finished child) has a root on disk already and
+    /// calls [`append_refusal`] instead; writing the root here would be a second
+    /// root for one run.
     #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
     pub fn refuse(
         mut self,
@@ -435,14 +458,31 @@ impl SessionStart {
             &self.facts,
             Disposition::Deny,
         )?;
-        let mut e = Map::new();
-        e.insert("op".into(), json!(OP_SESSION_REFUSED));
-        e.insert("sid".into(), json!(&self.sid));
-        e.insert("disposition".into(), json!("deny"));
-        e.insert("reason".into(), json!(refusal.reason));
-        e.insert("expected_tier".into(), json!(refusal.expected));
-        self.writer.append(e)
+        append_refusal(&self.writer, &self.sid, refusal)
     }
+}
+
+/// Append the leaf that records a guardrail refusal **after** the root exists.
+///
+/// Split out of [`SessionStart::refuse`] in P3.1 (S-55), when the MXC root moved
+/// ahead of the launch. A guardrail-1 refusal is the one verdict only the finished
+/// child can produce, so its root is necessarily already on disk — and the
+/// guarantee is one root per run, so the refusal records itself without writing a
+/// second one. The chain then reads root(allow: the session started) →
+/// `SESSION_REFUSED`(deny, with the reason), which is exactly what happened.
+///
+/// Takes `&AuditWriter` rather than a [`SessionStart`] because the guard is
+/// consumed by the root write: after `complete` there is no value left to hold
+/// the fallback, which is the point.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub fn append_refusal(writer: &AuditWriter, sid: &str, refusal: TierRefusal<'_>) -> Result<()> {
+    let mut e = Map::new();
+    e.insert("op".into(), json!(OP_SESSION_REFUSED));
+    e.insert("sid".into(), json!(sid));
+    e.insert("disposition".into(), json!("deny"));
+    e.insert("reason".into(), json!(refusal.reason));
+    e.insert("expected_tier".into(), json!(refusal.expected));
+    writer.append(e)
 }
 
 impl Drop for SessionStart {

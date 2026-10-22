@@ -20,15 +20,19 @@ pub fn run_verify(session_id: &str) -> i32 {
     }
 }
 
+/// `pub(crate)`, not private (P3.1, S-55): the crash test lives beside the
+/// mechanism it protects (the root that is written before the launch) and has to
+/// assert the *verdict* `verify` reaches, not a copy of it. The CLI entry point
+/// stays [`run_verify`].
 #[derive(Debug)]
-enum VerifyOutcome {
+pub(crate) enum VerifyOutcome {
     Ok,
     Incomplete(String),
     Tampered(String),
     BadSignature(String),
 }
 
-fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
+pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
     let log_path = audit_log_path(session_id);
     if !log_path.exists() {
         return Ok(VerifyOutcome::Incomplete(format!("no audit log at {}", log_path.display())));

@@ -746,6 +746,11 @@ const EXIT_REFUSED: i32 = 126;
 ///   port (`Required` with a proxy, `MustBeAbsent` without) and carries
 ///   `TierExpectation::Exactly(REQUIRED_TIER)`. A launch that cannot prove the
 ///   child reached the proxy **fails the session** (exit 126) instead of warning.
+/// * **audit** — the session root is written **before** the launch, from the probe
+///   of the exact request, the port this run bound and this process's token, so a
+///   supervisor killed mid-session leaves a readable chain with no sealed root
+///   (`audit verify` says INCOMPLETE — S-55). The launch record afterwards only
+///   confirms that root's tier; it never writes it.
 ///
 /// What it deliberately does NOT do: create an AppContainer profile, grant host
 /// DACLs, open a DACL journal, register a loopback exemption or create the
@@ -807,12 +812,13 @@ fn run_mxc_session(
             }
         };
 
-    // (4) The audit writer and the ARMED root. The tier is deliberately not known
-    //     here — it comes from `v1::probe` of the exact request, which the launch
-    //     decides — so the guard is armed with this process's elevation and the
-    //     tier is supplied just before the leaf is written. Every `?` between here
-    //     and that write returns through `Drop`, which writes the armed root: one
-    //     root per run, even for a session that dies in setup.
+    // (4) The audit writer and the ARMED root. The writer must exist before the
+    //     listener, because the listener audits through it — and the tier is not
+    //     known yet: it comes from `v1::probe` of the exact request, which needs
+    //     the bound port. So the guard is armed with this process's elevation, and
+    //     the tier arrives from that probe at (7b), before the launch. Every `?`
+    //     between here and that write returns through `Drop`, which writes the
+    //     armed root: one root per run, even for a session that dies in setup.
     let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(sid, audit_strict)?);
     let session_start = audit::session_start::SessionStart::arm(
         audit_writer.clone(),
@@ -876,8 +882,34 @@ fn run_mxc_session(
         &input,
     )?;
     let probed = net::mxc::probe_tier(&request)?;
-    let session_start = session_start.with_tier(probed.audit_facts());
     let endpoint = proxy_port.map(audit::session_start::LoopbackEndpoint::new);
+
+    // (7b) THE ROOT — before the child can exist (P3.1, S-55). Every fact the leaf
+    //      states is already known at this point: the probe of the exact request
+    //      named the tier and its provenance, `start_session_proxy` bound the port,
+    //      and the elevation is this process's own token. Writing it here is what
+    //      makes a supervisor killed mid-session leave a readable chain with no
+    //      sealed root — `audit verify` then says INCOMPLETE, exactly as the
+    //      AppContainer path always has. P3.0 wrote this leaf after the launch
+    //      returned (taking the tier from the launch record), so a hard kill left
+    //      nothing to verify at all.
+    //
+    //      Guardrail 2's hard half is decided from the SAME probe, so a degraded
+    //      tier still refuses before anything runs: root(deny) naming what the
+    //      probe reported, then SESSION_REFUSED, no child, no CONNECT leaf.
+    let claimed = probed.audit_facts();
+    if let Some(mismatch) = pre_launch_tier_refusal(&probed) {
+        session_start.with_tier(claimed).refuse(
+            endpoint,
+            audit::session_start::TierRefusal::tier_mismatch(mismatch.expected),
+        )?;
+        seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
+        eprintln!("[sandbox] mxc: {mismatch}");
+        return Ok(EXIT_REFUSED);
+    }
+    session_start
+        .with_tier(claimed.clone())
+        .complete(endpoint)?;
 
     // (8) The launch. `launch_session` derives the guardrail leg from the port and
     //     builds its backend with `TierExpectation::Exactly(REQUIRED_TIER)`.
@@ -890,8 +922,8 @@ fn run_mxc_session(
         &input,
     ) {
         Ok(outcome) => outcome,
-        Err(e) => match refusal_for(&e, &probed) {
-            Some((facts, refusal)) => {
+        Err(e) => match refusal_for(&e) {
+            Some(refusal) => {
                 // A guardrail-1 refusal happens AFTER the child ran, and the refusal
                 // carries its result: print what the workload did first, so the
                 // operator sees their own command's output next to the reason the
@@ -900,25 +932,48 @@ fn run_mxc_session(
                 if let net::mxc::MxcError::Unproven(unproven) = &e {
                     emit_child_output(&unproven.outcome);
                 }
-                // Decision 5: a refused session is refused IN THE CHAIN — the root
-                // says `deny` and names the tier that was dispatched, and the next
-                // leaf says why. Both are written before the chain is sealed.
-                session_start.with_tier(facts).refuse(endpoint, refusal)?;
+                // Decision 5: a refused session is refused IN THE CHAIN. Only the
+                // refusal leaf is written here — the root is already on disk (7b)
+                // and one root per run is the guarantee, so this leaf records how
+                // the session ended beside a root that records how it started. That
+                // root says `allow` because it was written before the verdict
+                // existed, and it is not rewritten to say otherwise.
+                audit::session_start::append_refusal(&audit_writer, sid, refusal)?;
                 seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
                 eprintln!("[sandbox] mxc: {e}");
                 return Ok(launch_failure_exit(&e));
             }
-            // Nothing was established (no request, no container, no epoch): the
-            // armed root from `Drop` is the whole record and `run_cmd` reports.
+            // Nothing was established (no request, no container, no epoch, an SDK
+            // failure): the root from (7b) is the whole record, and no refusal leaf
+            // is added — a refusal leaf would claim a gate ran when none did.
             None => return Err(e.into()),
         },
     };
 
-    // (9) The launch record is authoritative for the tier — it is the record the
-    //     gate actually applied. `complete` adds the endpoint and writes the leaf.
-    session_start
-        .with_tier(outcome.tier.audit_facts())
-        .complete(endpoint)?;
+    // (9) The launch record is a CONFIRMATION, not a source (P3.1, S-55). The root
+    //     already claims the tier the pre-launch probe of the exact request named,
+    //     and the launch gates on its own probe of that same request — so the two
+    //     must agree. If they do not, the root is wrong about the containment this
+    //     session got, and rewriting it is not an option (one root per run): the
+    //     session is refused, and the refusal leaf names the tier it required.
+    if !launch_confirms_root(&claimed, &outcome.tier) {
+        emit_child_output(&outcome);
+        audit::session_start::append_refusal(
+            &audit_writer,
+            sid,
+            audit::session_start::TierRefusal::tier_mismatch(net::mxc::REQUIRED_TIER),
+        )?;
+        seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
+        eprintln!(
+            "[sandbox] mxc: guardrail 2: the launch recorded tier `{}` (source `{}`) but this \
+             session's root already claims `{}` — a record that does not confirm the root \
+             refuses the session, and the root is not rewritten",
+            outcome.tier.tier.as_deref().unwrap_or("no tier"),
+            outcome.tier.tier_source,
+            claimed.tier.as_deref().unwrap_or("no tier"),
+        );
+        return Ok(EXIT_REFUSED);
+    }
 
     emit_child_output(&outcome);
     // Guardrail 1's evidence, in the operator's own transcript: since the
@@ -950,53 +1005,75 @@ fn run_mxc_session(
     Ok(session_exit_code(&outcome))
 }
 
-/// How a failed MXC launch is recorded in the chain (P3.0 decision 5).
+/// How a failed MXC launch is recorded in the chain (P3.0 decision 5, P3.1 S-55).
 ///
-/// `Some((facts, refusal))` means the session reached a state a reader must be
-/// able to select on: a root with `disposition: deny` carrying the tier that was
-/// dispatched, followed by a `SESSION_REFUSED` leaf naming the reason. That is
-/// both of ADR-0004's guardrails — the tier gate (refused before the child exists)
-/// and the proof gate (refused after it ran).
+/// `Some(refusal)` means the session reached a state a reader must be able to
+/// select on: the root is already on disk (written before the launch, which is the
+/// S-55 fix), so
+/// the refusal appends a `SESSION_REFUSED` leaf naming the reason. Both of
+/// ADR-0004's guardrails are audited that way — the tier gate (which refuses
+/// *before* the child exists, so [`pre_launch_tier_refusal`] has already written
+/// root(`deny`)) and the proof gate (refused after it ran).
 ///
 /// `None` means nothing was established (a request that could not be built, an SDK
-/// error, a second concurrent launch): the armed `Drop` root is the whole record,
-/// and no refusal leaf is written — a refusal leaf would claim a gate ran when none
-/// did.
+/// error, a second concurrent launch): the root written before the launch is the
+/// whole record, and no refusal leaf is added — a refusal leaf would claim a gate
+/// ran when none did.
 #[cfg(feature = "mxc-backend")]
-fn refusal_for(
-    err: &net::mxc::MxcError,
-    probed: &net::mxc::TierRecord,
-) -> Option<(
-    audit::session_start::TierFacts,
-    audit::session_start::TierRefusal<'static>,
-)> {
-    use audit::session_start::{TierFacts, TierRefusal};
+fn refusal_for(err: &net::mxc::MxcError) -> Option<audit::session_start::TierRefusal<'static>> {
+    use audit::session_start::TierRefusal;
     use net::mxc::{MxcError, REQUIRED_TIER};
     match err {
         // Guardrail 1, both shapes of it: `Guard` is the pre-run refusal (no proof
         // source, `Required` without a proxy) and `Unproven` the post-run one. The
-        // tier is the one the probe of the exact request named, and the launch gated
-        // on that same decision, so the root still answers "which containment did
-        // this get?" even when the session is refused.
-        MxcError::Guard(_) | MxcError::Unproven(_) => Some((
-            probed.audit_facts(),
-            TierRefusal::proof_unmet(REQUIRED_TIER),
-        )),
-        // Guardrail 2: refused before the child existed. The mismatch carries what
-        // was dispatched INSTEAD — the value the leaf must show, never the
-        // requirement, whose own value is the refusal's `expected_tier`.
-        MxcError::Tier(mismatch) => Some((
-            TierFacts {
-                tier: mismatch.observed.clone(),
-                tier_source: Some(mismatch.source),
-                // The mismatch does not carry it, and `TierFacts` is explicit that
-                // "nothing stated it" is `None` rather than a narrowed `false`.
-                needs_dacl_augmentation: None,
-            },
-            TierRefusal::tier_mismatch(mismatch.expected),
-        )),
+        // tier the session required is the refusal's `expected`; the root already
+        // carries the tier that was probed.
+        MxcError::Guard(_) | MxcError::Unproven(_) => Some(TierRefusal::proof_unmet(REQUIRED_TIER)),
+        // Guardrail 2, the shape that can only be reached after the root exists:
+        // the launch's own probe of the same request disagreed with the pre-launch
+        // probe the root was written from. The mismatch carries what was dispatched
+        // INSTEAD, and the requirement is the refusal's `expected_tier` — the root
+        // is not rewritten to either.
+        MxcError::Tier(mismatch) => Some(TierRefusal::tier_mismatch(mismatch.expected)),
         MxcError::Request(_) | MxcError::Sdk(_) | MxcError::Concurrency(_) => None,
     }
+}
+
+/// Guardrail 2's hard half, applied to the tier the **pre-launch** probe named
+/// (P3.1, S-55).
+///
+/// This runs before the root is written, from the same [`net::mxc::TierRecord`]
+/// the root is filled from — that is what lets a mismatch still be `root(deny) +
+/// SESSION_REFUSED` with no child and no CONNECT leaf, while every other session's
+/// root goes to disk before `launch_session` is even called.
+///
+/// `Some` is the refusal: the session requires [`net::mxc::REQUIRED_TIER`] and the
+/// probe of the exact request named something else (or nothing at all, which is
+/// refused rather than waved through — see [`net::mxc::verify_tier`]).
+#[cfg(feature = "mxc-backend")]
+fn pre_launch_tier_refusal(probed: &net::mxc::TierRecord) -> Option<net::mxc::TierMismatch> {
+    net::mxc::verify_tier(
+        probed,
+        net::mxc::TierExpectation::Exactly(net::mxc::REQUIRED_TIER),
+    )
+    .err()
+}
+
+/// Does the launch record **confirm** the facts the root already claims?
+/// (P3.1, S-55.)
+///
+/// The root is written from the probe of the exact request before the launch, and
+/// the launch gates on its own probe of that same request, so the two must agree.
+/// The comparison is made in the leaf's own vocabulary
+/// (`audit::session_start::TierFacts`) because the leaf is what a reader of the
+/// chain sees: a record that differed would leave the root's `tier` a claim nothing
+/// confirmed, which is exactly what guardrail 2 forbids.
+#[cfg(feature = "mxc-backend")]
+fn launch_confirms_root(
+    claimed: &audit::session_start::TierFacts,
+    recorded: &net::mxc::TierRecord,
+) -> bool {
+    recorded.audit_facts() == *claimed
 }
 
 /// The exit code a refused MXC session ends with (P3.0 decision 6).
@@ -1378,28 +1455,64 @@ mod tests {
         );
     }
 
-    /// P3.0 decision 5: only a **gate** refusal is written into the chain (root
-    /// `deny` + `SESSION_REFUSED`). A failure that established nothing gets the
-    /// armed root from `Drop` and no refusal leaf — a refusal leaf would claim a gate
-    /// ran when none did.
+    /// A `TierRecord` for a session that dispatched to the **degraded** tier: the
+    /// shape guardrail 2 refuses. The probe named it, so `tier_source` is `probe`
+    /// and `needs_dacl_augmentation` is the probe's own `true` — not `None`.
+    #[cfg(feature = "mxc-backend")]
+    fn degraded_record() -> net::mxc::TierRecord {
+        net::mxc::tier_record(net::mxc::ProbeView {
+            tier: Some("appcontainer-dacl"),
+            needs_dacl_augmentation: Some(true),
+        })
+    }
+
+    /// A session id no other test can collide with.
+    #[cfg(feature = "mxc-backend")]
+    fn chain_sid(label: &str) -> String {
+        format!(
+            "test-p31-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// Every leaf of a session's chain, in file order.
+    #[cfg(feature = "mxc-backend")]
+    fn chain_leaves(sid: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(audit::audit_log_path(sid))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each leaf is one JSON object"))
+            .collect()
+    }
+
+    /// Remove a test session's chain, seal included.
+    #[cfg(feature = "mxc-backend")]
+    fn drop_chain(sid: &str) {
+        let p = audit::audit_log_path(sid);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("root"));
+        let _ = std::fs::remove_file(p.with_extension("sig"));
+    }
+
+    /// P3.0 decision 5, restated for P3.1 (S-55): only a **gate** refusal is
+    /// written into the chain, and it is written as one leaf — the root is already
+    /// on disk from before the launch.
     #[cfg(feature = "mxc-backend")]
     #[test]
     fn only_a_gate_refusal_reaches_the_chain() {
+        use audit::session_start::{REASON_PROOF_UNMET, REASON_TIER_MISMATCH};
         use net::mxc::{GuardError, MxcError, REQUIRED_TIER, RequestError, TierMismatch};
-
-        let probed = base_container_record();
 
         // Guardrail 1, pre-run shape.
         let guard = MxcError::Guard(GuardError::ProbeUnmet);
-        let (facts, refusal) = refusal_for(&guard, &probed).expect("guardrail 1 is recorded");
-        assert_eq!(
-            facts.tier.as_deref(),
-            Some(REQUIRED_TIER),
-            "the dispatched tier"
-        );
-        assert_eq!(facts.tier_source, Some("probe"));
+        let refusal = refusal_for(&guard).expect("guardrail 1 is recorded");
         assert_eq!(refusal.expected, REQUIRED_TIER);
-        assert_eq!(refusal.reason, audit::session_start::REASON_PROOF_UNMET);
+        assert_eq!(refusal.reason, REASON_PROOF_UNMET);
         assert_eq!(launch_failure_exit(&guard), EXIT_REFUSED);
 
         // Guardrail 1, post-run shape: same reason, and the one that carries the
@@ -1408,33 +1521,439 @@ mod tests {
             error: GuardError::ProbeUnmet,
             outcome: finished_outcome(Some(0), None),
         }));
-        let (facts, refusal) = refusal_for(&unproven, &probed).expect("guardrail 1 is recorded");
-        assert_eq!(facts.tier.as_deref(), Some(REQUIRED_TIER));
-        assert_eq!(refusal.reason, audit::session_start::REASON_PROOF_UNMET);
+        let refusal = refusal_for(&unproven).expect("guardrail 1 is recorded");
+        assert_eq!(refusal.reason, REASON_PROOF_UNMET);
         assert_eq!(launch_failure_exit(&unproven), EXIT_REFUSED);
 
-        // Guardrail 2: the root names what was dispatched INSTEAD, never the
-        // requirement, and "the probe said nothing" stays `None`.
+        // Guardrail 2 after the root exists: the refusal names the requirement,
+        // never the tier that was dispatched instead — the root already says that,
+        // and it is not rewritten.
         let degraded = MxcError::Tier(TierMismatch {
             expected: REQUIRED_TIER,
             observed: Some("appcontainer-dacl".to_string()),
             source: "probe",
         });
-        let (facts, refusal) = refusal_for(&degraded, &probed).expect("guardrail 2 is recorded");
-        assert_eq!(facts.tier.as_deref(), Some("appcontainer-dacl"));
-        assert_eq!(
-            facts.needs_dacl_augmentation, None,
-            "unknown is not `false`"
-        );
-        assert_eq!(refusal.reason, audit::session_start::REASON_TIER_MISMATCH);
+        let refusal = refusal_for(&degraded).expect("guardrail 2 is recorded");
+        assert_eq!(refusal.reason, REASON_TIER_MISMATCH);
+        assert_eq!(refusal.expected, REQUIRED_TIER);
+        assert_eq!(launch_failure_exit(&degraded), EXIT_REFUSED);
 
-        // Nothing established: the armed root is the whole record.
+        // Nothing established: the root from before the launch is the whole
+        // record, and a refusal leaf would claim a gate ran when none did.
         let unbuilt = MxcError::Request(RequestError::EmptyCommand);
-        assert!(
-            refusal_for(&unbuilt, &probed).is_none(),
-            "a request that could not be built refused nothing"
-        );
+        assert!(refusal_for(&unbuilt).is_none());
         assert_eq!(launch_failure_exit(&unbuilt), 1);
+    }
+
+    /// **S-55 on the MXC path**: the root is written before the launch, so a
+    /// supervisor killed from that moment on leaves a readable chain — one root,
+    /// the five facts, **no** `.root` seal — and `verify` says INCOMPLETE.
+    ///
+    /// The crash is expressed the only way a test can: the root is written and then
+    /// nothing else happens — no launch, no `seal_audit`, no second leaf, and the
+    /// writer is dropped without committing a root. `AuditWriter::append` opens,
+    /// writes and closes per leaf ([`audit::AuditWriter::append`]), so the root is
+    /// on disk the moment `complete` returns: there is no userspace buffer a
+    /// `TerminateProcess` could lose, which is why the ordering alone is the fix.
+    ///
+    /// Both network postures: S-55 runs `--block-net`, where no listener exists and
+    /// the endpoint must stay `null`; a networked session must record the port it
+    /// bound, because that is a fact the root is now written early enough to carry.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn a_kill_after_the_root_leaves_one_root_five_facts_and_no_seal() {
+        use audit::session_start::{LoopbackEndpoint, SessionStart, SessionStartFacts, TierFacts};
+        use audit::verify::{VerifyOutcome, verify_inner};
+
+        let elevated = setup::is_elevated();
+        for (label, port) in [("block-net", None), ("networked", Some(49_152u16))] {
+            let sid = chain_sid(label);
+            // (4) writer + armed guard, (5) listener bound, (7b) the root — and then
+            // the supervisor dies: the launch never happens.
+            {
+                let writer = std::sync::Arc::new(audit::AuditWriter::open(&sid, false).unwrap());
+                SessionStart::arm(
+                    writer,
+                    &sid,
+                    "cmd /c ping -n 30 127.0.0.1",
+                    // Armed with what the supervisor knows before the probe — the
+                    // probe's tier arrives through `with_tier`, as the session path
+                    // does it.
+                    SessionStartFacts::measured(TierFacts::default(), Some(elevated)),
+                )
+                .with_tier(base_container_record().audit_facts())
+                .complete(port.map(LoopbackEndpoint::new))
+                .unwrap();
+            }
+
+            let path = audit::audit_log_path(&sid);
+            let leaves = chain_leaves(&sid);
+            let sealed = path.with_extension("root").is_file();
+            let signed = path.with_extension("sig").is_file();
+            let verdict = verify_inner(&sid).unwrap();
+            drop_chain(&sid);
+
+            assert_eq!(
+                leaves.len(),
+                1,
+                "{label}: the root is the whole chain: {leaves:?}"
+            );
+            let root = &leaves[0];
+            assert_eq!(root["op"], audit::session_start::OP_SESSION_START);
+            assert_eq!(root["seq"], 0, "{label}: the root is the genesis leaf");
+            assert_eq!(root["parent"], serde_json::Value::Null);
+            assert_eq!(root["disposition"], "allow", "{label}: it started");
+            // The five facts, all of them, with no `.root` anywhere in sight.
+            assert_eq!(root["tier"], net::mxc::REQUIRED_TIER);
+            assert_eq!(root["tier_source"], net::mxc::TIER_SOURCE_PROBE);
+            assert_eq!(root["tier_needs_dacl_augmentation"], false);
+            assert_eq!(root["elevated"], elevated);
+            match port {
+                Some(p) => assert_eq!(root["proxy_endpoint"], format!("127.0.0.1:{p}")),
+                None => assert_eq!(
+                    root["proxy_endpoint"],
+                    serde_json::Value::Null,
+                    "{label}: --block-net binds nothing, so the endpoint is null"
+                ),
+            }
+            assert!(!sealed, "{label}: a killed supervisor commits no root");
+            assert!(!signed, "{label}: and signs nothing");
+            match verdict {
+                VerifyOutcome::Incomplete(reason) => assert!(
+                    reason.contains("no committed root"),
+                    "{label}: INCOMPLETE must name the missing seal: {reason}"
+                ),
+                other => {
+                    panic!("{label}: a killed session must verify as INCOMPLETE, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Requirement (b): on the success path the leaf's facts **equal** the launch
+    /// record's tier. Because the record now arrives after the root, the only thing
+    /// it may do is confirm it — and a record that disagrees refuses the session
+    /// instead of rewriting the root, still leaving exactly one root.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn the_launch_record_confirms_the_root_it_did_not_write() {
+        use audit::session_start::{
+            LoopbackEndpoint, OP_SESSION_REFUSED, OP_SESSION_START, SessionStart,
+            SessionStartFacts, TierFacts, TierRefusal,
+        };
+
+        let sid = chain_sid("confirm");
+        let probed = base_container_record();
+        let writer = {
+            let writer = std::sync::Arc::new(audit::AuditWriter::open(&sid, false).unwrap());
+            SessionStart::arm(
+                writer.clone(),
+                &sid,
+                "cmd /c echo MXC-WIRED",
+                SessionStartFacts::measured(TierFacts::default(), Some(false)),
+            )
+            .with_tier(probed.audit_facts())
+            .complete(Some(LoopbackEndpoint::new(49_154)))
+            .unwrap();
+            writer
+        };
+
+        // The record a successful launch hands back, for the same request.
+        let recorded = base_container_record();
+        let leaves = chain_leaves(&sid);
+        let root = &leaves[0];
+        assert_eq!(leaves.len(), 1, "one root: {leaves:?}");
+        assert_eq!(root["op"], OP_SESSION_START);
+        // The leaf's facts ARE the record's, field for field.
+        assert_eq!(root["tier"], recorded.tier.clone().unwrap_or_default());
+        assert_eq!(root["tier_source"], recorded.tier_source);
+        assert_eq!(
+            root["tier_needs_dacl_augmentation"],
+            recorded.needs_dacl_augmentation.unwrap_or(false)
+        );
+        assert!(
+            launch_confirms_root(&probed.audit_facts(), &recorded),
+            "the launch record must confirm the facts the root claims"
+        );
+
+        // A record from a different tier is NOT confirmed, and step (9) refuses
+        // rather than rewriting the root: the refusal leaf is the only write.
+        let degraded = degraded_record();
+        assert!(
+            !launch_confirms_root(&probed.audit_facts(), &degraded),
+            "a degraded record must not pass as confirmation"
+        );
+        audit::session_start::append_refusal(
+            &writer,
+            &sid,
+            TierRefusal::tier_mismatch(net::mxc::REQUIRED_TIER),
+        )
+        .unwrap();
+        drop(writer);
+
+        let leaves = chain_leaves(&sid);
+        drop_chain(&sid);
+        let roots = leaves
+            .iter()
+            .filter(|l| l["op"] == OP_SESSION_START)
+            .count();
+        assert_eq!(roots, 1, "one root per run, even when refused: {leaves:?}");
+        assert_eq!(
+            leaves[0]["disposition"], "allow",
+            "the root is not rewritten to deny after the fact"
+        );
+        assert_eq!(leaves[0]["tier"], net::mxc::REQUIRED_TIER);
+        assert_eq!(leaves[1]["op"], OP_SESSION_REFUSED);
+        assert_eq!(
+            leaves[1]["reason"],
+            audit::session_start::REASON_TIER_MISMATCH
+        );
+        assert_eq!(
+            leaves[1]["parent"], leaves[0]["hash"],
+            "the refusal links to the root"
+        );
+    }
+
+    /// Requirement 2: a tier mismatch is still decided **before** the root is
+    /// written, so a refused session's root can still say `deny` and still be the
+    /// first leaf — the shape a refused AppContainer session has.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn a_tier_mismatch_is_decided_before_the_root_so_the_root_can_say_deny() {
+        use audit::session_start::{
+            LoopbackEndpoint, OP_SESSION_REFUSED, OP_SESSION_START, SessionStart,
+            SessionStartFacts, TierFacts, TierRefusal,
+        };
+
+        assert!(
+            pre_launch_tier_refusal(&base_container_record()).is_none(),
+            "the required tier is not a refusal"
+        );
+        let degraded = degraded_record();
+        let mismatch = pre_launch_tier_refusal(&degraded)
+            .expect("a degraded tier is refused before anything is launched");
+        assert_eq!(mismatch.expected, net::mxc::REQUIRED_TIER);
+        assert_eq!(mismatch.observed.as_deref(), Some("appcontainer-dacl"));
+
+        let sid = chain_sid("pre-launch-deny");
+        {
+            let writer = std::sync::Arc::new(audit::AuditWriter::open(&sid, false).unwrap());
+            SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo MXC-WIRED",
+                SessionStartFacts::measured(TierFacts::default(), Some(false)),
+            )
+            .with_tier(degraded.audit_facts())
+            .refuse(
+                Some(LoopbackEndpoint::new(41_000)),
+                TierRefusal::tier_mismatch(mismatch.expected),
+            )
+            .unwrap();
+        }
+        let leaves = chain_leaves(&sid);
+        drop_chain(&sid);
+
+        assert_eq!(leaves.len(), 2, "root + refusal: {leaves:?}");
+        assert_eq!(leaves[0]["op"], OP_SESSION_START);
+        assert_eq!(leaves[0]["parent"], serde_json::Value::Null);
+        assert_eq!(
+            leaves[0]["disposition"], "deny",
+            "the root must not claim a start when the next leaf says refused"
+        );
+        assert_eq!(leaves[0]["tier"], "appcontainer-dacl");
+        assert_eq!(
+            leaves[0]["tier_needs_dacl_augmentation"], true,
+            "the probe's own value, verbatim: the deny root is as complete as the allow one"
+        );
+        assert_eq!(leaves[1]["op"], OP_SESSION_REFUSED);
+        assert_eq!(leaves[1]["expected_tier"], net::mxc::REQUIRED_TIER);
+        assert!(
+            leaves.iter().all(|l| l["op"] != "CONNECT"),
+            "nothing ran, so nothing could reach the proxy: {leaves:?}"
+        );
+    }
+
+    /// The newest `mtime` under `src/`, so a spawned supervisor can be shown to be
+    /// newer than the code this run is testing.
+    #[cfg(feature = "mxc-backend")]
+    fn newest_source_mtime() -> Option<std::time::SystemTime> {
+        fn walk(dir: &std::path::Path, newest: &mut Option<std::time::SystemTime>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, newest);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
+                    && newest.map(|n| mtime > n).unwrap_or(true)
+                {
+                    *newest = Some(mtime);
+                }
+            }
+        }
+        let mut newest = None;
+        walk(std::path::Path::new("src"), &mut newest);
+        newest
+    }
+
+    /// **S-55, the shape the harness runs** (P3.1): spawn the real supervisor on a
+    /// real container, wait for its root, `TerminateProcess` it mid-session, then
+    /// read the chain the way `audit verify` does.
+    ///
+    /// This is the *ordering* test. It asserts the root is on disk **while the child
+    /// is still running**, which is exactly what P3.0's post-launch write could not
+    /// do: with that ordering the log never appeared at all — `audit show` failed
+    /// and `verify` had nothing to call INCOMPLETE. Reproduced against the old
+    /// ordering, this test fails on "the root must be on disk while the child is
+    /// still running"; with the root moved ahead of the launch it passes.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    #[ignore = "launches a real ProcessContainer and hard-kills a real supervisor; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    fn a_supervisor_killed_mid_session_leaves_a_chain_verify_can_read() {
+        use audit::verify::{VerifyOutcome, verify_inner};
+        use std::time::Duration;
+
+        let exe = std::env::current_exe().expect("current test exe");
+        let supervisor = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|profile| profile.join("sandbox.exe"))
+            .expect("a profile directory above deps/");
+        assert!(
+            supervisor.is_file(),
+            "build it first: cargo build --features mxc-backend --bin sandbox ({})",
+            supervisor.display()
+        );
+        assert!(
+            net::mxc::launcher_beside(&supervisor).is_some(),
+            "mxc-launch.exe must sit beside the supervisor: \
+             cargo build --features mxc-backend --bin mxc-launch"
+        );
+        // A spawned supervisor is evidence only if it was built from the sources
+        // under test: `cargo test --bin sandbox` builds the TEST harness and leaves
+        // `target/debug/sandbox.exe` alone, so a stale binary would answer for code
+        // that has since changed — it inverted this very test's own RED probe.
+        if let (Some(built), Some(source)) = (
+            std::fs::metadata(&supervisor)
+                .and_then(|m| m.modified())
+                .ok(),
+            newest_source_mtime(),
+        ) {
+            assert!(
+                built >= source,
+                "{} is older than src/: rebuild it first \
+                 (`cargo build --features mxc-backend --bin sandbox`), or this run is \
+                 measuring a binary that does not contain the code under test",
+                supervisor.display()
+            );
+        }
+
+        let scratch = std::env::temp_dir().join(format!("sandbox-s55-live-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).expect("create the session working directory");
+        let sid = chain_sid("s55-live");
+        // A reused id would continue an existing chain and land a second root.
+        drop_chain(&sid);
+
+        let mut child = std::process::Command::new(&supervisor)
+            .args([
+                "run",
+                "--backend",
+                "mxc",
+                // The posture S-55 runs: no listener, so no CONNECT leaf and no
+                // endpoint to record — the root alone has to carry the session.
+                "--block-net",
+                "--allow-cwd",
+                "--sid",
+                &sid,
+                "--",
+                "cmd",
+                "/c",
+                // A workload that stays alive without a console, a network or an
+                // interpreter the container may not have: S-55's own sleeper
+                // (`python`) is not on the container's PATH, and `ping` cannot reach
+                // the IP driver inside a `--block-net` container (both observed). A
+                // counting loop runs for several seconds and exits on its own if the
+                // kill somehow misses it.
+                "for /l %i in (1,1,20000000) do @rem",
+            ])
+            .current_dir(&scratch)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the supervisor");
+
+        // Wait for the root the way a reader would — the file exists and carries a
+        // SESSION_START. A minute is a container launch, not the assertion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut root = None;
+        while std::time::Instant::now() < deadline {
+            root = chain_leaves(&sid)
+                .into_iter()
+                .find(|l| l["op"] == audit::session_start::OP_SESSION_START);
+            if root.is_some() {
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the supervisor exited before writing a root: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let root = root.expect("the root must be on disk while the child is still running");
+
+        // The property, stated once: the root is on disk **because it was written
+        // before the launch**, so the supervisor is still running when the kill
+        // arrives. A supervisor that writes the root only after the launch returns
+        // has nothing to show a kill — by the time the file exists the session is
+        // over, which is what this assertion catches.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait().expect("poll the supervisor").is_none(),
+            "the supervisor must still be running when it is killed; a root that only \
+             appears once the launch returns is a root written after the session ended"
+        );
+        // Stop-Process -Force, as the harness does it.
+        let killed = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &child.id().to_string()])
+            .output()
+            .expect("run taskkill");
+        assert!(killed.status.success(), "taskkill failed: {killed:?}");
+        let _ = child.wait();
+
+        let path = audit::audit_log_path(&sid);
+        let leaves = chain_leaves(&sid);
+        let sealed = path.with_extension("root").is_file();
+        let verdict = verify_inner(&sid).unwrap();
+        drop_chain(&sid);
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        // The root the supervisor wrote before the child, with all five facts.
+        assert_eq!(root["seq"], 0, "the root is the genesis leaf: {leaves:?}");
+        assert_eq!(root["tier"], net::mxc::REQUIRED_TIER);
+        assert_eq!(root["tier_source"], net::mxc::TIER_SOURCE_PROBE);
+        assert_eq!(root["tier_needs_dacl_augmentation"], false);
+        assert_eq!(root["elevated"], setup::is_elevated());
+        assert_eq!(
+            root["proxy_endpoint"],
+            serde_json::Value::Null,
+            "--block-net binds nothing, so the endpoint is null"
+        );
+        let roots = leaves
+            .iter()
+            .filter(|l| l["op"] == audit::session_start::OP_SESSION_START)
+            .count();
+        assert_eq!(roots, 1, "one root per run: {leaves:?}");
+        assert!(!sealed, "a killed supervisor commits no root");
+        match verdict {
+            VerifyOutcome::Incomplete(reason) => assert!(
+                reason.contains("no committed root"),
+                "INCOMPLETE must name the missing seal: {reason}"
+            ),
+            other => panic!("a killed session must verify as INCOMPLETE, got {other:?}"),
+        }
     }
 
     /// Unique temp dir per test (learned.rs's pattern) so the learned-CLI
