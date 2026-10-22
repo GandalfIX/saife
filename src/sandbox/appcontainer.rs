@@ -4,8 +4,7 @@ use windows::Win32::Security::Isolation::*;
 use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
-    REG_OPTION_NON_VOLATILE,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW,
 };
 use windows::Win32::System::Threading::*;
 use windows::core::*;
@@ -115,7 +114,8 @@ fn try_create_or_derive(ac_name_w: &HSTRING) -> Result<PSID> {
 /// that do not recreate them themselves.
 fn ensure_profile_resources() {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let profiles = std::path::Path::new(&local).join("Microsoft\\Windows\\AppContainer\\Profiles");
+        let profiles =
+            std::path::Path::new(&local).join("Microsoft\\Windows\\AppContainer\\Profiles");
         if !profiles.is_dir() {
             let _ = std::fs::create_dir_all(&profiles);
         }
@@ -124,7 +124,9 @@ fn ensure_profile_resources() {
         let mut hkey = HKEY::default();
         let r = RegCreateKeyExW(
             HKEY_CURRENT_USER,
-            w!("Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage"),
+            w!(
+                "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage"
+            ),
             None,
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
@@ -920,7 +922,9 @@ fn builtin_admins_sid() -> Option<PSID> {
 /// Returns `None` if the SID allocation fails (should not happen on any
 /// supported Windows build).
 pub(crate) fn allocate_private_network_capability_sid() -> Option<PSID> {
-    let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 15] };
+    let authority = SID_IDENTIFIER_AUTHORITY {
+        Value: [0, 0, 0, 0, 0, 15],
+    };
     let mut sid_ptr: PSID = PSID(std::ptr::null_mut());
     // S-1-15-3-7: authority 15 (security manager), 2 sub-authorities.
     // SubAuthority[0] = 3 (capability group), [1] = 7 (privateNetworkClientServer).
@@ -931,9 +935,15 @@ pub(crate) fn allocate_private_network_capability_sid() -> Option<PSID> {
             sub_authorities.len() as u8,
             sub_authorities[0],
             sub_authorities[1],
-            0, 0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             &mut sid_ptr,
-        ).is_ok()
+        )
+        .is_ok()
         {
             Some(sid_ptr)
         } else {
@@ -976,7 +986,10 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     let (http_proxy, https_proxy, sandbox_proxy_port, no_proxy): (String, String, String, String) =
         match proxy {
             Some(p) => {
-                let proxy_url = format!("http://sandbox:{}@127.0.0.1:{}", p.token, p.port);
+                // `RunToken`: the only way a credential reaches this format
+                // string, so no unchecked string can become the URL's userinfo
+                // (P1.6(c)).
+                let proxy_url = format!("http://sandbox:{}@127.0.0.1:{}", p.token.value(), p.port);
                 (
                     proxy_url.clone(),
                     proxy_url,
@@ -984,17 +997,16 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
                     "localhost,127.0.0.1,::1".to_string(),
                 )
             }
-            None => (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
         };
     // Names of the four proxy vars, in the order we post-process them.
     // Comparison is case-insensitive (Windows env vars are case-insensitive).
-    const PROXY_VARS: [&str; 4] =
-        ["HTTP_PROXY", "HTTPS_PROXY", "SANDBOX_PROXY_PORT", "NO_PROXY"];
+    const PROXY_VARS: [&str; 4] = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "SANDBOX_PROXY_PORT",
+        "NO_PROXY",
+    ];
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
@@ -1028,7 +1040,13 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
             .position(|name| k.eq_ignore_ascii_case(name))
         {
             proxy_seen[idx] = true;
-            let replacement = [http_proxy.clone(), https_proxy.clone(), sandbox_proxy_port.clone(), no_proxy.clone()][idx].clone();
+            let replacement = [
+                http_proxy.clone(),
+                https_proxy.clone(),
+                sandbox_proxy_port.clone(),
+                no_proxy.clone(),
+            ][idx]
+                .clone();
             vars.push((k, replacement));
         } else {
             vars.push((k, v));
@@ -1224,12 +1242,13 @@ mod propagation_tests {
         }));
         // System32 / SystemRoot: never walked (huge, system-owned, and
         // already world-readable).
-        let sysroot =
-            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         assert!(!should_propagate(&test_entry(
             &std::path::PathBuf::from(&sysroot).join("System32")
         )));
-        assert!(!should_propagate(&test_entry(std::path::Path::new(&sysroot))));
+        assert!(!should_propagate(&test_entry(std::path::Path::new(
+            &sysroot
+        ))));
     }
 
     #[test]
@@ -1278,7 +1297,11 @@ mod propagation_tests {
         );
         assert!(
             trustee_ace_flags(
-                &root.join("prot").join("deeper").join("d.txt").to_string_lossy(),
+                &root
+                    .join("prot")
+                    .join("deeper")
+                    .join("d.txt")
+                    .to_string_lossy(),
                 &sid
             )
             .is_empty(),
@@ -1363,8 +1386,7 @@ mod env_block_tests {
             get("PATH")
         );
         assert!(
-            get("PYTHONPATH")
-                .starts_with(r"C:\some\cwd\.sandbox\testsid\pyshim"),
+            get("PYTHONPATH").starts_with(r"C:\some\cwd\.sandbox\testsid\pyshim"),
             "PYTHONPATH prepended with session pyshim dir: {}",
             get("PYTHONPATH")
         );
@@ -1376,12 +1398,58 @@ mod env_block_tests {
         // every other var).
         assert_eq!(get("SANDBOX_SESSION_SID"), "testsid");
     }
+
+    /// P1.6(c): the proxy variables carry *this run's* typed credential.
+    ///
+    /// Before the typing, `ProxyEnv::token` was a bare `String` and this
+    /// interpolation had no check at all: whatever string reached the field became
+    /// the URL's userinfo, where `@` ends the userinfo early and `/` ends the
+    /// authority - so an unsafe value points the child at a different host or port
+    /// than the supervisor bound and then proves (`mxc::proxy_url` has always
+    /// refused such a value; this edge only had a `String`). The field is a
+    /// [`RunToken`] now, so this test can only be written with a credential, and
+    /// the charset assertion below is what makes that typing worth something.
+    #[test]
+    fn proxy_env_carries_the_runs_own_token_in_the_url() {
+        let token = crate::net::token::RunToken::issue().expect("mint a token");
+        assert!(
+            token
+                .value()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
+            "a RunToken must stay URL-unreserved, or typing the field buys nothing: {}",
+            token.value()
+        );
+        let proxy = ProxyEnv {
+            port: 49_152,
+            token: token.clone(),
+        };
+        let vars = decode(&build_env_block(
+            "testsid",
+            std::path::Path::new(r"C:\some\cwd"),
+            Some(&proxy),
+        ));
+        let get = |name: &str| {
+            vars.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .expect("env var present")
+        };
+        let want = format!("http://sandbox:{}@127.0.0.1:49152", token.value());
+        assert_eq!(get("HTTP_PROXY"), want);
+        assert_eq!(
+            get("HTTPS_PROXY"),
+            want,
+            "both proxy vars carry the same URL"
+        );
+        assert_eq!(get("SANDBOX_PROXY_PORT"), "49152");
+        assert_eq!(get("NO_PROXY"), "localhost,127.0.0.1,::1");
+    }
 }
 
 #[test]
 fn private_network_capability_sid_is_s_1_15_3_7() {
-    let sid = allocate_private_network_capability_sid()
-        .expect("SID allocation should succeed");
+    let sid = allocate_private_network_capability_sid().expect("SID allocation should succeed");
     unsafe {
         let mut pwstr = PWSTR::null();
         assert!(ConvertSidToStringSidW(sid, &mut pwstr).is_ok());

@@ -3979,9 +3979,14 @@ mod live {
     }
 
     /// A local origin server that records the request line it was asked for.
+    ///
+    /// Each origin answers with **its own** nonce, so "the body came from its own
+    /// origin" is a testable claim: two origins answering with one shared string
+    /// make a crossed body indistinguishable from a correct one (P1.6(f)).
     struct Origin {
         host: String,
         port: u16,
+        nonce: String,
         seen: Arc<Mutex<Vec<String>>>,
         heads: Arc<Mutex<Vec<String>>>,
         stop: Arc<AtomicBool>,
@@ -3990,6 +3995,11 @@ mod live {
 
     impl Origin {
         fn start() -> Self {
+            Self::start_with_nonce(NONCE)
+        }
+
+        fn start_with_nonce(nonce: &str) -> Self {
+            let nonce = nonce.to_string();
             let ip = non_loopback_ipv4();
             let listener =
                 TcpListener::bind((ip, 0)).expect("bind origin on the host's LAN address");
@@ -4000,6 +4010,7 @@ mod live {
             let seen_thread = Arc::clone(&seen);
             let heads_thread = Arc::clone(&heads);
             let stop_thread = Arc::clone(&stop);
+            let nonce_thread = nonce.clone();
             let join = std::thread::spawn(move || {
                 for accepted in listener.incoming() {
                     if stop_thread.load(Ordering::SeqCst) {
@@ -4008,17 +4019,24 @@ mod live {
                     let Ok(stream) = accepted else { continue };
                     let seen = Arc::clone(&seen_thread);
                     let heads = Arc::clone(&heads_thread);
-                    std::thread::spawn(move || serve_origin(stream, &seen, &heads));
+                    let nonce = nonce_thread.clone();
+                    std::thread::spawn(move || serve_origin(stream, &seen, &heads, &nonce));
                 }
             });
             Self {
                 host: ip.to_string(),
                 port,
+                nonce,
                 seen,
                 heads,
                 stop,
                 join: Some(join),
             }
+        }
+
+        /// The body this origin answers with (P1.6(f)).
+        fn nonce(&self) -> &str {
+            &self.nonce
         }
 
         fn authority(&self) -> String {
@@ -4065,7 +4083,12 @@ mod live {
     /// Answer one request with the nonce and close. Records the request line and
     /// the whole head verbatim, which is the evidence that the forwarded request
     /// was rewritten to origin-form with the admitted authority as `Host`.
-    fn serve_origin(mut stream: TcpStream, seen: &Mutex<Vec<String>>, heads: &Mutex<Vec<String>>) {
+    fn serve_origin(
+        mut stream: TcpStream,
+        seen: &Mutex<Vec<String>>,
+        heads: &Mutex<Vec<String>>,
+        nonce: &str,
+    ) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -4086,7 +4109,7 @@ mod live {
         if let Ok(mut heads) = heads.lock() {
             heads.push(head.clone());
         }
-        let body = NONCE;
+        let body = nonce;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
@@ -4107,8 +4130,13 @@ mod live {
     }
 
     impl LiveProxy {
+        /// A listener with a credential of its own.
+        ///
+        /// Minted, not a constant: `spawn` refuses a token that is already live
+        /// (P1.6(b)) and the live tests share one process, so a fixed value would
+        /// make them refuse each other as soon as two run in parallel.
         fn start(allow: &[&str]) -> Self {
-            Self::start_with_token(allow, RunToken::for_tests(LIVE_TOKEN))
+            Self::start_with_token(allow, RunToken::issue().expect("mint a live token"))
         }
 
         /// The same listener with a run token of its own (P1.4's two-run test
@@ -4542,7 +4570,7 @@ mod live {
         let outcome = launch_session(
             counters.as_ref(),
             Some(proxy.port()),
-            Some(LIVE_TOKEN),
+            Some(proxy.token().value()),
             &launcher,
             &session_input(
                 &scratch_dir,
@@ -4611,7 +4639,7 @@ mod live {
         let outcome = launch_session(
             counters.as_ref(),
             Some(proxy.port()),
-            Some(LIVE_TOKEN),
+            Some(proxy.token().value()),
             &launcher,
             &session_input(
                 &scratch_dir,
@@ -4919,6 +4947,30 @@ mod live {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    /// Did `port` stop accepting connections within `within`?
+    ///
+    /// Polled because dropping a [`crate::net::proxy::ProxyHandle`] cancels the
+    /// accept loop and then shuts its runtime down in the background
+    /// (`shutdown_background`, AC-3.14 promises the port inside ~1s). P1.6(f):
+    /// "closed" has to be *observed*; asserting it by not asserting anything after
+    /// `drop` is an inference about `Drop`, not evidence.
+    fn port_is_closed(port: u16, within: Duration) -> bool {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                // Refused (or unroutable): nothing is listening any more.
+                Err(_) => return true,
+                Ok(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
     /// CONNECT leaves in a session's audit chain.
     fn connect_leaves(sid: &str) -> usize {
         std::fs::read_to_string(crate::audit::audit_log_path(sid))
@@ -4926,6 +4978,190 @@ mod live {
             .lines()
             .filter(|line| line.contains("\"op\":\"CONNECT\""))
             .count()
+    }
+
+    /// One attempt of the concurrency test: when each launch was in flight, and
+    /// what it returned.
+    ///
+    /// Extracted from the test body so the retry rule is testable without
+    /// launching a container - and the retry rule is the part that was wrong: the
+    /// loop used to discard ANY non-overlapping attempt, including one whose
+    /// launch had failed, so a real failure could be retried into invisibility.
+    struct ConcurrencyAttempt {
+        a: (Duration, Duration),
+        b: (Duration, Duration),
+        out_a: Result<SessionOutcome, MxcError>,
+        out_b: Result<SessionOutcome, MxcError>,
+    }
+
+    impl ConcurrencyAttempt {
+        /// Both launch calls were executing at some common instant.
+        fn overlaps(&self) -> bool {
+            self.a.0 < self.b.1 && self.b.0 < self.a.1
+        }
+
+        /// How long the two windows were in flight together.
+        fn overlap(&self) -> Duration {
+            self.a
+                .1
+                .min(self.b.1)
+                .checked_sub(self.a.0.max(self.b.0))
+                .unwrap_or_default()
+        }
+
+        /// May this attempt be thrown away and tried again?
+        ///
+        /// Only when it is BOTH serialized (so it measured nothing about
+        /// concurrency) AND clean on both sides. A serialized attempt whose launch
+        /// failed is the finding, not noise: retrying it would replace a real
+        /// failure with a later, luckier run - a test that passes over the defect
+        /// it exists to catch. An overlapping attempt is never discarded either,
+        /// because it *is* the measurement.
+        fn discardable(&self) -> bool {
+            !self.overlaps() && self.out_a.is_ok() && self.out_b.is_ok()
+        }
+
+        /// One line of evidence for this attempt, outcome included.
+        ///
+        /// Printed for every attempt, not only the chosen one, so a failure
+        /// cannot hide behind a retry. Deliberately narrow: exit code, proof and
+        /// the error - never the child's stderr (it can quote a URL) and never a
+        /// credential.
+        fn evidence(&self) -> String {
+            format!(
+                "run_a=[{}ms..{}ms] run_b=[{}ms..{}ms] overlap={}ms out_a={} out_b={}",
+                self.a.0.as_millis(),
+                self.a.1.as_millis(),
+                self.b.0.as_millis(),
+                self.b.1.as_millis(),
+                self.overlap().as_millis(),
+                describe_launch(&self.out_a),
+                describe_launch(&self.out_b),
+            )
+        }
+    }
+
+    /// How one launch outcome reads in evidence.
+    fn describe_launch(out: &Result<SessionOutcome, MxcError>) -> String {
+        match out {
+            Ok(o) => format!(
+                "ok exit={:?} proof={:?} success={}",
+                o.exit_code,
+                o.proxy_proof,
+                o.success()
+            ),
+            Err(e) => format!("ERR {e}"),
+        }
+    }
+
+    /// The attempt the concurrency test settles on, if it may stop now.
+    ///
+    /// Stops on the latest attempt when it may not be discarded (an overlap to
+    /// measure, or a failure to report) or when the attempt budget is spent.
+    fn chosen_attempt(attempts: &[ConcurrencyAttempt], max: usize) -> Option<usize> {
+        let last = attempts.len().checked_sub(1)?;
+        (!attempts[last].discardable() || attempts.len() >= max).then_some(last)
+    }
+
+    /// P1.6 (blocking 3): a serialized attempt whose launch FAILED is reported,
+    /// never retried.
+    ///
+    /// The live test retries a serialized pair because a scheduler can deschedule
+    /// one thread for the whole of the other's launch. The first version retried
+    /// on `!overlaps()` alone, so an attempt that serialized *and* failed was
+    /// discarded - the failure replaced by a later run's luck, which is exactly
+    /// how a test passes over the defect it was written to catch.
+    #[test]
+    fn a_serial_attempt_with_a_failed_launch_is_reported_not_retried() {
+        let failed = ConcurrencyAttempt {
+            a: (Duration::from_millis(0), Duration::from_millis(400)),
+            b: (Duration::from_millis(500), Duration::from_millis(900)),
+            out_a: Err(MxcError::Concurrency(EpochAlreadyOpen { active: 1 })),
+            out_b: Ok(passing_outcome()),
+        };
+        assert!(
+            !failed.overlaps(),
+            "the fixture must be the serialized case"
+        );
+        assert!(
+            !failed.discardable(),
+            "a serialized attempt with a failed launch is the finding, not noise"
+        );
+        // The loop appends one attempt at a time: the failed one settles it at
+        // once, even though a retry would still have budget left.
+        let attempts = [failed, clean_serial(), clean_serial()];
+        assert_eq!(
+            chosen_attempt(&attempts[..1], 3),
+            Some(0),
+            "the loop must settle on the failed attempt immediately, not retry it"
+        );
+        assert_eq!(
+            attempts.len(),
+            3,
+            "a failed attempt settles the loop, so the other two are never launched"
+        );
+        // The failure is visible in the per-attempt evidence, not only in the
+        // panic at the end.
+        let evidence = attempts[0].evidence();
+        assert!(
+            evidence.contains("out_a=ERR") && evidence.contains("overlap="),
+            "every attempt must print its outcome: {evidence}"
+        );
+
+        // The scheduler case the retry exists for is unchanged: a clean serialized
+        // attempt is discarded and retried...
+        let clean = clean_serial();
+        assert!(clean.discardable());
+        assert_eq!(
+            chosen_attempt(&[clean], 3),
+            None,
+            "one clean attempt: retry"
+        );
+        // The attempt budget is what bounds the retrying: at the limit, a clean
+        // serialized attempt is settled on so the test can report the finding.
+        assert_eq!(chosen_attempt(&[clean_serial()], 1), Some(0));
+        // ... and an overlapping attempt is the measurement, so it is chosen even
+        // when it is also a failure (the outcome is asserted separately).
+        let overlapping = ConcurrencyAttempt {
+            a: (Duration::from_millis(0), Duration::from_millis(400)),
+            b: (Duration::from_millis(100), Duration::from_millis(500)),
+            out_a: Err(MxcError::Concurrency(EpochAlreadyOpen { active: 1 })),
+            out_b: Ok(passing_outcome()),
+        };
+        assert!(overlapping.overlaps());
+        assert!(!overlapping.discardable());
+        assert_eq!(chosen_attempt(&[overlapping], 3), Some(0));
+    }
+
+    /// A serialized attempt whose launches both came back clean.
+    fn clean_serial() -> ConcurrencyAttempt {
+        ConcurrencyAttempt {
+            a: (Duration::from_millis(0), Duration::from_millis(400)),
+            b: (Duration::from_millis(500), Duration::from_millis(900)),
+            out_a: Ok(passing_outcome()),
+            out_b: Ok(passing_outcome()),
+        }
+    }
+
+    /// An outcome that passes guardrail 1 on the `Required` leg.
+    fn passing_outcome() -> SessionOutcome {
+        SessionOutcome {
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            warnings: Vec::new(),
+            tier: TierRecord {
+                tier: Some("base-container".to_string()),
+                tier_source: TIER_SOURCE_PROBE,
+                needs_dacl_augmentation: Some(false),
+            },
+            proxy_proof: ProxyProof {
+                accepted: 1,
+                tunnels: 1,
+            },
+            expectation: ProofExpectation::Required,
+        }
     }
 
     /// **P1.4 mandatory test: two containers, concurrently.**
@@ -4943,8 +5179,10 @@ mod live {
     #[ignore = "launches two real ProcessContainers; run: cargo test --features mxc-backend -- --ignored"]
     fn two_concurrent_sessions_prove_only_their_own_traffic_and_refuse_each_others_tokens() {
         let launcher = launcher_under_test();
-        let origin_a = Origin::start();
-        let origin_b = Origin::start();
+        // Each origin answers with a body only it can produce (P1.6(f)): a shared
+        // nonce would let a crossed body pass as a correct one.
+        let origin_a = Origin::start_with_nonce("p14-origin-run-a");
+        let origin_b = Origin::start_with_nonce("p14-origin-run-b");
         // Two runs, two credentials, minted the way the supervisor mints them.
         let token_a = RunToken::issue().expect("mint run A's token");
         let token_b = RunToken::issue().expect("mint run B's token");
@@ -4994,35 +5232,102 @@ mod live {
         let counters_a = a.counters();
         let counters_b = b.counters();
 
-        // Genuinely concurrent: both containers are in flight at once, each
-        // pointed at its own listener by its own proxy URL.
-        let (out_a, out_b) = std::thread::scope(|scope| {
-            let handle_a = scope.spawn(|| {
-                launch_session(
-                    counters_a.as_ref(),
-                    Some(a.port()),
-                    Some(a.token().value()),
-                    &launcher,
-                    &input_a,
+        // Genuinely concurrent, and **observed** to be (P1.6(f)): both threads
+        // meet at a barrier before either launches, so neither launch can start
+        // after the other *finished waiting*, and the measured windows then have to
+        // overlap - which is printed as evidence, not asserted in prose.
+        //
+        // An attempt that comes out serialized is retried, and the retry is not
+        // politeness: it happened once for real, with four live tests launching
+        // containers at the same time, where one thread sat descheduled for the
+        // whole 327 ms of the other's launch. That is a fact about the scheduler,
+        // not about the proxy. If *no* attempt overlaps, the finding is real and
+        // the test fails.
+        //
+        // Only an attempt that is BOTH serialized AND clean is discarded
+        // ([`ConcurrencyAttempt::discardable`]): a launch that failed must fail
+        // this test, never be retried into a luckier run.
+        const CONCURRENCY_ATTEMPTS: usize = 3;
+        let barrier = std::sync::Barrier::new(2);
+        let mut attempts: Vec<ConcurrencyAttempt> = Vec::new();
+        let chosen = loop {
+            let launched_at = std::time::Instant::now();
+            let run = std::thread::scope(|scope| {
+                let barrier_a = &barrier;
+                let barrier_b = &barrier;
+                let handle_a = scope.spawn(|| {
+                    barrier_a.wait();
+                    let began = launched_at.elapsed();
+                    let outcome = launch_session(
+                        counters_a.as_ref(),
+                        Some(a.port()),
+                        Some(a.token().value()),
+                        &launcher,
+                        &input_a,
+                    );
+                    (began, launched_at.elapsed(), outcome)
+                });
+                let handle_b = scope.spawn(|| {
+                    barrier_b.wait();
+                    let began = launched_at.elapsed();
+                    let outcome = launch_session(
+                        counters_b.as_ref(),
+                        Some(b.port()),
+                        Some(b.token().value()),
+                        &launcher,
+                        &input_b,
+                    );
+                    (began, launched_at.elapsed(), outcome)
+                });
+                (
+                    handle_a.join().expect("run A's launch thread"),
+                    handle_b.join().expect("run B's launch thread"),
                 )
             });
-            let handle_b = scope.spawn(|| {
-                launch_session(
-                    counters_b.as_ref(),
-                    Some(b.port()),
-                    Some(b.token().value()),
-                    &launcher,
-                    &input_b,
-                )
+            attempts.push(ConcurrencyAttempt {
+                a: (run.0.0, run.0.1),
+                b: (run.1.0, run.1.1),
+                out_a: run.0.2,
+                out_b: run.1.2,
             });
-            (
-                handle_a.join().expect("run A's launch thread"),
-                handle_b.join().expect("run B's launch thread"),
-            )
-        });
-
-        let out_a = out_a.expect("run A must pass guardrail 1");
-        let out_b = out_b.expect("run B must pass guardrail 1");
+            let last = attempts.len() - 1;
+            // Every attempt, outcome included - not just the one that gets used.
+            // A launch that failed once must be visible in the log even when a
+            // later attempt succeeds.
+            println!(
+                "EVIDENCE concurrency attempt={}/{} {} (barrier of 2 released before either \
+                 launch)",
+                last + 1,
+                CONCURRENCY_ATTEMPTS,
+                attempts[last].evidence()
+            );
+            if let Some(settled) = chosen_attempt(&attempts, CONCURRENCY_ATTEMPTS) {
+                break settled;
+            }
+        };
+        let chosen = attempts.swap_remove(chosen);
+        let overlapped = chosen.overlaps();
+        let chosen_evidence = chosen.evidence();
+        // Outcomes BEFORE the overlap verdict: when a launch failed, that error is
+        // the finding, and it must be what the reader sees - not a note about the
+        // scheduler that would bury it.
+        let out_a = chosen
+            .out_a
+            .expect("run A's launch failed (a failed launch is never retried away)");
+        let out_b = chosen
+            .out_b
+            .expect("run B's launch failed (a failed launch is never retried away)");
+        assert!(
+            overlapped,
+            "no attempt put the two launches in flight at the same time, so this run proves \
+             nothing about concurrent sessions: {}",
+            attempts
+                .iter()
+                .map(ConcurrencyAttempt::evidence)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        println!("EVIDENCE concurrency_chosen {chosen_evidence}");
         println!(
             "EVIDENCE run_a exit={:?} success={} proof={:?} stdout={:?} stderr={:?}",
             out_a.exit_code,
@@ -5063,9 +5368,33 @@ mod live {
             },
             "run B's proof must count only run B's consultation"
         );
+        // The body each session printed must be the nonce of the origin that
+        // session was allowed to reach - and not the other one's (P1.6(f)).
+        println!(
+            "EVIDENCE bodies run_a={:?} (own nonce {}) run_b={:?} (own nonce {})",
+            stdout_of(&out_a).trim(),
+            origin_a.nonce(),
+            stdout_of(&out_b).trim(),
+            origin_b.nonce()
+        );
         assert!(
-            stdout_of(&out_a).contains(NONCE) && stdout_of(&out_b).contains(NONCE),
-            "each session's body must come from its own origin"
+            stdout_of(&out_a).contains(origin_a.nonce()),
+            "run A's body must be its own origin's nonce {}: {:?}",
+            origin_a.nonce(),
+            stdout_of(&out_a)
+        );
+        assert!(
+            stdout_of(&out_b).contains(origin_b.nonce()),
+            "run B's body must be its own origin's nonce {}: {:?}",
+            origin_b.nonce(),
+            stdout_of(&out_b)
+        );
+        assert!(
+            !stdout_of(&out_a).contains(origin_b.nonce())
+                && !stdout_of(&out_b).contains(origin_a.nonce()),
+            "neither session may print the other's origin nonce: A={:?} B={:?}",
+            stdout_of(&out_a),
+            stdout_of(&out_b)
         );
         assert!(
             origin_a.saw("/run-a") && !origin_a.saw("/run-b"),
@@ -5146,12 +5475,26 @@ mod live {
         // (iv) closing one session does not disturb the other's counters or its
         // ability to serve.
         let frozen_b = counters_b.counters(epoch_b);
+        let port_b = b.port();
         drop(b);
+        // Observed, not inferred: B's listener must actually stop accepting, and
+        // A's must still be serving (checked below) - the pair is what makes
+        // "closing B left A alone" mean something (P1.6(f)).
+        let closed = port_is_closed(port_b, Duration::from_secs(5));
         println!(
-            "EVIDENCE after_closing_run_b run_a_counters={:?} run_b_counters_frozen={:?}",
+            "EVIDENCE after_closing_run_b port_b={port_b} refuses_connections={closed} \
+             run_a_counters={:?} run_b_counters_frozen={:?}",
             counters_a.counters(epoch_a),
             frozen_b
         );
+        assert!(
+            closed,
+            "run B's listener on port {port_b} must stop accepting connections once its handle is \
+             dropped; a live socket would mean `drop` did not close its peer"
+        );
+        // ...and A is still *serving*, which the authenticated CONNECT below
+        // asserts directly (an accept-and-407 would prove less, and would spend
+        // A's `no_token` leaf budget doing it).
         assert_eq!(
             counters_b.counters(epoch_b),
             frozen_b,

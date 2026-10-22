@@ -706,8 +706,9 @@ fn run_inner(
             proxy_env = Some(net::ProxyEnv {
                 port: handle.port,
                 // The child's copy of this run's credential; the listener holds
-                // the same value and refuses every other.
-                token: token.value().to_string(),
+                // the same value and refuses every other. Cloning the `RunToken`
+                // (rather than its `String`) keeps the env edge typed (P1.6(c)).
+                token: token.clone(),
             });
             Some(handle)
         }

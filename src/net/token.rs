@@ -63,11 +63,17 @@ impl RunToken {
 
     /// A token with a fixed value, for tests that must know the credential the
     /// listener expects (the live tests build the child's proxy URL themselves).
+    ///
+    /// The serial still comes from the process counter: it is the live-token
+    /// registry's key (P1.6), so two fixtures — distinct listeners — must not
+    /// collide merely because a test chose the same value twice. `Clone` is the
+    /// only way to get one identity twice, which is exactly the case the registry
+    /// exists to refuse.
     #[cfg(test)]
     pub(crate) fn for_tests(value: &str) -> Self {
         Self {
             value: value.to_string(),
-            run: 0,
+            run: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -78,11 +84,12 @@ impl RunToken {
 
     /// This token's run serial (the numeric form of the value's prefix).
     ///
-    /// Test-only for now: the `SANDBOX_DIAG` log line that used it became the
-    /// `foreign_token` audit leaf (which names no run), and no production caller
-    /// has appeared since. `#[cfg(test)]` keeps the zero-warning gate honest
-    /// instead of an `allow(dead_code)` that would hide a real dead path later.
-    #[cfg(test)]
+    /// Two callers, both about identity rather than secrecy: `Debug` prints it
+    /// (never the value), and the live-token registry keys on it (P1.6) so a
+    /// process-global set can enforce "one credential, one listener" without
+    /// keeping a second copy of the credential. Unique per process by
+    /// construction — the counter starts at 1 and only `issue` (and, in tests,
+    /// `for_tests`) mints.
     pub fn run(&self) -> u64 {
         self.run
     }
@@ -92,6 +99,29 @@ impl RunToken {
     /// The `ct_eq` on unequal lengths returns "not equal" but leaks the length;
     /// that is acceptable for a fixed-length token on a loopback listener, and
     /// is the pre-existing behaviour ([G-7]).
+    ///
+    /// # This property is unpinned by the suite, and that is deliberate
+    ///
+    /// **A plain `==` here would pass every test in this suite.** Every assertion
+    /// in the crate compares outcomes - the run's own credential is admitted,
+    /// every other string is a `407` - and `==` answers all of them identically.
+    /// The only observable difference is timing, and a timing assertion is noise
+    /// on a shared machine: a test loose enough to be stable would also pass
+    /// against a leaky comparison, and a test tight enough to catch the swap would
+    /// be flaky enough to get deleted. So the honest position is that this
+    /// property rests on **review**, not on a test, and a fake test here would be
+    /// worse than none - it would look like coverage.
+    ///
+    /// What review gets to lean on is the shape of the code, so keep it this
+    /// small: **the comparison must remain a single whole-value `ct_eq` over the
+    /// two byte slices.** No early return on a length mismatch, no per-character
+    /// loop, no `str == str`, no pre-hashing of the presented value (hashing
+    /// changes the timing *shape* without making the comparison constant-time).
+    /// Written this way, removing the defence is a visible one-line diff instead
+    /// of a subtle re-slice nobody notices.
+    ///
+    /// The one caller is the password arm of `classify_auth` in
+    /// [`net::proxy`](crate::net::proxy).
     pub fn matches(&self, presented: &str) -> bool {
         presented.as_bytes().ct_eq(self.value.as_bytes()).into()
     }

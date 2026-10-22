@@ -271,11 +271,7 @@ current behaviour (harness smoke on 5 scenarios).
   dedicated one-entry launcher directory is deferred. Test asserting the
   workspace-only posture (outside write and read denied, `C:\Windows` readable =
   documented caveat).
-- [ ] **P1.4** **Concurrency:** per-run token — the supervisor mints a `RunToken` (64 lowercase hex = 8 hex chars of a **process-global run serial** + 224 CNG random bits; the serial makes two runs distinct **within one supervisor process**, while across processes both start at `00000001` and uniqueness rests on the 224 random bits; the serial is diagnostic only), the child's `HTTP_PROXY` userinfo carries it, and the listener rejects any credential that is not this run's
-  the child's `HTTP_PROXY` userinfo carries it, the proxy rejects CONNECTs whose
-  token does not match the run; two concurrent containers must both pass their
-  own guardrail and neither can satisfy the other's. Alternative (only if the
-  token proves impossible): one proxy instance per run — document the cost.
+- [x] **P1.4** **Concurrency:** per-run token — the supervisor mints a `RunToken` (64 lowercase hex = 8 hex chars of a **process-global run serial** + 224 CNG random bits; the serial makes two runs distinct **within one supervisor process**, while across processes both start at `00000001` and uniqueness rests on the 224 random bits; the serial is diagnostic, and since P1.6 it is also the live-token registry's key), the child's `HTTP_PROXY` userinfo carries it, and the listener rejects any credential that is not this run's — a foreign one gets the identical `407`, is not counted, and leaves exactly one `foreign_token` leaf; two concurrent containers must both pass their own guardrail and neither can satisfy the other's. Alternative (only if the token proves impossible): one proxy instance per run — document the cost. Landed with its reviews, then hardened, as P1.6.
 - [x] **P1.5** (risk check) WinHTTP per-container proxy path: does a
   WinHTTP/Chromium-style client honour it? **Measured 2026-10-21: no.** The env is
   the only proxy information in the child (IE/WinHTTP/WinINet config reads
@@ -292,6 +288,19 @@ current behaviour (harness smoke on 5 scenarios).
   Independently: **the CLR does not start** in this container (coreclr
   `0x8007045A` / `0xC0000142`; the same binary runs under AppContainer) - P3
   blocker, root cause open. Evidence: `docs/backends/process-container/winhttp-proxy-path.md`.
+- [x] **P1.6** **Harden what P1.4's reviews left open** — the `no_token` leaf flood capped (8 leaves, then one
+  aggregate per window of 12 suppressed refusals carrying an integer `suppressed`, with `scope` left alone), the same
+  budget on the `foreign_token` arm, the live-token registry keyed on the run serial instead of the credential, and
+  the live concurrency test no longer able to retry a failed launch into invisibility. Mechanism, measurements and
+  RED evidence: `docs/superpowers/tasks/mxc-migration/PROGRESS.md` row P1.6.
+- [x] **P1.7** **CLR-startup root cause** — the container ran every child with the Win32k-syscall ban because
+  `build_request` never set `ui`; `ui.disable = false` restores .NET 8 / `pwsh` while all ten UI job restrictions and
+  the AppContainer-shaped token survive (measured, unelevated). Evidence: PROGRESS row P1.7 and
+  `docs/backends/process-container/clr-startup-failure.md`.
+- [x] **P1.8** **Managed proxy-path re-measurement** — .NET 8 `HttpClient` and `pwsh` 7 authenticate after the
+  listener's `407` + `Proxy-Authenticate: Basic` challenge and get egress; PS 5.1 / .NET Framework read the
+  (direct) WinINet view and never consult the proxy. Evidence: PROGRESS row P1.8 and
+  `docs/backends/process-container/winhttp-proxy-path.md`.
 
 **Acceptance:** in the VM, unelevated, the network scenarios (S-27..S-36, S-72,
 S-75..S-77, S-81..S-87, S-90, S-91) pass against `--backend mxc`; the guardrail

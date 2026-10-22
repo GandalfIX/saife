@@ -24,13 +24,15 @@
 //! Likewise `hyper`, `hyper-util`, `http`, `http-body-util`, and `bytes`
 //! are present as deps for that future work and are NOT imported here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -127,15 +129,191 @@ struct ConnCtx {
     /// Per-launch attribution counters (ADR-0004 guardrail 1). Shared with the
     /// handle, so the launch path reads exactly what this listener counted.
     counters: Arc<LaunchCounters>,
+    /// This listener's audit budget for credential-less refusals (P1.6(a)).
+    no_token: RefusalBudget,
+    /// The same budget for a credential that is not this run's (P1.6, blocking
+    /// 2). A cap on one refusal arm and not the other caps nothing: the flood is
+    /// one extra header away (`Proxy-Authorization: Basic <anything base64>`
+    /// takes the `Foreign` arm instead).
+    foreign_token: RefusalBudget,
+}
+
+/// How many refusals of one kind get their own leaf before the aggregate window
+/// opens.
+///
+/// Measured before the cap: 400 credential-less CONNECTs produced 400 leaves
+/// (129 KB) with nothing to stop a loop at any size (P1.4 review, P1.6(a)). Eight
+/// is enough to see that something is probing and with what shape, and small
+/// enough that a flood costs one screen of chain instead of a file.
+const LEAF_BUDGET: u64 = 8;
+
+/// Suppressed refusals summarised by one aggregate leaf.
+///
+/// The window is what makes the count both **exact** and **bounded**: each full
+/// window writes one leaf carrying exactly this many refusals, so a reader sums
+/// the chain to the true total instead of reading a constant, and a million
+/// refusals cost 8 + ~83,000 leaves instead of 1,000,000. (P1.6 review: the
+/// previous one-off aggregate wrote `suppressed=1` into `scope` because the
+/// count was `n - budget` with `n == budget + 1` — a constant, and a count
+/// sitting in a field whose documented domain is rule scope.)
+///
+/// Twelve rather than a round 100 because the realistic flood here is tens of
+/// refusals, not millions: P1.8 made one credential-less attempt per managed
+/// connection the steady state, so a window of 100 would leave a 20-refusal
+/// burst with no aggregate at all — recording nothing about the refusals that
+/// were suppressed, which is the defect being fixed. The bound that matters
+/// (leaf volume grows as n/12, never as n) holds at either size.
+const SUPPRESSED_LEAF_WINDOW: u64 = 12;
+
+/// What the audit chain should record for one refusal of a budgeted kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalLeaf {
+    /// Inside the budget: this refusal gets its own leaf.
+    Individual,
+    /// This refusal completes a window: write one aggregate leaf standing in for
+    /// exactly this many suppressed refusals.
+    Aggregate { suppressed: u64 },
+    /// Inside a window that is not full yet: write nothing.
+    Nothing,
+}
+
+/// One refusal kind's leaf budget for one listener (P1.6).
+///
+/// Plain atomics on the listener state, **not** behind the audit writer's lock:
+/// the decision "does this refusal get its own leaf?" must not serialize every
+/// 407 behind one mutex, and it must not be a place a slow audit sink can stall a
+/// refusal.
+///
+/// The budget is spent in arrival order and the window is *claimed* with a
+/// single atomic rather than decided by a look-then-write, so two refusals racing
+/// for a window cannot both write one. Nothing is ever subtracted from
+/// `suppressed`, so a concurrent arrival cannot be counted twice or lost.
+///
+/// Per *listener* rather than per epoch on purpose: the flood this caps is a
+/// property of the listener being dialled (an unauthenticated probe loop, or a
+/// managed client's uncounted first attempt, see P1.8), and one listener serves
+/// one run, so a per-epoch budget would hand a long-lived listener a fresh eight
+/// leaves per launch while leaving a single launch's flood uncapped.
+struct RefusalBudget {
+    /// Refusals of this kind this listener has answered, ever. Decides whether a
+    /// refusal is still inside the individual budget.
+    seen: AtomicU64,
+    /// Refusals past the individual budget, ever — monotonic, never reset.
+    suppressed: AtomicU64,
+    /// Suppressed refusals already summarised by an aggregate leaf, ever. A
+    /// window is due when `suppressed` is a whole window ahead of it, so this is
+    /// the window's re-arm state and the arithmetic stays exact across a partial
+    /// trailing window (a count of *windows* would not).
+    accounted: AtomicU64,
+}
+
+impl RefusalBudget {
+    const fn new() -> Self {
+        Self {
+            seen: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+            accounted: AtomicU64::new(0),
+        }
+    }
+
+    /// Take one unit of this listener's leaf budget for one refusal.
+    ///
+    /// The caller writes the leaf this answer names, and nothing more. Refusals
+    /// stay uncounted as consultations either way — this decides the *audit*
+    /// footprint only, never the proof counters.
+    fn spend(&self) -> RefusalLeaf {
+        let seen = self.seen.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= LEAF_BUDGET {
+            return RefusalLeaf::Individual;
+        }
+        let suppressed = self.suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+        let accounted = self.accounted.load(Ordering::Relaxed);
+        if suppressed < accounted + SUPPRESSED_LEAF_WINDOW {
+            return RefusalLeaf::Nothing;
+        }
+        // The claim *is* the re-arm, and it happens immediately before the
+        // caller's append: one window is summarised by exactly one leaf, and no
+        // window is re-armed without an attempt following it.
+        match self.accounted.compare_exchange(
+            accounted,
+            accounted + SUPPRESSED_LEAF_WINDOW,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => RefusalLeaf::Aggregate {
+                suppressed: SUPPRESSED_LEAF_WINDOW,
+            },
+            // Another arrival claimed this window between the load and the
+            // exchange: its leaf already covers this refusal.
+            Err(_) => RefusalLeaf::Nothing,
+        }
+    }
+
+    /// The refusals a shutting-down listener still owes the chain: whatever the
+    /// last partial window holds, claimed so it can be written exactly once.
+    ///
+    /// A live reader can therefore be short by at most
+    /// `SUPPRESSED_LEAF_WINDOW - 1` refusals; closing the listener writes the
+    /// remainder, so a completed run's chain sums to the true total.
+    fn claim_trailing(&self) -> Option<u64> {
+        let accounted = self.accounted.load(Ordering::Relaxed);
+        let trailing = self
+            .suppressed
+            .load(Ordering::Relaxed)
+            .saturating_sub(accounted);
+        if trailing == 0 {
+            return None;
+        }
+        // This leaf now stands in for the remainder, so a second flush cannot
+        // write it again.
+        self.accounted
+            .compare_exchange(
+                accounted,
+                accounted + trailing,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| trailing)
+    }
+}
+
+impl ConnCtx {
+    /// Write the trailing aggregate of every spent refusal budget.
+    ///
+    /// Best effort, like every other append on this listener: the writer is
+    /// non-strict, so `AuditWriter::append` swallows an I/O error and the count
+    /// recorded is an *attempted* count.
+    fn flush_refusal_aggregates(&self) {
+        for (budget, reason) in [
+            (&self.no_token, "no_token_suppressed"),
+            (&self.foreign_token, "foreign_token_suppressed"),
+        ] {
+            if let Some(suppressed) = budget.claim_trailing() {
+                let _ = emit_connect(
+                    &self.writer,
+                    "<unknown>",
+                    0,
+                    "deny",
+                    Some(reason),
+                    "default",
+                    None,
+                    false,
+                    Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
+                );
+            }
+        }
+    }
 }
 
 /// Emit a CONNECT audit leaf directly through the threaded `AuditWriter`
 /// (replaces the per-call `audit::emit_connect` wrapper, which opened the
 /// writer fresh on each event).
 //
-// The 8-arg signature is mandated by D-5.1 Step 1 (host, port, disposition,
-// reason, source, scope, persisted + writer); folding into a struct would
-// diverge from the spec, so the clippy lint is suppressed here only.
+// The positional signature is D-5.1 Step 1's (host, port, disposition, reason,
+// source, scope, persisted + writer), extended by P1.6's `suppressed`; folding it
+// into a struct would diverge from the spec, so the clippy lint is suppressed
+// here only.
 #[allow(clippy::too_many_arguments)]
 fn emit_connect(
     writer: &AuditWriter,
@@ -146,6 +324,7 @@ fn emit_connect(
     source: &str,
     scope: Option<&str>,
     persisted: bool,
+    suppressed: Option<u32>,
 ) -> Result<()> {
     use serde_json::{Map, json};
     let mut e = Map::new();
@@ -157,6 +336,16 @@ fn emit_connect(
     e.insert("source".into(), json!(source));
     e.insert("scope".into(), json!(scope));
     e.insert("persisted".into(), json!(persisted));
+    // How many refusals this leaf stands in for; `null` for a leaf that
+    // describes one request. A first-class integer, never text packed into
+    // `scope`: `scope` is a documented, filterable enum of *rule scope*
+    // (`once` | `host` | `suffix` | null — `audit::filter::KNOWN_KEYS`,
+    // `tasks/adr-0001/d-5.1-connect-source-field.md`), so a count written there
+    // makes a consumer filtering on scope read a number as a scope. The price of
+    // the new key is a `null` in every other leaf, which is the cheap side of
+    // that trade: the leaf was always open-shaped (a reader takes the fields it
+    // knows), and the alternative is a field whose meaning depends on `reason`.
+    e.insert("suppressed".into(), json!(suppressed));
     writer.append(e)?;
     Ok(())
 }
@@ -369,6 +558,109 @@ impl CounterState {
     }
 }
 
+/// Every proxy credential that is live in this process right now.
+///
+/// [`RunToken: Clone`](RunToken) means two `ProxyConfig`s *can* carry the same
+/// value, and two listeners that accept one credential is exactly the ambiguity
+/// P1.4 removed (which run's traffic was that?). It is unreachable today - one
+/// mint per run in `main.rs` - but nothing in the type system said so, so the
+/// check lives here instead of in a comment (P1.6(b)).
+///
+/// Keyed by the run **serial** ([`RunToken::run`]), never by the credential: a
+/// process-global set is the last place a second copy of the secret belongs, and
+/// the serial is exactly as discriminating — the token module's process-global
+/// run counter makes it unique per process by construction, and a clone carries
+/// the serial it was cloned from, so a clone of a live token still collides while
+/// no copy of the value is retained anywhere.
+/// Poison-tolerant, and the lock discipline is one rule — **the registry lock is
+/// a leaf**: it is taken for one insert or one remove and never held across a
+/// bind, an audit write, a lock the other side might take, or an `.await`. So it
+/// cannot deadlock, and a panic elsewhere cannot wedge it (the guard is
+/// recovered, house style).
+///
+/// Note what it is *not*: it does not stop the *same* `ProxyHandle` from serving
+/// sequential launches (that is the epoch machinery), and releasing the token in
+/// `Drop` does not wait for the old accept loop to drain - a re-spawned listener
+/// with the same value may overlap a dying task for a few milliseconds. That is
+/// the same credential and the same run, so it is attribution-neutral.
+static LIVE_TOKENS: LazyLock<StdMutex<HashSet<u64>>> =
+    LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+/// The registry lock, recovered from poisoning instead of panicking.
+fn live_tokens() -> std::sync::MutexGuard<'static, HashSet<u64>> {
+    LIVE_TOKENS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Record `token` as live, or refuse because another listener already serves it.
+fn register_live_token(token: &RunToken) -> std::result::Result<(), TokenAlreadyLive> {
+    if !live_tokens().insert(token.run()) {
+        return Err(TokenAlreadyLive);
+    }
+    Ok(())
+}
+
+/// Forget `token`. Idempotent: a serial that is not registered is not an error.
+fn release_live_token(token: &RunToken) {
+    live_tokens().remove(&token.run());
+}
+
+/// Refusal for a second listener that would carry a credential already in use.
+///
+/// Deliberately holds **no field**: the value is a credential (nothing about it
+/// belongs in an error string), and a run serial would be wrong for the case this
+/// exists for - a clone of a live token is not a new run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenAlreadyLive;
+
+impl fmt::Display for TokenAlreadyLive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "this run's proxy token is already live on another listener: one credential may \
+             serve exactly one listener, so that a connection is attributable to one run - \
+             spawn the second session with its own token",
+        )
+    }
+}
+
+impl std::error::Error for TokenAlreadyLive {}
+
+/// The registration [`spawn`] takes before it binds anything.
+///
+/// Armed on construction and disarmed when the handle adopts it, so every early
+/// return between the two (`?` on the runtime build, a failed bind handshake)
+/// releases the credential instead of leaking it into the process-global set.
+struct LiveTokenClaim {
+    token: RunToken,
+    armed: bool,
+}
+
+impl LiveTokenClaim {
+    fn claim(token: &RunToken) -> std::result::Result<Self, TokenAlreadyLive> {
+        register_live_token(token)?;
+        Ok(Self {
+            token: token.clone(),
+            armed: true,
+        })
+    }
+
+    /// Hand the registration to the returned [`ProxyHandle`], which releases it
+    /// in `Drop`.
+    fn into_handle(mut self) -> RunToken {
+        self.armed = false;
+        self.token.clone()
+    }
+}
+
+impl Drop for LiveTokenClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            release_live_token(&self.token);
+        }
+    }
+}
+
 pub struct ProxyHandle {
     pub port: u16,
     /// This listener's per-launch attribution counters. The MXC launch path
@@ -380,6 +672,17 @@ pub struct ProxyHandle {
     /// the live tests still surfaces.
     #[cfg_attr(not(test), allow(dead_code))]
     counters: Arc<LaunchCounters>,
+    /// This listener's entry in [`LIVE_TOKENS`]: the credential it accepts,
+    /// registered by [`spawn`] and released here. Holding it is what makes
+    /// "one credential, one listener" true for the process, not just for a
+    /// comment (P1.6(b)).
+    live_token: RunToken,
+    /// This listener's state, kept so `Drop` can write the trailing suppression
+    /// aggregates. It cannot be left to the accept loop's exit path: the runtime
+    /// is shut down with `shutdown_background`, which drops in-flight tasks
+    /// instead of polling them, so "the task observed the cancellation" is not
+    /// something this shutdown path may rely on.
+    ctx: Arc<ConnCtx>,
     cancel: CancellationToken,
     rt: Option<Runtime>,
     join: Option<tokio::task::JoinHandle<()>>,
@@ -415,6 +718,15 @@ impl ProxyHandle {
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
+        // 0. Release the credential. Last-statement ordering does not matter
+        //    (nothing below can fail), but doing it first means a caller that
+        //    re-spawns with the same token in the next statement is not racing
+        //    this drop at all.
+        release_live_token(&self.live_token);
+        // 0b. Write whatever a spent refusal budget still owes the chain (the
+        //     trailing partial window of each kind). Done here rather than in the
+        //     accept task, which `shutdown_background` may drop unpolled.
+        self.ctx.flush_refusal_aggregates();
         // 1. Signal the accept loop to break.
         self.cancel.cancel();
         // 2. Drop the JoinHandle (detaches the task; it will finish on
@@ -449,6 +761,10 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         upstream,
         prompt,
     } = cfg;
+    // One credential, one listener (P1.6(b)). Claimed before a runtime or a
+    // socket exists, so a refusal costs nothing and cannot leave a half-built
+    // listener behind; `claim` is disarmed only when the handle takes it over.
+    let claim = LiveTokenClaim::claim(&token)?;
     let counters = LaunchCounters::new();
     let ctx = Arc::new(ConnCtx {
         token,
@@ -458,6 +774,8 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         upstream,
         prompt,
         counters: Arc::clone(&counters),
+        no_token: RefusalBudget::new(),
+        foreign_token: RefusalBudget::new(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -469,6 +787,9 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
+    // Kept for `ProxyHandle::drop`, which writes the trailing suppression
+    // aggregates itself - see the field's note.
+    let ctx_for_handle = Arc::clone(&ctx);
     let join = rt.spawn(async move {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
@@ -511,6 +832,8 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
     Ok(ProxyHandle {
         port,
         counters,
+        live_token: claim.into_handle(),
+        ctx: ctx_for_handle,
         cancel,
         rt: Some(rt),
         join: Some(join),
@@ -854,6 +1177,8 @@ fn emit_decision(writer: &AuditWriter, host: &str, port: u16, d: &Decision) {
         d.source,
         d.scope.as_deref(),
         d.persisted,
+        // A decision is one request: nothing is suppressed about it.
+        None,
     );
 }
 
@@ -1362,17 +1687,60 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     match classify_auth(head, &ctx.token) {
         AuthVerdict::OwnRun => {}
         AuthVerdict::Absent => {
+            // The response is the same 407 for every credential-less request;
+            // only the audit footprint is budgeted (P1.6(a)). Without the cap a
+            // loop of these writes one leaf per connection (measured: 400
+            // connections -> 400 leaves, 129 KB), and P1.8 made that the *normal*
+            // case - every managed client's first attempt on a connection is
+            // credential-less, so `no_token` stopped being a signal at all.
+            //
+            // Audit BEFORE responding, the rule the deny path already states: the
+            // append is synchronous, so whoever observes the 407 also observes
+            // the leaf. Responding first left a window in which a refusal was on
+            // the wire and nothing was in the chain yet - which the P1.4 live test
+            // asserted against and lost to twice while P1.6 re-ran it.
+            match ctx.no_token.spend() {
+                RefusalLeaf::Individual => {
+                    let _ = emit_connect(
+                        &ctx.writer,
+                        "<unknown>",
+                        0,
+                        "deny",
+                        Some("no_token"),
+                        "default",
+                        None,
+                        false,
+                        None,
+                    );
+                }
+                RefusalLeaf::Aggregate { suppressed } => {
+                    // One leaf per full window of suppressed refusals, carrying
+                    // the exact number it stands in for. `scope` stays `null`:
+                    // its domain is rule scope, and a count there would make a
+                    // scope filter read a number.
+                    //
+                    // Best effort, and honestly so: `append` on this non-strict
+                    // writer swallows I/O errors (`audit::AuditWriter::append`),
+                    // so what the leaf records is an ATTEMPTED count, not a
+                    // guaranteed one. There is no retry by design — a retry queue
+                    // on the refusal path is the cost this budget exists to
+                    // avoid — and the window was re-armed by `spend` only as this
+                    // append was about to be attempted.
+                    let _ = emit_connect(
+                        &ctx.writer,
+                        "<unknown>",
+                        0,
+                        "deny",
+                        Some("no_token_suppressed"),
+                        "default",
+                        None,
+                        false,
+                        Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
+                    );
+                }
+                RefusalLeaf::Nothing => {}
+            }
             let _ = sock.write_all(AUTH_REQUIRED).await;
-            let _ = emit_connect(
-                &ctx.writer,
-                "<unknown>",
-                0,
-                "deny",
-                Some("no_token"),
-                "default",
-                None,
-                false,
-            );
             return Ok(());
         }
         AuthVerdict::Foreign => {
@@ -1382,17 +1750,50 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             // the only one with no evidence. The leaf names no host and never
             // the credential, and because it is not a consultation it can
             // neither satisfy guardrail 1 nor reach `decide()`.
+            //
+            // Audited before the 407 goes out, for the same reason as the
+            // `Absent` arm: the two arms must be indistinguishable to the
+            // client, including in what the chain contains by the time the
+            // response is readable.
+            //
+            // Budgeted exactly like the `Absent` arm, with its OWN counter and
+            // its own reason (P1.6, blocking 2): without it the flood is one
+            // extra header away — any base64 blob in `Proxy-Authorization`
+            // reaches this arm instead, and an uncapped arm caps nothing. The
+            // budgets stay separate because the two arms answer different
+            // questions (a client that lost its credential vs a client holding
+            // someone else's), and one flood must not silence the other's
+            // evidence.
+            match ctx.foreign_token.spend() {
+                RefusalLeaf::Individual => {
+                    let _ = emit_connect(
+                        &ctx.writer,
+                        "<unknown>",
+                        0,
+                        "deny",
+                        Some("foreign_token"),
+                        "default",
+                        None,
+                        false,
+                        None,
+                    );
+                }
+                RefusalLeaf::Aggregate { suppressed } => {
+                    let _ = emit_connect(
+                        &ctx.writer,
+                        "<unknown>",
+                        0,
+                        "deny",
+                        Some("foreign_token_suppressed"),
+                        "default",
+                        None,
+                        false,
+                        Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
+                    );
+                }
+                RefusalLeaf::Nothing => {}
+            }
             let _ = sock.write_all(AUTH_REQUIRED).await;
-            let _ = emit_connect(
-                &ctx.writer,
-                "<unknown>",
-                0,
-                "deny",
-                Some("foreign_token"),
-                "default",
-                None,
-                false,
-            );
             return Ok(());
         }
     }
@@ -2622,7 +3023,36 @@ async fn handle_non_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    thread_local! {
+        /// The credential of the listener this test thread spawned last.
+        ///
+        /// The suite runs dozens of listeners in one process, and `spawn` now
+        /// refuses a token that is already live (P1.6(b)), so the fixture can no
+        /// longer hand every listener one constant value. The request builders
+        /// (`auth_header`, `connect_req`, `http_req`) read the value from here
+        /// instead, which keeps them matching the listener the test just started.
+        /// A test that needs a *different* credential presents it explicitly with
+        /// `connect_req_with`.
+        static LISTENER_TOKEN: std::cell::RefCell<String> =
+            std::cell::RefCell::new(TEST_TOKEN.to_string());
+    }
+
+    /// A credential no other live listener in this process can already hold.
+    ///
+    /// `TEST_TOKEN`-prefixed so a leaked value in a log line is recognisably a
+    /// fixture, and serialised so the value is deterministic per process.
+    fn unique_test_token() -> RunToken {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        RunToken::for_tests(&format!("{TEST_TOKEN}-{serial}"))
+    }
+
+    /// The credential `auth_header` presents: the last one spawned on this thread.
+    fn listener_token() -> String {
+        LISTENER_TOKEN.with(|token| token.borrow().clone())
+    }
 
     fn make_head(auth: &str) -> String {
         format!("CONNECT api.example.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n")
@@ -2717,6 +3147,7 @@ mod tests {
             "allowlist",
             None,
             false,
+            None,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -2730,6 +3161,12 @@ mod tests {
         assert_eq!(v["source"], "allowlist");
         assert_eq!(v["scope"], serde_json::Value::Null);
         assert_eq!(v["persisted"], false);
+        assert!(
+            v.get("suppressed").is_some(),
+            "every leaf carries the key, so a consumer never has to distinguish \
+             'absent' from 'nothing suppressed'"
+        );
+        assert_eq!(v["suppressed"], serde_json::Value::Null);
     }
 
     #[test]
@@ -2745,6 +3182,7 @@ mod tests {
             "default",
             None,
             false,
+            None,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -2771,6 +3209,7 @@ mod tests {
             "allowlist",
             Some("session-42"),
             true,
+            None,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -2783,6 +3222,66 @@ mod tests {
         assert!(v["persisted"].is_boolean());
         assert_eq!(v["persisted"], true);
         assert_eq!(v["scope"], "session-42");
+    }
+
+    /// P1.6 (blocking 1): the suppressed count is a first-class integer field.
+    ///
+    /// It used to be written as `scope: "suppressed=1"`, which put a number into
+    /// a key whose documented domain is rule scope (`once` | `host` | `suffix` |
+    /// null) and made the count a constant, because it was computed as
+    /// `n - BUDGET` with `n` always one past the budget. Here the field itself is
+    /// pinned: a JSON number when a leaf stands in for several refusals, `null`
+    /// when it describes exactly one, and `scope` untouched either way.
+    #[test]
+    fn emit_connect_writes_suppressed_as_an_integer_or_null() {
+        let sid = temp_sid("src-suppressed");
+        let writer = crate::audit::AuditWriter::open(&sid, false).unwrap();
+        emit_connect(
+            &writer,
+            "<unknown>",
+            0,
+            "deny",
+            Some("no_token_suppressed"),
+            "default",
+            None,
+            false,
+            Some(12),
+        )
+        .unwrap();
+        emit_connect(
+            &writer,
+            "<unknown>",
+            0,
+            "deny",
+            Some("no_token"),
+            "default",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let path = crate::audit::audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let mut lines = content.trim_end().lines();
+        let aggregate: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let single: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert!(
+            aggregate["suppressed"].is_u64(),
+            "a count must be a JSON number, not a string: {aggregate:?}"
+        );
+        assert_eq!(aggregate["suppressed"], 12);
+        assert_eq!(
+            aggregate["scope"],
+            serde_json::Value::Null,
+            "scope's domain is rule scope, never a count: {aggregate:?}"
+        );
+        assert_eq!(
+            single["suppressed"],
+            serde_json::Value::Null,
+            "one request suppresses nothing: {single:?}"
+        );
     }
 
     #[test]
@@ -3774,7 +4273,7 @@ mod tests {
             timeout,
             policy,
             upstream,
-            RunToken::for_tests(TEST_TOKEN),
+            unique_test_token(),
         )
     }
 
@@ -3792,6 +4291,29 @@ mod tests {
         upstream: Option<Arc<UpstreamDialer>>,
         token: RunToken,
     ) -> T36 {
+        try_t36_token_cfg(
+            label, allow, deny, dialog, enabled, timeout, policy, upstream, token,
+        )
+        .expect("spawn test proxy")
+    }
+
+    /// [`t36_setup_token_cfg`], with the spawn result kept: the one test that
+    /// asserts a *refused* spawn (a duplicate live credential, P1.6(b)) needs the
+    /// error, and every other caller wants it unwrapped. A failed attempt leaves
+    /// nothing behind: the scratch state it created is removed here.
+    #[allow(clippy::too_many_arguments)]
+    fn try_t36_token_cfg(
+        label: &str,
+        allow: &[&str],
+        deny: &[&str],
+        dialog: DialogFn,
+        enabled: bool,
+        timeout: Duration,
+        policy: PromptPolicy,
+        upstream: Option<Arc<UpstreamDialer>>,
+        token: RunToken,
+    ) -> Result<T36> {
+        let token_value = token.value().to_string();
         let learned_base = std::env::temp_dir().join(format!(
             "sandbox-t36-{label}-{}-{}",
             std::process::id(),
@@ -3817,7 +4339,7 @@ mod tests {
         };
         let sid = temp_sid(label);
         let writer = Arc::new(crate::audit::AuditWriter::open(&sid, false).unwrap());
-        let handle = super::spawn(super::ProxyConfig {
+        let handle = match super::spawn(super::ProxyConfig {
             session_id: sid.clone(),
             token,
             allow_domain: allow.iter().map(|s| s.to_string()).collect(),
@@ -3825,17 +4347,25 @@ mod tests {
             upstream,
             writer,
             prompt: gate,
-        })
-        .expect("spawn test proxy");
+        }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = std::fs::remove_file(crate::audit::audit_log_path(&sid));
+                let _ = std::fs::remove_dir_all(&learned_base);
+                return Err(e);
+            }
+        };
         let port = handle.port;
-        T36 {
+        // The helpers below build requests for *this* listener's credential.
+        LISTENER_TOKEN.with(|current| *current.borrow_mut() = token_value);
+        Ok(T36 {
             handle,
             port,
             sid,
             intent,
             learned,
             learned_base,
-        }
+        })
     }
 
     /// Default-config test proxy: prompting enabled, 60 s timeout,
@@ -3868,8 +4398,8 @@ mod tests {
     }
 
     fn auth_header() -> String {
-        let creds =
-            base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{TEST_TOKEN}"));
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("sandbox:{}", listener_token()));
         format!("Proxy-Authorization: Basic {creds}\r\n")
     }
 
@@ -4939,6 +5469,550 @@ mod tests {
             connect_events(&a.sid).len(),
             leaves_before + 1,
             "a missing credential is worth a leaf; a foreign one is not"
+        );
+    }
+
+    // ---- P1.6: hardening ------------------------------------------------
+
+    /// P1.6(a): a credential-less flood is capped per listener, and what it
+    /// suppresses is counted exactly.
+    ///
+    /// Measured before the cap: 400 credential-less CONNECTs wrote 400 `no_token`
+    /// leaves (129 KB) with nothing bounding a loop of any size, and P1.8 made it
+    /// the *normal* case - every managed client's first request on a connection
+    /// carries no credential, so `no_token` had stopped being a signal. The budget
+    /// is eight individual leaves, then one aggregate leaf per window of
+    /// suppressed refusals; the wire answer is unchanged and a refusal is still
+    /// not a consultation.
+    ///
+    /// 20 refusals are 8 leaves of their own plus 12 suppressed - exactly one
+    /// window - which pins all three review findings at once: a real `suppressed`
+    /// integer (never text in `scope`), a count that is the true one (12, not a
+    /// constant `1`), and a leaf volume that no longer tracks the flood.
+    #[test]
+    fn credential_less_refusals_are_capped_and_what_they_suppress_is_counted() {
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("p16-no-token-flood", &["*"], &[], dialog);
+        let epoch = t
+            .handle
+            .counters()
+            .begin_epoch()
+            .expect("a window to watch");
+
+        let mut statuses = Vec::new();
+        for _ in 0..20 {
+            let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
+            statuses.push(resp.lines().next().unwrap_or("").to_string());
+        }
+        assert!(
+            statuses
+                .iter()
+                .all(|line| line == "HTTP/1.1 407 Proxy Authentication Required"),
+            "every credential-less CONNECT must still get the same 407: {statuses:?}"
+        );
+
+        let leaves = connect_events(&t.sid);
+        let individual = leaves.iter().filter(|e| e["reason"] == "no_token").count();
+        let aggregate: Vec<&serde_json::Value> = leaves
+            .iter()
+            .filter(|e| e["reason"] == "no_token_suppressed")
+            .collect();
+        assert_eq!(
+            individual, 8,
+            "the first eight refusals keep a leaf each: {leaves:?}"
+        );
+        assert_eq!(
+            aggregate.len(),
+            1,
+            "twelve suppressed refusals are exactly one window: {leaves:?}"
+        );
+        assert_eq!(
+            leaves.len(),
+            9,
+            "20 refusals must leave 8 + 1 leaves, not 20: {leaves:?}"
+        );
+        let aggregate = aggregate[0];
+        assert_eq!(aggregate["disposition"], "deny");
+        assert_eq!(aggregate["source"], "default");
+        assert_eq!(aggregate["host"], "<unknown>");
+        assert_eq!(aggregate["reason"], "no_token_suppressed");
+        assert_eq!(
+            aggregate["suppressed"], 12,
+            "the aggregate stands in for exactly 20 - 8 refusals: {aggregate:?}"
+        );
+        assert_eq!(
+            aggregate["scope"],
+            serde_json::Value::Null,
+            "scope means rule scope; a count in it makes a scope filter read a number: \
+             {aggregate:?}"
+        );
+
+        // The CONTRACT is each field's domain, not a shared key set: `scope` is a
+        // rule scope or null, `suppressed` a count or null, `persisted` a boolean,
+        // `disposition` one of two words. Asserting "all leaves have the same
+        // keys" tested the encoding of the fix (a count squeezed into an existing
+        // field) instead of what a consumer is allowed to rely on.
+        for leaf in &leaves {
+            assert!(
+                leaf["scope"].is_null() || leaf["scope"].is_string(),
+                "scope must be a rule scope or null: {leaf:?}"
+            );
+            assert!(
+                leaf["suppressed"].is_null() || leaf["suppressed"].is_u64(),
+                "suppressed must be a count or null: {leaf:?}"
+            );
+            assert!(
+                leaf["persisted"].is_boolean(),
+                "persisted must be a boolean: {leaf:?}"
+            );
+            assert!(
+                leaf["disposition"] == "allow" || leaf["disposition"] == "deny",
+                "disposition is a closed vocabulary: {leaf:?}"
+            );
+            assert!(
+                leaf["reason"].is_string() || leaf["reason"].is_null(),
+                "reason is text or null: {leaf:?}"
+            );
+        }
+        assert!(
+            leaves
+                .iter()
+                .filter(|e| e["reason"] == "no_token")
+                .all(|e| e["suppressed"].is_null()),
+            "a leaf that describes one refusal suppresses nothing: {leaves:?}"
+        );
+
+        assert_eq!(
+            t.handle.counters().counters(epoch),
+            Some(LaunchProofCounters::default()),
+            "a credential-less refusal is still not a consultation"
+        );
+        assert!(t.handle.counters().close_epoch(epoch));
+    }
+
+    /// P1.6(a): a listener that closes mid-window still writes what it suppressed.
+    ///
+    /// A partial window cannot be written when it is filled (it never is), so the
+    /// chain would be short by up to eleven refusals forever if closing dropped
+    /// it. 13 refusals are 8 leaves + a 5-refusal partial window; the aggregate
+    /// for those 5 must appear once the handle is dropped, and only once.
+    #[test]
+    fn the_trailing_suppressed_window_is_written_once_when_the_listener_closes() {
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        // `T36::drop` unlinks the chain before its fields drop, so the fixture is
+        // held undropped and only the handle is dropped in place - the flush is
+        // what this test is about, and it must land in the file the listener
+        // wrote. The fixture's scratch state is removed by hand below.
+        let mut t =
+            std::mem::ManuallyDrop::new(t36_setup("p16-no-token-trailing", &["*"], &[], dialog));
+        let sid = t.sid.clone();
+        for _ in 0..13 {
+            let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
+            assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        }
+        assert_eq!(
+            connect_events(&sid).len(),
+            8,
+            "a partial window writes no leaf while the listener runs"
+        );
+
+        // SAFETY: the handle is dropped exactly once, and no reference to it is
+        // used afterwards.
+        unsafe { std::ptr::drop_in_place(&mut t.handle) };
+
+        let leaves = connect_events(&sid);
+        let aggregates: Vec<&serde_json::Value> = leaves
+            .iter()
+            .filter(|e| e["reason"] == "no_token_suppressed")
+            .collect();
+        assert_eq!(
+            aggregates.len(),
+            1,
+            "closing the listener must write the partial window exactly once: {leaves:?}"
+        );
+        assert_eq!(
+            aggregates[0]["suppressed"], 5,
+            "the remainder is the refusals no other leaf accounts for: {aggregates:?}"
+        );
+        assert_eq!(aggregates[0]["scope"], serde_json::Value::Null);
+        assert_eq!(
+            leaves.len(),
+            9,
+            "8 individual leaves + the one flushed aggregate: {leaves:?}"
+        );
+
+        // The fixture's own cleanup, since its `Drop` is what we bypassed.
+        let _ = std::fs::remove_file(crate::audit::audit_log_path(&sid));
+        let _ = std::fs::remove_dir_all(&t.learned_base);
+    }
+
+    /// P1.6(a): the leaf volume is bounded, and the chain still sums to the total.
+    ///
+    /// 44 refusals are 8 leaves of their own plus 36 suppressed - three full
+    /// windows - so the chain must hold 8 + 3 leaves, each aggregate carrying
+    /// exactly 12. A count that reset per window without being written, or a
+    /// window that fired once and then went silent, fails here: the sum of the
+    /// aggregates is the number of refusals no other leaf accounts for.
+    #[test]
+    fn a_long_flood_writes_one_aggregate_per_window_and_they_sum_to_the_total() {
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("p16-no-token-windows", &["*"], &[], dialog);
+        let epoch = t
+            .handle
+            .counters()
+            .begin_epoch()
+            .expect("a window to watch");
+
+        for _ in 0..44 {
+            let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
+            assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        }
+
+        let leaves = connect_events(&t.sid);
+        let individual = leaves.iter().filter(|e| e["reason"] == "no_token").count();
+        let aggregates: Vec<&serde_json::Value> = leaves
+            .iter()
+            .filter(|e| e["reason"] == "no_token_suppressed")
+            .collect();
+        assert_eq!(individual, 8, "the budget is eight leaves: {leaves:?}");
+        assert_eq!(
+            aggregates.len(),
+            3,
+            "36 suppressed refusals are three windows: {aggregates:?}"
+        );
+        let suppressed: u64 = aggregates
+            .iter()
+            .map(|e| e["suppressed"].as_u64().expect("an integer count"))
+            .sum();
+        assert_eq!(
+            suppressed,
+            44 - 8,
+            "the aggregates must account for every refusal no other leaf does: {aggregates:?}"
+        );
+        assert_eq!(
+            leaves.len(),
+            11,
+            "44 refusals must cost 8 + 3 leaves, never 44: {leaves:?}"
+        );
+        assert_eq!(
+            t.handle.counters().counters(epoch),
+            Some(LaunchProofCounters::default()),
+            "none of it is a consultation"
+        );
+        assert!(t.handle.counters().close_epoch(epoch));
+    }
+
+    /// P1.6 (blocking 2): the FOREIGN arm is budgeted too, with its own counter.
+    ///
+    /// `Proxy-Authorization: Basic <anything base64>` reaches the `Foreign` arm,
+    /// so capping only the credential-less arm left the flood one header away.
+    /// The budgets are separate on purpose: a foreign flood must not spend the
+    /// missing-credential budget (that is the P1.8 steady state), and neither arm
+    /// may silence the other's evidence.
+    ///
+    /// 20 refusals are 8 `foreign_token` leaves plus 12 suppressed - one window -
+    /// and the counters stay `{0,0}`: a foreign credential is still not a
+    /// consultation, so it can never satisfy guardrail 1.
+    #[test]
+    fn foreign_token_refusals_are_capped_by_their_own_budget() {
+        let token = RunToken::issue().expect("mint the listener's token");
+        let intruder = RunToken::issue().expect("mint another run's token");
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup_token_cfg(
+            "p16-foreign-flood",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        );
+        let epoch = t
+            .handle
+            .counters()
+            .begin_epoch()
+            .expect("a window to watch");
+
+        for _ in 0..20 {
+            let resp = exchange(
+                t.port,
+                &connect_req_with("api.example.com:443", intruder.value()),
+            );
+            assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        }
+
+        let leaves = connect_events(&t.sid);
+        let individual = leaves
+            .iter()
+            .filter(|e| e["reason"] == "foreign_token")
+            .count();
+        let aggregates: Vec<&serde_json::Value> = leaves
+            .iter()
+            .filter(|e| e["reason"] == "foreign_token_suppressed")
+            .collect();
+        assert_eq!(
+            individual, 8,
+            "the first eight foreign refusals keep a leaf each: {leaves:?}"
+        );
+        assert_eq!(
+            aggregates.len(),
+            1,
+            "twelve suppressed foreign refusals are one window: {leaves:?}"
+        );
+        assert_eq!(leaves.len(), 9, "20 refusals must not cost 20 leaves");
+        assert_eq!(
+            aggregates[0]["suppressed"], 12,
+            "20 - 8, exactly: {aggregates:?}"
+        );
+        assert_eq!(
+            aggregates[0]["scope"],
+            serde_json::Value::Null,
+            "scope means rule scope: {aggregates:?}"
+        );
+        assert_eq!(aggregates[0]["host"], "<unknown>");
+        assert_eq!(
+            t.handle.counters().counters(epoch),
+            Some(LaunchProofCounters::default()),
+            "a foreign token is not a consultation, capped or not"
+        );
+
+        // Independence: the missing-credential arm still owns its own budget, so
+        // the foreign flood cannot have spent it.
+        let before = connect_events(&t.sid).len();
+        let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        assert_eq!(
+            connect_events(&t.sid).len(),
+            before + 1,
+            "the no_token budget was untouched by the foreign flood"
+        );
+        assert_eq!(last_connect_event(&t.sid)["reason"], "no_token");
+        assert!(t.handle.counters().close_epoch(epoch));
+    }
+
+    /// P1.6(a)/(blocking 1c): windows are exact, and the remainder is claimable.
+    ///
+    /// Drives the budget directly - no sockets - so the arithmetic is pinned
+    /// where it lives: eight individual leaves, one aggregate per full window of
+    /// twelve, and whatever the last partial window holds is carried out exactly
+    /// once when the listener closes (never twice, never silently dropped).
+    #[test]
+    fn a_refusal_budget_yields_exact_windows_and_one_flushable_remainder() {
+        let budget = super::RefusalBudget::new();
+        for i in 1..=8 {
+            assert_eq!(
+                budget.spend(),
+                super::RefusalLeaf::Individual,
+                "refusal {i} is still inside the budget"
+            );
+        }
+        let mut aggregates = Vec::new();
+        for _ in 0..30 {
+            match budget.spend() {
+                super::RefusalLeaf::Aggregate { suppressed } => aggregates.push(suppressed),
+                super::RefusalLeaf::Nothing => {}
+                super::RefusalLeaf::Individual => panic!("the individual budget is spent"),
+            }
+        }
+        assert_eq!(
+            aggregates,
+            vec![12, 12],
+            "30 suppressed refusals are two windows, each carrying exactly its own count"
+        );
+        assert_eq!(
+            budget.claim_trailing(),
+            Some(6),
+            "the partial window is what the chain still owes"
+        );
+        assert_eq!(
+            budget.claim_trailing(),
+            None,
+            "a remainder is written exactly once"
+        );
+        // And a later refusal cannot resurrect a window that was already paid.
+        assert_eq!(budget.spend(), super::RefusalLeaf::Nothing);
+        assert_eq!(budget.claim_trailing(), Some(1));
+    }
+
+    /// P1.6(b): one credential may be live on exactly one listener.
+    ///
+    /// `RunToken: Clone` meant two `ProxyConfig`s *could* carry the same value and
+    /// both listeners would accept it - the P1.4 ambiguity (whose traffic was
+    /// that?) reintroduced through a clone. `spawn` now refuses the second one by
+    /// name, and the handle's `Drop` releases the credential.
+    #[test]
+    fn a_run_token_can_be_live_on_only_one_listener() {
+        let token = RunToken::issue().expect("mint a token");
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let first = t36_setup_token_cfg(
+            "p16-dup-first",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        );
+
+        // A second listener with a CLONE of the live credential: refused, by name,
+        // before it binds a socket or builds a runtime.
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let err = try_t36_token_cfg(
+            "p16-dup-second",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        )
+        .err()
+        .expect("a duplicate live credential must be refused");
+        assert!(
+            err.downcast_ref::<super::TokenAlreadyLive>().is_some(),
+            "the refusal must be the named error, not a free-form string: {err:?}"
+        );
+        let shown = format!("{err}");
+        assert!(
+            shown.contains("already live"),
+            "the error must say what happened: {shown}"
+        );
+        assert!(
+            !shown.contains(token.value()),
+            "the refusal must never print the credential: {shown}"
+        );
+
+        // The refused spawn did not disturb the listener that holds the token.
+        let resp = exchange(first.port, &connect_req_with("127.0.0.1:9", token.value()));
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "the holder must still serve its own credential (admitted, then loopback-refused): {resp}"
+        );
+
+        // Dropping the handle releases the credential.
+        let port = first.port;
+        drop(first);
+        let again = t36_setup_token_cfg(
+            "p16-dup-again",
+            &["*"],
+            &[],
+            {
+                let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+                dialog
+            },
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        );
+        let resp = exchange(again.port, &connect_req_with("127.0.0.1:9", token.value()));
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "the re-spawned listener must serve the same credential at its own port {port}: {resp}"
+        );
+
+        // Two distinct credentials coexist: the rule is one *live* token per
+        // listener, not one listener per process.
+        let other_token = RunToken::issue().expect("mint another token");
+        let other = t36_setup_token_cfg(
+            "p16-dup-other",
+            &["*"],
+            &[],
+            {
+                let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+                dialog
+            },
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            other_token.clone(),
+        );
+        let resp = exchange(
+            other.port,
+            &connect_req_with("127.0.0.1:9", other_token.value()),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "a distinct credential must spawn alongside the first: {resp}"
+        );
+    }
+
+    /// P1.6 (registry): the live-token set holds run serials, never credentials.
+    ///
+    /// The registry exists to make "one credential, one listener" true for the
+    /// process, and it used to do that by keeping the credential itself in a
+    /// process-global `HashSet<String>` - a second plaintext copy of the secret
+    /// for the lifetime of the run. Keying on the run serial keeps the property
+    /// (a clone carries the serial it was cloned from, so a clone still collides)
+    /// and holds no copy at all. The key type is the assertion: `Vec<u64>` below
+    /// does not compile against a string-keyed set.
+    #[test]
+    fn the_live_token_registry_holds_run_serials_and_no_credential() {
+        let token = RunToken::issue().expect("mint a token");
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let handle = t36_setup_token_cfg(
+            "p16-registry-keys",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        );
+
+        let keys: Vec<u64> = super::live_tokens().iter().copied().collect();
+        assert!(
+            keys.contains(&token.run()),
+            "this listener's run serial must be registered: {keys:?}"
+        );
+        let dump = format!("{keys:?}");
+        assert!(
+            !dump.contains(token.value()),
+            "the registry must not retain the credential: {dump}"
+        );
+        assert!(
+            !dump.contains(&token.value()[8..]),
+            "nor the secret half of it: {dump}"
+        );
+
+        // The same credential twice is still refused (a clone is one identity),
+        // which is the property the value-keyed registry used to provide.
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let err = try_t36_token_cfg(
+            "p16-registry-clone",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        )
+        .err()
+        .expect("a clone of a live token must still be refused");
+        assert!(
+            err.downcast_ref::<super::TokenAlreadyLive>().is_some(),
+            "{err:?}"
+        );
+
+        // The handle's `Drop` releases the serial, so the set does not grow with
+        // the number of listeners a process has ever served.
+        let run = token.run();
+        drop(handle);
+        assert!(
+            !super::live_tokens().iter().any(|key| *key == run),
+            "drop must release the run serial"
         );
     }
 
@@ -6747,6 +7821,8 @@ mod tests {
             upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
             prompt,
             counters: LaunchCounters::new(),
+            no_token: super::RefusalBudget::new(),
+            foreign_token: super::RefusalBudget::new(),
         });
         (ctx, base)
     }

@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod token;
 pub mod upstream;
 
+use crate::net::token::RunToken;
 use crate::profile::NetworkSlice;
 
 /// The fully-resolved network configuration for a session.
@@ -51,20 +52,34 @@ pub enum NetworkConfig {
 }
 
 impl NetworkConfig {
-    pub fn is_blocked(&self) -> bool { matches!(self, NetworkConfig::Blocked) }
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, NetworkConfig::Blocked)
+    }
     /// Reserved for the proxy-bootstrap path (currently the supervisor
     /// dispatches on `is_blocked` alone). Tracked by the US-3 follow-up.
     #[allow(dead_code)]
-    pub fn needs_proxy(&self) -> bool { matches!(self, NetworkConfig::Allow { .. }) }
+    pub fn needs_proxy(&self) -> bool {
+        matches!(self, NetworkConfig::Allow { .. })
+    }
 }
 
 /// Proxy configuration injected into the sandboxed child's environment.
 /// Carries only what the env block needs; `ProxyConfig` (used by
 /// `net::proxy::spawn`) additionally holds the session id and allow-list
 /// which the child process does not see.
+///
+/// `token` is a [`RunToken`], not a `String` (P1.6(c)). The env block
+/// interpolates it into `HTTP_PROXY`/`HTTPS_PROXY` as `userinfo`
+/// (`http://sandbox:<token>@127.0.0.1:<port>`), where `@` would end the userinfo
+/// early and `/` would end the authority - i.e. an unsafe value there changes
+/// *which host or port the child is told to use*, while the supervisor goes on
+/// proving the port it actually bound. `mxc::proxy_url` has always rejected such
+/// a value; this edge had no check at all, only a `String` that anybody could
+/// build. Typing the field is the check: the only values that can reach the
+/// interpolation are ones a `RunToken` produced.
 pub struct ProxyEnv {
     pub port: u16,
-    pub token: String,
+    pub token: RunToken,
 }
 
 /// Merge profile network slice + CLI flags into a `NetworkConfig` (with
@@ -113,8 +128,7 @@ pub fn resolve_network(
     // [G-47] prompt defaults to ON when the network is active, unless the
     // profile explicitly sets `promptEnabled: false` or the CLI passes
     // `--no-prompt`.
-    let prompt_enabled = !cli_no_prompt
-        && profile_net.prompt_enabled.unwrap_or(true);
+    let prompt_enabled = !cli_no_prompt && profile_net.prompt_enabled.unwrap_or(true);
 
     // [G-48] `onUnavailable` defaults to "deny". Profile-only field.
     // Validated against {"deny", "allow"}: an invalid value (e.g. a typo like
@@ -207,7 +221,14 @@ mod tests {
 
     #[test]
     fn minimal_profile_plus_cli_allow_domain_merges() {
-        let cfg = resolve_network(&empty_slice(), false, &["github.com".into()], &[], false, Some("minimal"));
+        let cfg = resolve_network(
+            &empty_slice(),
+            false,
+            &["github.com".into()],
+            &[],
+            false,
+            Some("minimal"),
+        );
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 // minimal includes api.openai.com etc. but not github.com
@@ -221,7 +242,14 @@ mod tests {
     #[test]
     fn unknown_profile_does_not_crash() {
         // Returns Allow with just CLI/domain entries; warning printed to stderr.
-        let cfg = resolve_network(&empty_slice(), false, &["example.com".into()], &[], false, Some("bogus"));
+        let cfg = resolve_network(
+            &empty_slice(),
+            false,
+            &["example.com".into()],
+            &[],
+            false,
+            Some("bogus"),
+        );
         match cfg {
             NetworkConfig::Allow { allow_domain, .. } => {
                 assert_eq!(allow_domain, vec!["example.com".to_string()]);
@@ -292,7 +320,9 @@ mod tests {
                 assert!(allow_domain.iter().any(|d| d == "github.com"));
                 assert_eq!(
                     allow_domain.len(),
-                    crate::net::profile::builtin_profile("developer").unwrap().len()
+                    crate::net::profile::builtin_profile("developer")
+                        .unwrap()
+                        .len()
                 );
             }
             NetworkConfig::Blocked => panic!("expected Allow"),
@@ -332,7 +362,14 @@ mod tests {
             deny_domain: vec!["*.profile-evil.com".into()],
             ..Default::default()
         };
-        let cfg = resolve_network(&slice, false, &["a.com".into()], &["*.cli-evil.com".into()], false, None);
+        let cfg = resolve_network(
+            &slice,
+            false,
+            &["a.com".into()],
+            &["*.cli-evil.com".into()],
+            false,
+            None,
+        );
         match cfg {
             NetworkConfig::Allow { deny_domain, .. } => {
                 assert!(deny_domain.iter().any(|d| d == "*.profile-evil.com"));
@@ -363,7 +400,10 @@ mod tests {
         };
         let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
         match cfg {
-            NetworkConfig::Allow { prompt_timeout_secs, .. } => assert_eq!(prompt_timeout_secs, 60),
+            NetworkConfig::Allow {
+                prompt_timeout_secs,
+                ..
+            } => assert_eq!(prompt_timeout_secs, 60),
             _ => panic!("expected Allow"),
         }
     }
@@ -395,7 +435,10 @@ mod tests {
         let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
         match cfg {
             NetworkConfig::Allow { on_unavailable, .. } => {
-                assert_eq!(on_unavailable, "deny", "invalid onUnavailable must fall back to \"deny\"");
+                assert_eq!(
+                    on_unavailable, "deny",
+                    "invalid onUnavailable must fall back to \"deny\""
+                );
             }
             _ => panic!("expected Allow"),
         }
@@ -419,9 +462,15 @@ mod tests {
                 prompt_enabled,
                 ..
             } => {
-                assert!(allow_domain.is_empty(), "allow-list should be empty in deny-only mode");
+                assert!(
+                    allow_domain.is_empty(),
+                    "allow-list should be empty in deny-only mode"
+                );
                 assert_eq!(deny_domain, vec!["*.evil.com".to_string()]);
-                assert!(prompt_enabled, "prompt must be on so empty allow means prompt-for-all");
+                assert!(
+                    prompt_enabled,
+                    "prompt must be on so empty allow means prompt-for-all"
+                );
             }
             _ => panic!("expected Allow in deny-only mode"),
         }
@@ -440,6 +489,9 @@ mod tests {
             ..Default::default()
         };
         let cfg = resolve_network(&slice, false, &[], &["*.evil.com".into()], true, None);
-        assert!(matches!(cfg, NetworkConfig::Blocked), "no-prompt + deny-only must be Blocked");
+        assert!(
+            matches!(cfg, NetworkConfig::Blocked),
+            "no-prompt + deny-only must be Blocked"
+        );
     }
 }
