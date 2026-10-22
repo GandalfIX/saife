@@ -222,10 +222,16 @@ tree, the loopback exemption, concurrent sessions) — add it to
 transport failure". Parse-check the file (`[Parser]::ParseFile`) before running.
 
 **Add an audit field.** Extend the emitting function, add the key to
-`audit::filter`'s `KNOWN_KEYS` (plus `BOOL_KEYS`/`ENUM_KEYS` when it is not a
-free string, so `=true` and `=null` behave), keep `verify` untouched (it is
-field-agnostic), and document the field where the rest of the taxonomy lives
-(`docs/tasks/adr-0001/d-5.1-*.md`).
+`audit::filter`'s `KNOWN_KEYS` (plus `BOOL_KEYS`/`ENUM_KEYS`/`ARRAY_KEYS` when it
+is not a free string, so `=true`, `=null` and per-element array matching behave),
+keep `verify` untouched (it is field-agnostic), and document the field where the
+rest of the taxonomy lives (`docs/tasks/adr-0001/d-5.1-*.md`).
+
+The filesystem keys (`fs_workspace`, `fs_readwrite`, `fs_readonly`, `fs_deny`,
+P3.5) are built from the **same `MxcFilesystemInput` the launch uses**, attached
+with `SessionStartFacts::with_filesystem` before the root is armed. Absent keys
+mean "not recorded" — distinct from empty arrays, which mean "allowed nothing";
+the AppContainer path is the absent case until its DACL grants are plumbed.
 
 **Add a CLI flag.** `cli.rs` (with a doc comment stating the default and the
 refusal behaviour) → `run_inner` → `README.md` if user-visible.

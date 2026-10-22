@@ -377,6 +377,30 @@ the chain and checks the signature:
   killed). The leaves that were written are still readable and still chained;
   that is the point of writing the root before the child starts.
 
+### What the audit does and does not answer
+
+`SESSION_START` also records the **enforced filesystem posture**, so a question
+like "was `.ssh` really denied in that session?" is answered from the record
+instead of from the profile on disk (which is not necessarily what the launch
+used):
+
+```powershell
+sandbox audit show 20261022-224340-89068 --json --filter 'fs_deny~=.ssh'
+sandbox audit show 20261022-224340-89068 --json --filter 'fs_readwrite~=opencode'
+```
+
+* `fs_workspace` — the working directory the session ran in.
+* `fs_readwrite` / `fs_readonly` / `fs_deny` — the granted and denied paths, as
+  enforced. These are arrays: `=` matches any element, `~=` matches any element
+  containing the text.
+
+They appear on `mxc` sessions. The AppContainer path does not record them yet
+(its DACL grants are computed later in the run).
+
+What the audit cannot answer is what was **attempted**: the backend reports no
+denial events, so a refused file open leaves no trace. The record states the
+policy, not the accesses — for that, run with the failure in view.
+
 The `SESSION_START` leaf records the containment tier (`tier`, `tier_source`,
 `tier_needs_dacl_augmentation`), whether the supervisor was `elevated`, and the
 `proxy_endpoint`. A refused session carries `disposition: deny` on the root plus
