@@ -3363,6 +3363,12 @@ $script:ReservedScenarioNumbers = @(93)
 # THIRD value, the rest empty) while this shape is correct. The header print
 # sorts the keys so the output order is stable without the ordered type.
 $script:AppContainerOnlyScenarios = @{
+    # Writable grant outside the workspace: the mxc backend refuses it by name
+    # (filesystem policy is workspace-only, ADR-0004 P1.3), so the scenario's
+    # subject - a second writable root - does not exist on that backend.
+    68 = 'grants a writable path outside the workspace (mxc refuses that by design: workspace-only policy)'
+    70 = 'merges a writable CLI grant outside the workspace (mxc refuses that by design)'
+    71 = 'grants a writable path outside the workspace from a profile (mxc refuses that by design)'
     2  = 'PASS condition is an AppContainer DACL denial (src/sandbox/appcontainer.rs writes the ACE); the mxc path writes no DACLs, so a pass would be vacuous'
     3  = 'sibling-project read denial is the same DACL mechanism (appcontainer.rs grant_access) - no DACLs exist on the mxc path'
     5  = 'write denial outside the allow-list is a DACL outcome (appcontainer.rs); the mxc path writes no DACLs'
@@ -3514,10 +3520,17 @@ function Main {
     if ($gateFailed) {
         Write-Host "SANDBOX: FAIL (gate test S-6 failed)" -ForegroundColor Red
     } else {
-        $required = 1,2,3,4,5,6,7,10,11,12,13,16,17,18,21,24,27,28,29,30,31,32,33,34,35,36,38,42,46
-        $hardFail = $false
-        foreach ($n in $required) {
-            foreach ($r in $results) { if ($r.Num -eq $n -and $r.State -eq 'fail') { $hardFail = $true } }
+        # ANY failure fails the suite. This used to consult a hard-coded list of
+        # 'required' scenario numbers (1..46, from an older plan), so on
+        # 2026-10-22 seven failing scenarios (S-55, S-68, S-70, S-71, S-77, S-86,
+        # S-91 - none of them in that list) still printed 'SANDBOX: PASS' while
+        # the harness wrapper recorded fail=7. A verdict that depends on a
+        # scenario NUMBER allow-list is a false-green generator: new scenarios
+        # are exactly the ones that fail first.
+        $failedScenarios = @($results | Where-Object { $_.State -eq 'fail' })
+        $hardFail = $failedScenarios.Count -gt 0
+        if ($hardFail) {
+            Write-Host ("  failing scenarios ({0}): {1}" -f $failedScenarios.Count, (($failedScenarios | ForEach-Object { 'S-' + $_.Num }) -join ', ')) -ForegroundColor Red
         }
         $pythonSkipped = $false
         $loopbackSkipped = $false
