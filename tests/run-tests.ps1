@@ -359,21 +359,37 @@ function Get-Curl { $c = Get-Command curl.exe -ErrorAction SilentlyContinue; if 
 function Test-LoopbackProxyReachable {
     if ($null -ne $script:LoopbackProxyCache) { return $script:LoopbackProxyCache }
     $curl = Get-Curl
-    if (-not $curl) { $script:LoopbackProxyCache = $false; return $false }
+    if (-not $curl) {
+        # Distinguish "no curl" from "loopback blocked": both skip the same
+        # scenarios, but the operator must see WHICH one it was.
+        Write-Host '  [probe] curl.exe not found - loopback scenarios will skip'
+        $script:LoopbackProxyCache = $false; return $false
+    }
     $d = New-ScenarioDir 9999
-    # Clear NO_PROXY so curl does not bypass the proxy for loopback. The target
-    # host (denied.invalid) is not in NO_PROXY, so curl routes through the
-    # proxy regardless. Use HTTP (not HTTPS) so the proxy sees a plain
-    # request and refuses it fast with a 400 (no CONNECT round-trip; plain
-    # HTTP forwarding is refused per D-4).
     $oldNoProxy = $env:NO_PROXY
     $env:NO_PROXY = ''
+    # Three attempts with a 15 s timeout. ONE 5 s sample used to decide the fate
+    # of ~25 scenarios for the whole run, so a slow first sandbox start (cold
+    # cache, AV scan) turned them all into skips while the suite still printed
+    # PASS - a green run with silently lost coverage. A real block fails all
+    # three; a slow start recovers on the second.
+    $attempts = @()
+    $reachable = $false
     try {
-        $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 5 -o NUL -w %{http_code} http://denied.invalid/') -WorkingDirectory $d
-    } finally { $env:NO_PROXY = $oldNoProxy }
-    # Exit 28 = curl's -m timeout → loopback blocked. Anything else (exit 0 with
-    # 403/000, exit 7, etc.) means curl reached the proxy and got a response.
-    $reachable = ($r.ExitCode -ne 28)
+        for ($i = 1; $i -le 3; $i++) {
+            $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl.exe -s -m 15 -o NUL -w %{http_code} http://denied.invalid/') -WorkingDirectory $d
+            $attempts += [int]$r.ExitCode
+            if ($r.ExitCode -ne 28) { $reachable = $true; break }
+        }
+    }
+    finally { $env:NO_PROXY = $oldNoProxy }
+    $script:LoopbackProxyProbeExitCodes = $attempts
+    if (-not $reachable) {
+        Write-Host ("  [probe] loopback UNREACHABLE after {0} attempt(s), curl exit codes: {1}" -f $attempts.Count, ($attempts -join ', '))
+    }
+    elseif ($attempts.Count -gt 1) {
+        Write-Host ("  [probe] loopback reachable on attempt {0} (exit codes: {1}) - the first sample was a slow start, NOT a block" -f $attempts.Count, ($attempts -join ', '))
+    }
     $script:LoopbackProxyCache = $reachable
     return $reachable
 }
@@ -3166,7 +3182,10 @@ function Main {
         }
         if ($hardFail) { Write-Host "SANDBOX: FAIL" -ForegroundColor Red }
         elseif ($loopbackSkipped -and $pythonSkipped) { Write-Host "SANDBOX: PASS (loopback + python scenarios skipped)" -ForegroundColor Yellow }
-        elseif ($loopbackSkipped) { Write-Host "SANDBOX: PASS (loopback network scenarios skipped)" -ForegroundColor Yellow }
+        elseif ($loopbackSkipped) {
+            $probeCodes = if ($script:LoopbackProxyProbeExitCodes) { ($script:LoopbackProxyProbeExitCodes -join ',') } else { 'n/a' }
+            Write-Host ("SANDBOX: PASS (loopback network scenarios skipped - probe curl exit codes: {0}; 28 = timeout/blocked)" -f $probeCodes) -ForegroundColor Yellow
+        }
         elseif ($pythonSkipped) { Write-Host "SANDBOX: PASS (python scenarios skipped)" -ForegroundColor Yellow }
         else { Write-Host "SANDBOX: PASS" -ForegroundColor Green }
     }
