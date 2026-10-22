@@ -125,6 +125,15 @@ foreach ($file in $journals) {
 }
 Write-Host "  pruned $pruned stale journal(s); $($journals.Count - $pruned) still record a live grant"
 
+# Journals the writer quarantined as unparseable (`*.jsonl.corrupt`). They can
+# never drive a restore, so they are not "dirty" - but they are residue and the
+# gate must not be blind to them.
+$corrupt = @(Get-ChildItem -LiteralPath $journalDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '*.corrupt' })
+if ($corrupt.Count -gt 0) {
+    Write-Host ("  {0} quarantined journal(s) (*.corrupt, unparseable - no ACEs can be matched from them): {1}" -f $corrupt.Count, (($corrupt | ForEach-Object { $_.Name }) -join ', '))
+}
+
 # --- 5. temp directories ---------------------------------------------------
 Write-Step 'test temp directories'
 $patterns = @('sandbox-test-*', 'sandbox-mxc-*', 'c4-*', 'sandbox-p1-*', 'p18-*')
