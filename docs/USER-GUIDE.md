@@ -339,6 +339,23 @@ Session deadline is `promptTimeoutSecs + workloadTimeoutSecs + slack`
 (defaults 60 s + 30 min + 2 min). If a build or download legitimately runs
 longer, raise `workloadTimeoutSecs` — there is no unlimited mode.
 
+### 5.1 Ready-made profiles
+
+`profiles/` in the repository ships working samples with the reasoning for every
+path and host, and the verified status of each:
+
+| profile | covers | verified |
+|---|---|---|
+| `node.json` | Node.js, npm (cache, global prefix, nvm trees) | `npm install` + `require` inside the sandbox |
+| `jvm.json` | JDK, Gradle, Maven (`~/.gradle`, `~/.m2`) | `javac`/`java` yes; **Gradle no** — its daemon needs loopback |
+| `opencode.json` | the opencode TUI and its state directories | TUI renders, keys work, model round-trip |
+
+Copy one to `%USERPROFILE%\.sandbox\profiles\` and use `--profile <name>`. Two
+Windows facts they document: batch shims (`npm`, `gradle`, `mvn`, `npx`) need
+`cmd /c "npm ..."`, because the launcher does not apply `PATHEXT`; and Gradle's
+daemon cannot connect over loopback under this backend, so Gradle builds belong
+on `--backend appcontainer` (or wait for a policy decision on loopback egress).
+
 ---
 
 ## 6. Reading the proof line

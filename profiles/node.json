@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "name": "node",
+    "version": "1.0.0",
+    "schema_version": 1
+  },
+  "filesystem": {
+    "allow": [
+      "$CWD",
+      "$USERPROFILE/AppData/Local/npm-cache",
+      "$USERPROFILE/AppData/Roaming/npm"
+    ],
+    "read_only": [
+      "C:/Users/marku/AppData/Local/nvm",
+      "C:/nvm4w",
+      "$USERPROFILE/.npmrc"
+    ],
+    "deny": [
+      "$HOME/.ssh",
+      "$HOME/.aws"
+    ]
+  },
+  "network": {
+    "block_net": false,
+    "profile": "developer",
+    "allow_domain": [
+      "registry.npmjs.org",
+      "registry.npmjs.com",
+      "nodejs.org"
+    ]
+  }
+}

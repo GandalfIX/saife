@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "name": "jvm",
+    "version": "1.0.0",
+    "schema_version": 1
+  },
+  "filesystem": {
+    "allow": [
+      "$CWD",
+      "$USERPROFILE/.gradle",
+      "$USERPROFILE/.m2"
+    ],
+    "read_only": [
+      "C:/Program Files/Microsoft/jdk-25.0.4.101-hotspot"
+    ],
+    "deny": [
+      "$HOME/.ssh",
+      "$HOME/.aws"
+    ]
+  },
+  "network": {
+    "block_net": false,
+    "profile": "developer",
+    "allow_domain": [
+      "repo.maven.apache.org",
+      "repo1.maven.org",
+      "plugins.gradle.org",
+      "services.gradle.org",
+      "downloads.gradle.org"
+    ]
+  }
+}
