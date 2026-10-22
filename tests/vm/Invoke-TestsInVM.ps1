@@ -1226,11 +1226,11 @@ try {
     # touch user32 (venv/ensurepip's subprocess, ctypes, ...) die with
     # 0xC0000142 and S-9 fails at ensurepip. Interactive WinSta0 carries
     # the ACEs, which is why the same suite passes on the host. Grant AAP
-    # GA on the session's winsta + desktop before running the suite -
-    # identical to the round-5 battery and tests/vm/confirm-s9-winsta.ps1
-    # (verified in-VM 2026-10-12: with the grant, S-9 r1/venv creation
-    # passes). The grant lives only in this logon session and evaporates
-    # with it; the VM is disposable either way.
+    # GA on the session's winsta + desktop before running the suite.
+    # Verified in-VM 2026-10-12 (round 5): with the grant S-9's venv creation
+    # passes; without it the child dies at 0xC0000142. The grant lives only in
+    # this logon session and evaporates with it; the VM is disposable either
+    # way. Background: docs/DEVELOPERS.md, "The VM lane and the window station".
     $winstaHelper = @'
 using System;
 using System.Runtime.InteropServices;

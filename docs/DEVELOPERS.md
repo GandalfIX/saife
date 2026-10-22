@@ -145,6 +145,18 @@ freshness guard fails the lane (and you will be debugging a stale binary).
 pwsh -File tests\vm\Invoke-TestsInVM.ps1 -Image sbx-base-a -Backend mxc -Phase all
 ```
 
+**The VM lane and the window station.** PowerShell Direct sessions run on a
+`Service-0x0-*$` window station whose security descriptor carries **no
+ALL APPLICATION PACKAGES ACE** (`S-1-15-2-1`). A sandboxed child that touches
+`user32` — `venv`/`ensurepip`'s subprocess, `ctypes`, any managed runtime — dies
+at load with `0xC0000142`, and scenario S-9 fails at `ensurepip`. Interactive
+`WinSta0` carries those ACEs, which is why the same suite passes on a desktop.
+The harness therefore grants `(A;;GA;;;S-1-15-2-1)` on the session's window
+station and desktop before running the suite, non-fatally, and prints whether the
+grant succeeded; it lives only in that logon session. If a VM-only failure looks
+like a load-time kill (`0xC0000142`, `ERROR_DLL_INIT_FAILED`), check that line in
+the harness output before suspecting the product.
+
 A VM session always runs with the guest's token, which is elevated: the VM
 proves product logic, **not** elevation. The standard-user lane that would close
 that gap is parked (see §8). End every host block with

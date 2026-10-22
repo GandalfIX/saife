@@ -781,7 +781,7 @@ function Invoke-Scenario-S9 {
     }
     # r2 runs the venv python DIRECTLY. The previous form wrapped it in
     # `cmd /c`, which is broken in two independent ways proven on
-    # 2026-10-12 (see tests/vm/confirm-s9-winsta.ps1 round W + local sims):
+    # 2026-10-12 (the in-VM diagnostic round plus local simulations):
     # (a) cmd's /c quote heuristics strip quotes once the command line has
     #     more than two (spaced exe path, quoted -c arg), mangling it into
     #     "Access is denied."; (b) in-VM, cmd inside the AppContainer
