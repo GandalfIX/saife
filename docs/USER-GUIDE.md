@@ -391,7 +391,83 @@ on `--backend appcontainer` (or wait for a policy decision on loopback egress).
 
 ---
 
-## 6. Reading the proof line
+## 6. Plugins (sidecars)
+
+A **plugin** is a small HTTP service that runs on the host — outside the
+container — and is reachable from inside the session only as
+`http://<mount>.sandbox.invalid/` through the proxy. The workload holds no
+credential for it: the facade hop carries a per-session token that never enters
+the container.
+
+A plugin is a directory with a manifest:
+
+```
+%USERPROFILE%\.sandbox\plugins\<name>\plugin.json
+```
+
+`--plugin <name>` loads one (repeatable). `--plugin-dir <PATH>` adds another
+root, searched **before** the global one, in the order given (repeatable). The
+first root that holds the name wins; a later copy is shadowed, never merged.
+
+**Nothing inside a workspace is discovered automatically.** A cloned repository
+must not gain host-side code execution from the act of running `sandbox run` in
+it, so repo-local plugins are usable only when you name the directory:
+
+```powershell
+sandbox run --plugin-dir .\.sandbox\plugins --plugin tngtech -- <workload>
+```
+
+Plugins are wired on `--backend mxc` (the default) only, and they need the
+session proxy: `--block-net` refuses `--plugin`.
+
+### The sample: `tngtech`
+
+`plugins/tngtech/` in this repository is a stdlib-only Python sidecar that serves
+`https://www.tngtech.com/` at `GET /`; `GET /status` is its health probe. It
+proves the transport end to end before any secret handling exists.
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.sandbox\plugins" | Out-Null
+Copy-Item -Recurse -Force plugins\tngtech "$env:USERPROFILE\.sandbox\plugins\"
+cargo build --bin sandbox --bin mxc-launch
+target\debug\sandbox.exe run --no-prompt --plugin tngtech -- cmd /c "curl.exe -s -o NUL -w facade=%{http_code} http://tngtech.sandbox.invalid/ & curl.exe -s -o NUL -w direct=%{http_connect} https://www.tngtech.com/"
+```
+
+Expected, in one session: `facade=200` (the homepage came through the facade) and
+`direct=403` (the container's own egress is still denied — no `--allow-domain`
+was granted). The session's proof line agrees: `tunnels=0`.
+
+`--no-prompt` is there to keep the deny half deterministic. An unattended run has
+no dialog to answer, and a prompt that IS answered with "allow and remember this
+host" writes a learned entry that legitimately admits it — check
+`sandbox learned list`, and `sandbox learned clear` resets it.
+
+Requirements: working internet, a `python` on `PATH` (resolved as
+`python.exe`; `.cmd`/`.bat` entry points are refused), and the plugin installed
+under `%USERPROFILE%` — the sidecar runs on the host, not in the container.
+
+A plugin that cannot be loaded, spawned or made healthy **refuses the session**
+with exit code **5** and one line naming the plugin and the reason, e.g.
+`sidecar_unhealthy{tngtech}: …` or
+`plugin_not_found: tngtech (searched: --plugin-dir C:\x\plugins, %USERPROFILE%\.sandbox\plugins)`.
+There is no "run without it" fallback. Sidecars are killed on every exit path,
+before the proxy that routes to them goes away.
+
+What the facade carries today: `GET` only (anything else is
+`501 facade_method_unsupported`), an undeclared mount is `404 facade_unknown_mount`,
+and `CONNECT <mount>.sandbox.invalid:443` is `403 facade_requires_http` so TLS
+cannot be tunnelled past the check. Every facade request writes one audit leaf:
+
+```powershell
+sandbox audit show <sid> --filter 'op=FACADE'
+```
+
+Not in this POC: secret resolution, non-GET methods, per-operation enforcement by
+the supervisor, AppContainer wiring, and `sandbox plugin list`.
+
+---
+
+## 7. Reading the proof line
 
 Every successful session prints, on stderr:
 
@@ -413,7 +489,7 @@ remedy: `--backend appcontainer`).
 
 ---
 
-## 7. Audit
+## 8. Audit
 
 Every run writes `%LOCALAPPDATA%\sandbox\audit\<sid>.ndjson` plus a signed root.
 
@@ -473,7 +549,7 @@ sandbox learned clear
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -488,7 +564,7 @@ sandbox learned clear
 
 ---
 
-## 9. Limits
+## 10. Limits
 
 - **GUI and system-proxy applications** have no egress on `mxc`; use
   `--backend appcontainer`.
