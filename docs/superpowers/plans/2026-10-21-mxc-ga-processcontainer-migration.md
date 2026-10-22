@@ -544,6 +544,12 @@ baseline. Never read a green VM run as MXC coverage.
 
 ## P3 — Default flip + full parity
 
+- [x] **P3.0 (2026-10-22)** Wire `--backend mxc` behind the flag, default unchanged. Selection branches
+  before any AppContainer call; budget from the resolved profile; `Exactly(REQUIRED_TIER)` via
+  `supervisor_backend`; guardrail 1 refuses (exit 126) instead of warning; session leaf carries the measured
+  tier. Writable-grant-outside-workspace, missing launcher and deny-covers-grant are refused by name.
+  **Open for P3.2:** a network-enabled session whose workload makes no request fails guardrail 1 by design.
+
 - [ ] **P3.1** Full 92-scenario suite against `--backend mxc` in the VM on **both
   images**, unelevated.
 - [ ] **P3.2** Flip the default to `mxc`; keep `--backend appcontainer` as an
