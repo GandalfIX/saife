@@ -445,7 +445,7 @@ fn appcontainer_session_facts() -> audit::session_start::SessionStartFacts {
 
 #[allow(clippy::too_many_arguments)]
 fn run_cmd(
-    backend: cli::Backend,
+    backend: Option<cli::Backend>,
     profile: Option<String>,
     allow_cwd: bool,
     allow: Vec<String>,
@@ -463,8 +463,17 @@ fn run_cmd(
     // Backend selection is refused before anything is spawned or created. The
     // decision itself is `cli::route_backend` (pure, table-tested); this is only
     // the boundary that maps a refusal to its user-facing text and an exit code.
-    let backend =
-        match cli::route_backend(backend, cfg!(feature = "mxc-backend"), MXC_SESSION_WIRED) {
+    // P3.2: the default is the MXC backend in a feature build. A build without
+    // the feature keeps working on AppContainer and says so once, instead of
+    // refusing every run because the default names a backend it does not have.
+    let feature_enabled = cfg!(feature = "mxc-backend");
+    let backend = backend.unwrap_or_else(|| {
+        if !feature_enabled {
+            eprintln!("[sandbox] {}", cli::MXC_FEATURE_FALLBACK);
+        }
+        cli::default_backend(feature_enabled)
+    });
+    let backend = match cli::route_backend(backend, feature_enabled, MXC_SESSION_WIRED) {
             Ok(backend) => backend,
             Err(refusal) => {
                 eprintln!("[sandbox] {}", refusal.message());

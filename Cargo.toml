@@ -68,7 +68,10 @@ base64 = "0.22"
 mxc-sdk = { version = "=1.0.1", optional = true }
 
 [features]
-# Default OFF: the AppContainer supervisor is the shipped default until P3.
+# Opt-in feature, but since P3.2 it SELECTS the default backend: a build with it runs
+# `mxc` unless --backend appcontainer is passed, a build without it falls back to
+# AppContainer and says so. Kept non-default so the binary that needs no SDK can
+# still be built (bootstrap, CI without the vendored crate).
 mxc-backend = ["dep:mxc-sdk"]
 
 [profile.release]

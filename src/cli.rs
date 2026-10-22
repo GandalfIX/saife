@@ -75,6 +75,27 @@ required bin of that feature)";
 /// `--concurrency` flag yet (P0.5 found none), so callers pass `None` and the
 /// MXC concurrency refusal is currently unreachable; it exists so P1.4 only has
 /// to thread the value through once the flag lands.
+/// The backend used when `--backend` is not given (P3.2's flip).
+///
+/// Deliberately a function of the BUILD, not a constant: a binary compiled
+/// without `mxc-backend` has no MXC session path at all, and a hard default of
+/// `mxc` would make every `run` on such a build refuse with "feature missing".
+/// So the flip is feature-conditional and the fallback is loud
+/// ([`MXC_FEATURE_FALLBACK`]), never silent.
+pub fn default_backend(feature_enabled: bool) -> Backend {
+    if feature_enabled {
+        Backend::Mxc
+    } else {
+        Backend::AppContainer
+    }
+}
+
+/// Printed once when a build without `mxc-backend` falls back to the
+/// AppContainer backend, so "why is this still asking for admin?" has an answer.
+pub const MXC_FEATURE_FALLBACK: &str = "this build has no `mxc-backend` feature: \
+falling back to --backend appcontainer (which needs administrator rights for \
+network sessions). Build with `--features mxc-backend` for the unelevated path.";
+
 pub fn resolve_backend(
     backend: Backend,
     concurrency: Option<usize>,
@@ -203,12 +224,15 @@ pub enum Cmd {
         #[arg(long)]
         audit_strict: bool,
 
-        /// Containment backend. `appcontainer` (default) is the in-repo
-        /// supervisor. `mxc` requires a binary built with `--features
-        /// mxc-backend`, and each run must be a single session: proxy traffic
-        /// cannot be attributed per run yet.
-        #[arg(long, value_enum, default_value_t = Backend::AppContainer)]
-        backend: Backend,
+        /// Containment backend. When omitted the default is `mxc` in a build
+        /// with `--features mxc-backend` (P3.2) and `appcontainer` otherwise -
+        /// see [`default_backend`]. `mxc` runs unelevated and needs one session
+        /// per supervisor process; `appcontainer` remains the escape hatch for
+        /// workloads whose client stack cannot use a proxy (WinINet, PowerShell
+        /// 5.1: they reach the proxy and cannot authenticate, which guardrail 1
+        /// refuses by name).
+        #[arg(long, value_enum)]
+        backend: Option<Backend>,
 
         /// Print only the session id and exit 0 without spawning.
         #[arg(long, hide = true)]
@@ -472,7 +496,7 @@ mod tests {
         assert!(Cli::try_parse_from(["sandbox", "learned", "list", "--profile", "dev"]).is_err());
     }
 
-    fn run_backend(args: &[&str]) -> Backend {
+    fn run_backend(args: &[&str]) -> Option<Backend> {
         let mut argv = vec!["sandbox", "run"];
         argv.extend_from_slice(args);
         argv.extend(["--", "cmd", "/c", "exit", "0"]);
@@ -483,22 +507,29 @@ mod tests {
         backend
     }
 
-    /// P0.5: the default must stay `appcontainer` — P0 changes no behaviour.
+    /// P3.2: the default is `mxc` in a feature build and `appcontainer`
+    /// otherwise — never a refusal. The helper returns None when the flag is
+    /// absent, and `default_backend` decides.
     #[test]
-    fn run_defaults_to_the_appcontainer_backend() {
-        assert_eq!(run_backend(&[]), Backend::AppContainer);
+    fn the_default_backend_follows_the_build_and_never_refuses() {
+        assert_eq!(run_backend(&[]), None);
+        assert_eq!(default_backend(true), Backend::Mxc);
+        assert_eq!(default_backend(false), Backend::AppContainer);
+        // The fallback message names the flag a user would pass, not the feature.
+        assert!(MXC_FEATURE_FALLBACK.contains("--backend appcontainer"));
+        assert!(MXC_FEATURE_FALLBACK.contains("--features mxc-backend"));
     }
 
     #[test]
     fn run_accepts_backend_mxc() {
-        assert_eq!(run_backend(&["--backend", "mxc"]), Backend::Mxc);
+        assert_eq!(run_backend(&["--backend", "mxc"]), Some(Backend::Mxc));
     }
 
     #[test]
     fn run_accepts_backend_appcontainer_explicitly() {
         assert_eq!(
             run_backend(&["--backend", "appcontainer"]),
-            Backend::AppContainer
+            Some(Backend::AppContainer)
         );
     }
 
