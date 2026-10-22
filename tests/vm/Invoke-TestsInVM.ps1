@@ -390,6 +390,18 @@ try {
         $script:ResultsBaseDir,
         (Join-Path $script:ThisDir 'templates')
     )
+    # Nested build trees (tests/vm/spikes/*/target) are 2.5 GB of artifacts the
+    # guest never needs: they were 5,478 of the 5,478 staged files and 862 MB of
+    # the archive, on every run. Discovered as ABSOLUTE paths rather than a bare
+    # `/XD target`, because a bare name would exclude same-named directories
+    # tree-wide (see the note above).
+    $nestedTargets = @(Get-ChildItem -LiteralPath $script:RepoRoot -Directory -Recurse -Filter 'target' -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName |
+            Where-Object { $excludeDirs -notcontains $_ })
+    if ($nestedTargets.Count -gt 0) {
+        $excludeDirs += $nestedTargets
+        Write-Host ("[vm-run] excluding {0} nested target dir(s): {1}" -f $nestedTargets.Count, (($nestedTargets | ForEach-Object { $_.Substring($script:RepoRoot.Length).TrimStart('\') }) -join ', ')) -ForegroundColor DarkGray
+    }
     robocopy $script:RepoRoot $stageDir /E /XD $excludeDirs /XF vm-settings.json | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy staging failed (exit $LASTEXITCODE; 0-7 is success)" }
     $stageCount = @(Get-ChildItem -LiteralPath $stageDir -Recurse -File -Force).Count
