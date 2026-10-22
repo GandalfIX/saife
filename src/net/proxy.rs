@@ -419,11 +419,20 @@ fn emit_connect(
 /// what the gate needs for a workload that makes no request of its own, and
 /// counting it as either would respectively make `MustBeAbsent` unsatisfiable
 /// or claim a dial nobody made.
+///
+/// `unauthenticated` counts refusals answered **without this run's credential**
+/// (`no_token` and `foreign_token` alike — P3.2a, ADR-0004 guardrail 1 amended a
+/// second time). It exists because the probe alone let a silent misconfiguration
+/// through: a GUI / system-proxy client (WinINet, Windows PowerShell 5.1) reaches
+/// this listener, gets `407` for ever and never sends a credential, so the path is
+/// proven (`probes == 1`) while the application has no egress at all. Scoped to
+/// the EPOCH like every other field here — see [`LaunchCounters::note_unauthenticated`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchProofCounters {
     pub consultations: u64,
     pub upstream_established: u64,
     pub probes: u64,
+    pub unauthenticated: u64,
 }
 
 /// Closed epochs kept for after-the-fact reading.
@@ -697,6 +706,31 @@ impl LaunchCounters {
     /// credential leaves no observation that could stand in for a broken path.
     pub fn note_probe(&self) {
         self.bump(|counters| counters.probes += 1);
+    }
+
+    /// Count one request this listener answered **without this run's credential**
+    /// (P3.2a, ADR-0004 guardrail 1 amended a second time).
+    ///
+    /// Both refusal arms count: `no_token` (a client that never sends a
+    /// `Proxy-Authorization` header) and `foreign_token` (one holding somebody
+    /// else's). Lateral movement and a GUI client that cannot authenticate are
+    /// the same signal here — *something in the container reached the proxy and
+    /// could not use it* — and the arms stay separate only for their leaf budgets.
+    ///
+    /// Epoch-scoped by construction: [`LaunchCounters::bump`] writes to the active
+    /// epoch's own [`LaunchProofCounters`], so a second launch on this listener
+    /// starts at zero without a reset hook. Deliberately NOT the listener-lifetime
+    /// [`RefusalBudget`] counters that drive the leaf budget (`no_token`/`foreign_token`
+    /// on [`ConnCtx`]): those are per listener on purpose (the flood cap must
+    /// survive launches), and reusing them would refuse launch N+1 on launch N's
+    /// refusals.
+    ///
+    /// The wrapper's pre-flight probe authenticates with the run token, so it can
+    /// never bump this — which is what makes `probes >= 1` and
+    /// `unauthenticated == 0` independent evidence rather than one counter read
+    /// twice.
+    pub fn note_unauthenticated(&self) {
+        self.bump(|counters| counters.unauthenticated += 1);
     }
 
     fn bump(&self, f: impl FnOnce(&mut LaunchProofCounters)) {
@@ -1950,6 +1984,10 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     match classify_auth(head, &ctx.token) {
         AuthVerdict::OwnRun => {}
         AuthVerdict::Absent => {
+            // P3.2a: counted on this launch's epoch BEFORE the answer, so the gate
+            // can tell "no workload" from "a workload that could not authenticate".
+            // Both refusal arms count; this one is the WinINet / system-proxy shape.
+            ctx.counters.note_unauthenticated();
             // The response is the same 407 for every credential-less request;
             // only the audit footprint is budgeted (P1.6(a)). Without the cap a
             // loop of these writes one leaf per connection (measured: 400
@@ -2007,6 +2045,12 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             return Ok(());
         }
         AuthVerdict::Foreign => {
+            // P3.2a: same signal as the `Absent` arm - something reached this
+            // listener without this run's credential. Lateral movement and a client
+            // stack that cannot authenticate are one question for the gate ("could
+            // anything here USE the proxy?"); the arms stay separate only for their
+            // leaf budgets.
+            ctx.counters.note_unauthenticated();
             // Refused and uncounted, but RECORDED (P1.4 review): a credential
             // that is not this run's is lateral movement, and leaving it
             // invisible in BOTH chains made the one deliberate security event
@@ -5241,6 +5285,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             }),
             "a denied forward is an accepted consultation with no upstream"
         );
@@ -6216,11 +6261,14 @@ mod tests {
                 consultations: 2,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             }),
             "both reached us as a proxy; neither established anything upstream"
         );
 
-        // A 407 is not proof of anything and is not counted.
+        // A 407 is not a consultation and not a probe. Since P3.2a it IS counted,
+        // in its own field - which is why the frozen epoch below reads
+        // `unauthenticated: 1` rather than zero.
         let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
         assert!(resp.starts_with("HTTP/1.1 407"), "got: {resp}");
 
@@ -6238,6 +6286,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             }),
             "the second epoch must not inherit the first one's traffic"
         );
@@ -6247,8 +6296,10 @@ mod tests {
                 consultations: 2,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 1,
             }),
-            "a closed epoch keeps its frozen counters"
+            "a closed epoch keeps its frozen counters: two consultations and the one \
+             credential-less attempt it answered"
         );
         assert_eq!(
             counters.counters(9_999),
@@ -6286,6 +6337,7 @@ mod tests {
                 consultations: 0,
                 upstream_established: 0,
                 probes: 1,
+                unauthenticated: 0,
             }),
             "the probe must be its own observation - not a consultation, and not an \
              upstream connection"
@@ -6299,11 +6351,16 @@ mod tests {
     /// The property the gate exists for: evidence must be ATTRIBUTABLE.
     ///
     /// A probe under a credential this listener does not own is refused with the
-    /// same `407` as every other control-plane request and leaves NO observation
-    /// behind, so it can never satisfy guardrail 1 for a session whose own proxy
+    /// same `407` as every other control-plane request and never counts as a
+    /// probe, so it can never satisfy guardrail 1 for a session whose own proxy
     /// path is broken (dead listener, blocked loopback, wrong credential).
+    ///
+    /// Since P3.2a the refusal IS counted in its own field: something reached this
+    /// listener without the run's credential, which is exactly the fact the gate's
+    /// second leg reads. What must stay at zero is `probes` - the observation that
+    /// stands in for a working path.
     #[test]
-    fn a_probe_without_the_run_credential_is_407_and_is_not_counted() {
+    fn a_probe_without_the_run_credential_is_407_and_never_counts_as_a_probe() {
         let (dialog, _c) = recording_dialog(Ok(deny_once_result()));
         let t = t36_setup("probe-cred", &[], &[], dialog);
         let counters = t.handle.counters();
@@ -6324,11 +6381,21 @@ mod tests {
                 "{label}: the refusal must carry the challenge: {resp}"
             );
         }
+        let proof = counters.counters(epoch).expect("the open epoch");
         assert_eq!(
-            counters.counters(epoch),
-            Some(LaunchProofCounters::default()),
-            "a refused probe must leave no observation: it cannot stand in for the \
-             session's own proxy path"
+            (
+                proof.consultations,
+                proof.upstream_established,
+                proof.probes
+            ),
+            (0, 0, 0),
+            "a refused probe must leave no consultation, no tunnel and NO PROBE: it \
+             cannot stand in for the session's own proxy path"
+        );
+        assert_eq!(
+            proof.unauthenticated, 2,
+            "both refusals are counted in their own field (P3.2a): the gate has to see \
+             that something reached the listener without this run's credential"
         );
     }
 
@@ -6364,6 +6431,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             })
         );
         assert!(counters.close_epoch(epoch));
@@ -6474,6 +6542,7 @@ mod tests {
             consultations: 1,
             upstream_established: 0,
             probes: 0,
+            unauthenticated: 0,
         });
 
         // (i) A's own token at A's listener is served and counted.
@@ -6492,10 +6561,24 @@ mod tests {
             resp.starts_with("HTTP/1.1 407"),
             "A must refuse B's token: {resp}"
         );
+        let after_foreign = a
+            .handle
+            .counters()
+            .counters(epoch_a)
+            .expect("A's open window");
         assert_eq!(
-            a.handle.counters().counters(epoch_a),
-            one_consultation,
-            "a foreign token is not a consultation"
+            (
+                after_foreign.consultations,
+                after_foreign.upstream_established,
+                after_foreign.probes
+            ),
+            (1, 0, 0),
+            "a foreign token is not a consultation, a tunnel or a probe"
+        );
+        assert_eq!(
+            after_foreign.unauthenticated, 1,
+            "it IS counted as an unauthenticated attempt (P3.2a): the gate must see that \
+             something reached A without A's credential"
         );
         assert_eq!(
             connect_events(&a.sid).len(),
@@ -6522,8 +6605,14 @@ mod tests {
         );
         assert_eq!(
             b.handle.counters().counters(epoch_b),
-            Some(LaunchProofCounters::default()),
-            "a foreign token must not count at B either"
+            Some(LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+                probes: 0,
+                unauthenticated: 1,
+            }),
+            "a foreign token must not count at B as traffic - only as the unauthenticated \
+             attempt it was"
         );
         assert_eq!(
             connect_events(&b.sid).len(),
@@ -6536,7 +6625,17 @@ mod tests {
         // not a broken listener.
         let resp = exchange(b.port, &connect_req_with("127.0.0.1:9", token_b.value()));
         assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
-        assert_eq!(b.handle.counters().counters(epoch_b), one_consultation);
+        assert_eq!(
+            b.handle.counters().counters(epoch_b),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+                probes: 0,
+                unauthenticated: 1,
+            }),
+            "B's own credential is a consultation; the foreign attempt it refused earlier \
+             stays counted on the same epoch"
+        );
 
         // (iv) non-vacuity: a request with NO credential still gets its leaf, so
         // the silence above is the foreign-token rule and not a dead writer.
@@ -6548,6 +6647,96 @@ mod tests {
             leaves_before + 1,
             "a missing credential is worth a leaf; a foreign one is not"
         );
+    }
+
+    // ---- P3.2a: unauthenticated attempts at the proxy (guardrail 1, leg 2) --
+
+    /// **P3.2a: both refusal arms are counted on the launch's epoch, and the count
+    /// is per epoch.** The counter is what lets the gate see a client stack that
+    /// reaches the listener and can never authenticate (WinINet / Windows
+    /// PowerShell 5.1), instead of reading `probes == 1` as a working session.
+    ///
+    /// Deliberately a NEW epoch-scoped field rather than the listener-lifetime
+    /// `no_token`/`foreign_token` budgets that drive the leaf volume: those must
+    /// survive launches (the flood cap is per listener), so reusing them would
+    /// refuse launch N+1 on launch N's refusals.
+    #[test]
+    fn unauthenticated_attempts_are_counted_per_epoch_on_both_refusal_arms() {
+        let token = RunToken::issue().expect("mint a token");
+        let (dialog, _keep) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup_token_cfg(
+            "p32a-unauthenticated",
+            &["*"],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            token.clone(),
+        );
+        let counters = t.handle.counters();
+        let epoch = counters.begin_epoch().expect("the launch's epoch");
+
+        // 1. A client that sends no credential at all.
+        let resp = exchange(t.port, &connect_req_no_auth("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        // 2. A client holding somebody else's credential.
+        let resp = exchange(
+            t.port,
+            &connect_req_with("api.example.com:443", "a-different-runs-token"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+
+        let after_refusals = counters.counters(epoch).expect("the open epoch");
+        println!("EVIDENCE refusals counters={after_refusals:?}");
+        assert_eq!(
+            after_refusals.unauthenticated, 2,
+            "one per refusal, on BOTH arms: {after_refusals:?}"
+        );
+        assert_eq!(
+            (
+                after_refusals.consultations,
+                after_refusals.upstream_established,
+                after_refusals.probes
+            ),
+            (0, 0, 0),
+            "a refusal is not a consultation, a tunnel or a probe: {after_refusals:?}"
+        );
+
+        // 3. Control: this listener's own credential is never counted here, and the
+        //    request IS a consultation even though policy denies it (the gate must
+        //    not confuse a denial with a client that cannot authenticate).
+        let resp = exchange(t.port, &connect_req_with("127.0.0.1:9", token.value()));
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+        let proven = counters.counters(epoch).expect("the open epoch");
+        println!("EVIDENCE control counters={proven:?}");
+        assert_eq!(
+            proven,
+            LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+                probes: 0,
+                unauthenticated: 2,
+            },
+            "an authenticated request counts as a consultation and NOT as unauthenticated"
+        );
+
+        // 4. Per epoch: the next launch inherits nothing, and closing an epoch
+        //    FREEZES its record instead of zeroing it.
+        assert!(counters.close_epoch(epoch));
+        let second = counters.begin_epoch().expect("the second launch's epoch");
+        assert_eq!(
+            counters.counters(second),
+            Some(LaunchProofCounters::default()),
+            "a second launch on one listener must start at zero"
+        );
+        assert_eq!(
+            counters.counters(epoch).map(|c| c.unauthenticated),
+            Some(2),
+            "a closed epoch keeps its own count; a later launch must not reset it"
+        );
+        assert!(counters.close_epoch(second));
     }
 
     // ---- P1.6: hardening ------------------------------------------------
@@ -6662,8 +6851,14 @@ mod tests {
 
         assert_eq!(
             t.handle.counters().counters(epoch),
-            Some(LaunchProofCounters::default()),
-            "a credential-less refusal is still not a consultation"
+            Some(LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+                probes: 0,
+                unauthenticated: 20,
+            }),
+            "a credential-less refusal is not a consultation - and all twenty are \
+             counted as unauthenticated attempts (P3.2a), suppression or not"
         );
         assert!(t.handle.counters().close_epoch(epoch));
     }
@@ -6774,8 +6969,14 @@ mod tests {
         );
         assert_eq!(
             t.handle.counters().counters(epoch),
-            Some(LaunchProofCounters::default()),
-            "none of it is a consultation"
+            Some(LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+                probes: 0,
+                unauthenticated: 44,
+            }),
+            "none of it is a consultation, and every refusal is counted (P3.2a) - the \
+             count is exact even where the LEAVES are windowed"
         );
         assert!(t.handle.counters().close_epoch(epoch));
     }
@@ -6788,9 +6989,10 @@ mod tests {
     /// missing-credential budget (that is the P1.8 steady state), and neither arm
     /// may silence the other's evidence.
     ///
-    /// 20 refusals are 8 `foreign_token` leaves plus 12 suppressed - one window -
-    /// and the counters stay `{0,0}`: a foreign credential is still not a
-    /// consultation, so it can never satisfy guardrail 1.
+    /// 20 refusals are 8 `foreign_token` leaves plus 12 suppressed - one window.
+    /// A foreign credential is still not a consultation and never a probe, so it
+    /// can never satisfy guardrail 1; since P3.2a it IS counted as an
+    /// unauthenticated attempt, which is the signal the gate's second leg reads.
     #[test]
     fn foreign_token_refusals_are_capped_by_their_own_budget() {
         let token = RunToken::issue().expect("mint the listener's token");
@@ -6852,8 +7054,14 @@ mod tests {
         assert_eq!(aggregates[0]["host"], "<unknown>");
         assert_eq!(
             t.handle.counters().counters(epoch),
-            Some(LaunchProofCounters::default()),
-            "a foreign token is not a consultation, capped or not"
+            Some(LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+                probes: 0,
+                unauthenticated: 20,
+            }),
+            "a foreign token is not a consultation, capped or not - and all twenty are \
+             counted as unauthenticated attempts"
         );
 
         // Independence: the missing-credential arm still owns its own budget, so
@@ -6867,6 +7075,15 @@ mod tests {
             "the no_token budget was untouched by the foreign flood"
         );
         assert_eq!(last_connect_event(&t.sid)["reason"], "no_token");
+        assert_eq!(
+            t.handle
+                .counters()
+                .counters(epoch)
+                .map(|c| c.unauthenticated),
+            Some(21),
+            "the control's own credential-less refusal is counted too, on the same \
+             epoch - the two arms are separate BUDGETS, not separate counters"
+        );
         assert!(t.handle.counters().close_epoch(epoch));
     }
 
@@ -7124,6 +7341,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             }),
             "a refused launch must not steal or reset the open window"
         );
@@ -7147,6 +7365,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             })
         );
     }
@@ -7218,6 +7437,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             }),
             "the surviving window still holds the live launch's traffic"
         );
@@ -7247,6 +7467,7 @@ mod tests {
                 consultations: 1,
                 upstream_established: 0,
                 probes: 0,
+                unauthenticated: 0,
             }),
             "the newest window is still readable"
         );

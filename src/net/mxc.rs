@@ -840,6 +840,23 @@ pub struct ProxyProof {
     /// `accepted` and `tunnels` stay recorded as coverage — they say what the
     /// session actually did over the proxy — but they no longer decide.
     pub probes: u64,
+    /// Refusals this listener answered **without this run's credential** in the
+    /// epoch (`no_token` + `foreign_token`).
+    ///
+    /// The second half of guardrail 1's evidence (P3.2a, amended 2026-10-22): the
+    /// probe proves the child's PATH works, and this counter proves that nothing
+    /// in the container was left *trying without* the credential. A GUI /
+    /// system-proxy client (WinINet, Windows PowerShell 5.1 — measured in P1.5 and
+    /// P1.8) reaches the proxy, never sends a `Proxy-Authorization`, and gets `407`
+    /// for ever: `probes == 1, tunnels == 0` used to PASS such a session while the
+    /// application had no egress at all.
+    ///
+    /// Read together with `accepted`, never alone: a .NET 8 / pwsh 7 managed
+    /// client legitimately makes ONE credential-less attempt per connection and
+    /// authenticates after the `407` challenge (`Proxy-Authenticate: Basic` is
+    /// load-bearing), so `unauthenticated > 0` with an authenticated consultation
+    /// is the handshake working, not a client that cannot use the proxy.
+    pub unauthenticated: u64,
 }
 
 /// What guardrail 1 must observe for this launch (plan decision D3).
@@ -891,6 +908,18 @@ pub enum GuardError {
     /// launch's epoch: the child's path to the proxy — a live loopback
     /// listener that accepts the session's own credential — was never proven.
     ProbeUnmet,
+    /// The probe proved the path, but **nothing in this epoch ever
+    /// authenticated** and the listener answered credential-less (or
+    /// foreign-credential) attempts instead (P3.2a).
+    ///
+    /// This is the silent-misconfiguration the probe amendment re-opened: a
+    /// GUI / system-proxy client (WinINet, Windows PowerShell 5.1 — P1.5, P1.8)
+    /// reaches the listener and gets `407` for ever without ever sending a
+    /// credential, so the session has no egress while every other signal in the
+    /// launch says it worked. Distinct from [`GuardError::ProbeUnmet`]: there the
+    /// path is unproven, here the path is proven and the *workload's client stack*
+    /// cannot use it.
+    WorkloadCannotAuthenticate,
 }
 
 impl fmt::Display for GuardError {
@@ -913,6 +942,13 @@ impl fmt::Display for GuardError {
                  this listener, so the child's path to the proxy is unproven (dead listener, \
                  blocked loopback, or a credential it does not accept)"
             }
+            Self::WorkloadCannotAuthenticate => {
+                "guardrail 1: workload_cannot_authenticate — something in the container reached \
+                 the proxy without this run credential and nothing in the session ever \
+                 authenticated: a client stack that cannot use the proxy (WinINet / system \
+                 proxy) or a misconfigured proxy setting, so the workload had no egress; use \
+                 --backend appcontainer for those workloads"
+            }
         };
         f.write_str(msg)
     }
@@ -922,10 +958,12 @@ impl std::error::Error for GuardError {}
 
 /// The hard gate, in both legs.
 ///
-/// `Required` demands `probes >= 1` — the wrapper's pre-flight probe reached
-/// this listener in the epoch. `MustBeAbsent` demands `accepted == 0 && tunnels
-/// == 0` (a proxy-less session cannot probe at all: the wrapper only probes
-/// when `--proxy-port` names a listener). Anything else fails the launch.
+/// `Required` demands **two things**: `probes >= 1` — the wrapper's pre-flight
+/// probe reached this listener in the epoch — and that no credential-less attempt
+/// was left unanswered by an authenticated one (`!(unauthenticated > 0 &&
+/// accepted == 0)`). `MustBeAbsent` demands `accepted == 0 && tunnels == 0` (a
+/// proxy-less session cannot probe at all: the wrapper only probes when
+/// `--proxy-port` names a listener). Anything else fails the launch.
 ///
 /// **Why `Required` no longer looks at `accepted`/`tunnels` (2026-10-22).**
 /// Both are produced by the workload, so a gate keyed on them answers "did the
@@ -936,18 +974,52 @@ impl std::error::Error for GuardError {}
 /// not accept. The property the old rule was reaching for — *this* listener,
 /// *this* run, *this* launch's window — is preserved: the probe is token-gated
 /// like every control-plane request and counted per epoch.
+///
+/// **Why the credential leg exists (P3.2a, 2026-10-22).** The probe alone proved
+/// the child *could* reach the listener, not that the workload *used* it with the
+/// credential. A GUI / system-proxy client (WinINet, Windows PowerShell 5.1 —
+/// P1.5/P1.8) is forced to this listener by the container's egress rules, never
+/// sends a `Proxy-Authorization`, and gets `407` for ever: `probes == 1` passed
+/// such a session while the application silently had no egress. The listener
+/// already counts those refusals (`unauthenticated`), so the gate reads them with
+/// `accepted`: an epoch where something authenticated is fine (that is the
+/// `407`-then-retry handshake every supported managed client uses), an epoch where
+/// the only contact was refusals is `workload_cannot_authenticate`.
+///
+/// **What remains OUTSIDE this gate.** (1) A workload that never attempts
+/// anything is unproven either way — the gate detects "tried and could not
+/// authenticate", never "chose not to use the network". (2) A MIXED session (one
+/// client that authenticates plus a GUI stack that cannot) is not caught by this
+/// leg, because one authenticated consultation satisfies it; catching that needs a
+/// per-client signal the listener does not have (peer SID / WFP attestation).
 pub fn verify_proxy_proof(
     proof: ProxyProof,
     expectation: ProofExpectation,
 ) -> Result<(), GuardError> {
     match expectation {
         ProofExpectation::Required => {
-            // The probe, and only the probe, decides. `accepted`/`tunnels` are
-            // carried in the same struct as coverage and printed in every
-            // `EVIDENCE` line, but a workload that made no request must not be
-            // able to fail this gate.
+            // Leg 1: the probe. `accepted`/`tunnels` are carried in the same struct
+            // as coverage and printed in every `EVIDENCE` line, but a workload that
+            // made no request must not be able to fail this gate.
             if proof.probes == 0 {
                 return Err(GuardError::ProbeUnmet);
+            }
+            // Second half of the evidence (P3.2a): the probe proves the PATH, this
+            // proves nothing in the container was left trying WITHOUT the
+            // credential. A GUI / system-proxy client (WinINet, Windows PowerShell
+            // 5.1) reaches the listener, gets `407` for ever and never
+            // authenticates - `probes == 1, tunnels == 0` used to PASS it while the
+            // application had no egress at all.
+            //
+            // Deliberately NOT `unauthenticated == 0`: a .NET 8 / pwsh 7 managed
+            // client makes one credential-less attempt per connection and
+            // authenticates after the `407` challenge (P1.8 - the challenge is
+            // load-bearing), so that shape has `unauthenticated > 0` AND
+            // `accepted > 0` and must pass. `accepted == 0` is the discriminator:
+            // nothing in this epoch ever used the credential, so the only contact
+            // was a refusal.
+            if proof.unauthenticated > 0 && proof.accepted == 0 {
+                return Err(GuardError::WorkloadCannotAuthenticate);
             }
             Ok(())
         }
@@ -1069,6 +1141,7 @@ impl ProxyProofSource for crate::net::proxy::LaunchCounters {
                 accepted: counters.consultations,
                 tunnels: counters.upstream_established,
                 probes: counters.probes,
+                unauthenticated: counters.unauthenticated,
             },
             // An unknown epoch has no counters. Zeros make the gate fail closed
             // instead of reporting traffic that belongs to someone else.
@@ -2742,6 +2815,7 @@ mod tests {
             accepted: 1,
             tunnels: 1,
             probes: 1,
+            unauthenticated: 0,
         }
     }
 
@@ -2750,6 +2824,7 @@ mod tests {
             accepted: 0,
             tunnels: 0,
             probes: 0,
+            unauthenticated: 0,
         }
     }
 
@@ -3148,6 +3223,7 @@ mod tests {
                 accepted: 0,
                 tunnels: 0,
                 probes: 1,
+                unauthenticated: 0,
             },
             ProofExpectation::Required,
         )
@@ -3178,6 +3254,7 @@ mod tests {
                     accepted: 5,
                     tunnels: 2,
                     probes: 0,
+                    unauthenticated: 0,
                 },
                 ProofExpectation::Required
             )
@@ -3209,11 +3286,13 @@ mod tests {
                 accepted: 1,
                 tunnels: 0,
                 probes: 0,
+                unauthenticated: 0,
             },
             ProxyProof {
                 accepted: 1,
                 tunnels: 1,
                 probes: 0,
+                unauthenticated: 0,
             },
         ] {
             assert_eq!(
@@ -3251,6 +3330,7 @@ mod tests {
                     accepted: 0,
                     tunnels: 0,
                     probes: 1,
+                    unauthenticated: 0,
                 },
                 true,
             ),
@@ -3260,6 +3340,7 @@ mod tests {
                     accepted: 1,
                     tunnels: 1,
                     probes: 0,
+                    unauthenticated: 0,
                 },
                 false,
             ),
@@ -3270,6 +3351,7 @@ mod tests {
                     accepted: 0,
                     tunnels: 1,
                     probes: 0,
+                    unauthenticated: 0,
                 },
                 false,
             ),
@@ -3297,6 +3379,7 @@ mod tests {
                 accepted: 1,
                 tunnels: 1,
                 probes: 0,
+                unauthenticated: 0,
             },
             ProofExpectation::Required,
             clock(),
@@ -3367,6 +3450,7 @@ mod tests {
                     accepted: 1,
                     tunnels: 0,
                     probes: 0,
+                    unauthenticated: 0,
                 },
             ),
             (
@@ -3375,6 +3459,7 @@ mod tests {
                     accepted: 1,
                     tunnels: 0,
                     probes: 0,
+                    unauthenticated: 0,
                 },
             ),
         ];
@@ -5428,6 +5513,7 @@ mod tests {
                 accepted: 1,
                 tunnels: 1,
                 probes: 1,
+                unauthenticated: 0,
             }
         );
         counters.close_launch(first);
@@ -5448,6 +5534,7 @@ mod tests {
                 accepted: 1,
                 tunnels: 1,
                 probes: 1,
+                unauthenticated: 0,
             },
             "a plain-HTTP-only session carries both the probe and its coverage"
         );
@@ -5458,6 +5545,7 @@ mod tests {
                 accepted: 1,
                 tunnels: 1,
                 probes: 1,
+                unauthenticated: 0,
             }
         );
         // An epoch nobody opened proves nothing.
@@ -6097,11 +6185,16 @@ mod live {
     /// **The property the gate exists for.** A session whose ONLY listener contact
     /// used a foreign credential is REFUSED.
     ///
-    /// The listener answers the same `407` it gives a credential-less request and
-    /// records nothing, so the launch's epoch has `probes == 0` and guardrail 1
-    /// refuses with `proxy_probe_unmet`. The positive control in the same epoch
-    /// (this listener's own credential, `204` and counted) is what makes the
-    /// refusal mean something: without it a dead listener would look identical.
+    /// The listener answers the same `407` it gives a credential-less request, so
+    /// the launch's epoch has `probes == 0` and guardrail 1 refuses with
+    /// `proxy_probe_unmet`. The positive control (this listener's own credential,
+    /// `204` and counted) is what makes the refusal mean something: without it a
+    /// dead listener would look identical.
+    ///
+    /// The control runs in its OWN epoch (P3.2a): the refused attempt stays counted
+    /// on the first launch's `unauthenticated`, so re-probing the same epoch with
+    /// the right credential would prove the listener serves it - which the `204`
+    /// below does - while the session would still (correctly) be refused.
     ///
     /// Not `#[ignore]`d: no container is involved — this is the real listener,
     /// the real counters and the real gate.
@@ -6135,22 +6228,343 @@ mod live {
             GuardError::ProbeUnmet
         );
 
-        // 2. Positive control, same epoch: this listener's own credential counts.
+        counters.close_launch(epoch);
+
+        // 2. Positive control, fresh epoch: this listener's own credential is served
+        //    and counted, and a launch whose only contact is that probe passes - so
+        //    the refusal above is about the credential, not a dead listener.
+        let control = counters.begin_launch().expect("the control's epoch");
         let own = probe_with(proxy.port(), Some(proxy.token().value()));
         println!(
             "EVIDENCE own_probe status={:?} proof={:?}",
             own.lines().next(),
-            counters.proof(epoch)
+            counters.proof(control)
         );
         assert!(
             own.starts_with("HTTP/1.1 204"),
             "the session's own credential must be served: {own:?}"
         );
-        assert_eq!(counters.proof(epoch).probes, 1, "exactly one observation");
-        verify_proxy_proof(counters.proof(epoch), ProofExpectation::Required)
-            .expect("the same session, probed with its own credential, is proven");
+        assert_eq!(counters.proof(control).probes, 1, "exactly one observation");
+        assert_eq!(
+            counters.proof(control).unauthenticated,
+            0,
+            "nothing but the probe touched this epoch"
+        );
+        verify_proxy_proof(counters.proof(control), ProofExpectation::Required)
+            .expect("a launch probed with its own credential is proven");
+
+        counters.close_launch(control);
+    }
+
+    /// One `CONNECT` carrying **no** credential at all, blocking on the status line.
+    ///
+    /// The WinINet / system-proxy shape (P1.5, P1.8): the container forces the
+    /// request to this listener and the client sends no `Proxy-Authorization`
+    /// header, so it is answered `407` for ever and the application has no egress
+    /// while the proxy path itself is perfectly healthy.
+    fn connect_no_auth(port: u16, target: &str) -> String {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect the listener");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let req = format!("CONNECT {target} HTTP/1.1\r\n\r\n");
+        sock.write_all(req.as_bytes()).expect("write CONNECT");
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 512];
+        // The status line ends at the first blank line; never read to EOF (a
+        // tunnel would keep the socket open).
+        while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// **P3.2a, the class the probe amendment re-opened.** A launch whose probe
+    /// arrived, whose ONLY other contact with the listener carried no credential,
+    /// is REFUSED with `workload_cannot_authenticate`.
+    ///
+    /// Before this leg the session PASSED on `probes == 1`: the wrapper's probe
+    /// proved the path, and nothing asked whether the workload could use it. A GUI
+    /// / system-proxy client (WinINet, Windows PowerShell 5.1 - measured in P1.5 and
+    /// P1.8) reaches this listener, gets `407` for ever, and the application
+    /// silently has no egress: exactly the silent-misconfiguration class guardrail
+    /// 1 exists for, so the evidence has to be two-part.
+    #[test]
+    fn a_probe_ok_session_whose_only_other_contact_was_credential_less_is_refused() {
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let epoch = counters.begin_launch().expect("the launch's epoch");
+
+        // 1. The wrapper's pre-flight probe: the PATH is proven.
+        let probe = probe_with(proxy.port(), Some(proxy.token().value()));
+        assert!(
+            probe.starts_with("HTTP/1.1 204"),
+            "the probe must be served: {probe:?}"
+        );
+
+        // 2. The workload: a client stack that cannot send the credential.
+        let attempt = connect_no_auth(proxy.port(), "api.example.com:443");
+        assert!(
+            attempt.starts_with("HTTP/1.1 407"),
+            "a credential-less CONNECT is refused, and identically every time: {attempt:?}"
+        );
+
+        let proof = counters.proof(epoch);
+        println!("EVIDENCE credential_less_system_proxy proof={proof:?}");
+        assert_eq!(proof.probes, 1, "the probe is the path evidence: {proof:?}");
+        assert_eq!(
+            (proof.accepted, proof.tunnels),
+            (0, 0),
+            "a refused attempt is not a consultation: it never reached the policy: {proof:?}"
+        );
+        assert_eq!(
+            proof.unauthenticated, 1,
+            "the attempt must be counted on this launch's epoch: {proof:?}"
+        );
+
+        let err = verify_proxy_proof(proof, ProofExpectation::Required)
+            .expect_err("a session whose only listener contact was credential-less had no egress");
+        println!("EVIDENCE refusal reason={err}");
+        assert_eq!(err, GuardError::WorkloadCannotAuthenticate);
+        assert!(
+            err.to_string().contains("workload_cannot_authenticate"),
+            "the operator must be told which cause it was: {err}"
+        );
+        assert!(
+            !err.to_string().contains("proxy_probe_unmet"),
+            "this is NOT a path failure - the probe arrived: {err}"
+        );
+
+        // 3. Positive control, fresh epoch on the SAME listener: probe and nothing
+        //    else still passes, so the refusal above is the credential-less
+        //    attempt and not the probe leg.
+        counters.close_launch(epoch);
+        let clean = counters.begin_launch().expect("the control's epoch");
+        let probe = probe_with(proxy.port(), Some(proxy.token().value()));
+        assert!(probe.starts_with("HTTP/1.1 204"), "{probe:?}");
+        println!(
+            "EVIDENCE control_probe_only proof={:?}",
+            counters.proof(clean)
+        );
+        verify_proxy_proof(counters.proof(clean), ProofExpectation::Required)
+            .expect("a probed session that made no other contact is unaffected");
+        counters.close_launch(clean);
+    }
+
+    /// **P3.2a: a foreign credential is the same signal.** Lateral movement and a
+    /// client stack that cannot authenticate both mean "reached the proxy and
+    /// could not use this run's credential", so a probe-ok session whose only
+    /// other contact presented somebody else's token is refused too.
+    ///
+    /// Distinguished from the existing foreign-credential leg (no probe, therefore
+    /// `proxy_probe_unmet`): here the path IS proven, so the reason has to be the
+    /// new one - the two refusals must not collapse into one string.
+    #[test]
+    fn a_probe_ok_session_whose_only_other_contact_used_a_foreign_credential_is_refused() {
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let epoch = counters.begin_launch().expect("the launch's epoch");
+
+        let probe = probe_with(proxy.port(), Some(proxy.token().value()));
+        assert!(probe.starts_with("HTTP/1.1 204"), "{probe:?}");
+        let attempt = cx(
+            proxy.port(),
+            "a-different-runs-token",
+            "api.example.com:443",
+        );
+        assert!(
+            attempt.starts_with("HTTP/1.1 407"),
+            "a foreign credential is refused exactly like a missing one: {attempt:?}"
+        );
+
+        let proof = counters.proof(epoch);
+        println!("EVIDENCE foreign_token_system_proxy proof={proof:?}");
+        assert_eq!(proof.probes, 1, "{proof:?}");
+        assert_eq!(
+            (proof.accepted, proof.unauthenticated),
+            (0, 1),
+            "the foreign attempt is counted and never a consultation: {proof:?}"
+        );
+        let err = verify_proxy_proof(proof, ProofExpectation::Required)
+            .expect_err("a session that only presented a foreign credential has no egress");
+        println!("EVIDENCE refusal reason={err}");
+        assert_eq!(err, GuardError::WorkloadCannotAuthenticate);
 
         counters.close_launch(epoch);
+    }
+
+    /// **P3.2a, the other direction: a policy denial is NOT a misconfiguration.**
+    /// A launch whose workload authenticated and was then DENIED must still PASS -
+    /// the credential path worked, the denial is the guardrail doing its job.
+    ///
+    /// Without this leg the new rule could drift into refusing every session that
+    /// was denied anything, which would make `--allow-domain` unusable.
+    #[test]
+    fn a_probe_ok_session_whose_authenticated_connect_was_denied_still_passes() {
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let epoch = counters.begin_launch().expect("the launch's epoch");
+
+        let probe = probe_with(proxy.port(), Some(proxy.token().value()));
+        assert!(probe.starts_with("HTTP/1.1 204"), "{probe:?}");
+        let denied = cx(proxy.port(), proxy.token().value(), "api.example.com:443");
+        assert!(
+            denied.starts_with("HTTP/1.1 403"),
+            "the workload authenticated and the POLICY denied it: {denied:?}"
+        );
+
+        let proof = counters.proof(epoch);
+        println!("EVIDENCE authenticated_denied proof={proof:?}");
+        assert_eq!(
+            (proof.accepted, proof.tunnels),
+            (1, 0),
+            "a consultation that was denied is recorded, and no tunnel is claimed: {proof:?}"
+        );
+        assert_eq!(
+            proof.unauthenticated, 0,
+            "a client that authenticates is never counted here: {proof:?}"
+        );
+        verify_proxy_proof(proof, ProofExpectation::Required)
+            .expect("an authenticated-but-denied workload used the proxy correctly");
+
+        counters.close_launch(epoch);
+    }
+
+    /// **P3.2a: the 407-then-retry handshake is not a failure.** A .NET 8 /
+    /// pwsh 7 managed client legitimately makes ONE credential-less attempt per
+    /// connection and authenticates only after the `Proxy-Authenticate: Basic`
+    /// challenge (P1.8), so this session must PASS.
+    ///
+    /// This is why the gate reads `unauthenticated` TOGETHER with `accepted`
+    /// rather than demanding zero: `unauthenticated > 0` with an authenticated
+    /// consultation is the handshake working, `> 0` with none is a client stack
+    /// that can never use the proxy. Pin both, or the rule drifts into refusing the
+    /// one managed shape the design supports.
+    #[test]
+    fn a_managed_client_that_authenticates_after_the_407_challenge_is_not_refused() {
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let epoch = counters.begin_launch().expect("the launch's epoch");
+
+        let probe = probe_with(proxy.port(), Some(proxy.token().value()));
+        assert!(probe.starts_with("HTTP/1.1 204"), "{probe:?}");
+        // 1. The unauthenticated first attempt: refused, but challenged.
+        let first = connect_no_auth(proxy.port(), "api.example.com:443");
+        assert!(first.starts_with("HTTP/1.1 407"), "{first:?}");
+        assert!(
+            first.contains("Proxy-Authenticate: Basic"),
+            "the challenge is what makes the retry authenticate: {first:?}"
+        );
+        // 2. The retry, with the credential the URL carried all along: a real
+        //    consultation, denied by policy (the gate's concern is the credential).
+        let retry = cx(proxy.port(), proxy.token().value(), "api.example.com:443");
+        assert!(retry.starts_with("HTTP/1.1 403"), "{retry:?}");
+
+        let proof = counters.proof(epoch);
+        println!("EVIDENCE managed_407_handshake proof={proof:?}");
+        assert_eq!(
+            (proof.probes, proof.unauthenticated, proof.accepted),
+            (1, 1, 1),
+            "one challenged attempt plus one authenticated consultation: {proof:?}"
+        );
+        verify_proxy_proof(proof, ProofExpectation::Required)
+            .expect("the 407 handshake is how every supported managed client authenticates");
+
+        counters.close_launch(epoch);
+    }
+
+    /// **P3.2a: the count is per EPOCH, not per listener.** Two sequential launches
+    /// on one listener: the first makes credential-less attempts, the second is
+    /// clean - and the second PASSES.
+    ///
+    /// Reusing the listener-lifetime `no_token`/`foreign_token` budgets would have
+    /// refused launch N+1 on launch N's refusals, which is why the proof counter is
+    /// its own epoch-scoped field.
+    #[test]
+    fn the_unauthenticated_count_is_per_epoch_so_a_second_launch_starts_clean() {
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+
+        // Launch 1: two credential-less attempts, no probe.
+        let first = counters.begin_launch().expect("the first launch's epoch");
+        let attempt = connect_no_auth(proxy.port(), "api.example.com:443");
+        assert!(attempt.starts_with("HTTP/1.1 407"), "{attempt:?}");
+        let attempt = connect_no_auth(proxy.port(), "api.anthropic.com:443");
+        assert!(attempt.starts_with("HTTP/1.1 407"), "{attempt:?}");
+        assert_eq!(
+            counters.proof(first).unauthenticated,
+            2,
+            "{:?}",
+            counters.proof(first)
+        );
+        counters.close_launch(first);
+
+        // Launch 2: probed, clean. It must inherit NOTHING.
+        let second = counters.begin_launch().expect("the second launch's epoch");
+        let probe = probe_with(proxy.port(), Some(proxy.token().value()));
+        assert!(probe.starts_with("HTTP/1.1 204"), "{probe:?}");
+        let proof = counters.proof(second);
+        println!("EVIDENCE per_epoch first={first} second={second} proof={proof:?}");
+        assert_eq!(
+            proof.unauthenticated, 0,
+            "a second launch must not inherit the first's refusals: {proof:?}"
+        );
+        verify_proxy_proof(proof, ProofExpectation::Required)
+            .expect("the second launch is clean and must pass");
+
+        // The first epoch's record is frozen, not reset: the evidence for launch 1
+        // still reads what launch 1 did.
+        assert_eq!(
+            counters.counters(first).map(|c| c.unauthenticated),
+            Some(2),
+            "closing an epoch freezes it; it must never be zeroed by a later launch"
+        );
+        assert_eq!(
+            counters.counters(second),
+            Some(crate::net::proxy::LaunchProofCounters {
+                consultations: 0,
+                upstream_established: 0,
+                probes: 1,
+                unauthenticated: 0,
+            }),
+            "the second epoch counts only its own traffic"
+        );
+
+        counters.close_launch(second);
+    }
+
+    /// **P3.2a: `--block-net` is unaffected.** The new leg is scoped to the
+    /// `Required` (proxy-configured) expectation.
+    ///
+    /// A proxy-less session has no listener to authenticate to, so its question -
+    /// "did anything go out?" - is unchanged: `MustBeAbsent` still fails a
+    /// consultation and still ignores the credential counters, which for a blocked
+    /// session can only ever be zero.
+    #[test]
+    fn block_net_is_unaffected_by_the_unauthenticated_leg() {
+        let refused = ProxyProof {
+            accepted: 1,
+            tunnels: 0,
+            probes: 0,
+            unauthenticated: 0,
+        };
+        assert_eq!(
+            verify_proxy_proof(refused, ProofExpectation::MustBeAbsent)
+                .expect_err("a blocked session that went out is still refused"),
+            GuardError::ProxyConsultedUnexpectedly
+        );
+        let untouched = ProxyProof {
+            accepted: 0,
+            tunnels: 0,
+            probes: 0,
+            unauthenticated: 3,
+        };
+        verify_proxy_proof(untouched, ProofExpectation::MustBeAbsent).expect(
+            "MustBeAbsent is the no-proxy leg: it neither probes nor authenticates, and the \
+             new counter cannot make a blocked session refuse itself",
+        );
     }
 
     /// A real session proxy (`127.0.0.1:0`, this process's own listener) plus the
@@ -7378,6 +7792,7 @@ mod live {
                 accepted: 1,
                 tunnels: 1,
                 probes: 1,
+                unauthenticated: 0,
             },
             expectation: ProofExpectation::Required,
             clock: SessionClock::default(),
@@ -7580,6 +7995,7 @@ mod live {
                 accepted: 1,
                 tunnels: 1,
                 probes: 1,
+                unauthenticated: 0,
             },
             "run A's proof must count only run A's consultation and its own probe"
         );
@@ -7589,6 +8005,7 @@ mod live {
                 accepted: 1,
                 tunnels: 1,
                 probes: 1,
+                unauthenticated: 0,
             },
             "run B's proof must count only run B's consultation and its own probe"
         );
@@ -7648,9 +8065,19 @@ mod live {
             "run A must refuse run B's token: {resp:?}"
         );
         assert_eq!(
-            counters_a.counters(epoch_a),
-            Some(LaunchProofCounters::default()),
-            "a foreign token must not count as a consultation"
+            counters_a.counters(epoch_a).map(|c| (
+                c.consultations,
+                c.upstream_established,
+                c.probes
+            )),
+            Some((0, 0, 0)),
+            "a foreign token must not count as a consultation, a tunnel or a probe"
+        );
+        assert_eq!(
+            counters_a.counters(epoch_a).map(|c| c.unauthenticated),
+            Some(1),
+            "it IS counted as an unauthenticated attempt (P3.2a): run A must be able to see \
+             that something reached its listener without its credential"
         );
         assert_eq!(
             connect_leaves(&a.sid),
@@ -7673,9 +8100,18 @@ mod live {
             "run B must refuse run A's token: {resp:?}"
         );
         assert_eq!(
-            counters_b.counters(epoch_b),
-            Some(LaunchProofCounters::default()),
-            "a foreign token must not count at run B either"
+            counters_b.counters(epoch_b).map(|c| (
+                c.consultations,
+                c.upstream_established,
+                c.probes
+            )),
+            Some((0, 0, 0)),
+            "a foreign token must not count at run B as traffic either"
+        );
+        assert_eq!(
+            counters_b.counters(epoch_b).map(|c| c.unauthenticated),
+            Some(1),
+            "and it is counted once as an unauthenticated attempt at B, symmetrically to A"
         );
         assert_eq!(
             connect_leaves(&b.sid),
@@ -7748,7 +8184,8 @@ mod live {
 
         println!(
             "EVIDENCE done: two concurrent sessions, each proofed by its own listener and its \
-             own run token, with the cross-run token refused uncounted and unaudited"
+             own run token, with the cross-run token refused as traffic (counted only as an \
+             unauthenticated attempt) and kept out of the other run's proof"
         );
     }
 
@@ -8489,8 +8926,15 @@ exit /b 0
                 // The wrapper's pre-flight probe, and nothing else: an intent call
                 // served on the listener is NOT a proxy consultation.
                 probes: 1,
+                // Exactly one: the workload's OWN `407` leg sends a wrong credential
+                // on purpose (`get_wrong_credential=407`). It is a control-plane
+                // refusal, so it counts as an unauthenticated attempt (P3.2a) and
+                // still never as traffic - and the session's expectation here is
+                // `MustBeAbsent`, which this counter cannot affect.
+                unauthenticated: 1,
             },
-            "the roundtrip must record the probe and zero proxy traffic: {outcome:?}"
+            "the roundtrip must record the probe, zero proxy traffic and the one \
+             407 the workload asked for: {outcome:?}"
         );
 
         let leaves = audit_leaves(&proxy.sid);
@@ -8800,6 +9244,7 @@ exit /b 0
                 consultations: 0,
                 upstream_established: 0,
                 probes: 1,
+                unauthenticated: 0,
             },
             "a probe is neither a consultation nor an upstream connection"
         );

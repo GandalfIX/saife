@@ -980,10 +980,15 @@ fn run_mxc_session(
     // 2026-10-22 amendment the gate is satisfied by the wrapper's pre-flight
     // probe, and a counter the operator cannot see is a gate nobody can audit
     // after the fact. One line, on stderr, beside the warnings and the timeout
-    // reason.
+    // reason. Since P3.2a it also carries the epoch's unauthenticated attempts —
+    // the leg that catches a client stack which reached the proxy and could not
+    // use it — so a refusal and a pass are auditable from the same line.
     eprintln!(
-        "[sandbox] mxc: guardrail 1 proof probes={} accepted={} tunnels={}",
-        outcome.proxy_proof.probes, outcome.proxy_proof.accepted, outcome.proxy_proof.tunnels
+        "[sandbox] mxc: guardrail 1 proof probes={} accepted={} tunnels={} unauthenticated={}",
+        outcome.proxy_proof.probes,
+        outcome.proxy_proof.accepted,
+        outcome.proxy_proof.tunnels,
+        outcome.proxy_proof.unauthenticated
     );
     for warning in &outcome.warnings {
         eprintln!("[sandbox] mxc: warning: {warning}");
