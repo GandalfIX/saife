@@ -468,23 +468,79 @@ forward (`respond_deny` is shared) — recorded, not fixed.
   **and already marked `disposition: deny`**) plus one `SESSION_REFUSED` leaf.
   `audit verify` still validates the whole chain, and the five new keys (plus
   `expected_tier`) are filterable, including `=null` for a fact nobody established.
-- [ ] **P2.4** Harness: add S-93 (silent-misconfig must fail the session, i.e.
-  the guardrail's negative case) and S-94 (unelevated launch: assert the
-  supervisor reports `elevated=false` and the session still works).
+- [x] **P2.4** Harness: **S-94 landed; S-93's harness form is DEFERRED to P3.1**
+  (the property is pinned meanwhile by an `#[ignore]`d live leg). Suite total:
+  **93 scenarios** (numbers 1..=94, with 93 RESERVED out of the run), so the
+  recorded VM baseline moves 92 -> 93.
+  **Product gap CLOSED — `SANDBOX_PROXY_PORT` under MXC.** The AppContainer path
+  injects it (`src/sandbox/appcontainer.rs:1007`) and nothing did under MXC, so a
+  workload written to D-0.3 could not discover the D-4 endpoint at all. The
+  wrapper now owns it: `mxc-launch.exe --proxy-port <port>` (built by
+  `launcher_command` from the same `input.network.proxy_port` that becomes the
+  request's `networkProxy`, so the variable and the proxy URL cannot name
+  different listeners), written into the child as `SANDBOX_PROXY_PORT`; the
+  no-proxy arm writes the name EMPTY, as the AppContainer `None` arm does for its
+  four variables, so an inherited profile value cannot point a workload at a
+  socket nobody owns. `--env SANDBOX_PROXY_PORT=` is refused as reserved, so only
+  `--proxy-port` can set it. Asserted in the P2.2 live leg's env evidence
+  (`EVIDENCE child_env … "SANDBOX_PROXY_PORT=<port>"` == the listener's port),
+  whose RED was the variable absent from the child's own `cmd /c set` dump.
+  **Guardrail 1's NEGATIVE case** (ADR-0004: `warnings: []` is not evidence, a
+  session must not be reported successful unless the child provably reached the
+  proxy — fail it, never warn-and-continue) is the new live leg
+  `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful`:
+  `ProofExpectation::Required` (a network session) with a workload that writes a
+  marker and exits 0 without touching the network is REFUSED with
+  `MxcError::Guard(GuardError::SessionNotAccepted)`, its Display naming the
+  missing proof; the listener's own counters for epoch 1 read `{0,0}` (with
+  `counters(1)` returning `Some`, so "zero" is not the zero of an epoch that never
+  existed), the epoch is closed on the refusal path, and the audit chain holds no
+  CONNECT leaf and no leaf claiming a decision about a host. Mutation-checked:
+  neutering `verify_proxy_proof`'s `Required` arm makes that leg fail on exactly
+  the forbidden outcome (`SessionOutcome { exit_code: Some(0), warnings: [],
+  proxy_proof: {0,0}, expectation: Required }`). **S-94** (`tests/run-tests.ps1`,
+  registration 94) proves a real session SUCCEEDS (exit 0 *and* the marker on
+  stdout) and that its `SESSION_START` leaf's `elevated` equals the harness's own
+  elevation — read with the same call the leaf is written from,
+  `GetTokenInformation(TokenElevation)` (`src/setup.rs::is_elevated`), via
+  `Get-TokenElevation`; NOT `setup --check-only` (feature matrix, no elevation)
+  and NOT `IsInRole(Administrator)` (group membership). It is an equality test,
+  never `elevated=false`: guest true==true, unelevated host false==false; the key
+  must also EXIST and be a JSON boolean, so a leaf that dropped it cannot pass an
+  unelevated lane for the wrong reason. **S-93 has no harness form here on
+  purpose:** guardrail 1 exists only in the MXC backend and the lane cannot select
+  it before P3.1 (`main.rs` refuses `--backend mxc`), so a VM scenario today would
+  exercise the AppContainer backend and could only pass for the wrong reason; a
+  permanently-skipping placeholder was rejected, so 93 is reserved OUT of the run
+  and S-93's harness form lands with P3.1.
 
   **COVERAGE NOTE (standing, P2.2 + P2.4):** until the wiring lands (P3), no VM
   scenario exercises MXC — `main.rs` refuses `--backend mxc` (`MXC_SESSION_WIRED
   = false`, and `cli::route_backend` refuses it before anything is spawned) and
   the harness never passes `--backend` at all (`tests/run-tests.ps1`: zero
-  occurrences) — so P2.2 and the MXC half of P2.4 are proven by in-process live
-  legs only, unelevated, on this host; the VM suite remains an AppContainer
-  baseline. Consequently: no scenario result in `tests/run-tests.ps1` may be
-  cited as MXC coverage before P3.1, S-77 stays the AppContainer scenario it is,
-  and P2.4's S-93/S-94 (like any VM scenario) cannot be evidence about this
-  backend until the wiring and the `--backend mxc` selection exist.
+  occurrences) — so P2.2 and P2.4's guardrail negative case are proven by
+  in-process live legs only, unelevated, on this host; the VM suite remains an
+  AppContainer baseline. Consequently: no scenario result in
+  `tests/run-tests.ps1` may be cited as MXC coverage before P3.1, S-77 stays the
+  AppContainer scenario it is, and S-94 (the one P2.4 scenario that DOES run in
+  the VM) asserts the session-start leaf, which both backends write, so it
+  survives the P3.1 flip without being evidence about MXC today.
 
 **Acceptance:** S-75/S-76/S-77/S-87…S-92 pass under MXC; audit chain verify OK;
 S-93/S-94 pass; no scenario depends on elevation.
+
+**As landed (2026-10-22):** the suite is **93 scenarios** and both images read
+`77 pass / 0 fail / 16 skip` (A osBuild 26340, B osBuild 29680, unelevated). S-94 runs in the
+harness. S-93 is RESERVED out (`ReservedScenarioNumbers = @(93)`) rather than skipped: guardrail 1
+exists only in the MXC path, the harness cannot select that backend until P3, so a VM scenario today
+would test the AppContainer backend and pass for the wrong reason. The property is pinned meanwhile by
+the `#[ignore]`d live leg `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful`;
+**the harness form of S-93 lands with P3.1**, when `--backend mxc` is selectable.
+
+**Coverage note (decided 2026-10-22):** until the wiring lands (P3), no VM scenario exercises MXC —
+`main.rs` refuses `--backend mxc` and the harness never passes it. P2.2 and the MXC half of P2.4 are
+proven by in-process live legs only, unelevated, on this host; the VM suite remains an AppContainer
+baseline. Never read a green VM run as MXC coverage.
 
 ## P3 — Default flip + full parity
 
