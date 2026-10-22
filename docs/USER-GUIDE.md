@@ -185,8 +185,15 @@ is granted read-only — measured all three ways with the same binary and profil
 sandbox run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
 ```
 
-Two grants make that work, and the shipped `profiles/opencode.json` carries
-both:
+It also needs two hosts opencode queries before it can talk to any model: its
+model catalogue (`models.opencode.ai`, `models.dev`) and the provider itself
+(`*.trustedtokens.eu` in the shipped profile). Without them the start-up
+catalogue fetch is denied, opencode reports `Failed to fetch models.dev … 403`
+and dies before the model is ever called — a crash that looks like the sandbox
+refusing the provider when it never asked.
+
+Two filesystem grants make that work, and the shipped `profiles/opencode.json`
+carries both:
 
 * the four state directories it writes (`~/.local/share/opencode`,
   `~/.cache/opencode`, `~/.config/opencode`, `~/.local/state/opencode`) — they
