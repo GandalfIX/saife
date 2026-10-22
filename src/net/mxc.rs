@@ -2497,8 +2497,8 @@ fn gate_outcome(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Stand-in launcher path: the mapping is pure, so it never has to exist.
     const TEST_LAUNCHER: &str = r"C:\tools\sandbox\mxc-launch.exe";
@@ -4197,13 +4197,11 @@ mod tests {
             tier: Some("appcontainer-dacl"),
             needs_dacl_augmentation: Some(true),
         });
-        assert!(MxcBackend::without_proof_source(
-            Some(1),
-            TEST_LAUNCHER,
-            TierExpectation::Recorded
-        )
-        .tier_gate(&degraded)
-        .is_ok());
+        assert!(
+            MxcBackend::without_proof_source(Some(1), TEST_LAUNCHER, TierExpectation::Recorded)
+                .tier_gate(&degraded)
+                .is_ok()
+        );
     }
 
     /// The audit adapter carries the record verbatim — including `None`, which
@@ -5086,10 +5084,11 @@ mod live {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::net::intent::{IntentRegistry, DEFAULT_TTL};
+    use crate::net::intent::{DEFAULT_TTL, IntentRegistry};
     use crate::net::learned::LearnedStore;
     use crate::net::prompt::{
-        DialogFn, DialogUnavailable, PromptConfig, PromptCoordinator, PromptPolicy,
+        DialogFn, DialogRequest, DialogUnavailable, PromptConfig, PromptCoordinator, PromptPolicy,
+        PromptResult,
     };
     use crate::net::proxy::LaunchProofCounters;
     use crate::net::token::RunToken;
@@ -5345,6 +5344,26 @@ mod live {
             Self::named("intent")
         }
 
+        /// A scratch directory whose name carries nothing `cmd.exe` parses
+        /// specially.
+        ///
+        /// P2.2 hands a `.bat` path to `cmd /c "<path>"`, and cmd's `/c`
+        /// quote-stripping heuristic gives up on `(` or `)` — which the
+        /// `ThreadId(n)` names in [`Scratch::named`] contain. Observed: the child
+        /// exited 1 with `Zugriff verweigert` and no stdout, i.e. cmd refused the
+        /// command line rather than the script.
+        fn plain(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "sandbox-mxc-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
         fn path(&self) -> &Path {
             &self.0
         }
@@ -5394,7 +5413,7 @@ mod live {
     fn process_is_elevated() -> bool {
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Security::{
-            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
         };
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         // SAFETY: the token handle is closed on every path, and the information
@@ -5632,6 +5651,32 @@ mod live {
         /// The same listener with a run token of its own (P1.4's two-run test
         /// needs two sessions that must not be able to speak for each other).
         fn start_with_token(allow: &[&str], token: RunToken) -> Self {
+            // Never called: a session that expects this listener's allow-list to
+            // answer never prompts. A dialog that reports itself unavailable makes
+            // an accidental prompt a denial rather than a hang.
+            let dialog: DialogFn = Arc::new(|_request| Err(DialogUnavailable));
+            Self::start_with(allow, token, false, dialog)
+        }
+
+        /// A listener whose D-3.5 prompt really fires (P2.2 leg 2), with the
+        /// dialog seam supplied by the caller: the seam is the only place that
+        /// sees what the user would be shown for a consultation.
+        fn start_prompting(allow: &[&str], dialog: DialogFn) -> Self {
+            Self::start_with(
+                allow,
+                RunToken::issue().expect("mint a live token"),
+                true,
+                dialog,
+            )
+        }
+
+        /// The one constructor: credential, prompt posture, dialog seam.
+        fn start_with(
+            allow: &[&str],
+            token: RunToken,
+            prompt_enabled: bool,
+            dialog: DialogFn,
+        ) -> Self {
             let learned_base = std::env::temp_dir().join(format!(
                 "sandbox-mxc-live-learned-{}-{}",
                 std::process::id(),
@@ -5642,12 +5687,8 @@ mod live {
                 LearnedStore::load_in(&learned_base, Some("live")).expect("learned store"),
             ));
             let intent = Arc::new(IntentRegistry::new(DEFAULT_TTL));
-            // Never called: the origin is allow-listed, so the pipeline answers
-            // from the allow-list. A dialog that reports itself unavailable makes
-            // an accidental prompt a denial rather than a hang.
-            let dialog: DialogFn = Arc::new(|_request| Err(DialogUnavailable));
             let prompt = crate::net::proxy::PromptGate {
-                enabled: false,
+                enabled: prompt_enabled,
                 config: PromptConfig {
                     timeout: Duration::from_secs(1),
                     on_unavailable: PromptPolicy::Deny,
@@ -6895,10 +6936,10 @@ mod live {
                 )
             });
             attempts.push(ConcurrencyAttempt {
-                a: (run.0 .0, run.0 .1),
-                b: (run.1 .0, run.1 .1),
-                out_a: run.0 .2,
-                out_b: run.1 .2,
+                a: (run.0.0, run.0.1),
+                b: (run.1.0, run.1.1),
+                out_a: run.0.2,
+                out_b: run.1.2,
             });
             let last = attempts.len() - 1;
             // Every attempt, outcome included - not just the one that gets used.
@@ -7398,6 +7439,608 @@ mod live {
         );
         println!(
             "EVIDENCE done: powershell started inside the container and printed FXOK (ui.disable = false)"
+        );
+    }
+
+    // =====================================================================
+    // P2.2: the D-4 control plane, proven from INSIDE a container
+    // =====================================================================
+    //
+    // ADR-0001 §D-4 puts three endpoints on the proxy's loopback listener:
+    // `POST /sandbox/intent` (204 / 400), `GET /sandbox/intent?host=` (200 with
+    // `{host, reason, ts}` / 404) and `POST /sandbox/intent/explain` (204,
+    // one-shot). The child reaches them DIRECTLY — `NO_PROXY` bypasses the proxy
+    // for loopback — and identifies itself with `Proxy-Authorization: Basic
+    // <sandbox:token>`.
+    //
+    // The two legs below are the MXC half of that contract. They are in-process
+    // on purpose: `main.rs` refuses `--backend mxc` and the VM harness never
+    // passes it, so no VM scenario can exercise this backend until the wiring
+    // lands in P3 (the plan's standing coverage note). VM scenario S-77 is the
+    // AppContainer baseline, and it checks strictly less than leg 1.
+
+    /// The host the container declares intent for. `.example` is reserved, so a
+    /// stray lookup could never leave this machine even if one were attempted.
+    const P22_HOST: &str = "p22-declared.example";
+
+    /// The reason the agent inside the container declares. Spelled once, so the
+    /// GET must return *this* string rather than merely a non-empty one.
+    const P22_REASON: &str = "reason-declared-from-inside-the-container";
+
+    /// A host the container consults and that nothing allow-lists, so the D-3.5
+    /// prompt is the only layer that can answer (leg 2).
+    const P22_PROMPT_HOST: &str = "p22-prompt.example";
+
+    /// What every P2.2 script starts with: derive the control-plane endpoint from
+    /// the session's **own** proxy variable, and derive the
+    /// `Proxy-Authorization: Basic` credential from that same token.
+    ///
+    /// This is done the way a real workload has to do it, because it is part of
+    /// what the leg proves. The MXC launcher injects
+    /// `HTTP_PROXY=http://sandbox:<token>@127.0.0.1:<port>` and
+    /// `NO_PROXY=localhost,127.0.0.1,::1`; nothing else names the endpoint —
+    /// the AppContainer path's `SANDBOX_PROXY_PORT` is *not* injected here
+    /// (recorded as a parity gap in the plan's P2.2 note). `cmd.exe` cannot
+    /// base64, so the credential comes from `certutil`: one PEM block whose
+    /// payload lines are concatenated (a 64-hex run token makes the payload wrap
+    /// at 64 columns, and using only the first line produced a truncated
+    /// credential — every call answered 407 until this joined them).
+    const P22_PRELUDE: &str = r#"@echo off
+rem Delayed expansion: the payload below can span more than one 64-column line.
+setlocal enabledelayedexpansion
+rem The endpoint, from the child's own environment: no argument from the test.
+for /f "tokens=3,5 delims=:@" %%a in ("%HTTP_PROXY%") do (
+  set "TOK=%%a"
+  set "PORT=%%b"
+)
+if not defined TOK ( echo MARK parse=no_token & exit 4 )
+if not defined PORT ( echo MARK parse=no_port & exit 4 )
+echo MARK parsed_port=%PORT%
+rem `set /p` with '=...' writes NO trailing newline: `echo` would add CRLF to the
+rem file, certutil would encode it, and the credential would carry a stray CRLF
+rem (observed: every call answered 407 because the password did not match).
+<nul > creds.txt set /p "=sandbox:%TOK%"
+certutil -encode -f creds.txt creds.b64 >nul 2>&1
+set "B64="
+for /f "skip=1 delims=" %%L in (creds.b64) do if not "%%L"=="-----END CERTIFICATE-----" set "B64=!B64!%%L"
+del creds.txt creds.b64 >nul 2>&1
+if not defined B64 ( echo MARK base64=failed & exit 4 )
+echo MARK auth=derived
+set "H=Proxy-Authorization: Basic %B64%"
+set "AURL=http://127.0.0.1:%PORT%/sandbox/intent"
+"#;
+
+    /// The eight calls of leg 1: the roundtrip, the one-shot, and the three
+    /// negative cases. Each status is a `MARK` line on stdout *and* an artifact
+    /// in the workspace, so a failure can be diagnosed from the file rather than
+    /// inferred from curl's exit code.
+    ///
+    /// The credential-dependent calls are the proof that the child identified
+    /// itself: the listener answers 407 to every credential that is not its
+    /// run's (P1.4), before it routes anything.
+    const P22_ROUNDTRIP_BODY: &str = r#"> body-declare.json echo {"target":"__HOST__","reason":"__REASON__"}
+> body-explain.json echo {"host":"__HOST__"}
+> body-malformed.json echo this-is-not-json
+curl -sS -o out-post.txt -w "MARK post_intent=%%{http_code}\n" -H "%H%" -H "Content-Type: application/json" --data-binary @body-declare.json "%AURL%"
+curl -sS -o out-get-declared.json -w "MARK get_declared=%%{http_code}\n" -H "%H%" "%AURL%?host=__HOST__"
+curl -sS -o out-explain.txt -w "MARK post_explain=%%{http_code}\n" -H "%H%" -H "Content-Type: application/json" --data-binary @body-explain.json "%AURL%/explain"
+curl -sS -o out-get-flagged.json -w "MARK get_after_explain=%%{http_code}\n" -H "%H%" "%AURL%?host=__HOST__"
+curl -sS -o out-get-consumed.json -w "MARK get_after_consume=%%{http_code}\n" -H "%H%" "%AURL%?host=__HOST__"
+curl -sS -o out-get404.json -w "MARK get_undeclared=%%{http_code}\n" -H "%H%" "%AURL%?host=never-declared-p22.example"
+curl -sS -o out-post400.txt -w "MARK post_malformed=%%{http_code}\n" -H "%H%" -H "Content-Type: application/json" --data-binary @body-malformed.json "%AURL%"
+curl -sS -o out-get407.txt -w "MARK get_wrong_credential=%%{http_code}\n" -H "Proxy-Authorization: Basic c2FuZGJveDp3cm9uZw==" "%AURL%?host=__HOST__"
+echo MARK done
+"#;
+
+    /// Leg 2's two calls: declare the intent, then consult the host. Both marker
+    /// lines also go to files, because the launch is *expected* to fail guardrail
+    /// 1 (a consultation), so the launch's stdout is not available to assert on.
+    ///
+    /// `exit /b 0` is deliberate: the CONNECT is meant to be refused, and the
+    /// evidence is the marker files plus the dialog, not the child's exit code.
+    const P22_PROMPT_BODY: &str = r#"> body-prompt.json echo {"target":"__HOST__","reason":"__REASON__"}
+curl -sS -o out-prompt-post.txt -w "MARK prompt_intent=%%{http_code}\n" -H "%H%" -H "Content-Type: application/json" --data-binary @body-prompt.json "%AURL%" > markers-prompt.txt
+type markers-prompt.txt
+curl -sS -o out-prompt-connect.txt -w "MARK prompt_connect=%%{http_code}\n" --max-time 10 "https://__HOST__/" > markers-connect.txt
+type markers-connect.txt
+echo MARK done
+exit /b 0
+"#;
+
+    /// Write one CRLF batch file (shared prelude + `body`) into the container's
+    /// workspace and return the command line that runs it.
+    fn p22_script(dir: &Path, name: &str, host: &str, reason: &str, body: &str) -> String {
+        let path = dir.join(format!("{name}.bat"));
+        let script = format!("{P22_PRELUDE}{body}")
+            .replace("__HOST__", host)
+            .replace("__REASON__", reason);
+        // CRLF before it reaches cmd.exe, and independently of the source file's
+        // own line endings (a batch file with bare LF loses `for /f` lines).
+        let script = script.replace("\r\n", "\n").replace('\n', "\r\n");
+        std::fs::write(&path, script.as_bytes())
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        format!("cmd /c \"{}\"", path.display())
+    }
+
+    /// One `MARK key=value` line from a P2.2 script's stdout.
+    fn mark(stdout: &str, key: &str) -> Option<String> {
+        let prefix = format!("MARK {key}=");
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .map(|value| value.trim().to_string())
+    }
+
+    /// One `MARK key=<http status>` line, as a number.
+    fn mark_code(stdout: &str, key: &str) -> Option<u16> {
+        mark(stdout, key).and_then(|value| value.parse().ok())
+    }
+
+    /// What the dialog seam saw, one `(host, agent reason)` per consultation.
+    ///
+    /// An alias rather than the literal type: the seam is what P2.2 leg 2
+    /// asserts on, and `clippy::type_complexity` asks for exactly this.
+    type DialogCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// The eight statuses leg 1 asserts, printed in one line.
+    fn p22_statuses(stdout: &str) -> String {
+        [
+            "post_intent",
+            "get_declared",
+            "post_explain",
+            "get_after_explain",
+            "get_after_consume",
+            "get_undeclared",
+            "post_malformed",
+            "get_wrong_credential",
+        ]
+        .iter()
+        .map(|key| format!("{key}={:?}", mark_code(stdout, key)))
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+
+    /// P2.2 leg 1 of 2: **the whole D-4 roundtrip, end to end, from inside an MXC
+    /// container**, against the supervisor's real listener.
+    ///
+    /// Proven in this leg (all unelevated, on this host):
+    ///
+    /// 1. the child carries `NO_PROXY` with all three loopback spellings, and the
+    ///    proxy variable that carries the session token;
+    /// 2. it derives the endpoint and its `Basic` credential from that token
+    ///    itself (no argument is handed to it by the test);
+    /// 3. `POST /sandbox/intent` → 204, then `GET …?host=` → 200 with the
+    ///    declared reason, the normalized host and an RFC3339 `ts`;
+    /// 4. `POST /sandbox/intent/explain` → 204 sets the flag, the first GET
+    ///    reports `"hint":"explain-more"`, and the *next* GET reports
+    ///    `"hint":"declared"` — the flag is one-shot;
+    /// 5. an undeclared host is 404, a malformed body is 400, and a wrong
+    ///    credential is 407 (`the control plane is not an unauthenticated
+    ///    oracle`);
+    /// 6. none of the eight calls is a proxy consultation: the listener's own
+    ///    counters stay `{accepted: 0, tunnels: 0}`, which is what
+    ///    `ProofExpectation::MustBeAbsent` refuses the launch over;
+    /// 7. the only audit leaf the launch writes is the wrong credential's
+    ///    `foreign_token` refusal (`host: "<unknown>"`), and nothing names a host
+    ///    or allows anything — an intent call is not a decision.
+    #[test]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    fn d4_intent_roundtrip_from_inside_the_container_is_proven() {
+        let launcher = launcher_under_test();
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let scratch = Scratch::plain("p22-intent");
+        let dir = scratch.path().to_path_buf();
+        let backend = supervisor_backend(
+            counters.as_ref(),
+            Some(proxy.port()),
+            Some(proxy.token().value()),
+            &launcher,
+        )
+        .with_budget(SessionBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(80),
+            Duration::from_secs(10),
+        ));
+
+        println!(
+            "EVIDENCE elevated={} launcher={} proxy_port={} sid={}",
+            process_is_elevated(),
+            launcher.display(),
+            proxy.port(),
+            proxy.sid
+        );
+
+        // ---- 1. the child's environment: NO_PROXY and the session token -----
+        let outcome = backend
+            .launch(
+                &live_input(proxy.port(), &dir, &launcher, "cmd /c set".to_string()),
+                ProofExpectation::MustBeAbsent,
+            )
+            .expect("environment dump launch");
+        let env_dump = stdout_of(&outcome);
+        let no_proxy = env_dump
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("no_proxy="))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default();
+        let http_proxy = env_dump
+            .lines()
+            .find(|line| line.to_ascii_uppercase().starts_with("HTTP_PROXY="))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default();
+        println!(
+            "EVIDENCE child_env {no_proxy:?} {http_proxy:?} proof={:?}",
+            outcome.proxy_proof
+        );
+        let no_proxy_value = no_proxy
+            .split_once('=')
+            .map(|(_, value)| value.trim())
+            .unwrap_or_default();
+        assert_eq!(
+            no_proxy_value, "localhost,127.0.0.1,::1",
+            "the child must carry NO_PROXY from the launcher: {no_proxy:?}"
+        );
+        for spelling in ["localhost", "127.0.0.1", "::1"] {
+            assert!(
+                no_proxy_value.split(',').any(|host| host == spelling),
+                "NO_PROXY must name the loopback spelling {spelling}: {no_proxy_value:?}"
+            );
+        }
+        // Without the token in the proxy variable a real workload has no
+        // credential for the control plane, so the endpoints would be
+        // unreachable while NO_PROXY still looked correct.
+        assert!(
+            http_proxy.to_ascii_lowercase().contains(&format!(
+                "sandbox:{}@127.0.0.1:{}",
+                proxy.token().value(),
+                proxy.port()
+            )),
+            "the child's proxy variable must carry the session token: {http_proxy:?}"
+        );
+
+        // ---- 2. the roundtrip, the one-shot and the negative cases ----------
+        let command = p22_script(
+            &dir,
+            "p22-roundtrip",
+            P22_HOST,
+            P22_REASON,
+            P22_ROUNDTRIP_BODY,
+        );
+        println!("EVIDENCE roundtrip_command={command:?}");
+        let outcome = backend
+            .launch(
+                &live_input(proxy.port(), &dir, &launcher, command),
+                ProofExpectation::MustBeAbsent,
+            )
+            .expect("intent calls are not proxy consultations, so guardrail 1 must see {0,0}");
+        let out = stdout_of(&outcome);
+        println!(
+            "EVIDENCE roundtrip exit={:?} success={} proof={:?} expectation={:?} tier={:?}",
+            outcome.exit_code,
+            outcome.success(),
+            outcome.proxy_proof,
+            outcome.expectation,
+            outcome.tier.tier
+        );
+        println!("EVIDENCE roundtrip_stdout={:?}", out.trim());
+        println!("EVIDENCE roundtrip_stderr={:?}", stderr_of(&outcome).trim());
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "the control-plane script must exit 0: {outcome:?}"
+        );
+        assert!(
+            out.contains("MARK done"),
+            "the script must have run every call: {out:?}"
+        );
+        // The endpoint came from the child's own environment, not from the test:
+        // if the test had supplied it, this line could not exist.
+        assert_eq!(
+            mark(&out, "parsed_port"),
+            Some(proxy.port().to_string()),
+            "the child must derive the port from its own HTTP_PROXY: {out:?}"
+        );
+        assert_eq!(
+            mark(&out, "auth"),
+            Some("derived".to_string()),
+            "the child must derive its own Basic credential from the session token: {out:?}"
+        );
+
+        println!("EVIDENCE statuses {}", p22_statuses(&out));
+        assert_eq!(
+            mark_code(&out, "post_intent"),
+            Some(204),
+            "POST /sandbox/intent must answer 204: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "get_declared"),
+            Some(200),
+            "GET /sandbox/intent must answer 200 for a declared host: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "post_explain"),
+            Some(204),
+            "POST /sandbox/intent/explain must answer 204: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "get_after_explain"),
+            Some(200),
+            "the GET after an explain POST must still answer 200: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "get_after_consume"),
+            Some(200),
+            "the second GET after an explain POST must still answer 200: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "get_undeclared"),
+            Some(404),
+            "an undeclared host must be 404, never a fabricated entry: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "post_malformed"),
+            Some(400),
+            "a malformed body must be 400, never a 204 that swallows it: {out:?}"
+        );
+        assert_eq!(
+            mark_code(&out, "get_wrong_credential"),
+            Some(407),
+            "a wrong credential must be refused before routing, or the control plane is an \
+             unauthenticated oracle: {out:?}"
+        );
+
+        // ---- 3. the bodies: the declared reason, the ts, the one-shot -------
+        let body = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let parsed = |name: &str| -> serde_json::Value {
+            serde_json::from_str(&body(name))
+                .unwrap_or_else(|e| panic!("{name} is not JSON ({e}): {:?}", body(name)))
+        };
+
+        let declared = parsed("out-get-declared.json");
+        println!("EVIDENCE get_declared_body={declared}");
+        assert_eq!(
+            declared["host"], P22_HOST,
+            "GET must echo the normalized host it looked up: {declared}"
+        );
+        assert_eq!(
+            declared["reason"], P22_REASON,
+            "GET must return the reason the container declared, verbatim: {declared}"
+        );
+        assert_eq!(
+            declared["hint"], "declared",
+            "a declared entry with no explain request reports `declared`: {declared}"
+        );
+        let ts = declared["ts"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a 200 must carry a ts: {declared}"));
+        assert!(
+            ts.len() == 20
+                && ts.ends_with('Z')
+                && ts.as_bytes()[4] == b'-'
+                && ts.as_bytes()[10] == b'T',
+            "ts must be RFC3339 UTC whole seconds (YYYY-MM-DDTHH:MM:SSZ): {ts:?}"
+        );
+        let year: u32 = ts[..4].parse().expect("a four-digit year");
+        assert!(
+            year >= 2026,
+            "ts must be this run's wall clock, not the epoch: {ts:?}"
+        );
+
+        // D-4's one-shot: the explain POST sets the flag, ONE read consumes it.
+        let flagged = parsed("out-get-flagged.json");
+        println!("EVIDENCE get_after_explain_body={flagged}");
+        assert_eq!(
+            flagged["hint"], "explain-more",
+            "POST /sandbox/intent/explain must take effect: the next GET reports the hint \
+             (the 204 alone would not prove it): {flagged}"
+        );
+        let consumed = parsed("out-get-consumed.json");
+        println!("EVIDENCE get_after_consume_body={consumed}");
+        assert_eq!(
+            consumed["hint"], "declared",
+            "the explain-more flag is ONE-SHOT: the read above consumed it, so the next GET must \
+             not report it again: {consumed}"
+        );
+        assert_eq!(
+            consumed["reason"], P22_REASON,
+            "consuming the hint must not disturb the entry: {consumed}"
+        );
+
+        let undeclared = parsed("out-get404.json");
+        println!("EVIDENCE get_undeclared_body={undeclared}");
+        assert_eq!(
+            undeclared["hint"], "undeclared",
+            "a 404 reports the undeclared hint: {undeclared}"
+        );
+        assert_eq!(
+            undeclared["reason"], "",
+            "a 404 must not invent a reason: {undeclared}"
+        );
+        assert_eq!(
+            body("out-post400.txt"),
+            "",
+            "a 400 carries no body: {:?}",
+            body("out-post400.txt")
+        );
+        assert_eq!(
+            body("out-get407.txt"),
+            "",
+            "a 407 carries no body: {:?}",
+            body("out-get407.txt")
+        );
+
+        // ---- 4. no proxy consultation, and no decision leaf ----------------
+        assert_eq!(
+            outcome.expectation,
+            ProofExpectation::MustBeAbsent,
+            "the intent calls can only be proven direct if the session expected no consultation"
+        );
+        assert_eq!(
+            outcome.proxy_proof,
+            ProxyProof::default(),
+            "an intent call is served on the listener but is NOT a proxy consultation: the \
+             counters must be {{accepted: 0, tunnels: 0}} across the whole roundtrip: {outcome:?}"
+        );
+
+        let leaves = audit_leaves(&proxy.sid);
+        for leaf in &leaves {
+            println!("EVIDENCE audit_leaf={leaf}");
+        }
+        assert_eq!(
+            connect_leaves(&proxy.sid),
+            leaves.len(),
+            "every leaf this launch wrote is a CONNECT-shaped leaf: {leaves:?}"
+        );
+        assert!(
+            leaves.iter().all(|leaf| leaf["host"] == "<unknown>"),
+            "no intent call may write a decision leaf naming a host: {leaves:?}"
+        );
+        assert!(
+            leaves.iter().all(|leaf| leaf["disposition"] != "allow"),
+            "no intent call may write an allow leaf: {leaves:?}"
+        );
+        assert_eq!(
+            leaves.len(),
+            1,
+            "exactly one leaf is expected: the wrong credential's own refusal (P1.4 records a \
+             foreign token, which is not a decision): {leaves:?}"
+        );
+        assert_eq!(
+            leaves[0]["reason"], "foreign_token",
+            "the 407 must be recorded as a refused credential, not as a decision: {leaves:?}"
+        );
+
+        println!(
+            "EVIDENCE done: D-4 roundtrip (204/200/204, one-shot consumed), 404/400/407, zero \
+             proxy consultations, only the credential refusal in the chain"
+        );
+    }
+
+    /// P2.2 leg 2 of 2: **D-4's actual point** — a reason declared by a process
+    /// *inside the container* is what the user's dialog sees when that host is
+    /// consulted.
+    ///
+    /// `prompt_default` (`src/net/proxy.rs`) reads the registry through
+    /// `ctx.prompt.intent.lookup_host(host)` before it calls the coordinator, and
+    /// the unit test `prompt_receives_declared_intent_reason` pins that wiring
+    /// in-process. This leg proves the same thing **across the container
+    /// boundary**: the child POSTs the intent, then the child itself issues a
+    /// CONNECT, and the dialog seam — the only thing that sees the request —
+    /// receives the child's own string.
+    ///
+    /// The launch is *expected* to fail guardrail 1 with
+    /// `ProxyConsultedUnexpectedly`: that failure is the proof that the CONNECT
+    /// really reached the decision pipeline, i.e. that the reason was not observed
+    /// by some shortcut the product does not take.
+    #[test]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    fn a_declared_intent_is_the_prompt_reason_from_inside_the_container() {
+        let launcher = launcher_under_test();
+        let seen: DialogCalls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let dialog: DialogFn = Arc::new(move |request: &DialogRequest| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((request.host.clone(), request.reason.clone()));
+            Ok(PromptResult::Deny {
+                persist: false,
+                scope: "host".to_string(),
+                suffix: None,
+            })
+        });
+        let proxy = LiveProxy::start_prompting(&[], dialog);
+        let counters = proxy.counters();
+        let scratch = Scratch::plain("p22-prompt");
+        let dir = scratch.path().to_path_buf();
+        let backend = supervisor_backend(
+            counters.as_ref(),
+            Some(proxy.port()),
+            Some(proxy.token().value()),
+            &launcher,
+        )
+        .with_budget(SessionBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(80),
+            Duration::from_secs(10),
+        ));
+
+        println!(
+            "EVIDENCE elevated={} launcher={} proxy_port={} prompt_enabled=true consult_host={}",
+            process_is_elevated(),
+            launcher.display(),
+            proxy.port(),
+            P22_PROMPT_HOST
+        );
+        let command = p22_script(
+            &dir,
+            "p22-prompt",
+            P22_PROMPT_HOST,
+            P22_REASON,
+            P22_PROMPT_BODY,
+        );
+        let err = backend
+            .launch(
+                &live_input(proxy.port(), &dir, &launcher, command),
+                // The expectation a session with no network use states: the
+                // failure below is the positive evidence of a consultation.
+                ProofExpectation::MustBeAbsent,
+            )
+            .expect_err("the CONNECT must reach the proxy, so guardrail 1 must refuse the launch");
+        println!("EVIDENCE consult_guard={err}");
+        assert!(
+            matches!(err, MxcError::Guard(GuardError::ProxyConsultedUnexpectedly)),
+            "the CONNECT must have been counted as a real consultation, not skipped: {err:?}"
+        );
+
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let intent_marker = read("markers-prompt.txt");
+        let connect_marker = read("markers-connect.txt");
+        println!("EVIDENCE prompt_intent_marker={:?}", intent_marker.trim());
+        println!("EVIDENCE prompt_connect_marker={:?}", connect_marker.trim());
+        assert_eq!(
+            mark_code(&intent_marker, "prompt_intent"),
+            Some(204),
+            "the container must declare its intent before consulting: {intent_marker:?}"
+        );
+
+        let calls = seen.lock().unwrap().clone();
+        println!("EVIDENCE dialog_calls={calls:?}");
+        let for_host: Vec<&(String, Option<String>)> = calls
+            .iter()
+            .filter(|(host, _)| host == P22_PROMPT_HOST)
+            .collect();
+        assert!(
+            !for_host.is_empty(),
+            "the dialog must have been asked about the consulted host: {calls:?}"
+        );
+        assert!(
+            for_host
+                .iter()
+                .all(|(_, reason)| reason.as_deref() == Some(P22_REASON)),
+            "the dialog must receive the reason the container declared — D-4's point — not \
+             `None` and not some other string: {calls:?}"
+        );
+
+        let leaves = audit_leaves(&proxy.sid);
+        for leaf in &leaves {
+            println!("EVIDENCE audit_leaf={leaf}");
+        }
+        assert!(
+            leaves
+                .iter()
+                .any(|leaf| leaf["host"] == P22_PROMPT_HOST && leaf["disposition"] == "deny"),
+            "the refused consultation must be audited for the consulted host: {leaves:?}"
+        );
+        assert!(
+            leaves.iter().any(|leaf| leaf["source"] == "prompt"),
+            "the leaf must name the dialog as the decision's source: {leaves:?}"
+        );
+
+        println!(
+            "EVIDENCE done: the container's declared reason reached the prompt, and the \
+             consultation was counted"
         );
     }
 }
