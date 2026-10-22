@@ -171,6 +171,14 @@ outside the sandbox:
 sandbox run --profile opencode --allow-cwd -- opencode
 ```
 
+Start it **at the project's git root** — the directory `git rev-parse
+--show-toplevel` prints. opencode resolves its project from the repository, and
+from a subdirectory it reads the parent's `.git` and `.opencode`, which the
+container denies: the failure is `Error: Unexpected server error. Check server
+logs for details.` (exit 1) with nothing in opencode's own log, because it dies
+in the client before its server starts. Running it at the root of the same
+repository works — measured both ways with the same binary and profile.
+
 Two grants make that work, and the shipped `profiles/opencode.json` carries
 both:
 
