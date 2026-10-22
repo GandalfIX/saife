@@ -167,8 +167,17 @@ console, so an interactive tool renders and reads keys exactly as it would
 outside the sandbox:
 
 ```powershell
-sandbox run --profile opencode -- opencode
+# opencode, verified 2026-10-22: TUI renders, keys work, egress authenticated
+sandbox run --profile opencode --allow-cwd `
+  --read-only "$env:LOCALAPPDATA\Microsoft\WinGet" -- opencode
 ```
+
+The `--read-only` grant is only for *finding* the executable: an installed
+program lives in a directory the container cannot see, so its name does not
+resolve on the inherited `PATH`. Grant its install tree read-only and the bare
+name works. Everything opencode *writes* comes from its profile
+(`~/.local/share/opencode`, `~/.cache/opencode`, `~/.config/opencode`,
+`~/.local/state/opencode`), which the profile grants writable.
 
 Two consequences worth knowing:
 
@@ -183,11 +192,15 @@ When either stream is redirected, the captured mode is chosen automatically and
 nothing changes for existing callers.
 
 > **Known limitation (mxc-sdk 1.0.1): a stat of an ANCESTOR of a granted path is
-> refused.** A tool that probes its way up the tree — opencode `lstat`s
-> `C:\Users\<you>` at startup — fails there, because the container's policy
-> grants the granted directories and nothing else. Writing *inside* a grant works
-> (path resolution through the ancestors is implicit); reading their attributes
-> is not.
+> refused.** Writing *inside* a grant works (path resolution through the
+> ancestors is implicit); reading their attributes is not, and
+> `--allow $HOME:read` only partly closes it (measured).
+>
+> In practice this does **not** stop opencode 1.19.1: with its four state
+> directories granted it starts, renders and runs, even though the same session
+> refuses `if exist %USERPROFILE%`. Measured 2026-10-22 on the default backend,
+> unelevated — if a tool does fail on that call, this is the limitation to blame,
+> not the grant configuration.
 >
 > There is no clean fix to configure: the SDK's policy has four path classes
 > (read-write, read-only, deny, enumerate-without-read) and none means "traverse
