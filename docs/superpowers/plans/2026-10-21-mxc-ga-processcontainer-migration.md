@@ -303,6 +303,8 @@ containers.
 
 ## P2 — Prompt, intent, audit parity
 
+**D3 addendum (2026-10-22, found while re-baselining the VM suite):** the 60 s prompt budget must cover the plain-HTTP FORWARD path, not only CONNECT. Since D9 an absolute-form request to a host that is neither allow-listed nor blocklisted goes to the prompt policy; in a headless context there is no dialog to answer, and the client stalls until the budget expires (observed as curl exit 28 at `-m 15`). The budget has to be enforced on both legs, and a forward-path prompt timeout must produce the same deny leaf a CONNECT timeout does.
+
 **Files:** `src/net/mxc.rs`, `src/net/prompt.rs`, `src/audit/*.rs`, `src/main.rs`.
 
 - [ ] **P2.1** Budget: `timeout_ms = prompt_budget + workload_budget + slack`,
