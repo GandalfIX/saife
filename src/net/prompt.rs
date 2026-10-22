@@ -55,12 +55,29 @@
 //! with a per-host waiter list (pre-authorized deviation). Only the
 //! *leader* takes a semaphore permit; followers never do.
 //!
-//! Semaphore ([G-28]): at most [`MAX_CONCURRENT_PROMPTS`] (8) concurrent
-//! dialogs. The 9th prompt for a NEW host is immediately denied
-//! ([`PromptOutcome::Overloaded`], audited as source `prompt_overload`
-//! by 3.6). The permit is held until the dialog call returns — including
-//! by an orphaned dialog after a timeout ([G-4]) — so at most 8 live
-//! dialogs exist at any time.
+//! Capacities ([G-28]): **two pools, not one.** "At most 8 concurrent
+//! prompts" was true of the *consultations* the proxy is blocked on
+//! ([`MAX_CONCURRENT_PROMPTS`]); a 9th prompt for a NEW host is refused
+//! immediately ([`PromptOutcome::Overloaded`], audited as source
+//! `prompt_overload` by 3.6). It was never the number of live windows: a
+//! dialog that outlives its budget is abandoned — still on screen, still
+//! blocking a thread — and keeps a permit from [`MAX_ABANDONED_PROMPTS`]
+//! (16) until its call returns, so **live dialogs are bounded by 16 and
+//! consultations by 8** — every dialog holds an abandoned permit for its whole
+//! life, which is what makes that second number the bound on windows. Two pools is what lets a timed-out consultation
+//! give its slot back (P2.1: an orphaned dialog used to keep it for the life of
+//! the process, and eight headless timeouts wedged the whole path into
+//! permanent `Overloaded`) without licensing unbounded windows. The refusal
+//! names which pool ran out ([`OverloadCause`]).
+//!
+//! Fast-fail ([P2.1 review]): a session that has had
+//! [`NO_BACKEND_STICKY_AFTER`] consecutive consultations produce no decision —
+//! no dialog backend, or a budget that elapsed with the dialog unanswered, which
+//! is what a dialog with nobody at the desktop looks like — concludes that no
+//! answer is obtainable here and stops showing dialogs, applying
+//! `on_unavailable` immediately (audited `no_dialog_backend`, one leaf per
+//! request). Otherwise every unlisted host in a headless run costs the client
+//! the whole prompt budget.
 //!
 //! Timeout ([G-46], [G-4]): the async caller awaits the blocking dialog
 //! under `tokio::time::timeout` (plan Steps 3/6). A `timeout` of
@@ -172,10 +189,12 @@
 //!   audit source `default`); when prompting is disabled outright, 3.6
 //!   must not construct a coordinator call at all.
 //! - Consider including a live-dialog count in prompt audit events:
-//!   orphaned dialogs hold their permits until their dialog completes
-//!   ([G-4]) — enough orphans and 3.6 reports `prompt_overload` with no
-//!   visible dialogs left on screen; a live count makes that state
-//!   diagnosable from the audit trail.
+//!   dialogs the coordinator stopped waiting on stay up until their
+//!   blocking call returns ([G-4]) and hold a permit from
+//!   [`MAX_ABANDONED_PROMPTS`] — enough orphans and 3.6 reports
+//!   `prompt_overload` while the visible dialogs are the abandoned ones;
+//!   [`PromptCoordinator::abandoned_dialogs`] makes that state
+//!   diagnosable.
 //! - Intent timestamps in audit/registry responses are RFC3339.
 //!
 //! The module's API is not yet called from the release binary — the
@@ -194,7 +213,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE, RPC_E_CHANGED_MODE};
@@ -209,12 +228,115 @@ use windows::Win32::UI::Controls::{
 };
 use windows::core::{BOOL, HRESULT, HSTRING, PCWSTR, s, w};
 
-/// Default prompt timeout: 60 seconds ([G-46]; ADR field
+/// Default prompt timeout in seconds ([G-46]; ADR field
 /// `network.promptTimeoutSecs`).
-pub const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// The number, in the unit the profile speaks, so the resolver
+/// ([`crate::net::resolve_network`]) can use the same constant as the default it
+/// applies and the session budget can be sized from the resolved value
+/// ([`crate::net::mxc::SessionBudget::from_config`]) rather than from a second
+/// literal that could drift (P2.1 review, item 6).
+pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = 60;
 
-/// Maximum number of concurrently live dialogs ([G-28]).
+/// Default prompt timeout as a [`Duration`]: [`DEFAULT_PROMPT_TIMEOUT_SECS`],
+/// by construction.
+pub const DEFAULT_PROMPT_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_PROMPT_TIMEOUT_SECS as u64);
+
+/// Maximum number of concurrent **consultations** ([G-28]): dialogs the proxy
+/// is waiting on, one per leader (coalesced followers never take a permit).
+///
+/// Not the number of live dialogs: an abandoned dialog is no longer consulted
+/// with but is still a window, and it is bounded separately by
+/// [`MAX_ABANDONED_PROMPTS`]. The session-wide bound on windows is the sum.
 pub const MAX_CONCURRENT_PROMPTS: usize = 8;
+
+/// Maximum number of dialogs that may be *abandoned* — still up after the
+/// coordinator stopped waiting on them (P2.1).
+///
+/// [`MAX_CONCURRENT_PROMPTS`] bounds consultations in flight; a dialog that
+/// outlives its budget is no longer one of those (its request was denied on
+/// budget), but it is still a window and a blocking thread, so it may not be
+/// unbounded either. Two pools rather than one is what makes both properties
+/// true at once: slots return when a consultation ends, while live dialogs stay
+/// capped. Sixteen is twice the consultation cap — enough that a session keeps
+/// answering on budget long past the point where the *old* code wedged, and still
+/// a hard bound, because the fallback when it is reached is a named `Overloaded`
+/// denial ([G-28]), never an unbounded spawn. It is also the bound on LIVE
+/// windows: every dialog holds a permit from this pool for its whole life, so the
+/// session-wide number of dialogs is at most sixteen while only eight of them can
+/// be consultations the proxy is blocked on.
+///
+/// **A backstop, not a routine state** (P2.1 review): with the fast-fail at
+/// [`NO_BACKEND_STICKY_AFTER`] a DENY-posture session stops opening dialogs after
+/// three consecutive consultations produced no decision, so a headless run cannot
+/// fill this pool any more — that is the point of the fast-fail. It is still
+/// reachable and still has to fail closed, because "cannot happen through that
+/// path" is not "cannot happen": the fast-fail does not apply under
+/// `on_unavailable = allow` (round 2, item 4), and a latch that has run out its
+/// re-probe cooldown opens a dialog again (item 3).
+pub const MAX_ABANDONED_PROMPTS: usize = 2 * MAX_CONCURRENT_PROMPTS;
+
+/// How many consecutive consultations may run without a decision before the
+/// coordinator stops asking (P2.1 review round 2, item 5).
+///
+/// **Why remembering is correct.** Whether a dialog can be answered at all is a
+/// property of the *environment*, not of the request: a headless session (a
+/// service window station, a VM guest with no interactive desktop) has nobody to
+/// click, and the machine will not grow a desktop in the next 60 s. Before this,
+/// every unlisted host cost the client the whole prompt budget — the D3
+/// addendum's `curl -m 15` exit 28, one stall per host. After
+/// [`NO_BACKEND_STICKY_AFTER`] consecutive consultations that produced no
+/// decision (a backend failure, or a budget that elapsed with the dialog
+/// unanswered), later consultations skip the dialog and apply the resolved
+/// `on_unavailable` policy immediately.
+///
+/// **Three, not two** (round 2, item 5). Two consultations that run concurrently
+/// start together and elapse at the same deadline, so "two in a row" could be ONE
+/// budget's worth of evidence, and it left no grace consultation after the
+/// second. Three consecutive observations tolerate two hiccups — a transient
+/// COM/activation failure plus a saturated deadline — before a session concludes
+/// nobody is at the desk. `observe` runs once per LEADER, so the three are three
+/// distinct consultations.
+///
+/// **The trade, stated.** The cost is the mirror image of the saving: a real
+/// desktop whose UI is lost (the dialog stops appearing) degrades to deny rather
+/// than stalling the workload for a budget it cannot spend usefully. Refusing
+/// fast is the fail-closed side of the same fact the policy already states — a
+/// missed prompt never allows unless `onUnavailable` says so — and it applies
+/// ONLY to the deny posture (item 4). Under `on_unavailable = allow` a skip would
+/// silently *permit* every later unlisted host with no dialog at all, deleting the
+/// user's veto, so that configuration keeps consulting and pays the per-host
+/// budget: a headless + allow profile is the operator's explicit choice.
+///
+/// **It is not one-way** (item 3). Once armed nothing spawns a dialog, so the
+/// `Decided` reset would be unreachable and an operator who came back and clicked
+/// the still-open dialog would have their answer discarded, with no recovery but
+/// restarting the run. After [`NO_BACKEND_REPROBE_COOLDOWN`] the next consultation
+/// re-probes once: a working dialog un-arms the latch (a decision resets the
+/// streak), a failing one re-arms it for another cooldown.
+///
+/// **It is LAUNCH-scoped, not listener-scoped** (item 2). The coordinator belongs
+/// to a listener, and a listener can serve sequential launches — that is what the
+/// P1.4 epoch machinery exists for. [`PromptCoordinator::begin_launch`] clears the
+/// latch at every epoch open, so launch N's stalled prompts cannot deny every
+/// prompt of launch N+1.
+///
+/// The refusal is named for what ARMED the latch (item 8): `no_dialog_backend`
+/// when consecutive consultations found no dialog at all, and
+/// `prompt_suppressed_after_budget` when they were budgets that elapsed with the
+/// dialog up. Folding those back together is what made a session whose backend
+/// demonstrably worked read as a machine with no desktop.
+pub const NO_BACKEND_STICKY_AFTER: usize = 3;
+
+/// How long an armed fast-fail waits before it consults a dialog again (P2.1
+/// review round 2, item 3).
+///
+/// Ten minutes: long enough that a headless run does not pay a 60 s budget per
+/// host once a minute, short enough that an operator who comes back gets prompts
+/// back within one coffee instead of restarting the run. Tests pass a short one
+/// through [`PromptCoordinator::with_cooldown`].
+pub const NO_BACKEND_REPROBE_COOLDOWN: Duration = Duration::from_secs(600);
 
 // Custom TaskDialog button ids: arbitrary nonzero values that must not
 // collide with the reserved common-button ids (IDOK=1, IDCANCEL=2, ...).
@@ -323,9 +445,18 @@ pub enum PromptOutcome {
     /// The user clicked a button (or cancelled → Deny once). Audit
     /// source `prompt`.
     Decided(PromptResult),
-    /// All [`MAX_CONCURRENT_PROMPTS`] permits are held and this was a
-    /// NEW host ([G-28]). Audit source `prompt_overload`.
-    Overloaded,
+    /// A pool of dialog capacity ran out and this was a NEW host ([G-28]).
+    /// Audit source `prompt_overload`; the two pools are different facts and the
+    /// denial names which one (see [`OverloadCause`]).
+    Overloaded {
+        /// Which capacity the consultation could not get (P2.1 review). The
+        /// callers' answer is the same — refuse, never spawn unbounded dialogs —
+        /// but the remediation is not: a full consultation pool means this
+        /// session is asking about many hosts at once, while a full abandoned
+        /// pool means earlier dialogs are still on screen and nobody has
+        /// answered them.
+        cause: OverloadCause,
+    },
     /// Timeout or dialog backend failure ([G-4, G-19, G-46]); the
     /// `on_unavailable` policy has already been applied. Audit source
     /// `unavailable`.
@@ -333,11 +464,72 @@ pub enum PromptOutcome {
         /// The applied policy: `true` only when `on_unavailable` is
         /// `Allow` ([G-46]).
         allowed: bool,
+        /// **Why** no decision exists (P2.1). The policy answer is the same
+        /// either way, but the two are different facts about the session: a
+        /// budget that elapsed is this session's own prompt term being spent
+        /// (P2.1 budgets the container around it), while a backend failure means
+        /// no dialog could appear at all. Folding them together made the audit
+        /// leaf say "timeout or no dialog backend" — a reason a reader cannot
+        /// act on, and the one string a headless forward request and a broken
+        /// desktop would share.
+        cause: UnavailableCause,
     },
     /// Zero timeout: the prompt is disabled for this profile ([G-46]).
     /// Instant deny; no dialog was attempted. Audit source `default`
     /// (same as `--no-prompt`).
     Disabled,
+}
+
+/// Which of the two capacity pools refused a consultation ([G-28], P2.1).
+///
+/// Two pools, two causes, because the single `Overloaded` conflated them the way
+/// `Unavailable` used to conflate a spent budget with a missing backend: "too many
+/// concurrent prompts" was also what a headless session was told when its
+/// *abandoned* pool — dialogs nobody answered, still on screen — was full, so the
+/// audit read like a concurrency limit with no dialog in sight. Both are
+/// fail-closed refusals with no dialog attempted; only the reason differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverloadCause {
+    /// All [`MAX_CONCURRENT_PROMPTS`] consultation slots are held: the proxy is
+    /// blocked on that many dialogs right now.
+    ConsultationsHeld,
+    /// The abandoned pool ([`MAX_ABANDONED_PROMPTS`]) is full: that many earlier
+    /// dialogs are still running after their budgets elapsed, so their windows
+    /// (and blocking threads) are the capacity this consultation lacks.
+    AbandonedCapacity,
+}
+
+/// Why a consultation produced no decision ([G-19, G-46], P2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableCause {
+    /// The prompt budget elapsed with the dialog still up ([G-4, G-46]): the
+    /// dialog is orphaned and its late answer is discarded.
+    BudgetElapsed,
+    /// The dialog backend could not produce a decision at all — [`show_dialog`]
+    /// failed (no interactive desktop, an API error) or the blocking call
+    /// panicked ([G-19]).
+    NoDialogBackend,
+    /// The leader's caller went away before the dialog answered; this outcome
+    /// was fanned out to the parked followers ([G-6]). No budget of the
+    /// follower's own elapsed, so it is not a timeout of theirs.
+    CallerGone,
+    /// The fast-fail latch is armed and it was armed by consultations whose
+    /// budgets ELAPSED with the dialog up (P2.1 review round 2, item 8) — so this
+    /// session is not consulting again, and the reason says which fact stopped it.
+    /// Distinct from [`UnavailableCause::NoDialogBackend`]: the backend here
+    /// demonstrably worked (a dialog was shown and nobody answered it), and the
+    /// remedy is "be at the desk", not "run interactively".
+    SuppressedAfterBudget,
+}
+
+impl UnavailableCause {
+    /// `true` for the cause a *budget* produced. The proxy turns this into the
+    /// distinct `prompt_budget_exhausted` deny reason (P2.1) — a timed-out
+    /// consultation and a missing dialog backend must not read the same in the
+    /// audit chain.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::BudgetElapsed)
+    }
 }
 
 /// Injected dialog backend ([test seam]): one blocking call that shows
@@ -865,17 +1057,216 @@ type Waiters = StdMutex<Vec<oneshot::Sender<PromptOutcome>>>;
 type WaiterMap = Arc<Mutex<HashMap<String, Arc<Waiters>>>>;
 
 /// Coordinating entry point for the proxy pipeline (Task 3.6 wiring):
-/// coalescing ([G-6]), the 8-dialog semaphore ([G-28]) and the timeout +
-/// fallback policy ([G-4, G-19, G-46]) around one blocking dialog call.
+/// coalescing ([G-6]), the two capacity pools ([G-28] — [`MAX_CONCURRENT_PROMPTS`]
+/// consultations plus [`MAX_ABANDONED_PROMPTS`] abandoned windows) and the
+/// timeout + fallback policy ([G-4, G-19, G-46]) around one blocking dialog call.
 pub struct PromptCoordinator {
-    /// Caps concurrent live dialogs at [`MAX_CONCURRENT_PROMPTS`]
-    /// ([G-28]).
+    /// Caps concurrent **consultations** at [`MAX_CONCURRENT_PROMPTS`]
+    /// ([G-28]); abandoned windows are bounded by `abandoned` below.
     permits: Arc<Semaphore>,
     /// Normalized hostname → parked followers of the in-flight leader
     /// ([G-6]); shared with the supervisor tasks (see [`WaiterMap`]).
     waiters: WaiterMap,
+    /// Dialogs the coordinator stopped waiting on and cannot cancel (P2.1):
+    /// [`MAX_ABANDONED_PROMPTS`] permits, one per orphaned dialog, released when
+    /// its blocking call returns.
+    ///
+    /// Separate from `permits` on purpose. `permits` bounds the consultations the
+    /// proxy is **blocked on**, and a consultation whose budget elapsed is over:
+    /// leaving its slot occupied made eight timed-out consultations (the routine
+    /// state of a headless run — no dialog can be answered) wedge the whole
+    /// prompt path into permanent `Overloaded` for the rest of the process. This
+    /// pool is what keeps that fix bounded: an orphaned dialog still holds a real
+    /// window and a blocking thread, so it keeps a permit here until it returns,
+    /// and when this pool is exhausted a NEW dialog is refused rather than
+    /// spawning an unbounded number of them.
+    abandoned: Arc<Semaphore>,
     /// The injected dialog backend (real: [`show_dialog`]; tests: fake).
     dialog: DialogFn,
+    /// Session-scoped memory of consultations that produced no decision
+    /// ([`NO_BACKEND_STICKY_AFTER`]). Shared with the supervisor tasks, which are
+    /// the only place one dialog's outcome is known exactly once.
+    backend: Arc<BackendStickiness>,
+}
+
+/// What armed the fast-fail — carried so the audit names the arming cause and not
+/// the nearest-looking one (P2.1 review round 2, item 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmingCause {
+    /// Consecutive consultations found no dialog to show at all ([G-19]).
+    NoBackend,
+    /// Consecutive consultations spent their budget with the dialog unanswered
+    /// ([G-4]): a dialog exists, nobody is clicking it.
+    BudgetElapsed,
+}
+
+impl ArmingCause {
+    /// The cause `outcome` is evidence of, if it is evidence at all.
+    fn of(outcome: &PromptOutcome) -> Option<Self> {
+        match outcome {
+            PromptOutcome::Unavailable {
+                cause: UnavailableCause::NoDialogBackend,
+                ..
+            } => Some(Self::NoBackend),
+            PromptOutcome::Unavailable {
+                cause: UnavailableCause::BudgetElapsed,
+                ..
+            } => Some(Self::BudgetElapsed),
+            _ => None,
+        }
+    }
+
+    /// The cause a consultation the latch SKIPPED reports, and with it the audit
+    /// reason. The two arming causes stay apart: a suppressed budget and a missing
+    /// dialog have different remedies.
+    fn skip_cause(self) -> UnavailableCause {
+        match self {
+            Self::NoBackend => UnavailableCause::NoDialogBackend,
+            Self::BudgetElapsed => UnavailableCause::SuppressedAfterBudget,
+        }
+    }
+}
+
+/// The mutable half of the latch — one lock, so a re-probe and the streak it
+/// inherits are never observed half-applied.
+#[derive(Debug, Default)]
+struct StickyState {
+    /// Consecutive consultations that produced no user decision.
+    streak: usize,
+    /// `Some((cause, armed_at))` while the fast-fail is armed. The instant is what
+    /// the re-probe cooldown counts from (item 3), and the cause is what the
+    /// skipped consultations report (item 8).
+    armed: Option<(ArmingCause, std::time::Instant)>,
+}
+
+/// Memory of consultations that produced no decision
+/// ([`NO_BACKEND_STICKY_AFTER`]), scoped to a LAUNCH (item 2) and cleared by
+/// [`PromptCoordinator::begin_launch`].
+#[derive(Debug)]
+struct BackendStickiness {
+    state: StdMutex<StickyState>,
+    /// The streak that arms the fast-fail. `usize::MAX` in tests that pin the
+    /// two-pool mechanics independently of this policy.
+    after: usize,
+    /// How long an armed latch waits before it re-probes the backend (item 3).
+    cooldown: Duration,
+}
+
+/// What one consultation does about the dialog (P2.1 review round 2, item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StickyPlan {
+    /// Consult the dialog (the capacity pools permitting).
+    Consult,
+    /// Stop asking, and report this cause — the one that armed the latch (item 8).
+    Skip(UnavailableCause),
+}
+
+impl BackendStickiness {
+    fn new(after: usize) -> Self {
+        Self::with_cooldown(after, NO_BACKEND_REPROBE_COOLDOWN)
+    }
+
+    fn with_cooldown(after: usize, cooldown: Duration) -> Self {
+        Self {
+            state: StdMutex::new(StickyState::default()),
+            after,
+            cooldown,
+        }
+    }
+
+    /// The lock, recovered from poisoning instead of panicking: the latch is a
+    /// policy hint, and a panicking proxy worker would turn it into an outage.
+    fn lock(&self) -> std::sync::MutexGuard<'_, StickyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether this consultation consults a dialog, and if not, which cause to
+    /// report.
+    ///
+    /// Item 4: the fast-fail answer is the DENY posture's answer only. Under
+    /// `on_unavailable = allow` a skip would *permit* the host with no dialog —
+    /// the opposite of the deny the posture degrades to — so allow keeps
+    /// consulting.
+    ///
+    /// Item 3: an armed latch re-probes after its cooldown. The re-probe is ONE
+    /// consultation, and it leaves the streak one short of the threshold, so a
+    /// failed re-probe re-arms immediately (the outage continues) while a
+    /// successful one resets the streak through [`BackendStickiness::observe`].
+    fn plan(&self, policy: PromptPolicy) -> StickyPlan {
+        if policy == PromptPolicy::Allow {
+            return StickyPlan::Consult;
+        }
+        let mut state = self.lock();
+        let Some((cause, armed_at)) = state.armed else {
+            return StickyPlan::Consult;
+        };
+        if armed_at.elapsed() < self.cooldown {
+            return StickyPlan::Skip(cause.skip_cause());
+        }
+        state.armed = None;
+        state.streak = self.after.saturating_sub(1);
+        StickyPlan::Consult
+    }
+
+    /// Fold one consultation's outcome into the latch. Exactly once per
+    /// consultation, and only for the LEADER: a coalesced follower reports the same
+    /// dialog's outcome and must not count it again.
+    ///
+    /// Reset on a decision (the backend works); count a missing backend and an
+    /// elapsed budget (no decision was obtainable — the routine headless shape is
+    /// the budget one, because a hang is what a dialog with nobody at the desktop
+    /// does); leave [`PromptOutcome::Overloaded`] and [`PromptOutcome::Disabled`]
+    /// alone, since neither consulted a dialog and neither is evidence either way.
+    /// `CallerGone` is not evidence about the backend either: the dialog may be on
+    /// screen and answering fine.
+    fn observe(&self, outcome: &PromptOutcome) {
+        let mut state = self.lock();
+        if matches!(outcome, PromptOutcome::Decided(_)) {
+            state.streak = 0;
+            state.armed = None;
+            return;
+        }
+        let Some(cause) = ArmingCause::of(outcome) else {
+            return;
+        };
+        // Saturating: `usize::MAX` means "never arm" in tests, and a counter that
+        // wrapped would arm the fast-fail accidentally.
+        state.streak = state.streak.saturating_add(1);
+        // Stamped on the ARMING observation only: a consultation the latch already
+        // skipped is not new evidence, and re-stamping here would restart the
+        // re-probe cooldown on every request, so a session under steady traffic
+        // would never re-probe at all (item 3).
+        if state.streak >= self.after && state.armed.is_none() {
+            state.armed = Some((cause, std::time::Instant::now()));
+        }
+    }
+
+    /// Forget everything: a new LAUNCH starts with no history (item 2).
+    fn begin_launch(&self) {
+        *self.lock() = StickyState::default();
+    }
+}
+
+/// What a leader's consultation will do about the dialog (P2.1 review, item 4).
+///
+/// Three arms rather than `Option<(permit, handle)>` because "no dialog" has two
+/// different reasons and every refusal must still finish the coalescing entry.
+enum DialogPlan {
+    /// Both permits were acquired: the dialog runs, holding them.
+    Show(
+        OwnedSemaphorePermit,
+        tokio::task::JoinHandle<Result<PromptResult, DialogUnavailable>>,
+    ),
+    /// Capacity ran out; no dialog was attempted.
+    Refused(OverloadCause),
+    /// The latch is armed ([`NO_BACKEND_STICKY_AFTER`] consecutive consultations
+    /// produced no decision, under the deny posture): no dialog is attempted and no
+    /// permit is taken, because there is nothing to wait for. The cause is the one
+    /// that ARMED it (item 8), so the audit can tell a suppressed budget from a
+    /// missing dialog.
+    SkipAbsentBackend(UnavailableCause),
 }
 
 impl PromptCoordinator {
@@ -891,11 +1282,76 @@ impl PromptCoordinator {
     /// lets the coalescing / semaphore / timeout logic run under real
     /// tests without a desktop.
     pub fn with_dialog(dialog: DialogFn) -> Self {
+        Self::with_dialog_and_stickiness(dialog, NO_BACKEND_STICKY_AFTER)
+    }
+
+    /// Coordinator with the caller's fast-fail threshold **and** re-probe cooldown
+    /// (P2.1 review round 2, item 3): how long an armed latch waits before it
+    /// consults a dialog again. Tests use milliseconds; production uses
+    /// [`NO_BACKEND_REPROBE_COOLDOWN`] through
+    /// [`PromptCoordinator::with_dialog`].
+    fn with_cooldown(dialog: DialogFn, after: usize, cooldown: Duration) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PROMPTS)),
+            abandoned: Arc::new(Semaphore::new(MAX_ABANDONED_PROMPTS)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             dialog,
+            backend: Arc::new(BackendStickiness::with_cooldown(after, cooldown)),
         }
+    }
+
+    /// Start a new LAUNCH on this listener's coordinator (P2.1 review round 2,
+    /// item 2).
+    ///
+    /// The latch lives on the coordinator, which is per listener and outlives a
+    /// launch, and nothing else resets it: one launch per process hid that, but a
+    /// listener CAN serve sequential launches (the P1.4 epoch machinery exists for
+    /// exactly that), and then launch N's stalled prompts would deny every prompt of
+    /// launch N+1 — a session that never prompted reporting
+    /// `no_dialog_backend`/`prompt_suppressed_after_budget`.
+    ///
+    /// Wired to the epoch: `proxy::spawn` registers this as the listener's launch
+    /// reset, and `LaunchCounters::begin_epoch` runs it, so the reset happens at the
+    /// same instant the attribution window opens.
+    pub fn begin_launch(&self) {
+        self.backend.begin_launch();
+    }
+
+    /// Coordinator with the fast-fail threshold chosen by the caller. Tests that
+    /// pin the two capacity pools pass `usize::MAX`: how *many* dialogs may be
+    /// live is a bound of its own, and the pool tests must not be re-derived from
+    /// a policy that stops opening dialogs after [`NO_BACKEND_STICKY_AFTER`] of them
+    /// go unanswered.
+    fn with_dialog_and_stickiness(dialog: DialogFn, after: usize) -> Self {
+        Self::with_cooldown(dialog, after, NO_BACKEND_REPROBE_COOLDOWN)
+    }
+
+    /// Live consultations: slots held by prompts the coordinator is still waiting
+    /// on (P2.1). Zero when nothing is being prompted; it must return to zero
+    /// after a timeout, because the timed-out consultation is over.
+    pub fn live_consultations(&self) -> usize {
+        MAX_CONCURRENT_PROMPTS - self.permits.available_permits()
+    }
+
+    /// Dialogs **still running after the coordinator stopped waiting on them**
+    /// (P2.1) — the number of windows nobody is waiting for any more. Bounded by
+    /// [`MAX_ABANDONED_PROMPTS`]; reaches zero as the orphaned calls return.
+    ///
+    /// Not "permits held": a dialog the coordinator is *still waiting on* holds
+    /// one of the same permits, so the raw permit arithmetic reports every live
+    /// consultation a second time — 8 parked consultations read as
+    /// `live=8 abandoned=8`, which is exactly the doubled number an incident
+    /// reader would take at face value. The subtraction is what makes the two
+    /// accessors describe disjoint sets: `live_consultations()` = dialogs being
+    /// awaited, `abandoned_dialogs()` = dialogs that outlived their budget and
+    /// whose late answer will be discarded.
+    pub fn abandoned_dialogs(&self) -> usize {
+        let held = MAX_ABANDONED_PROMPTS - self.abandoned.available_permits();
+        // Saturating: a dialog can return while its consultation is still live
+        // (the supervisor has not yet dropped the slot), which makes `held` a
+        // hair smaller than `live` — "no abandoned dialog" is the honest answer
+        // there, never a wrapped usize.
+        held.saturating_sub(self.live_consultations())
     }
 
     /// Ask the user about one request and await the outcome. `config`
@@ -907,10 +1363,29 @@ impl PromptCoordinator {
         reason: Option<String>,
         config: PromptConfig,
     ) -> PromptOutcome {
+        self.prompt_measured(host, port, reason, config).await.0
+    }
+
+    /// [`PromptCoordinator::prompt`], plus the wall clock **the leader of this
+    /// consultation** spent on the dialog it led (P2.1 review round 2, item 1).
+    ///
+    /// `Some` exactly for the leader of a dialog that actually ran; `None` for a
+    /// follower (it was parked on somebody else's request, so the dialog is not
+    /// its cost), for a consultation the latch skipped, and for one a capacity
+    /// pool refused. Crediting per REQUEST is what made four concurrent requests
+    /// to one host report four minutes for one minute of blocking, which in turn
+    /// labelled a genuine workload overrun `prompt_budget_exhausted`.
+    pub async fn prompt_measured(
+        &self,
+        host: &str,
+        port: u16,
+        reason: Option<String>,
+        config: PromptConfig,
+    ) -> (PromptOutcome, Option<Duration>) {
         // [G-46] ZERO timeout = the prompt is disabled for this profile:
         // instant deny, no dialog attempt, no coalescing entry.
         if config.timeout == Duration::ZERO {
-            return PromptOutcome::Disabled;
+            return (PromptOutcome::Disabled, None);
         }
 
         // [G-6] Key by normalized hostname only (port ignored; case,
@@ -950,39 +1425,78 @@ impl PromptCoordinator {
                 // failing closed ([G-46]). In practice 3.6 passes one
                 // profile config for all requests, so the policies
                 // coincide.
-                match tokio::time::timeout(config.timeout, rx).await {
+                let outcome = match tokio::time::timeout(config.timeout, rx).await {
                     Ok(Ok(outcome)) => outcome,
-                    // Our deadline hit, or the leader vanished without
-                    // delivering (a bug) — either way the policy
-                    // applies, never a silent allow ([G-46]).
-                    Ok(Err(_)) | Err(_) => unavailable_from(&config),
-                }
+                    // Our own deadline hit — this follower's budget is what
+                    // elapsed ([G-46]). The leader vanished without delivering
+                    // (a bug path): the follower's budget did not elapse, so the
+                    // cause is the leader, not this follower's timeout.
+                    Err(_) => unavailable_from(&config, UnavailableCause::BudgetElapsed),
+                    Ok(Err(_)) => unavailable_from(&config, UnavailableCause::CallerGone),
+                };
+                // Item 1: this request parked on a dialog somebody else led, so it
+                // credits no prompt time of its own.
+                (outcome, None)
             }
             Role::Leader(entry) => {
-                // [G-28] Only the leader takes a permit. If all
-                // [`MAX_CONCURRENT_PROMPTS`] are in flight, this NEW
-                // host is denied immediately without a dialog.
-                let permit = Arc::clone(&self.permits).try_acquire_owned();
-
+                // [G-28, P2.1] Only the leader takes a consultation slot, and the
+                // slot is held by the supervisor task below — *not* by the
+                // blocking dialog call. A dialog that outlives its budget is
+                // abandoned (it cannot be cancelled: `spawn_blocking` has no
+                // cancellation), and an abandoned dialog used to keep its slot
+                // for the life of the process. Eight of those — the routine
+                // state of a headless run, where no dialog can be answered —
+                // turned every later consultation into `Overloaded`, i.e. the
+                // prompt path never recovered and never even consulted its own
+                // budget again. The orphan still holds a real window and thread,
+                // so it keeps a permit from the separate abandoned pool.
                 // Plan Step 3: the dialog runs on the blocking pool so
-                // the async handler never blocks a tokio worker. The
-                // permit rides along and is released exactly when the
-                // dialog call returns — including by an orphaned dialog
-                // after a timeout ([G-4]) — so at most 8 dialogs are
-                // ever live ([G-28]).
-                let dialog_task = permit.ok().map(|permit| {
-                    let req = DialogRequest {
-                        host: host.to_string(),
-                        port,
-                        reason,
-                        suffix_hint: compute_suffix_hint(host),
-                    };
-                    let dialog = Arc::clone(&self.dialog);
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        dialog(&req)
-                    })
-                });
+                // the async handler never blocks a tokio worker. Which pool
+                // refused is carried, not folded (P2.1 review): "too many
+                // concurrent prompts" is what a full *abandoned* pool used to
+                // say too — a concurrency limit for a session whose dialogs are
+                // simply unanswered.
+                // Item 1: this leader's dialog starts now. The measurement is
+                // taken by the leader (not by each caller) because a coalesced
+                // follower must credit nothing: one dialog's wall clock added K
+                // times is what turned 60 s of blocking into 240 s of "prompt
+                // time" and mislabelled a real overrun.
+                let leader_started = std::time::Instant::now();
+                let plan = match self.backend.plan(config.on_unavailable) {
+                    // Items 3-5: enough consecutive consultations produced no
+                    // decision, the posture is deny, and the re-probe cooldown has
+                    // not run out — so this session has nobody to ask. No permit, no
+                    // blocking thread, no orphan: the policy answer is applied now,
+                    // under the reason that ARMED the latch (item 8).
+                    StickyPlan::Skip(cause) => DialogPlan::SkipAbsentBackend(cause),
+                    StickyPlan::Consult => match (
+                        Arc::clone(&self.permits).try_acquire_owned(),
+                        Arc::clone(&self.abandoned).try_acquire_owned(),
+                    ) {
+                        (Ok(permit), Ok(abandoned)) => {
+                            let req = DialogRequest {
+                                host: host.to_string(),
+                                port,
+                                reason,
+                                suffix_hint: compute_suffix_hint(host),
+                            };
+                            let dialog = Arc::clone(&self.dialog);
+                            let handle = tokio::task::spawn_blocking(move || {
+                                let _abandoned = abandoned;
+                                dialog(&req)
+                            });
+                            DialogPlan::Show(permit, handle)
+                        }
+                        // Every consultation slot is in flight ([G-28]). The
+                        // permit result is checked first because that is the cap
+                        // the ADR names: an exhausted consultation pool is the
+                        // more specific fact even when both pools are full.
+                        (Err(_), _) => DialogPlan::Refused(OverloadCause::ConsultationsHeld),
+                        // The abandoned pool is full: dialogs from earlier
+                        // consultations are still running.
+                        (_, Err(_)) => DialogPlan::Refused(OverloadCause::AbandonedCapacity),
+                    },
+                };
 
                 // Supervisor (review blocking fix): a detached task
                 // owns the whole timeout→finish pipeline, and
@@ -1002,21 +1516,31 @@ impl PromptCoordinator {
                 // branch — so there is no double fan-out, and a gone
                 // caller only turns the final report send into an
                 // ignored error.
-                let (mut report_tx, report) = oneshot::channel::<PromptOutcome>();
+                let (mut report_tx, report) =
+                    oneshot::channel::<(PromptOutcome, Option<Duration>)>();
                 let waiters = Arc::clone(&self.waiters);
                 let supervised_entry = Arc::clone(&entry);
+                let backend = Arc::clone(&self.backend);
                 tokio::spawn(async move {
-                    let outcome = match dialog_task {
-                        Some(handle) => {
+                    // `Some` only when a dialog actually ran for this leader (item 1).
+                    let mut credit: Option<Duration> = None;
+                    let outcome = match plan {
+                        DialogPlan::Show(permit, handle) => {
+                            // P2.1: held for as long as this consultation is
+                            // live — decided, budget elapsed, or caller gone —
+                            // and released here, so the slot is reusable the
+                            // moment the proxy stops waiting. The orphaned
+                            // dialog keeps only its abandoned-pool permit.
+                            let _slot = permit;
                             // Plan Step 6: await the dialog under the
                             // caller's timeout.
-                            tokio::select! {
+                            let outcome = tokio::select! {
                                 // The caller's future was dropped
                                 // mid-prompt: finish now with the
                                 // fallback outcome so parked followers
                                 // are released promptly ([G-6, G-46]).
                                 _ = report_tx.closed() => {
-                                    unavailable_from(&config)
+                                    unavailable_from(&config, UnavailableCause::CallerGone)
                                 }
                                 res = tokio::time::timeout(config.timeout, handle) => {
                                     match res {
@@ -1029,38 +1553,62 @@ impl PromptCoordinator {
                                         // blocking thread.
                                         Ok(Ok(Err(DialogUnavailable)))
                                         | Ok(Err(_)) => {
-                                            unavailable_from(&config)
+                                            unavailable_from(
+                                                &config,
+                                                UnavailableCause::NoDialogBackend,
+                                            )
                                         }
-                                        // Timed out: the orphaned
-                                        // dialog stays on screen and
+                                        // The prompt budget elapsed: the
+                                        // orphaned dialog stays on screen and
                                         // its late result is discarded
-                                        // ([G-4]); the policy decides
-                                        // — never a silent allow
-                                        // ([G-46]).
+                                        // ([G-4]); the policy decides — never
+                                        // a silent allow ([G-46]) — and the
+                                        // cause says a budget was spent, which
+                                        // is what P2.1 reports distinctly.
                                         Err(_) => {
-                                            unavailable_from(&config)
+                                            unavailable_from(
+                                                &config,
+                                                UnavailableCause::BudgetElapsed,
+                                            )
                                         }
                                     }
                                 }
-                            }
+                            };
+                            // The consultation is over: this is what the dialog cost
+                            // this session, charged once (item 1).
+                            credit = Some(leader_started.elapsed());
+                            outcome
                         }
-                        // [G-28] All permits held: this NEW host was
-                        // denied immediately and no dialog was
-                        // attempted, but the entry still must be
-                        // finished — followers that parked in the
-                        // election→deny window receive the Overloaded
-                        // outcome.
-                        None => PromptOutcome::Overloaded,
+                        // [G-28] A pool ran out: this NEW host was denied
+                        // immediately and no dialog was attempted, but the entry
+                        // still must be finished — followers that parked in the
+                        // election→deny window receive the refusal.
+                        DialogPlan::Refused(cause) => PromptOutcome::Overloaded { cause },
+                        // Item 3: the backend is known absent, so the policy
+                        // answer is the whole answer. The cause is the one that armed
+                        // the latch (item 8): `no_dialog_backend` when no dialog could
+                        // be shown, `prompt_suppressed_after_budget` when dialogs were
+                        // shown and their budgets elapsed — a budget this consultation
+                        // never spent either way.
+                        DialogPlan::SkipAbsentBackend(cause) => unavailable_from(&config, cause),
                     };
+                    // Exactly once per consultation, and only the leader: a
+                    // coalesced follower reports the same dialog's outcome and
+                    // must not count it again (K followers would arm the
+                    // fast-fail after one dialog).
+                    backend.observe(&outcome);
                     Self::finish(&waiters, &key, &supervised_entry, outcome.clone()).await;
-                    let _ = report_tx.send(outcome);
+                    let _ = report_tx.send((outcome, credit));
                 });
                 match report.await {
-                    Ok(outcome) => outcome,
+                    Ok(report) => report,
                     // The supervisor always finishes cleanup before
                     // reporting; a closed channel means it panicked —
                     // fail closed, never a silent allow ([G-46]).
-                    Err(_) => unavailable_from(&config),
+                    Err(_) => (
+                        unavailable_from(&config, UnavailableCause::CallerGone),
+                        None,
+                    ),
                 }
             }
         }
@@ -1088,9 +1636,16 @@ impl PromptCoordinator {
 }
 
 /// Apply the `on_unavailable` policy to a non-decision ([G-19, G-46]).
-fn unavailable_from(config: &PromptConfig) -> PromptOutcome {
+///
+/// `cause` is carried, not folded away (P2.1): the policy answer is the same for
+/// every cause, but the audit reason is not — a spent prompt budget is this
+/// session's own term being consumed, while a backend failure is a machine with
+/// no dialog. Reporting one string for both is what made a headless forward
+/// request indistinguishable from a broken desktop.
+fn unavailable_from(config: &PromptConfig, cause: UnavailableCause) -> PromptOutcome {
     PromptOutcome::Unavailable {
         allowed: matches!(config.on_unavailable, PromptPolicy::Allow),
+        cause,
     }
 }
 
@@ -1694,7 +2249,13 @@ mod tests {
         // ([G-28]).
         let start = Instant::now();
         let ninth = coord.prompt("h8.example.com", 443, None, cfg).await;
-        assert_eq!(ninth, PromptOutcome::Overloaded);
+        assert_eq!(
+            ninth,
+            PromptOutcome::Overloaded {
+                cause: OverloadCause::ConsultationsHeld
+            },
+            "the denial must name the pool that ran out: every consultation slot is in flight"
+        );
         assert_eq!(handle.calls().len(), 8, "no 9th dialog may be shown");
         assert!(
             start.elapsed() < Duration::from_secs(1),
@@ -1750,7 +2311,14 @@ mod tests {
         let cfg = cfg(Duration::from_millis(100), PromptPolicy::Deny);
 
         let out = coord.prompt("slow.example.com", 443, None, cfg).await;
-        assert_eq!(out, PromptOutcome::Unavailable { allowed: false });
+        assert_eq!(
+            out,
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::BudgetElapsed,
+            },
+            "a spent budget must be reported as the cause, not as a backend failure"
+        );
         assert_eq!(
             handle.calls().len(),
             1,
@@ -1767,7 +2335,13 @@ mod tests {
         let cfg = cfg(Duration::from_millis(100), PromptPolicy::Allow);
 
         let out = coord.prompt("slow.example.com", 443, None, cfg).await;
-        assert_eq!(out, PromptOutcome::Unavailable { allowed: true });
+        assert_eq!(
+            out,
+            PromptOutcome::Unavailable {
+                allowed: true,
+                cause: UnavailableCause::BudgetElapsed,
+            }
+        );
         assert_eq!(handle.calls().len(), 1);
     }
 
@@ -1795,7 +2369,10 @@ mod tests {
         let start = Instant::now();
         assert_eq!(
             follower.await.unwrap(),
-            PromptOutcome::Unavailable { allowed: false }
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::BudgetElapsed,
+            }
         );
         assert!(start.elapsed() < Duration::from_secs(5));
 
@@ -1914,7 +2491,14 @@ mod tests {
                 cfg(Duration::from_secs(60), PromptPolicy::Deny),
             )
             .await;
-        assert_eq!(out, PromptOutcome::Unavailable { allowed: false });
+        assert_eq!(
+            out,
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::NoDialogBackend,
+            },
+            "a dialog that could not be shown is NOT a spent budget"
+        );
 
         handle.reply("api.example.com", Err(DialogUnavailable));
         let out = coord
@@ -1925,9 +2509,533 @@ mod tests {
                 cfg(Duration::from_secs(60), PromptPolicy::Allow),
             )
             .await;
-        assert_eq!(out, PromptOutcome::Unavailable { allowed: true });
+        assert_eq!(
+            out,
+            PromptOutcome::Unavailable {
+                allowed: true,
+                cause: UnavailableCause::NoDialogBackend,
+            }
+        );
 
         assert_eq!(handle.calls().len(), 2);
+    }
+
+    // ---- P2.1: a timed-out consultation must give its slot back --------------
+
+    /// The bug this pins: the consultation slot used to ride along with the
+    /// blocking dialog call, so a dialog that outlived its budget (the routine
+    /// state of a headless run, where no dialog can be answered) kept that slot
+    /// for the life of the process. Eight of those turned every later
+    /// consultation into `Overloaded`: the prompt path never recovered and never
+    /// consulted its own budget again — a resource-exhaustion bug behind a
+    /// policy-looking denial.
+    #[tokio::test]
+    async fn timed_out_consultations_release_their_slots() {
+        let (handle, dialog) = fake_dialog();
+        // The pool/slot mechanics are pinned here, not the fast-fail policy: nine
+        // consecutive unanswered consultations are exactly what item 3 now
+        // short-circuits in production, so this coordinator never arms it.
+        let coord = Arc::new(PromptCoordinator::with_dialog_and_stickiness(
+            dialog,
+            usize::MAX,
+        ));
+        // No reply is ever programmed, so every dialog parks until the fake is
+        // dropped: these are orphans, not slow dialogs.
+        let cfg = cfg(Duration::from_millis(30), PromptPolicy::Deny);
+
+        // Distinct hosts: nothing coalesces, one dialog each.
+        for i in 0..MAX_CONCURRENT_PROMPTS {
+            let host = format!("slot{i}.example.com");
+            let out = coord.prompt(&host, 443, None, cfg).await;
+            assert_eq!(
+                out,
+                PromptOutcome::Unavailable {
+                    allowed: false,
+                    cause: UnavailableCause::BudgetElapsed,
+                },
+                "host {i} must time out"
+            );
+        }
+
+        // Eight dialogs are still parked — they are live windows, not dead
+        // requests...
+        assert_eq!(coord.abandoned_dialogs(), MAX_CONCURRENT_PROMPTS);
+        // ...and not one of them still holds a consultation slot, because the
+        // request each belonged to was denied on budget and is over.
+        assert_eq!(
+            coord.live_consultations(),
+            0,
+            "a timed-out consultation must give its slot back"
+        );
+
+        // The observable consequence. Before P2.1 this 9th consultation was
+        // `Overloaded` for the rest of the process.
+        let out = coord
+            .prompt("after-the-orphans.example.com", 443, None, cfg)
+            .await;
+        assert_eq!(
+            out,
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::BudgetElapsed,
+            },
+            "the prompt path must still be consulted after N timeouts"
+        );
+        assert_eq!(handle.calls().len(), MAX_CONCURRENT_PROMPTS + 1);
+    }
+
+    /// The other half of the same fix: releasing a slot must not license an
+    /// unbounded number of live windows. Orphans keep a permit from their own,
+    /// larger pool, and a full pool refuses the NEW host (`Overloaded`, [G-28])
+    /// instead of spawning one more dialog.
+    #[tokio::test]
+    async fn abandoned_dialogs_stay_bounded_and_fail_closed() {
+        let (handle, dialog) = fake_dialog();
+        // Pool mechanics only — see `timed_out_consultations_release_their_slots`.
+        let coord = Arc::new(PromptCoordinator::with_dialog_and_stickiness(
+            dialog,
+            usize::MAX,
+        ));
+        let cfg = cfg(Duration::from_millis(20), PromptPolicy::Deny);
+
+        for i in 0..MAX_ABANDONED_PROMPTS {
+            let host = format!("orphan{i}.example.com");
+            let _ = coord.prompt(&host, 443, None, cfg).await;
+        }
+        assert_eq!(coord.abandoned_dialogs(), MAX_ABANDONED_PROMPTS);
+
+        let out = coord
+            .prompt("one-too-many.example.com", 443, None, cfg)
+            .await;
+        assert_eq!(
+            out,
+            PromptOutcome::Overloaded {
+                cause: OverloadCause::AbandonedCapacity
+            },
+            "a full abandoned pool must refuse the new host, never spawn unbounded dialogs, \
+             and the denial must name THAT pool, not the consultation cap"
+        );
+        assert_eq!(
+            handle.calls().len(),
+            MAX_ABANDONED_PROMPTS,
+            "the refused consultation must not have shown a dialog"
+        );
+    }
+
+    /// An orphan returning is what empties the abandoned pool — the pool is a
+    /// bound on live windows, not a permanent debit.
+    #[tokio::test]
+    async fn an_orphan_that_returns_frees_its_abandoned_slot() {
+        let (handle, dialog) = fake_dialog();
+        // Pool mechanics only — see `timed_out_consultations_release_their_slots`.
+        let coord = Arc::new(PromptCoordinator::with_dialog_and_stickiness(
+            dialog,
+            usize::MAX,
+        ));
+        let cfg = cfg(Duration::from_millis(20), PromptPolicy::Deny);
+
+        for i in 0..MAX_ABANDONED_PROMPTS {
+            let host = format!("orphan{i}.example.com");
+            let _ = coord.prompt(&host, 443, None, cfg).await;
+        }
+        assert_eq!(coord.abandoned_dialogs(), MAX_ABANDONED_PROMPTS);
+
+        // Let the parked dialogs answer (their late results are discarded).
+        for i in 0..MAX_ABANDONED_PROMPTS {
+            handle.reply(&format!("orphan{i}.example.com"), Ok(allow_once()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coord.abandoned_dialogs() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "abandoned permits must come back when the orphan returns"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // And the pool is usable again.
+        handle.reply("fresh.example.com", Ok(allow_once()));
+        let out = coord.prompt("fresh.example.com", 443, None, cfg).await;
+        assert_eq!(out, PromptOutcome::Decided(allow_once()));
+    }
+
+    /// Item 3: a backend that has just told us twice that it cannot produce a
+    /// decision is an **environment property**, so later consultations must not
+    /// pay for it again. Today every one of them spawns another doomed blocking
+    /// call; the supervisor knows the answer after the second.
+    #[tokio::test]
+    async fn a_known_absent_dialog_backend_is_not_consulted_a_third_time() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        // A budget long enough that nothing here is a timeout: these are backend
+        // failures, not elapsed budgets.
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        // A failing reply for every host: if the fast-fail does not arrive, the
+        // later dialogs park (and the test says so) instead of being fed.
+        for i in 0..5 {
+            handle.reply(&format!("absent-{i}.example.com"), Err(DialogUnavailable));
+        }
+
+        for i in 0..5 {
+            let host = format!("absent-{i}.example.com");
+            let out = coord.prompt(&host, 443, None, cfg).await;
+            assert_eq!(
+                out,
+                PromptOutcome::Unavailable {
+                    allowed: false,
+                    cause: UnavailableCause::NoDialogBackend,
+                },
+                "host {i} must be denied for want of a backend"
+            );
+        }
+
+        assert_eq!(
+            handle.calls().len(),
+            NO_BACKEND_STICKY_AFTER,
+            "a known-absent backend must not be consulted again: {:?}",
+            handle
+                .calls()
+                .iter()
+                .map(|c| c.host.clone())
+                .collect::<Vec<_>>()
+        );
+        // No dialog was spawned for the skipped consultations, so neither pool
+        // has anything held.
+        assert_eq!(coord.live_consultations(), 0);
+        assert_eq!(coord.abandoned_dialogs(), 0);
+    }
+
+    /// The other half of item 3: the counter is CONSECUTIVE. A dialog that
+    /// succeeds proves the backend works and starts the count again, so one
+    /// earlier failure plus one later failure must not disable prompts.
+    #[tokio::test]
+    async fn a_dialog_that_succeeds_resets_the_no_backend_streak() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+
+        handle.reply("resets-0.example.com", Err(DialogUnavailable));
+        handle.reply("resets-1.example.com", Ok(deny_once()));
+        handle.reply("resets-2.example.com", Err(DialogUnavailable));
+        handle.reply("resets-3.example.com", Ok(allow_once()));
+
+        let mut outcomes = Vec::new();
+        for i in 0..4 {
+            let host = format!("resets-{i}.example.com");
+            outcomes.push(coord.prompt(&host, 443, None, cfg).await);
+        }
+        assert_eq!(
+            outcomes[1],
+            PromptOutcome::Decided(deny_once()),
+            "the second consultation was answered by a working dialog"
+        );
+        assert_eq!(
+            outcomes[3],
+            PromptOutcome::Decided(allow_once()),
+            "one success between the failures resets the streak: the fourth \
+             consultation must still show a dialog"
+        );
+        assert_eq!(
+            handle.calls().len(),
+            4,
+            "every consultation here must reach the dialog"
+        );
+    }
+
+    /// The accessor a reader reaches for during an incident must not double-count:
+    /// a LIVE dialog holds an abandoned-pool permit too, so "8 parked
+    /// consultations" used to report `live=8 abandoned=8` and made the diagnostic
+    /// say twice the number of windows that exist.
+    #[tokio::test]
+    async fn abandoned_dialogs_does_not_count_the_dialogs_we_are_still_waiting_on() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        // A budget the dialogs cannot outlive: nothing here is abandoned, every
+        // dialog is one the coordinator is still waiting on.
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+
+        let leaders: Vec<_> = (0..MAX_CONCURRENT_PROMPTS)
+            .map(|i| {
+                let c = Arc::clone(&coord);
+                tokio::spawn(async move {
+                    c.prompt(&format!("live{i}.example.com"), 443, None, cfg)
+                        .await
+                })
+            })
+            .collect();
+        handle.wait_for_calls(MAX_CONCURRENT_PROMPTS).await;
+
+        assert_eq!(coord.live_consultations(), MAX_CONCURRENT_PROMPTS);
+        assert_eq!(
+            coord.abandoned_dialogs(),
+            0,
+            "no dialog has been abandoned: every one of those windows is still being awaited"
+        );
+
+        for i in 0..MAX_CONCURRENT_PROMPTS {
+            handle.reply(&format!("live{i}.example.com"), Ok(deny_once()));
+        }
+        assert_eq!(futures_of(leaders).await.len(), MAX_CONCURRENT_PROMPTS);
+        assert_eq!(coord.live_consultations(), 0);
+        assert_eq!(coord.abandoned_dialogs(), 0);
+    }
+
+    // ---- P2.1 review round 2 --------------------------------------------------
+
+    /// **Round 2, item 1: the dialog's cost is credited ONCE, by its leader.**
+    ///
+    /// `note_prompt_wait` was called per REQUEST, so K coalesced followers of one
+    /// dialog each added that dialog's wall clock: four concurrent requests to one
+    /// unlisted host credited four minutes for one minute of real blocking, and a
+    /// workload that genuinely overran was then recorded as
+    /// `prompt_budget_exhausted`. The coordinator now reports the wall clock its
+    /// LEADER paid; a follower adds nothing, because the dialog was never its own.
+    #[tokio::test]
+    async fn one_dialog_is_credited_to_its_leader_and_no_follower_adds_to_it() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_secs(5), PromptPolicy::Deny);
+        const FOLLOWERS: usize = 3;
+        const DIALOG: Duration = Duration::from_millis(120);
+
+        let leader = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move {
+                c.prompt_measured("credit.example.com", 443, None, cfg)
+                    .await
+            })
+        };
+        handle.wait_for_calls(1).await;
+        let followers: Vec<_> = (0..FOLLOWERS)
+            .map(|_| {
+                let c = Arc::clone(&coord);
+                tokio::spawn(async move {
+                    c.prompt_measured("credit.example.com", 443, None, cfg)
+                        .await
+                })
+            })
+            .collect();
+        FakeHandle::wait_parked(&coord, "credit.example.com", FOLLOWERS).await;
+        // The dialog is open for as long as a user would sit in front of it.
+        tokio::time::sleep(DIALOG).await;
+        handle.reply("credit.example.com", Ok(allow_once()));
+
+        let (out, leader_wait) = leader.await.unwrap();
+        assert_eq!(out, PromptOutcome::Decided(allow_once()));
+        let leader_wait = leader_wait.expect("the leader led the dialog and paid for it");
+        let mut credited = leader_wait;
+        for f in followers {
+            let (out, follower_wait) = f.await.unwrap();
+            assert_eq!(
+                out,
+                PromptOutcome::Decided(allow_once()),
+                "one dialog answers every follower"
+            );
+            assert_eq!(
+                follower_wait, None,
+                "a follower was parked on the leader's dialog: it paid nothing of its own"
+            );
+            credited += follower_wait.unwrap_or(Duration::ZERO);
+        }
+
+        assert!(
+            leader_wait >= DIALOG,
+            "the leader's credit must be the dialog's own wall clock, got {leader_wait:?}"
+        );
+        assert_eq!(
+            credited, leader_wait,
+            "the aggregate is ONE dialog's wall clock, never {FOLLOWERS}x it"
+        );
+        assert_eq!(handle.calls().len(), 1, "one host, one dialog");
+        println!("EVIDENCE one-dialog-credit followers={FOLLOWERS} leader_wait={leader_wait:?}");
+    }
+
+    /// **Round 2, item 5: two CONCURRENT consultations are one budget, not two
+    /// pieces of evidence.** They start together and elapse at the same deadline,
+    /// so arming at two let a single stalled dialog disable prompting with no grace
+    /// consultation in between. Three consecutive observations tolerate two
+    /// hiccups.
+    #[tokio::test]
+    async fn a_concurrent_pair_does_not_arm_the_fast_fail_but_a_third_consecutive_does() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let budget = Duration::from_millis(60);
+        let cfg = cfg(budget, PromptPolicy::Deny);
+
+        // Two leaders on DISTINCT hosts (same-host requests coalesce into ONE
+        // consultation, which is a different question), no reply programmed: both
+        // elapse at the same deadline.
+        let pair: Vec<_> = ["pair-a.example.com", "pair-b.example.com"]
+            .iter()
+            .map(|host| {
+                let c = Arc::clone(&coord);
+                let host = host.to_string();
+                tokio::spawn(async move { c.prompt(&host, 443, None, cfg).await })
+            })
+            .collect();
+        for t in pair {
+            assert_eq!(
+                t.await.unwrap(),
+                PromptOutcome::Unavailable {
+                    allowed: false,
+                    cause: UnavailableCause::BudgetElapsed,
+                }
+            );
+        }
+        assert_eq!(handle.calls().len(), 2, "two hosts, two dialogs");
+
+        // A third consecutive consultation is still consulted: a pair that elapsed
+        // together is one budget's worth of evidence.
+        let third = coord.prompt("pair-c.example.com", 443, None, cfg).await;
+        assert_eq!(
+            third,
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::BudgetElapsed,
+            },
+            "a concurrent pair must not arm the fast-fail: the third still consults"
+        );
+        assert_eq!(handle.calls().len(), 3);
+
+        // Now it is armed: the fourth is refused without a dialog.
+        let fourth = coord.prompt("pair-d.example.com", 443, None, cfg).await;
+        assert!(
+            matches!(fourth, PromptOutcome::Unavailable { allowed: false, .. }),
+            "got {fourth:?}"
+        );
+        assert_eq!(
+            handle.calls().len(),
+            3,
+            "an armed latch must not spawn another dialog"
+        );
+    }
+
+    /// **Round 2, item 4: the fast-fail is the DENY posture's answer only.** Under
+    /// `on_unavailable = allow` the latch *permitted* every later unlisted host with
+    /// no dialog at all - silently removing the user's veto, the opposite of
+    /// "degrades to deny". A headless + allow configuration is the operator's
+    /// explicit choice, and it keeps consulting (and paying the per-host budget).
+    #[tokio::test]
+    async fn the_fast_fail_never_applies_to_the_allow_policy() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_millis(40), PromptPolicy::Allow);
+
+        for i in 0..5 {
+            let out = coord
+                .prompt(&format!("allow-{i}.example.com"), 443, None, cfg)
+                .await;
+            assert_eq!(
+                out,
+                PromptOutcome::Unavailable {
+                    allowed: true,
+                    cause: UnavailableCause::BudgetElapsed,
+                },
+                "host {i}: allow answers, but only after the dialog was consulted"
+            );
+        }
+        assert_eq!(
+            handle.calls().len(),
+            5,
+            "under allow every host gets its own consultation"
+        );
+    }
+
+    /// **Round 2, item 3: the latch re-probes after a cooldown, so it is not
+    /// one-way.** Nothing spawns a dialog while armed, so the `Decided` reset was
+    /// unreachable: an operator who came back and clicked the still-open dialog had
+    /// their answer discarded, with no recovery but restarting the run. After the
+    /// cooldown one consultation consults again, and an answer un-arms the latch.
+    #[tokio::test]
+    async fn an_armed_latch_reprobes_after_its_cooldown_and_a_decision_un_arms_it() {
+        let (handle, dialog) = fake_dialog();
+        // A cooldown long enough to observe the difference between "since the latch
+        // armed" and "since the last skipped consultation": the skips below are spread
+        // across it (round 2, item 3's clock).
+        const COOLDOWN: Duration = Duration::from_millis(100);
+        let coord = Arc::new(PromptCoordinator::with_cooldown(
+            dialog,
+            NO_BACKEND_STICKY_AFTER,
+            COOLDOWN,
+        ));
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        for i in 0..NO_BACKEND_STICKY_AFTER {
+            handle.reply(&format!("armed-{i}.example.com"), Err(DialogUnavailable));
+        }
+
+        for i in 0..NO_BACKEND_STICKY_AFTER {
+            let out = coord
+                .prompt(&format!("armed-{i}.example.com"), 443, None, cfg)
+                .await;
+            assert_eq!(
+                out,
+                PromptOutcome::Unavailable {
+                    allowed: false,
+                    cause: UnavailableCause::NoDialogBackend,
+                },
+                "host {i} consults (and finds no backend)"
+            );
+        }
+        assert_eq!(handle.calls().len(), NO_BACKEND_STICKY_AFTER);
+
+        // Armed: no dialog while the cooldown runs — and a skipped consultation does
+        // NOT restart the cooldown, or a session under steady traffic would push its own
+        // re-probe out for ever.
+        let skipped = coord.prompt("armed-cold.example.com", 443, None, cfg).await;
+        assert_eq!(
+            skipped,
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::NoDialogBackend,
+            }
+        );
+        assert_eq!(
+            handle.calls().len(),
+            NO_BACKEND_STICKY_AFTER,
+            "the cooldown has not run out: nothing is consulted"
+        );
+        tokio::time::sleep(COOLDOWN / 2).await;
+        let skipped_again = coord
+            .prompt("armed-colder.example.com", 443, None, cfg)
+            .await;
+        assert!(
+            matches!(skipped_again, PromptOutcome::Unavailable { .. }),
+            "still armed halfway through the cooldown: {skipped_again:?}"
+        );
+        assert_eq!(
+            handle.calls().len(),
+            NO_BACKEND_STICKY_AFTER,
+            "a skipped consultation must not spawn a dialog either"
+        );
+
+        // The operator came back: the next consultation after the cooldown — counted
+        // from ARMING, not from the last skip — gets a dialog again, and its answer
+        // resets the streak.
+        tokio::time::sleep(COOLDOWN / 2 + Duration::from_millis(20)).await;
+        handle.reply("armed-warm.example.com", Ok(deny_once()));
+        let warmed = coord.prompt("armed-warm.example.com", 443, None, cfg).await;
+        assert_eq!(
+            warmed,
+            PromptOutcome::Decided(deny_once()),
+            "a returning user must get their dialog back"
+        );
+        assert_eq!(handle.calls().len(), NO_BACKEND_STICKY_AFTER + 1);
+
+        // ...and the latch is un-armed, so the NEXT host is consulted too rather
+        // than waiting for another cooldown.
+        handle.reply("armed-after.example.com", Err(DialogUnavailable));
+        let next = coord
+            .prompt("armed-after.example.com", 443, None, cfg)
+            .await;
+        assert_eq!(
+            next,
+            PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::NoDialogBackend,
+            },
+            "one success un-arms the latch: the streak starts again"
+        );
+        assert_eq!(handle.calls().len(), NO_BACKEND_STICKY_AFTER + 2);
     }
 
     /// Await a batch of spawned tasks, preserving order.

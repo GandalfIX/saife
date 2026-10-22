@@ -126,6 +126,7 @@ pub fn to_expanded_json(
             "prompt_enabled": resolved.network.prompt_enabled,
             "on_unavailable": resolved.network.on_unavailable,
             "prompt_timeout_secs": resolved.network.prompt_timeout_secs,
+            "workload_timeout_secs": resolved.network.workload_timeout_secs,
             "upstream_proxy": resolved.network.upstream_proxy,
         }
     });
@@ -164,6 +165,9 @@ pub struct NetworkSlice {
     pub prompt_enabled: Option<bool>,
     pub on_unavailable: Option<String>,
     pub prompt_timeout_secs: Option<u32>,
+    /// Seconds the workload may run (`network.workloadTimeoutSecs`, P2.1 review
+    /// item 6). `None` = the resolver's default (30 min).
+    pub workload_timeout_secs: Option<u32>,
     pub upstream_proxy: Option<String>,
 }
 
@@ -286,6 +290,12 @@ pub struct RawNetwork {
     /// (handled by the prompt layer in D-3.5). Profile-only ([G-46]).
     #[serde(default, rename = "promptTimeoutSecs")]
     pub prompt_timeout_secs: Option<u32>,
+    /// Seconds the workload itself may run before the container kills it.
+    /// Default 1800 (30 min); validated `1..=86400` by the resolver (P2.1 review,
+    /// item 6). The session bound is new, so a workload that legitimately runs
+    /// longer must raise this.
+    #[serde(default, rename = "workloadTimeoutSecs")]
+    pub workload_timeout_secs: Option<u32>,
     /// Upstream proxy URL (e.g. `http://corp:8080`). Parsed now, consumed in
     /// Phase 4.
     #[serde(default, rename = "upstreamProxy")]
@@ -493,6 +503,7 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
             prompt_enabled: c.prompt_enabled.or(p.prompt_enabled),
             on_unavailable: c.on_unavailable.or(p.on_unavailable),
             prompt_timeout_secs: c.prompt_timeout_secs.or(p.prompt_timeout_secs),
+            workload_timeout_secs: c.workload_timeout_secs.or(p.workload_timeout_secs),
             upstream_proxy: c.upstream_proxy.or(p.upstream_proxy),
         }),
         (Some(p), None) => Some(p),
@@ -556,6 +567,7 @@ fn resolve_network_slice(raw: &Option<RawNetwork>) -> NetworkSlice {
         prompt_enabled: raw.prompt_enabled,
         on_unavailable: raw.on_unavailable.clone(),
         prompt_timeout_secs: raw.prompt_timeout_secs,
+        workload_timeout_secs: raw.workload_timeout_secs,
         upstream_proxy: raw.upstream_proxy.clone(),
     }
 }

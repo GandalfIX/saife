@@ -3,7 +3,7 @@
 //! Grammar (AC-4.13):
 //!   filter  := clause ( "&" clause )*
 //!   clause  := key ( "=" | "~=" | ">=" | "<=" ) value
-//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted"
+//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted" | "reason" | "suppressed"
 //!   value   := bare-string (no & or = chars)
 //!
 //! Semantics:
@@ -33,8 +33,26 @@ pub struct Filter {
     clauses: Vec<Clause>,
 }
 
+/// Every filterable leaf key.
+///
+/// `reason` (P2.1) and `suppressed` (P1.6) were added to the leaf without being
+/// added here, so the two fields that name *why* a request was refused and *how
+/// many* refusals a window stands for were unqueryable — the one place an operator
+/// would look after an incident. `scope` keeps its own meaning (rule scope) and is
+/// never a count.
 const KNOWN_KEYS: &[&str] = &[
-    "op", "disposition", "host", "path", "ts", "pid", "seq", "source", "scope", "persisted",
+    "op",
+    "disposition",
+    "host",
+    "path",
+    "ts",
+    "pid",
+    "seq",
+    "source",
+    "scope",
+    "persisted",
+    "reason",
+    "suppressed",
 ];
 
 impl Filter {
@@ -155,6 +173,34 @@ mod tests {
     fn leaf(pairs: &[(&str, Value)]) -> Value {
         let m: serde_json::Map<String, Value> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         Value::Object(m)
+    }
+
+    /// P2.1 review (item d): `reason` and `suppressed` are in the leaf but were not
+    /// filterable, so the two fields an incident reader actually needs to select on
+    /// (`reason=prompt_budget_exhausted`, `suppressed>=1`) were a parse error.
+    #[test]
+    fn reason_and_suppressed_are_filterable_keys() {
+        let by_reason = Filter::parse("reason=prompt_abandoned_capacity").unwrap();
+        assert!(by_reason.matches(&leaf(&[("reason", json!("prompt_abandoned_capacity"))])));
+        assert!(!by_reason.matches(&leaf(&[("reason", json!("prompt_budget_exhausted"))])));
+
+        let by_reason_substring = Filter::parse("reason~=no_dialog").unwrap();
+        assert!(by_reason_substring.matches(&leaf(&[("reason", json!("no_dialog_backend"))])));
+
+        let by_suppressed = Filter::parse("suppressed>=12").unwrap();
+        assert!(by_suppressed.matches(&leaf(&[("suppressed", json!(12))])));
+        assert!(!by_suppressed.matches(&leaf(&[("suppressed", json!(11))])));
+
+        // Combined with a taxonomy key, as a reader would write it.
+        let combined = Filter::parse("op=CONNECT&reason=no_dialog_backend").unwrap();
+        assert!(combined.matches(&leaf(&[
+            ("op", json!("CONNECT")),
+            ("reason", json!("no_dialog_backend")),
+        ])));
+        // A leaf that carries neither (every leaf written before P1.6/P2.1 has a
+        // null `reason` or `suppressed`) must not MATCH an equality clause, and must
+        // not blow up.
+        assert!(!by_reason.matches(&leaf(&[("reason", json!(null))])));
     }
 
     #[test]

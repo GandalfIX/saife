@@ -41,19 +41,24 @@
 //!   or an ancestor of it) is a hard [`RequestError::DenyCoversGrant`], never a
 //!   silent drop — dropping it would leave the rest of the denied tree readable.
 //!
-//! Not here, by design: the session-start audit leaf (P2.3), the prompt/timeout
-//! budget arithmetic (P2.1) and the WinHTTP measurement (P1.5). The per-run token
+//! Not here, by design: the session-start audit leaf (P2.3) and the WinHTTP
+//! measurement (P1.5). The per-run token
 //! that makes concurrent sessions safe landed in P1.4 and lives where it is
 //! enforced: `net::token::RunToken` mints one credential per run and the listener
 //! accepts only its own (`net::proxy::classify_auth`). What this module owns is
 //! the other half — an overlapping launch epoch is refused with
 //! [`MxcError::Concurrency`] rather than splitting one window between two runs.
-//! [`build_request`] passes the caller's `timeout_ms` through unchanged —
-//! `None` means *no deadline*, because the SDK turns a zero timeout into
-//! `INFINITE` (`mxc_common::script_runner::get_timeout_milliseconds`) — and
-//! [`MxcBackend`] overrides it only when a budget was set explicitly with
-//! [`with_budget`](MxcBackend::with_budget). A backend that was never given a
-//! budget therefore never discards the caller's deadline.
+//! **The session deadline is supervisor-owned (P2.1).** [`build_request`] passes
+//! the caller's `timeout_ms` through unchanged — `None` means *no deadline*,
+//! because the SDK turns a zero timeout into `INFINITE`
+//! (`mxc_common::script_runner::get_timeout_milliseconds`) — so the arithmetic
+//! lives one layer up, in [`MxcBackend`]: it always writes
+//! `Some(SessionBudget::timeout_ms())`, i.e. the prompt term plus the workload term
+//! plus the slack ([`PROMPT_BUDGET`], [`WORKLOAD_BUDGET`], [`SESSION_SLACK`]).
+//! There is no representation of "no budget" on that path, so a caller cannot ship
+//! an unbounded session by leaving a field unset, and a kill at the deadline is
+//! attributed to the term that spent the time ([`TimeoutReason`]) instead of being
+//! reported as a bare timeout.
 //!
 //! There is no attestation at `mxc-sdk 1.0.1` (ADR-0004): the tier is observed
 //! after the fact, and `warnings: []` is never treated as evidence.
@@ -78,6 +83,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::net::proxy::EpochAlreadyOpen;
 
@@ -88,7 +94,7 @@ use mxc_sdk::v1::configs::{
 };
 use mxc_sdk::v1::{
     ClipboardPolicy, ContainerRequest, Containment, FilesystemPolicy, NetworkAction,
-    NetworkEgressPolicy, NetworkIngressPolicy, NetworkPolicy, NetworkRuntimeConfig, RunOptions,
+    NetworkEgressPolicy, NetworkIngressPolicy, NetworkPolicy, NetworkRuntimeConfig, SpawnOptions,
     UiPolicy, WaitResult,
 };
 
@@ -551,12 +557,16 @@ pub struct MxcSessionInput {
     pub environment: Vec<(String, String)>,
     pub filesystem: MxcFilesystemInput,
     pub network: MxcNetworkInput,
-    /// Wall-clock bound for the whole workload, in milliseconds. `None` — and
+    /// Wall-clock bound for the whole session, in milliseconds. `None` — and
     /// `Some(0)` — means **no deadline**: the SDK maps a zero timeout to
-    /// `INFINITE` (`mxc_common::script_runner::get_timeout_milliseconds`). P2.1
-    /// owns the budget arithmetic; [`build_request`] passes the value through
-    /// unchanged, and [`MxcBackend`] overrides it only when it carries an
-    /// explicit budget ([`with_budget`](MxcBackend::with_budget)).
+    /// `INFINITE` (`mxc_common::script_runner::get_timeout_milliseconds`).
+    ///
+    /// Since P2.1 the supervisor never ships this value as-is: [`MxcBackend`]
+    /// always writes `Some(budget.timeout_ms())` from its own [`SessionBudget`],
+    /// because a caller-supplied `None` here is how an unbounded session gets
+    /// shipped by accident. [`build_request`] still passes the field through
+    /// unchanged (it is a pure mapping), so the guarantee lives where the launch
+    /// is decided — see [`MxcBackend::request_for`].
     pub timeout_ms: Option<u32>,
 }
 
@@ -916,6 +926,21 @@ pub trait ProxyProofSource: Send + Sync {
     /// Close `epoch`'s attribution window. Called exactly once per
     /// [`begin_launch`](ProxyProofSource::begin_launch).
     fn close_launch(&self, epoch: u64);
+
+    /// Time this source's dialogs cost since the current launch began (P2.1): one
+    /// credit per LEADER, and reset when a launch opens its epoch — so a listener
+    /// that serves several sequential launches attributes to each one only its own
+    /// prompt time. The launch path also takes a **delta** around the run, so the
+    /// reset and the delta agree instead of depending on each other.
+    ///
+    /// Default zero: a proof source that is not a proxy listener has no prompt
+    /// path, and zero is the honest answer — it makes a kill attribute to the
+    /// workload or handshake term only, never to a prompt that did not happen. The
+    /// real implementation is the listener's own measurement, so a session that
+    /// died waiting for a dialog says so.
+    fn prompt_wait(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The real proof source: the supervisor's proxy listener, in
@@ -928,6 +953,10 @@ pub trait ProxyProofSource: Send + Sync {
 impl ProxyProofSource for crate::net::proxy::LaunchCounters {
     fn begin_launch(&self) -> Result<u64, EpochAlreadyOpen> {
         self.begin_epoch()
+    }
+
+    fn prompt_wait(&self) -> Duration {
+        crate::net::proxy::LaunchCounters::prompt_wait(self)
     }
 
     fn proof(&self, epoch: u64) -> ProxyProof {
@@ -1254,7 +1283,10 @@ impl From<v1::Error> for MxcError {
 pub struct SessionOutcome {
     /// `None` when the workload was killed by `timeout_ms`.
     pub exit_code: Option<i32>,
-    pub timed_out: bool,
+    /// Why the session was killed, when it was (P2.1). One field instead of a
+    /// boolean because "timed out" was three different failures with three
+    /// different remediations — see [`TimeoutReason`].
+    pub timeout: Option<TimeoutReason>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// Policy/operational warnings from the container. Never evidence of
@@ -1267,6 +1299,14 @@ pub struct SessionOutcome {
     ///
     /// [`success`]: SessionOutcome::success
     pub expectation: ProofExpectation,
+    /// What the supervisor measured of this launch (P2.1 review, item 2; round 2,
+    /// item 7 added the teardown): `elapsed`, `handshake_elapsed`, `prompt_wait` and
+    /// `teardown_elapsed`. Carried so the
+    /// [`timeout`](SessionOutcome::timeout) label can be checked against its own
+    /// inputs — "workload overran" is falsifiable only if the reader can see that
+    /// the container was ready in 200 ms, and "prompt budget spent" only if the
+    /// prompt time is visible next to the wall clock.
+    pub clock: SessionClock,
 }
 
 impl SessionOutcome {
@@ -1278,8 +1318,13 @@ impl SessionOutcome {
     /// carrying a zero exit code.
     pub fn success(&self) -> bool {
         self.exit_code == Some(0)
-            && !self.timed_out
+            && !self.timed_out()
             && verify_proxy_proof(self.proxy_proof, self.expectation).is_ok()
+    }
+
+    /// `true` when the container killed the session at its deadline.
+    pub fn timed_out(&self) -> bool {
+        self.timeout.is_some()
     }
 }
 
@@ -1290,6 +1335,118 @@ struct ChildRun {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     warnings: Vec<String>,
+}
+
+/// One finished child, plus the supervisor's own time after it exited
+/// (P2.1 review round 2, item 7).
+struct TimedChild {
+    child: ChildRun,
+    /// Time from the child's exit to the container being gone: the tree kill, the
+    /// proxy stop, the release. Carried onto [`SessionClock`] so a deadline that went
+    /// on cleanup is not reported as the operator's command overrunning.
+    teardown_elapsed: Duration,
+}
+
+/// Run `process` to its exit, measuring the workload's run and the supervisor's
+/// teardown **separately** (P2.1 review round 2, item 7).
+///
+/// `wait_with_output` reports the two as one call — it waits, samples warnings and
+/// tears the container down — so `elapsed` spanned a teardown whose share was
+/// invisible, and a supervisor fault was recorded as the operator's command. This
+/// does what `wait_with_output` does, in the same order, with the child's exit (which
+/// the SDK exposes as `try_wait`) as the boundary between the two.
+///
+/// The session deadline is enforced here rather than left to the SDK's own
+/// `timeout_ms`: the exit poll is what measures the boundary, so at `deadline` the
+/// run is over, and [`v1::MxcProcess::kill_for_timeout`] is the SDK's own timeout
+/// arm. `wait` then reports `TimedOut` and the teardown it performs is measured on
+/// its own. A run that ends earlier never reaches that arm.
+fn run_timed(process: v1::MxcProcess, deadline: std::time::Instant) -> std::io::Result<TimedChild> {
+    // How often the child's exit is sampled: the cost of noticing it, paid once per
+    // launch. Small against the `slack` a session budgets for startup and teardown,
+    // large against the syscall's own cost.
+    const EXIT_POLL: Duration = Duration::from_millis(20);
+
+    let mut process = process;
+    // Take both streams before waiting so `wait` cannot discard them, and read each on
+    // its own thread so an output-heavy child cannot deadlock on a full pipe. Same
+    // shape as the SDK's `wait_with_output`, whose closers are what let a timed-out
+    // descendant's readers finish.
+    let stdout_closer = process.stdout_closer();
+    let stderr_closer = process.stderr_closer();
+    let stdout = capture_stream(process.take_stdout());
+    let stderr = capture_stream(process.take_stderr());
+
+    // (1) The workload's own time: from the handshake to the child being gone.
+    loop {
+        match process.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            // The SDK's own deadline fired, or the wait itself failed: `wait` owns
+            // the report, and it cannot take long now.
+            Err(_) => break,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = process.kill_for_timeout();
+            break;
+        }
+        std::thread::sleep(EXIT_POLL);
+    }
+
+    // (2) The supervisor's own time: tree kill, teardown, release.
+    let teardown_started = std::time::Instant::now();
+    let wait = process.wait();
+    let teardown_elapsed = teardown_started.elapsed();
+    // Sampled after the wait: a backend whose teardown runs there reports its
+    // failures here.
+    let warnings = process.warnings();
+    // Some backends keep their original pipe ends until the process object is
+    // released. Drop it before joining the readers so they observe EOF.
+    drop(process);
+    // A timed-out descendant may retain a write end even after the foreground
+    // process is gone: stop capture rather than wait for it.
+    if !matches!(wait, Ok(WaitResult::Exited(_))) {
+        if let Some(closer) = stdout_closer {
+            closer.close();
+        }
+        if let Some(closer) = stderr_closer {
+            closer.close();
+        }
+    }
+    let stdout = join_capture(stdout)?;
+    let stderr = join_capture(stderr)?;
+    Ok(TimedChild {
+        child: ChildRun {
+            wait: wait?,
+            stdout,
+            stderr,
+            warnings,
+        },
+        teardown_elapsed,
+    })
+}
+
+/// Read one of the child's pipes to EOF on its own thread (see [`run_timed`]).
+fn capture_stream(
+    stream: Option<Box<dyn std::io::Read + Send>>,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stream {
+            std::io::Read::read_to_end(&mut stream, &mut buf)?;
+        }
+        Ok(buf)
+    })
+}
+
+/// The bytes a capture thread read, or the failure it hit — the same two answers
+/// `wait_with_output` gives.
+fn join_capture(
+    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("output capture thread panicked")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +1683,357 @@ pub fn build_request(
 }
 
 // ---------------------------------------------------------------------------
+// P2.1: the session budget (timeout_ms = prompt + workload + slack)
+// ---------------------------------------------------------------------------
+
+/// The **prompt term**: how long ONE prompt consultation may legitimately take.
+///
+/// The same value the coordinator uses ([`crate::net::prompt::
+/// DEFAULT_PROMPT_TIMEOUT`], 60 s — the ADR's `network.promptTimeoutSecs`
+/// default), and deliberately the same constant rather than a second number that
+/// can drift: the container's deadline is computed from this, and if a dialog were
+/// allowed to take longer than the term this budget reserves for it, a
+/// legitimate dialog would kill the session.
+pub const PROMPT_BUDGET: Duration = crate::net::prompt::DEFAULT_PROMPT_TIMEOUT;
+
+/// The **workload term**: how long the sandboxed workload itself may run.
+///
+/// [`crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS`] (30 min) — the `network.
+/// workloadTimeoutSecs` default: long enough for the workloads this tool actually
+/// runs (a build, a test suite, a model download over the proxy) and short enough
+/// that a wedged child cannot hold a container for a day. It is *not* the
+/// container's deadline — that is this plus the prompt term plus the slack — so a
+/// session that spends its whole prompt budget still gets this much time to work.
+///
+/// **This is a bound the tool never had.** Before P2.1 the session had no bound at
+/// all (`timeout_ms: None`, i.e. `INFINITE`), so a profile that legitimately needs
+/// longer — a cold Rust build with a large dependency graph, a multi-gigabyte model
+/// download — must RAISE it with `network.workloadTimeoutSecs`. The failure mode
+/// of leaving it at the default is a killed session whose audit reason says
+/// `workload_budget_exceeded`, which is exactly what that reason is for.
+pub const WORKLOAD_BUDGET: Duration =
+    Duration::from_secs(crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS as u64);
+
+/// The **slack term**: container create, proxy proof, teardown, and the scheduling
+/// jitter between the container's own clock and ours.
+///
+/// Two minutes, because everything this term covers is either process creation
+/// (hundreds of milliseconds, but it includes Defender scanning the launcher) or
+/// process teardown (the SDK killing the tree and draining the pipes). Its job is
+/// to make the deadline *strictly larger* than prompt + workload, so a session that
+/// uses both terms to the last millisecond is not killed for arithmetic reasons.
+pub const SESSION_SLACK: Duration = Duration::from_secs(2 * 60);
+
+/// The three terms a session's `timeout_ms` is made of (P2.1).
+///
+/// **Why three terms.** `timeout_ms` bounds the whole session, and the prompt and
+/// the workload are two independent things that can each take a long time. Sizing
+/// the container's deadline as the prompt term alone (or as the workload term
+/// alone) makes one of them kill the other: a 60 s dialog would kill a workload
+/// that was still working, and a workload that legitimately waits 3 minutes on a
+/// slow origin would starve the dialog that has to be answered to unblock it. So
+/// the deadline is the *sum*, and neither term can be spent by the other.
+///
+/// **Why not `None`.** `timeout_ms: None` is mapped to `INFINITE` by the SDK, so a
+/// session with no budget is a container that outlives its supervisor's attention.
+/// This type has no way to express that, and the backend always writes
+/// `Some(..)` — see [`MxcBackend::request_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionBudget {
+    /// How long one prompt consultation may take.
+    pub prompt: Duration,
+    /// How long the workload itself may run.
+    pub workload: Duration,
+    /// Create/prove/teardown allowance on top of both.
+    pub slack: Duration,
+}
+
+impl Default for SessionBudget {
+    /// The configuration defaults, through the same constructor a resolved profile
+    /// uses ([`SessionBudget::from_config`]) — not three literals that could drift
+    /// from `network.promptTimeoutSecs` / `network.workloadTimeoutSecs`.
+    fn default() -> Self {
+        Self::from_config(
+            crate::net::prompt::DEFAULT_PROMPT_TIMEOUT_SECS,
+            crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS,
+            SESSION_SLACK,
+        )
+    }
+}
+
+impl SessionBudget {
+    /// A budget with explicit terms (tests, and any future profile knob).
+    pub const fn new(prompt: Duration, workload: Duration, slack: Duration) -> Self {
+        Self {
+            prompt,
+            workload,
+            slack,
+        }
+    }
+
+    /// The budget a **resolved profile** asks for (P2.1 review, item 6).
+    ///
+    /// Takes the RESOLVED values in seconds — `network.promptTimeoutSecs` and
+    /// `network.workloadTimeoutSecs` after defaults and validation — never the
+    /// constants, and never a `Duration` built at the call site: the failure this
+    /// replaces was a budget sized from [`PROMPT_BUDGET`] (the 60 s DEFAULT) while
+    /// the dialog actually got the profile's `promptTimeoutSecs`. A 300 s profile
+    /// then reserved 60 s + slack of prompt time and killed a legitimate dialog
+    /// plus a full workload — the exact kill P2.1 exists to prevent — and blamed
+    /// the wrong term for it. [`SessionBudget::default`] is defined as
+    /// `from_config` of the config defaults, so the two cannot disagree.
+    pub fn from_config(prompt_secs: u32, workload_secs: u32, slack: Duration) -> Self {
+        Self {
+            prompt: Duration::from_secs(u64::from(prompt_secs)),
+            workload: Duration::from_secs(u64::from(workload_secs)),
+            slack,
+        }
+    }
+
+    /// The whole session: every term added.
+    pub fn session(&self) -> Duration {
+        self.prompt + self.workload + self.slack
+    }
+
+    /// The value the container gets as `timeout_ms`.
+    ///
+    /// Saturating rather than wrapping: `u32::MAX` milliseconds is 49 days and the
+    /// SDK reads it as a finite (absurdly long) deadline, which is the safe side of
+    /// a bug here — the alternative, a wrapped small number, would kill every
+    /// session immediately.
+    pub fn timeout_ms(&self) -> u32 {
+        u32::try_from(self.session().as_millis()).unwrap_or(u32::MAX)
+    }
+
+    /// Attribute a kill at this budget's deadline to the term that spent the time
+    /// (P2.1), from the measurements the session carries ([`SessionClock`]).
+    ///
+    /// **The handshake decides first** (P2.1 review, item 2). Whether the container
+    /// ever became ready is a question about the supervisor and the platform, and it
+    /// is asked before any question about the operator's command: a create/prove
+    /// that never finished means the deadline was spent before the workload could
+    /// run. Reporting that as `WorkloadBudgetExceeded` blamed the command for a
+    /// container that never started. This branch used to be unreachable: `elapsed`
+    /// was measured around the whole run, so it was always at least
+    /// `prompt + workload` and the check could never fire. It is measured separately
+    /// now (`SessionClock::handshake_elapsed`) and this is the first branch that reads
+    /// it. Round 2 (item 6) added the other half of the rule: an over-`slack`
+    /// handshake is only to blame when it also **deprived** the workload, because a
+    /// 130 s create plus a command that then used its whole term is the command's
+    /// overrun and nothing about the container is wrong.
+    ///
+    /// **Teardown is a supervisor term too** (round 2, item 7), on the same
+    /// deprivation rule and after the handshake: the command finished and cleanup ran
+    /// the clock out is [`TimeoutReason::SessionTeardown`], never the operator's
+    /// command.
+    ///
+    /// **Prompt time is a sum, not a share of the wall clock** (item 1c). The
+    /// listener credits each dialog once, to its LEADER (round 2, item 1), so what the
+    /// session carries is the total time it was blocked on dialogs — still not a
+    /// share of the wall clock, because dialogs on different hosts run concurrently.
+    /// What it can answer is whether the workload was **starved**: the workload is
+    /// entitled to `workload` of unblocked wall clock, so a prompt term is to blame
+    /// only when `elapsed - prompt_wait - teardown < workload` (item 1b) — otherwise
+    /// the workload had its full entitlement and overran it, which is the operator's
+    /// command and nobody else's. The rule is stated as deprivation rather than as
+    /// "`prompt_wait > prompt + slack`" because those two are equal only when the
+    /// kill lands exactly on the deadline; the deprivation form also holds for a
+    /// kill that arrives late.
+    ///
+    /// **Saturation is not evidence** (item 1a). The aggregate is clamped to the
+    /// session it happened in — `prompt_wait.min(elapsed)` — and a value that needed
+    /// the clamp is the fingerprint of the over-count, not a measurement that the
+    /// workload was blocked for the whole session. Such a value cannot support a
+    /// positive claim about the prompt term, so it falls back to the term the
+    /// supervisor measures with its own clock.
+    pub fn classify(&self, clock: &SessionClock) -> TimeoutReason {
+        let elapsed = clock.elapsed;
+        // (2a) A session that ended before either term could have been spent did not
+        // lose the deadline to either of them: nothing but the supervisor explains it.
+        if elapsed < self.prompt + self.workload {
+            return TimeoutReason::SessionHandshake;
+        }
+        // (2b) The handshake, from its own measurement — and only when it DEPRIVED
+        // the workload (round 2, item 6). `handshake_elapsed > slack` alone made a
+        // 130 s create plus a workload that then used its full term read as
+        // "container never started", which sends the reader after the wrong
+        // subsystem: the rule is the prompt rule, applied to the supervisor's own
+        // term.
+        if clock.handshake_elapsed > self.slack
+            && elapsed.saturating_sub(clock.handshake_elapsed) < self.workload
+        {
+            return TimeoutReason::SessionHandshake;
+        }
+        // (2c) The teardown, on the same rule (round 2, item 7). Nothing about the
+        // command's own time is in question when the command had already finished and
+        // cleanup is what ran the clock out.
+        if clock.teardown_elapsed > self.slack
+            && elapsed.saturating_sub(clock.teardown_elapsed) < self.workload
+        {
+            return TimeoutReason::SessionTeardown;
+        }
+        // (1a) The clamp, repeated defensively so a hand-built clock cannot claim
+        // more prompt time than session.
+        let prompt_wait = clock.prompt_wait.min(elapsed);
+        if prompt_wait >= elapsed {
+            // Saturated: the aggregate over-counted (see above), or the workload
+            // genuinely never ran — either way a prompt overrun is not the claim
+            // this measurement can support.
+            return TimeoutReason::WorkloadBudgetExceeded;
+        }
+        // (1b) Deprivation: prompt-bound only if the workload did not get its term.
+        // Net of the supervisor's own teardown, which is time the workload could not
+        // have used either way — without that subtraction a real workload overrun
+        // next to a pathological teardown is blamed on the dialog.
+        let workload_available = elapsed
+            .saturating_sub(prompt_wait)
+            .saturating_sub(clock.teardown_elapsed);
+        if workload_available < self.workload {
+            TimeoutReason::PromptBudgetExhausted
+        } else {
+            TimeoutReason::WorkloadBudgetExceeded
+        }
+    }
+}
+
+/// Why a session hit its deadline (P2.1).
+///
+/// Four variants because the four have different remediations and must not share a
+/// reason string: a workload overrun is the operator's command, a spent prompt budget
+/// is an unanswered dialog, a handshake timeout is a container that never started, and
+/// a teardown timeout is a container that will not go away (round 2, item 7). Before
+/// this the only fact an outcome carried was `timed_out: true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutReason {
+    /// The workload ran past [`SessionBudget::workload`].
+    WorkloadBudgetExceeded,
+    /// Prompt consultations consumed the whole [`SessionBudget::prompt`] term.
+    PromptBudgetExhausted,
+    /// Neither term was spent: create/prove/teardown is what the deadline covered.
+    SessionHandshake,
+    /// The command finished, and the supervisor's teardown is what ran the deadline
+    /// out (round 2, item 7). Supervisor-side, like [`Self::SessionHandshake`], and
+    /// separate from it because the remedies differ: a container that never started
+    /// versus a container that will not go away.
+    SessionTeardown,
+}
+
+impl TimeoutReason {
+    /// The stable, greppable reason string (audit/log vocabulary, same shape as the
+    /// proxy's `prompt_budget_exhausted`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WorkloadBudgetExceeded => "workload_budget_exceeded",
+            Self::PromptBudgetExhausted => "prompt_budget_exhausted",
+            Self::SessionHandshake => "session_handshake_timeout",
+            Self::SessionTeardown => "session_teardown_timeout",
+        }
+    }
+}
+
+impl fmt::Display for TimeoutReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Prompt time one launch spent: the listener's counter restarts at every launch
+/// (`LaunchCounters::begin_epoch`) and the delta across the run is this session's own
+/// contribution to it (P2.1). The delta is kept as well as the reset, so the two
+/// cannot silently disagree.
+///
+/// A SUM of dialog wall clocks, not a share of the session's wall clock: the listener
+/// credits each dialog once, to the consultation that LED it (round 2, item 1), and
+/// dialogs on different hosts run concurrently. Nothing here may be read as "the
+/// session spent this long in a dialog" — [`SessionClock::measured`] is what turns it
+/// into a measurement a label can be based on (clamped, and
+/// saturated-means-over-counted).
+///
+/// Saturating on purpose: the clock cannot go backwards, and if it ever did (a
+/// counter reset), the session must be credited with zero prompt time rather than
+/// with an underflowed giant, which would report every later kill as a prompt
+/// timeout.
+fn prompt_wait_during(before: Duration, after: Duration) -> Duration {
+    after.saturating_sub(before)
+}
+
+/// What the supervisor observed of one launch, for attributing a kill (P2.1).
+///
+/// Measurements, never policy: [`SessionBudget::classify`] is the only consumer, and
+/// every field is carried onto [`SessionOutcome`] so a reader can check the label
+/// against its own inputs instead of trusting it. Round 2 added the teardown, because
+/// `elapsed` spans it and an unmeasured phase can only be blamed on the workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionClock {
+    /// The budget the session was launched with.
+    pub budget: SessionBudget,
+    /// Wall-clock time from launch to the child's exit (or kill): create, run and
+    /// teardown.
+    pub elapsed: Duration,
+    /// Time from launch until the container was **ready** — the SDK's `spawn`
+    /// returned, i.e. the container exists and the workload was launched (P2.1
+    /// review, item 2). Measured separately because `elapsed` alone cannot say
+    /// whether the workload ever ran: a create that hangs is a supervisor/platform
+    /// failure and must not be reported as the operator's command overrunning.
+    pub handshake_elapsed: Duration,
+    /// Time inside prompt consultations, measured by the proxy listener: the wall
+    /// clock of each dialog it LED, summed (a coalesced follower adds nothing) and
+    /// clamped to [`SessionClock::elapsed`].
+    pub prompt_wait: Duration,
+    /// Time the supervisor spent tearing the container down after the child's exit
+    /// (round 2, item 7): the tree kill, the proxy stop and the container release.
+    /// Measured separately for the same reason as the handshake — `elapsed` spans it,
+    /// and a deadline that went on cleanup is a supervisor fault, not the operator's
+    /// command.
+    pub teardown_elapsed: Duration,
+}
+
+impl SessionClock {
+    /// Record one launch's measurements, clamping the prompt aggregate to the
+    /// session it happened in (P2.1 review, item 1a).
+    ///
+    /// The clamp belongs here, at the reader: the counter is a sum over the dialogs
+    /// this session LED, and dialogs on different hosts run concurrently, so it can
+    /// exceed the session's wall clock even with each dialog credited exactly once.
+    /// Crediting the session with more prompt time than it ran for is not a
+    /// measurement — and `min` keeps the carried value
+    /// (`SessionOutcome::clock.prompt_wait`) a number a reader can reason about,
+    /// with saturation as the visible sign that the aggregate over-counted.
+    pub fn measured(
+        budget: SessionBudget,
+        elapsed: Duration,
+        handshake_elapsed: Duration,
+        prompt_wait: Duration,
+    ) -> Self {
+        Self {
+            budget,
+            elapsed,
+            handshake_elapsed,
+            prompt_wait: prompt_wait.min(elapsed),
+            teardown_elapsed: Duration::ZERO,
+        }
+    }
+
+    /// Record the teardown this session measured (round 2, item 7).
+    ///
+    /// A builder rather than a fifth parameter of [`SessionClock::measured`]: the
+    /// teardown is only measurable where a container is really torn down, and a
+    /// caller that has no such measurement must not be able to leave a fifth `0`
+    /// standing in for it.
+    pub fn with_teardown(self, teardown: Duration) -> Self {
+        Self {
+            teardown_elapsed: teardown,
+            ..self
+        }
+    }
+
+    /// The reason this session's deadline produced, if it produced one.
+    pub fn timeout_reason(&self) -> TimeoutReason {
+        self.budget.classify(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Launch
 // ---------------------------------------------------------------------------
 
@@ -1542,11 +2050,12 @@ pub struct MxcBackend<'a> {
     /// this backend's token can satisfy this backend's proxy, so a caller value
     /// is a lookalike by definition.
     proxy_token: Option<String>,
-    /// `None` when this backend has no budget of its own, so the caller's
-    /// [`MxcSessionInput::timeout_ms`] ships untouched. `Some(budget)` is an
-    /// explicit decision — including `Some(None)`, which means "no deadline" —
-    /// and wins over the caller's value.
-    budget: Option<Option<u32>>,
+    /// The session's budget (P2.1). **Not** optional: a backend with no budget
+    /// ships the caller's `timeout_ms`, and a caller that passed `None` used to
+    /// produce a container with an infinite deadline. There is no representation
+    /// of "no budget" here, so that cannot be reintroduced by forgetting to call
+    /// a setter.
+    budget: SessionBudget,
     launcher: PathBuf,
 }
 
@@ -1561,7 +2070,7 @@ impl<'a> MxcBackend<'a> {
             proof: Some(proof),
             proxy_port,
             proxy_token: None,
-            budget: None,
+            budget: SessionBudget::default(),
             launcher: launcher.into(),
         }
     }
@@ -1574,17 +2083,11 @@ impl<'a> MxcBackend<'a> {
             proof: None,
             proxy_port,
             proxy_token: None,
-            budget: None,
+            budget: SessionBudget::default(),
             launcher: launcher.into(),
         }
     }
 
-    /// Set the wall-clock budget for the whole workload, in milliseconds.
-    ///
-    /// `Some(ms)` is a deadline and `None` explicitly asks for **no** deadline;
-    /// either way the budget wins over the caller's
-    /// [`MxcSessionInput::timeout_ms`]. A backend that never calls this leaves
-    /// the caller's deadline in force. P2.1 owns the real arithmetic.
     /// The session token the backend's proxy expects, embedded in the proxy URL
     /// the child receives (see [`MxcNetworkInput::proxy_token`]).
     pub fn with_proxy_token(mut self, token: impl Into<String>) -> Self {
@@ -1592,9 +2095,22 @@ impl<'a> MxcBackend<'a> {
         self
     }
 
-    pub fn with_budget(mut self, timeout_ms: Option<u32>) -> Self {
-        self.budget = Some(timeout_ms);
+    /// Replace the session budget (P2.1).
+    ///
+    /// Takes the three-term [`SessionBudget`], never a bare `Option<u32>`: a bare
+    /// `None` is the unbounded session this item removed, and a bare number hides
+    /// which term it is meant to cover. The default is
+    /// [`SessionBudget::default`] — prompt + workload + slack — and this setter
+    /// exists for a caller that knows better (a profile knob, or a test with a
+    /// 300 ms prompt term).
+    pub fn with_budget(mut self, budget: SessionBudget) -> Self {
+        self.budget = budget;
         self
+    }
+
+    /// This backend's session budget.
+    pub fn budget(&self) -> SessionBudget {
+        self.budget
     }
 
     /// The port this backend's proxy listens on.
@@ -1614,10 +2130,13 @@ impl<'a> MxcBackend<'a> {
     /// actually about to happen, or guardrail 1 would attribute traffic to the
     /// wrong place.
     ///
-    /// The budget is replaced only when this backend was given one explicitly
-    /// ([`with_budget`](MxcBackend::with_budget)). Overwriting it
-    /// unconditionally would discard every caller-supplied deadline — and since
-    /// `None` means "no deadline", the workload would then run unbounded.
+    /// The budget is **always** written, unconditionally, from this backend's
+    /// [`SessionBudget`] (P2.1). Passing the caller's value through was the
+    /// unbounded-session bug: `timeout_ms: None` means no deadline at all in the
+    /// SDK, so a supervisor that forgot to set one launched a container that could
+    /// outlive everything. The caller's field is still honoured where it belongs —
+    /// as the *default* a caller can set — but only a value covering prompt +
+    /// workload + slack can survive this function.
     ///
     /// Returns [`RequestError`] (wrapped in [`MxcError`]) for a command line that
     /// cannot be launched; see [`build_request`].
@@ -1628,9 +2147,9 @@ impl<'a> MxcBackend<'a> {
         // cannot authenticate against this backend's listener, and shipping it
         // would produce a 407 that reads like a broken proxy.
         effective.network.proxy_token = self.proxy_token.clone();
-        if let Some(budget) = self.budget {
-            effective.timeout_ms = budget;
-        }
+        // Never `None`, never the caller's number: the session deadline is this
+        // backend's own arithmetic.
+        effective.timeout_ms = Some(self.budget.timeout_ms());
         Ok(build_request(&effective, &self.launcher)?)
     }
 
@@ -1666,24 +2185,57 @@ impl<'a> MxcBackend<'a> {
         // lookalike, and not the backend ceiling (which policy can lower).
         let tier = probe_tier(&request)?;
 
+        // P2.1: the same measurement starts before the child does, so a kill at the
+        // deadline can be attributed to a term instead of reported as a bare
+        // timeout. `prompt_wait` comes from the listener, i.e. from the code that
+        // actually waited on the dialog.
+        let started = std::time::Instant::now();
+        // The listener's prompt clock is a per-listener total, so the session's own
+        // prompt time is a DELTA between two reads: one listener can serve several
+        // sequential launches, and a later session must not inherit an earlier one's
+        // spent budget (it would be reported as `prompt_budget_exhausted` having
+        // never prompted). Concurrent launches are impossible here ([`MxcError::
+        // Concurrency`] refuses an overlapping epoch), so the window is exactly this
+        // launch.
+        let prompt_baseline = source.prompt_wait();
         // The epoch is opened before the child starts, so guardrail 1 cannot be
         // satisfied by traffic from an earlier launch, and it is closed on every
         // path out of the run (success, SDK error, panic unwind).
-        let (exec, proof) = run_in_epoch(source, || {
-            v1::run(request, RunOptions::default()).map_err(MxcError::from)
+        //
+        // P2.1 review (item 2): `v1::run` is `spawn` + `wait_with_output` with no
+        // seam between them, so the one moment that says whether the container ever
+        // became ready was invisible — and a container that hung at create was
+        // recorded as the operator's workload overrunning. The two calls are made
+        // here instead: identical to what `run` does internally (spawn, then capture
+        // both streams while waiting, then sample warnings and tear down), with the
+        // handshake measured in between and the teardown measured on the way out
+        // ([`run_timed`], round 2 item 7).
+        // The session deadline, handed to the run so the exit poll and the SDK's own
+        // `timeout_ms` agree on when the workload is over (round 2, item 7).
+        let deadline = started + self.budget.session();
+        let ((exec, handshake_elapsed), proof) = run_in_epoch(source, || {
+            let process = v1::spawn(request, SpawnOptions::default()).map_err(MxcError::from)?;
+            // The container exists and the workload was launched: the handshake is
+            // over. Everything after this point is the workload's own time.
+            let handshake_elapsed = started.elapsed();
+            let exec = run_timed(process, deadline).map_err(|e| {
+                MxcError::Sdk(v1::Error::new(
+                    v1::ErrorCode::BackendError,
+                    format!("waiting for the sandbox to complete failed: {e}"),
+                ))
+            })?;
+            Ok((exec, handshake_elapsed))
         })?;
-
-        gate_outcome(
-            tier,
-            ChildRun {
-                wait: exec.outcome,
-                stdout: exec.stdout,
-                stderr: exec.stderr,
-                warnings: exec.warnings,
-            },
-            proof,
-            expectation,
+        let clock = SessionClock::measured(
+            self.budget,
+            started.elapsed(),
+            handshake_elapsed,
+            prompt_wait_during(prompt_baseline, source.prompt_wait()),
         )
+        // The supervisor's own time after the child exited (round 2, item 7).
+        .with_teardown(exec.teardown_elapsed);
+
+        gate_outcome(tier, exec.child, proof, expectation, clock)
     }
 }
 
@@ -1727,25 +2279,31 @@ fn gate_outcome(
     child: ChildRun,
     proof: ProxyProof,
     expectation: ProofExpectation,
+    clock: SessionClock,
 ) -> Result<SessionOutcome, MxcError> {
     // Guardrail 1 first and unconditionally: `warnings: []` and exit 0 are not
     // evidence, so a failed proof poisons every outcome, timeout included.
     verify_proxy_proof(proof, expectation)?;
 
-    let (exit_code, timed_out) = match child.wait {
-        WaitResult::Exited(code) => (Some(code), false),
-        WaitResult::TimedOut => (None, true),
+    // P2.1: a kill at the deadline is attributed to the term that spent the time,
+    // from measurements the supervisor and the listener took — never guessed from
+    // the fact that a timeout happened.
+    let (exit_code, timeout) = match child.wait {
+        WaitResult::Exited(code) => (Some(code), None),
+        WaitResult::TimedOut => (None, Some(clock.timeout_reason())),
     };
 
     Ok(SessionOutcome {
         exit_code,
-        timed_out,
+        timeout,
         stdout: child.stdout,
         stderr: child.stderr,
         warnings: child.warnings,
         tier,
         proxy_proof: proof,
         expectation,
+        // The label above is derived from exactly these numbers (P2.1 review).
+        clock,
     })
 }
 
@@ -1790,6 +2348,13 @@ mod tests {
             tier_source: "probe",
             needs_dacl_augmentation: Some(false),
         }
+    }
+
+    /// A session clock for tests that are about the gate, not the budget: the
+    /// default budget, no elapsed time, no prompt time. A kill under it classifies
+    /// as a handshake timeout, which is what "no time was spent anywhere" means.
+    fn clock() -> SessionClock {
+        SessionClock::default()
     }
 
     fn child(wait: WaitResult) -> ChildRun {
@@ -2285,6 +2850,7 @@ mod tests {
                 tunnels: 0,
             },
             ProofExpectation::Required,
+            clock(),
         )
         .expect_err("exit 0 must not mask a failed proof");
         assert!(matches!(
@@ -2300,11 +2866,12 @@ mod tests {
             child(WaitResult::Exited(0)),
             proven(),
             ProofExpectation::Required,
+            clock(),
         )
         .expect("proven launch");
         assert!(outcome.success());
         assert_eq!(outcome.exit_code, Some(0));
-        assert!(!outcome.timed_out);
+        assert!(!outcome.timed_out());
         assert_eq!(outcome.stdout, b"hi\n");
         assert!(outcome.stderr.is_empty());
         // Container warnings are carried for the audit trail, never as evidence
@@ -2322,6 +2889,7 @@ mod tests {
             child(WaitResult::Exited(0)),
             untouched(),
             ProofExpectation::MustBeAbsent,
+            clock(),
         )
         .expect("a blocked session that never reached the proxy");
         assert!(outcome.success());
@@ -2352,13 +2920,14 @@ mod tests {
         for (expectation, proof) in cases {
             let outcome = SessionOutcome {
                 exit_code: Some(0),
-                timed_out: false,
+                timeout: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 warnings: Vec::new(),
                 tier: tier(),
                 proxy_proof: proof,
                 expectation,
+                clock: clock(),
             };
             assert!(
                 !outcome.success(),
@@ -2377,6 +2946,7 @@ mod tests {
             child(WaitResult::Exited(3)),
             proven(),
             ProofExpectation::Required,
+            clock(),
         )
         .expect("proven launch");
         assert_eq!(outcome.exit_code, Some(3));
@@ -2390,9 +2960,15 @@ mod tests {
             child(WaitResult::TimedOut),
             proven(),
             ProofExpectation::Required,
+            clock(),
         )
         .expect("proven launch");
-        assert!(outcome.timed_out);
+        assert!(outcome.timed_out());
+        assert_eq!(
+            outcome.timeout,
+            Some(TimeoutReason::SessionHandshake),
+            "a kill with no time spent in the workload or the prompt is a handshake timeout"
+        );
         assert_eq!(outcome.exit_code, None);
         assert!(!outcome.success());
     }
@@ -2404,6 +2980,7 @@ mod tests {
             child(WaitResult::TimedOut),
             untouched(),
             ProofExpectation::Required,
+            clock(),
         )
         .expect_err("proof gate applies to every outcome");
         assert!(matches!(
@@ -2662,8 +3239,13 @@ mod tests {
     #[test]
     fn the_backend_owns_the_proxy_port_and_the_budget() {
         let source = RecordingSource::default();
-        let backend =
-            MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_budget(Some(1_000));
+        // 300 + 650 + 50 = 1000 ms of session.
+        let budget = SessionBudget::new(
+            Duration::from_millis(300),
+            Duration::from_millis(650),
+            Duration::from_millis(50),
+        );
+        let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_budget(budget);
         let mut i = input();
         i.network.proxy_port = Some(1); // a caller-supplied lookalike
         i.timeout_ms = Some(999_999);
@@ -2678,53 +3260,497 @@ mod tests {
             "the request must point at the proxy this backend proves"
         );
         assert_eq!(req.timeout_ms, Some(1_000), "the backend's budget wins");
+        assert_eq!(backend.budget(), budget);
         assert_eq!(backend.proxy_port(), Some(49_152));
         assert_eq!(backend.launcher(), Path::new(TEST_LAUNCHER));
     }
 
+    /// P2.1, item 4: **the supervisor path cannot ship an unbounded session.**
+    ///
+    /// `timeout_ms: None` (and `Some(0)`) is INFINITE in the SDK, and the old
+    /// backend passed a caller's value through unchanged — so a supervisor that
+    /// left the field unset launched a container with no deadline at all. The
+    /// backend now owns the arithmetic and always writes `Some(..)`, and the value
+    /// has to cover the whole session: prompt + workload + slack, never one term.
     #[test]
-    fn a_caller_supplied_timeout_survives_a_backend_with_no_budget() {
+    fn the_supervisor_session_always_carries_a_deadline() {
         let source = RecordingSource::default();
-        // No `with_budget`: this backend has no opinion, so the caller's
-        // deadline is the one that must ship. Overwriting it with `None` would
-        // have discarded it *and* removed the deadline (None = no deadline).
         let backend = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER);
         let mut i = input();
-        i.timeout_ms = Some(1_500);
+        i.timeout_ms = None; // the shape that used to ship an infinite session
 
         let req = backend.request_for(&i).expect("launchable request");
+        let whole = PROMPT_BUDGET + WORKLOAD_BUDGET + SESSION_SLACK;
+        let whole_ms = u32::try_from(whole.as_millis()).expect("budget fits u32 ms");
         assert_eq!(
             req.timeout_ms,
-            Some(1_500),
-            "an unset backend budget must not discard the caller's deadline"
+            Some(whole_ms),
+            "an unbounded session must be impossible from the supervisor path"
+        );
+        // Not vacuous: the value is the SUM, so no single term can be mistaken for
+        // the session's deadline (a 60 s prompt term would kill a working workload,
+        // a 30 min workload term would kill an unanswered dialog's session).
+        assert!(whole_ms > u32::try_from(PROMPT_BUDGET.as_millis()).unwrap());
+        assert!(whole_ms > u32::try_from(WORKLOAD_BUDGET.as_millis()).unwrap());
+        assert!(
+            whole_ms > u32::try_from((PROMPT_BUDGET + WORKLOAD_BUDGET).as_millis()).unwrap(),
+            "the slack must be strictly on top of both terms"
         );
     }
 
+    /// The short-budget arithmetic of the same rule, and the reason the defaults are
+    /// what they are: **a dialog may legitimately take 30 s**, so a session sized on
+    /// a test-sized prompt term would kill a real workload. The deadline is the sum,
+    /// which is strictly greater than prompt + workload.
     #[test]
-    fn an_explicit_budget_wins_over_the_caller_timeout_in_both_directions() {
-        let source = RecordingSource::default();
-        let mut i = input();
-        i.timeout_ms = Some(999_999);
+    fn a_dialog_that_uses_its_whole_budget_does_not_kill_the_container() {
+        // The short budget the test asks for: 300 ms of dialog, 200 ms of work,
+        // 50 ms of slack.
+        let budget = SessionBudget::new(
+            Duration::from_millis(300),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        );
+        assert_eq!(budget.session(), Duration::from_millis(550));
+        assert_eq!(budget.timeout_ms(), 550);
+        assert!(
+            budget.session() > budget.prompt + budget.workload,
+            "a session that spends BOTH terms in full must still be inside its deadline"
+        );
+        // A dialog that takes its whole 300 ms and a workload that then takes its
+        // whole 200 ms = 500 ms, inside the 550 ms deadline: no kill.
+        assert!(budget.session() >= Duration::from_millis(500));
+        // Nothing was killed: when both terms were spent to the last millisecond the
+        // session still had the slack left.
+        assert!(budget.prompt + budget.workload < budget.session());
+    }
 
-        let capped = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_budget(Some(250));
+    /// P2.1: the prompt time a session is judged on is its OWN — a listener that
+    /// already served a launch must not hand its predecessor's spent dialog time to
+    /// the next session, which would report a kill as `prompt_budget_exhausted` for a
+    /// session that never prompted.
+    #[test]
+    fn the_session_prompt_time_is_the_delta_across_the_launch() {
+        let before = Duration::from_secs(45);
         assert_eq!(
-            capped
-                .request_for(&i)
-                .expect("launchable request")
-                .timeout_ms,
-            Some(250),
-            "an explicit budget narrows the caller's deadline"
+            prompt_wait_during(before, Duration::from_secs(50)),
+            Duration::from_secs(5),
+            "an earlier session's 45 s must not be attributed to this one"
+        );
+        assert_eq!(
+            prompt_wait_during(before, before),
+            Duration::ZERO,
+            "a launch that never prompted has spent no prompt time"
+        );
+        assert_eq!(
+            prompt_wait_during(Duration::from_secs(50), Duration::from_secs(45)),
+            Duration::ZERO,
+            "a clock that went backwards must credit zero, never an underflow"
+        );
+    }
+
+    /// P2.1: a workload that exceeds its budget is killed and reported with a reason
+    /// **distinct** from a spent prompt budget and from a session-handshake timeout.
+    #[test]
+    fn a_workload_overrun_is_reported_distinctly_from_a_prompt_or_handshake_timeout() {
+        let budget = fixture_budget();
+
+        // The workload ran the clock out with no prompt in the way.
+        let workload = budget.classify(&SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        ));
+        // Dialogs ate their 60 s term plus the slack, so the workload never got the
+        // 600 s it was entitled to.
+        let prompt = budget.classify(&SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(200),
+            Duration::from_secs(180),
+        ));
+        // The session ended long before either term could have been spent.
+        let handshake = budget.classify(&SessionClock::measured(
+            budget,
+            Duration::from_secs(120),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        ));
+
+        assert_eq!(workload, TimeoutReason::WorkloadBudgetExceeded);
+        assert_eq!(prompt, TimeoutReason::PromptBudgetExhausted);
+        assert_eq!(handshake, TimeoutReason::SessionHandshake);
+
+        let mut reasons = vec![workload.as_str(), prompt.as_str(), handshake.as_str()];
+        reasons.sort_unstable();
+        reasons.dedup();
+        assert_eq!(
+            reasons.len(),
+            3,
+            "the three deadline causes must be three distinct reasons: {reasons:?}"
+        );
+        assert_eq!(workload.as_str(), "workload_budget_exceeded");
+        assert_eq!(handshake.as_str(), "session_handshake_timeout");
+        // The prompt cause shares its vocabulary with the proxy's deny reason for the
+        // same term: a consumer reading either side names the budget, not the layer.
+        assert_eq!(prompt.as_str(), crate::net::proxy::PROMPT_TIMEOUT_REASON);
+
+        // And a session that is killed with time left on the workload term is not
+        // reported as a workload overrun — the distinction is not vacuous.
+        assert_ne!(workload, handshake);
+    }
+
+    /// The 60 s / 600 s / 60 s budget the attribution tests are written against: a
+    /// deadline of 720 s, where "the workload was starved" and "the prompt term ate
+    /// the slack" are the same statement.
+    fn fixture_budget() -> SessionBudget {
+        SessionBudget::new(
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        )
+    }
+
+    /// **Item 1b: the label requires deprivation.** A prompt label is a claim that
+    /// the workload did not get the time it was entitled to — not that some dialog
+    /// spent "more than its term". Two sessions with the SAME prompt aggregate are
+    /// labelled differently depending on whether the workload was starved, which is
+    /// the property that makes the prompt branch subordinate to the workload's.
+    #[test]
+    fn the_prompt_term_is_named_only_when_the_workload_was_starved() {
+        let budget = fixture_budget();
+
+        // One 720 s session, two prompt aggregates, and the label follows the
+        // starvation rather than the aggregate's size relative to the term:
+        // 100 s of prompt time leaves the workload 620 s of its 600 s term, so the
+        // deadline it hit was its own.
+        let had_its_time = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(200),
+            Duration::from_secs(100),
+        );
+        assert_eq!(
+            had_its_time.timeout_reason(),
+            TimeoutReason::WorkloadBudgetExceeded,
+            "the workload got its full 600 s: the prompt term is not to blame"
         );
 
-        // `with_budget(None)` is a decision ("no deadline"), not a missing value.
-        let unbounded = MxcBackend::new(&source, Some(49_152), TEST_LAUNCHER).with_budget(None);
+        // 200 s of prompt time leaves it 520 s — 80 s short of its term — so the
+        // session ended because of the dialogs, even though the prompt term is six
+        // times what such a dialog is allowed to take (P2.1's point: the aggregate
+        // is not a share, and the workload's deprivation is what decides).
+        let starved = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(200),
+            Duration::from_secs(200),
+        );
         assert_eq!(
-            unbounded
-                .request_for(&i)
-                .expect("launchable request")
-                .timeout_ms,
-            None,
-            "an explicit `None` budget must win over a caller-supplied timeout"
+            starved.timeout_reason(),
+            TimeoutReason::PromptBudgetExhausted,
+            "520 s of workload time against a 600 s term: dialogs are why it ended"
+        );
+        assert_ne!(
+            had_its_time.timeout_reason(),
+            starved.timeout_reason(),
+            "the two differ only in the prompt aggregate"
+        );
+    }
+
+    /// **Item 1a + 1c: the aggregate is a sum over requests, so it is clamped and a
+    /// saturated value is not evidence.** The measured over-count was 5.90x (six
+    /// connections, one host) and 7.87x (eight hosts): `prompt_wait` said 4700 s in a
+    /// 600 s session. That number must not become a prompt verdict.
+    #[test]
+    fn a_prompt_measurement_larger_than_the_session_is_clamped_and_blames_no_prompt() {
+        let budget = fixture_budget();
+        let raw = Duration::from_secs(4700); // 7.83x the session it happened in
+        let clock = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(200),
+            raw,
+        );
+
+        assert_eq!(
+            clock.prompt_wait,
+            Duration::from_secs(720),
+            "the carried measurement is clamped to the session: a reader must not see \
+             more prompt time than wall clock"
+        );
+        let reason = clock.timeout_reason();
+        assert_ne!(
+            reason,
+            TimeoutReason::PromptBudgetExhausted,
+            "a saturated aggregate is the fingerprint of the over-count, not a verdict"
+        );
+        assert_eq!(reason, TimeoutReason::WorkloadBudgetExceeded);
+
+        // The clamp is not vacuous: a plausible aggregate on a session whose
+        // workload was starved DOES produce a prompt verdict.
+        let plausible = SessionBudget::new(
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            SessionClock::measured(
+                plausible,
+                Duration::from_secs(420),
+                Duration::from_millis(200),
+                Duration::from_secs(200)
+            )
+            .timeout_reason(),
+            TimeoutReason::PromptBudgetExhausted
+        );
+    }
+
+    /// **Item 2: the handshake is observable and decides first — when it deprived the
+    /// workload.** A container that hangs at create/prove used to be recorded as the
+    /// operator's workload overrunning, because `elapsed` was measured around the whole
+    /// run and therefore always exceeded `prompt + workload`. With the handshake
+    /// measured separately (launch start → container ready) a create that outlived the
+    /// allowance `slack` exists to provide for it AND left less than the workload's
+    /// term is the handshake's failure (round 2, item 6 tightened that second half;
+    /// `the_handshake_term_is_named_only_when_it_starved_the_workload` is the pair).
+    ///
+    /// The clock is the session's own deadline: this fixture's budget is 60 + 600 + 60,
+    /// so 720 s is the longest a session under it can run, and a clock claiming more
+    /// would be a measurement bug rather than a case to classify.
+    #[test]
+    fn a_stalled_handshake_is_reported_as_a_handshake_timeout() {
+        let budget = fixture_budget();
+        let stalled = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_secs(300), // > the 60 s slack, i.e. the create ate the session
+            Duration::ZERO,
+        );
+        assert_eq!(
+            stalled.timeout_reason(),
+            TimeoutReason::SessionHandshake,
+            "the container never became ready in time: the workload never got a chance"
+        );
+        assert_ne!(
+            stalled.timeout_reason(),
+            TimeoutReason::WorkloadBudgetExceeded,
+            "a supervisor/container failure must not be recorded as the command's"
+        );
+        assert_eq!(
+            stalled.timeout_reason().as_str(),
+            "session_handshake_timeout"
+        );
+
+        // And the label is not vacuous: the same session with a handshake that
+        // finished inside its allowance is the workload's overrun.
+        let ready = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(180),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            ready.timeout_reason(),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+    }
+
+    /// **Round 2, item 6: the handshake arm is DEPRIVATION-based, like the prompt
+    /// one.** `handshake_elapsed > slack` alone misdirects the remedy when both are
+    /// true: a 130 s create followed by a workload that then used its whole 600 s
+    /// term is the operator's command overrunning, and calling it
+    /// `session_handshake_timeout` sends the reader after a container that started
+    /// perfectly well.
+    #[test]
+    fn the_handshake_term_is_named_only_when_it_starved_the_workload() {
+        let budget = fixture_budget(); // prompt 60 + workload 600 + slack 60
+
+        // Slow create (130 s, over the slack) AND the workload spent its whole term
+        // on top of it: 730 - 130 = 600, i.e. nothing was taken from the command.
+        let overran = SessionClock::measured(
+            budget,
+            Duration::from_secs(730),
+            Duration::from_secs(130),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            overran.timeout_reason(),
+            TimeoutReason::WorkloadBudgetExceeded,
+            "the command got its full 600 s after the create: the handshake ate nothing"
+        );
+
+        // Same slow create, but the workload never got its entitlement.
+        let starved = SessionClock::measured(
+            budget,
+            Duration::from_secs(730),
+            Duration::from_secs(300),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            starved.timeout_reason(),
+            TimeoutReason::SessionHandshake,
+            "430 s of workload time against a 600 s term, and the create is why"
+        );
+        assert_ne!(overran.timeout_reason(), starved.timeout_reason());
+    }
+
+    /// **Round 2, item 7: teardown is measured, and a deadline that went on cleanup
+    /// is a SUPERVISOR fault.** `elapsed` spans create + run + teardown, but only
+    /// create was measured, so a teardown that ate the deadline was reported as the
+    /// operator's command overrunning - the one label the operator cannot act on.
+    #[test]
+    fn a_deadline_spent_on_teardown_is_its_own_supervisor_side_reason() {
+        let budget = fixture_budget();
+
+        // 1 s create, the command ran 500 s and exited, then 190 s of teardown:
+        // 691 s elapsed, of which 190 s is cleanup (over the 60 s slack) and the
+        // command never approached its 600 s term.
+        let cleanup = SessionClock::measured(
+            budget,
+            Duration::from_secs(691),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .with_teardown(Duration::from_secs(190));
+        assert_eq!(cleanup.teardown_elapsed, Duration::from_secs(190));
+        assert_eq!(
+            cleanup.timeout_reason(),
+            TimeoutReason::SessionTeardown,
+            "the command finished at 501 s: cleanup is what ran the clock out"
+        );
+        assert_eq!(
+            cleanup.timeout_reason().as_str(),
+            "session_teardown_timeout"
+        );
+
+        // The same 691 s with an ordinary teardown IS the command's overrun: the
+        // label follows the measurement, not the total.
+        let ordinary = SessionClock::measured(
+            budget,
+            Duration::from_secs(691),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .with_teardown(Duration::from_secs(2));
+        assert_ne!(
+            ordinary.timeout_reason(),
+            TimeoutReason::SessionTeardown,
+            "a 2 s teardown is not why a 691 s session ended"
+        );
+
+        // And the four arms stay four distinct labels.
+        let mut arms: Vec<&str> = [
+            TimeoutReason::WorkloadBudgetExceeded,
+            TimeoutReason::PromptBudgetExhausted,
+            TimeoutReason::SessionHandshake,
+            TimeoutReason::SessionTeardown,
+        ]
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect();
+        arms.sort_unstable();
+        arms.dedup();
+        assert_eq!(
+            arms.len(),
+            4,
+            "each deadline cause keeps its own reason: {arms:?}"
+        );
+    }
+
+    /// **Item 2: the measurements ride on the outcome**, so the label can be checked
+    /// against its own inputs — and both cases above are reachable through the real
+    /// mapping (`gate_outcome`), not only through `classify`.
+    #[test]
+    fn a_killed_session_carries_the_measurements_its_label_came_from() {
+        let budget = fixture_budget();
+        let stalled = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+        let outcome = gate_outcome(
+            tier(),
+            child(WaitResult::TimedOut),
+            proven(),
+            ProofExpectation::Required,
+            stalled,
+        )
+        .expect("a timed-out launch still has to pass guardrail 1");
+        assert_eq!(outcome.timeout, Some(TimeoutReason::SessionHandshake));
+        assert_eq!(outcome.clock.elapsed, Duration::from_secs(720));
+        assert_eq!(outcome.clock.handshake_elapsed, Duration::from_secs(300));
+        assert_eq!(outcome.clock.prompt_wait, Duration::from_secs(10));
+        assert_eq!(
+            outcome.clock.timeout_reason(),
+            outcome.timeout.unwrap(),
+            "the carried label must be exactly what the carried measurements produce"
+        );
+
+        // The long-workload half: same shape, a handshake that finished promptly.
+        let ready = SessionClock::measured(
+            budget,
+            Duration::from_secs(720),
+            Duration::from_millis(180),
+            Duration::from_secs(5),
+        );
+        let outcome = gate_outcome(
+            tier(),
+            child(WaitResult::TimedOut),
+            proven(),
+            ProofExpectation::Required,
+            ready,
+        )
+        .expect("proven launch");
+        assert_eq!(outcome.timeout, Some(TimeoutReason::WorkloadBudgetExceeded));
+        assert_eq!(outcome.clock.handshake_elapsed, Duration::from_millis(180));
+        assert_eq!(outcome.clock.prompt_wait, Duration::from_secs(5));
+        assert_eq!(outcome.clock.elapsed, Duration::from_secs(720));
+    }
+
+    /// **Item 6: the defaults agree by construction.** The production budget is
+    /// `from_config` of the same constants the resolver applies as defaults, so a
+    /// wiring mistake cannot silently reserve the DEFAULT prompt term while the
+    /// dialog gets a resolved one.
+    #[test]
+    fn the_default_budget_is_the_config_defaults_through_from_config() {
+        assert_eq!(
+            PROMPT_BUDGET,
+            Duration::from_secs(u64::from(crate::net::prompt::DEFAULT_PROMPT_TIMEOUT_SECS)),
+            "the prompt term must be the profile default, in seconds"
+        );
+        assert_eq!(
+            WORKLOAD_BUDGET,
+            Duration::from_secs(u64::from(crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS)),
+            "the workload term must be the profile default, in seconds"
+        );
+        assert_eq!(
+            SessionBudget::default(),
+            SessionBudget::from_config(
+                crate::net::prompt::DEFAULT_PROMPT_TIMEOUT_SECS,
+                crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS,
+                SESSION_SLACK
+            ),
+            "Default and the resolved-config constructor must be the same budget"
+        );
+        // The terms a default profile resolves to, spelled out: 60 s + 30 min + 2 min.
+        assert_eq!(
+            SessionBudget::default().session(),
+            Duration::from_secs(60 + 1800 + 120)
+        );
+        assert_eq!(SessionBudget::default().timeout_ms(), 1_980_000);
+        // A raised profile is bigger in both terms, and still a finite u32 deadline.
+        let raised = SessionBudget::from_config(300, 5400, SESSION_SLACK);
+        assert_eq!(raised.prompt, Duration::from_secs(300));
+        assert_eq!(raised.workload, Duration::from_secs(5400));
+        assert_eq!(raised.session(), Duration::from_secs(300 + 5400 + 120));
+        assert_eq!(raised.timeout_ms(), 5_820_000);
+        assert!(raised.session() > SessionBudget::default().session());
+        assert!(
+            raised.timeout_ms() > 0,
+            "a raised budget must still be expressible as timeout_ms"
         );
     }
 
@@ -4276,7 +5302,11 @@ mod live {
 
         let backend = MxcBackend::new(&proof, Some(endpoint.port), &launcher)
             .with_proxy_token(LIVE_TOKEN)
-            .with_budget(Some(120_000));
+            .with_budget(SessionBudget::new(
+                Duration::from_secs(30),
+                Duration::from_secs(80),
+                Duration::from_secs(10),
+            ));
 
         // ---- 1. the child sees NO_PROXY and the SDK's own proxy variables ----
         let outcome = backend
@@ -5147,7 +6177,7 @@ mod live {
     fn passing_outcome() -> SessionOutcome {
         SessionOutcome {
             exit_code: Some(0),
-            timed_out: false,
+            timeout: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
             warnings: Vec::new(),
@@ -5161,6 +6191,7 @@ mod live {
                 tunnels: 1,
             },
             expectation: ProofExpectation::Required,
+            clock: SessionClock::default(),
         }
     }
 
@@ -5556,6 +6587,154 @@ mod live {
     /// Red without the fix: remove the `request.ui` assignment in
     /// [`build_request`] and this leg reports `exit=Some(-1073741502)`
     /// (`0xC0000142`) with empty stdout.
+    /// P2.1, live: a session whose **workload term** is exceeded is killed by the
+    /// container, and the outcome says so with the workload's own reason — not with
+    /// `timed_out: true` and no more, and not with the prompt's reason.
+    ///
+    /// The budget is deliberately small (2 s prompt + 1 s workload + 1 s slack = 4 s
+    /// session) and the workload sleeps for 8 s, so the kill happens at the session
+    /// deadline with the workload term spent and no prompt time at all: that is the
+    /// `workload_budget_exceeded` case by construction, and it also pins the fact
+    /// that `timeout_ms` really reaches the SDK (a `None` — or a value that wrapped
+    /// small — would either run to completion or die at once).
+    #[test]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend -- --ignored"]
+    fn a_workload_that_overruns_its_term_is_killed_and_reported_as_such() {
+        let launcher = launcher_under_test();
+        let proxy = LiveProxy::start(&[]);
+        let counters = proxy.counters();
+        let scratch = Scratch::named("budget-kill");
+        let dir = scratch.path().to_path_buf();
+        let no_denies: Vec<String> = Vec::new();
+
+        // `cmd /c timeout` needs a console; a native sleep is what the container
+        // runs, and 8 s is comfortably past the 4 s session deadline.
+        let command =
+            format!(r#"{POWERSHELL} -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 8""#);
+        let input = session_input(
+            &dir,
+            &launcher,
+            &no_denies,
+            command.clone(),
+            Some(proxy.port()),
+        );
+        // prompt 1 s + workload 1 s + slack 2 s: the deadline still lands at 4 s
+        // (so an 8 s workload is killed), while the slack leaves the container's own
+        // create/prove two seconds — the allowance it exists to provide (P2.1 review,
+        // item 2). With a 1 s slack a slow Defender scan of the launcher could push
+        // the handshake past its allowance and correctly re-label this kill.
+        let budget = SessionBudget::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
+        println!(
+            "EVIDENCE budget_kill command={:?} budget={:?} session_ms={}",
+            command,
+            budget,
+            budget.timeout_ms()
+        );
+
+        let started = std::time::Instant::now();
+        let backend = MxcBackend::new(counters.as_ref(), Some(proxy.port()), &launcher)
+            .with_proxy_token(proxy.token().value())
+            .with_budget(budget);
+        let outcome = backend
+            .launch(&input, ProofExpectation::MustBeAbsent)
+            .expect("a workload with no network use must leave the proxy unconsulted");
+        let elapsed = started.elapsed();
+        println!(
+            "EVIDENCE budget_kill exit={:?} timeout={:?} success={} elapsed={:?} proof={:?}",
+            outcome.exit_code,
+            outcome.timeout,
+            outcome.success(),
+            elapsed,
+            outcome.proxy_proof
+        );
+
+        // Item 2's live half: the measurements the label came from are on the
+        // outcome, and the handshake really did finish inside its allowance — the
+        // workload, not a stalled container, is what ran out of time.
+        println!("EVIDENCE budget_kill clock={:?}", outcome.clock);
+        assert!(
+            outcome.clock.handshake_elapsed < budget.slack,
+            "the container must be ready inside the slack that exists for it: {:?}",
+            outcome.clock
+        );
+        assert!(
+            outcome.clock.handshake_elapsed < elapsed,
+            "the handshake is a part of the session, not the whole of it: {:?}",
+            outcome.clock
+        );
+        assert_eq!(
+            outcome.clock.prompt_wait,
+            Duration::ZERO,
+            "a workload that never used the proxy spent no prompt time: {:?}",
+            outcome.clock
+        );
+        assert!(
+            outcome.clock.elapsed >= budget.session(),
+            "the kill landed at the deadline: {:?}",
+            outcome.clock
+        );
+        // Item 7's live half: the teardown is MEASURED (a real container was reclaimed
+        // after the kill), and it is a part of the session rather than the whole of it
+        // — so the supervisor-side term now has a number instead of being folded into
+        // `elapsed`.
+        println!(
+            "EVIDENCE budget_kill phases handshake={:?} run+teardown={:?} teardown={:?}",
+            outcome.clock.handshake_elapsed,
+            outcome
+                .clock
+                .elapsed
+                .saturating_sub(outcome.clock.handshake_elapsed),
+            outcome.clock.teardown_elapsed
+        );
+        assert!(
+            outcome.clock.teardown_elapsed > Duration::ZERO,
+            "reclaiming the container must be measured, not assumed zero: {:?}",
+            outcome.clock
+        );
+        assert!(
+            outcome.clock.teardown_elapsed <= budget.slack,
+            "an ordinary teardown fits inside the slack that exists for it — a larger one \
+             would (correctly) make this kill a `SessionTeardown`: {:?}",
+            outcome.clock
+        );
+        assert!(
+            outcome.clock.handshake_elapsed + outcome.clock.teardown_elapsed
+                < outcome.clock.elapsed,
+            "the two supervisor phases are parts of the session, not the whole of it: {:?}",
+            outcome.clock
+        );
+
+        assert!(
+            outcome.timed_out(),
+            "the container must kill a workload that overruns its term: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.exit_code, None,
+            "a killed session has no exit code: {outcome:?}"
+        );
+        // The distinct reason: the workload term, not the prompt's and not the
+        // handshake's.
+        assert_eq!(
+            outcome.timeout,
+            Some(TimeoutReason::WorkloadBudgetExceeded),
+            "a kill with the workload term spent must be reported as a workload overrun, \
+             not as a prompt or handshake timeout"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "the kill can only happen at the session deadline (4 s), not at once: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the kill must be the deadline, not the workload's own 8 s run: {elapsed:?}"
+        );
+        assert!(!outcome.success(), "a killed session is never a success");
+    }
+
     #[test]
     #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend -- --ignored"]
     fn managed_powershell_workload_starts_and_prints_fxok_inside_the_container() {
@@ -5590,7 +6769,11 @@ mod live {
         // carries a proxy port, and this command cannot consult a proxy.
         let backend = MxcBackend::new(counters.as_ref(), Some(proxy.port()), &launcher)
             .with_proxy_token(proxy.token().value())
-            .with_budget(Some(120_000));
+            .with_budget(SessionBudget::new(
+                Duration::from_secs(30),
+                Duration::from_secs(80),
+                Duration::from_secs(10),
+            ));
         let outcome = backend
             .launch(&input, ProofExpectation::MustBeAbsent)
             .expect("a workload with no network use must leave the proxy unconsulted");
@@ -5598,7 +6781,7 @@ mod live {
         println!(
             "EVIDENCE managed_workload exit={:?} timed_out={} success={} proof={:?} tier={:?}",
             outcome.exit_code,
-            outcome.timed_out,
+            outcome.timed_out(),
             outcome.success(),
             outcome.proxy_proof,
             outcome.tier.tier

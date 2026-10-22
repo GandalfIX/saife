@@ -16,6 +16,25 @@ pub mod upstream;
 use crate::net::token::RunToken;
 use crate::profile::NetworkSlice;
 
+/// Default workload term in seconds: the `network.workloadTimeoutSecs` default
+/// (30 min), and the number [`crate::net::mxc::WORKLOAD_BUDGET`] is built from
+/// (P2.1 review, item 6).
+///
+/// The session bound is new in P2.1 (the container used to have no deadline at
+/// all), so a profile whose workload legitimately runs longer — a cold build, a
+/// large download — must raise it. The default exists to bound a wedged child,
+/// not to size a normal run.
+pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = 30 * 60;
+
+/// Ceiling for `network.workloadTimeoutSecs`: 24 hours.
+///
+/// Validation, not policy: the container's `timeout_ms` is a `u32` of
+/// milliseconds (49 days), so an absurd value survives the arithmetic and becomes
+/// a session nothing will ever reclaim. A day is already far past any workload this
+/// tool runs; beyond it the honest reading is "a wedged session", and refusing the
+/// value (with a warning and the default) is the fail-closed answer.
+pub const MAX_WORKLOAD_TIMEOUT_SECS: u32 = 24 * 60 * 60;
+
 /// The fully-resolved network configuration for a session.
 #[derive(Debug, Clone)]
 pub enum NetworkConfig {
@@ -43,6 +62,12 @@ pub enum NetworkConfig {
         /// Seconds before the prompt auto-denies. Default 60; `0` = instant
         /// deny (handled by the prompt layer in D-3.5). Profile-only ([G-46]).
         prompt_timeout_secs: u32,
+        /// Seconds the workload itself may run before the container kills it.
+        /// Default [`DEFAULT_WORKLOAD_TIMEOUT_SECS`] (30 min), validated
+        /// `> 0` and `<=` [`MAX_WORKLOAD_TIMEOUT_SECS`] (P2.1 review, item 6).
+        /// This is the term the session budget reserves for the workload; a
+        /// profile that needs longer must raise it.
+        workload_timeout_secs: u32,
         /// Upstream proxy URL. Parsed now, consumed in Phase 4.
         upstream_proxy: Option<String>,
         profile_name: Option<String>,
@@ -54,6 +79,33 @@ pub enum NetworkConfig {
 impl NetworkConfig {
     pub fn is_blocked(&self) -> bool {
         matches!(self, NetworkConfig::Blocked)
+    }
+
+    /// The session budget this configuration resolves to (P2.1 review, item 6).
+    ///
+    /// The launch path must size the container's deadline from THIS, never from
+    /// [`crate::net::mxc::SessionBudget::default`]: the dialogs get the resolved
+    /// `promptTimeoutSecs` (see `main.rs`), so a budget built from the constant
+    /// would reserve 60 s for a dialog a 300 s profile lets run — and kill a
+    /// legitimate dialog plus a full workload. One resolved config, one budget.
+    ///
+    /// A blocked session still gets a budget: it runs a container too, and the
+    /// defaults are what bound it.
+    #[cfg(feature = "mxc-backend")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn session_budget(&self) -> crate::net::mxc::SessionBudget {
+        match self {
+            Self::Allow {
+                prompt_timeout_secs,
+                workload_timeout_secs,
+                ..
+            } => crate::net::mxc::SessionBudget::from_config(
+                *prompt_timeout_secs,
+                *workload_timeout_secs,
+                crate::net::mxc::SESSION_SLACK,
+            ),
+            Self::Blocked => crate::net::mxc::SessionBudget::default(),
+        }
     }
     /// Reserved for the proxy-bootstrap path (currently the supervisor
     /// dispatches on `is_blocked` alone). Tracked by the US-3 follow-up.
@@ -147,8 +199,31 @@ pub fn resolve_network(
     };
 
     // [G-46] `promptTimeoutSecs` defaults to 60. Profile-only field.
-    // `0` means "instant deny" (handled by the prompt layer in D-3.5).
-    let prompt_timeout_secs = profile_net.prompt_timeout_secs.unwrap_or(60);
+    // `0` means "instant deny" (handled by the prompt layer in D-3.5). The
+    // default comes from the SAME constant the prompt layer and the session
+    // budget use, so `SessionBudget::default()` and a default profile agree by
+    // construction (P2.1 review, item 6).
+    let prompt_timeout_secs = profile_net
+        .prompt_timeout_secs
+        .unwrap_or(crate::net::prompt::DEFAULT_PROMPT_TIMEOUT_SECS);
+
+    // P2.1 review (item 6): `workloadTimeoutSecs` is the workload term the session
+    // budget reserves. Validated here (like `onUnavailable`) because an absurd
+    // value would become a container deadline nothing reclaims: `0` would end every
+    // session before the workload started, and beyond the cap the value can only be
+    // a wedged session. A rejected value falls back to the default with a warning,
+    // so the resolved field is always in range.
+    let workload_timeout_secs = match profile_net.workload_timeout_secs {
+        Some(v) if v > 0 && v <= MAX_WORKLOAD_TIMEOUT_SECS => v,
+        Some(invalid) => {
+            eprintln!(
+                "[sandbox] invalid workloadTimeoutSecs value {invalid} (must be 1..=\
+                 {MAX_WORKLOAD_TIMEOUT_SECS}), defaulting to {DEFAULT_WORKLOAD_TIMEOUT_SECS}"
+            );
+            DEFAULT_WORKLOAD_TIMEOUT_SECS
+        }
+        None => DEFAULT_WORKLOAD_TIMEOUT_SECS,
+    };
 
     // Deny-by-default: when neither an allow-list nor a deny-list is present,
     // there is nothing to enforce — skip the proxy entirely. This also avoids
@@ -170,6 +245,7 @@ pub fn resolve_network(
         prompt_enabled,
         on_unavailable,
         prompt_timeout_secs,
+        workload_timeout_secs,
         upstream_proxy: profile_net.upstream_proxy.clone(),
         profile_name,
         proxy_port: None,
@@ -353,6 +429,157 @@ mod tests {
             NetworkConfig::Allow { prompt_enabled, .. } => assert!(prompt_enabled),
             _ => panic!("expected Allow"),
         }
+    }
+
+    /// P2.1 review (item 6): the workload term is a profile knob, defaulting to the
+    /// same 30 minutes the budget constant is built from, and validated into range.
+    #[test]
+    fn workload_timeout_defaults_and_is_validated_into_range() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            ..Default::default()
+        };
+        match resolve_network(&slice, false, &["a.com".into()], &[], false, None) {
+            NetworkConfig::Allow {
+                workload_timeout_secs,
+                ..
+            } => assert_eq!(
+                workload_timeout_secs, DEFAULT_WORKLOAD_TIMEOUT_SECS,
+                "an unset workloadTimeoutSecs must resolve to the documented default"
+            ),
+            _ => panic!("expected Allow"),
+        }
+
+        // In range: kept verbatim.
+        for accepted in [1, 600, MAX_WORKLOAD_TIMEOUT_SECS] {
+            let slice = NetworkSlice {
+                allow_domain: vec!["a.com".into()],
+                workload_timeout_secs: Some(accepted),
+                ..Default::default()
+            };
+            match resolve_network(&slice, false, &["a.com".into()], &[], false, None) {
+                NetworkConfig::Allow {
+                    workload_timeout_secs,
+                    ..
+                } => assert_eq!(workload_timeout_secs, accepted),
+                _ => panic!("expected Allow"),
+            }
+        }
+
+        // Out of range (zero would end every session before the workload started;
+        // past the cap the deadline could only be a wedged session): the default,
+        // so the resolved field is always usable.
+        for rejected in [0, MAX_WORKLOAD_TIMEOUT_SECS + 1, u32::MAX] {
+            let slice = NetworkSlice {
+                allow_domain: vec!["a.com".into()],
+                workload_timeout_secs: Some(rejected),
+                ..Default::default()
+            };
+            match resolve_network(&slice, false, &["a.com".into()], &[], false, None) {
+                NetworkConfig::Allow {
+                    workload_timeout_secs,
+                    ..
+                } => assert_eq!(
+                    workload_timeout_secs, DEFAULT_WORKLOAD_TIMEOUT_SECS,
+                    "{rejected} is out of range and must not reach the budget"
+                ),
+                _ => panic!("expected Allow"),
+            }
+        }
+    }
+
+    /// **Item 6, the whole point: the budget is built from the RESOLVED profile.**
+    /// A profile with a 300 s prompt timeout and a 90 min workload must reserve both,
+    /// because that is what the dialog and the workload actually get — a budget sized
+    /// from the 60 s default would kill a legitimate dialog plus a full workload and
+    /// label the kill as a prompt overrun.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn a_raised_profile_prompt_timeout_and_workload_both_fit_the_session_deadline() {
+        use crate::net::mxc::{SESSION_SLACK, SessionBudget, SessionClock, TimeoutReason};
+
+        let slice = NetworkSlice {
+            allow_domain: vec!["build.example.com".into()],
+            prompt_timeout_secs: Some(300),
+            workload_timeout_secs: Some(5400),
+            ..Default::default()
+        };
+        let cfg = resolve_network(
+            &slice,
+            false,
+            &["build.example.com".into()],
+            &[],
+            false,
+            None,
+        );
+        match &cfg {
+            NetworkConfig::Allow {
+                prompt_timeout_secs,
+                workload_timeout_secs,
+                ..
+            } => {
+                assert_eq!(*prompt_timeout_secs, 300);
+                assert_eq!(*workload_timeout_secs, 5400);
+            }
+            _ => panic!("expected Allow"),
+        }
+
+        let budget = cfg.session_budget();
+        assert_eq!(
+            budget.prompt,
+            std::time::Duration::from_secs(300),
+            "the prompt term must be the resolved profile value, not the default"
+        );
+        assert_eq!(budget.workload, std::time::Duration::from_secs(5400));
+        assert_eq!(
+            budget.session(),
+            std::time::Duration::from_secs(300 + 5400 + SESSION_SLACK.as_secs())
+        );
+        assert_eq!(budget.timeout_ms(), 5_820_000);
+        assert!(
+            budget.session() > SessionBudget::default().session(),
+            "a raised profile must widen the deadline, not narrow it"
+        );
+
+        // A dialog that uses its whole raised term AND a workload that then overruns
+        // are both inside the deadline: the prompt term is not blamed, and the
+        // workload kill is what the audit names.
+        let clock = SessionClock::measured(
+            budget,
+            std::time::Duration::from_secs(300 + 5400 + SESSION_SLACK.as_secs()),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_secs(300),
+        );
+        assert_eq!(
+            clock.timeout_reason(),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        assert!(
+            clock.elapsed <= budget.session(),
+            "the session deadline must cover the dialog it allowed"
+        );
+    }
+
+    /// The default profile and `SessionBudget::default()` are the same budget — so a
+    /// wiring mistake cannot reserve the constants' terms while the dialogs get the
+    /// resolved ones.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    fn a_default_profile_resolves_to_the_default_session_budget() {
+        let slice = NetworkSlice {
+            allow_domain: vec!["a.com".into()],
+            ..Default::default()
+        };
+        let cfg = resolve_network(&slice, false, &["a.com".into()], &[], false, None);
+        assert_eq!(
+            cfg.session_budget(),
+            crate::net::mxc::SessionBudget::default()
+        );
+        // And a blocked session still has one: it runs a container too.
+        assert_eq!(
+            resolve_network(&empty_slice(), true, &[], &[], false, None).session_budget(),
+            crate::net::mxc::SessionBudget::default()
+        );
     }
 
     #[test]

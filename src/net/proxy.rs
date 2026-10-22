@@ -47,7 +47,8 @@ use crate::net::intent::IntentRegistry;
 use crate::net::learned::{LearnedDecision, LearnedStore};
 use crate::net::matcher::{self, DenyReason, Verdict};
 use crate::net::prompt::{
-    PromptConfig, PromptCoordinator, PromptOutcome, PromptPolicy, PromptResult, is_loopback_host,
+    OverloadCause, PromptConfig, PromptCoordinator, PromptOutcome, PromptPolicy, PromptResult,
+    UnavailableCause, is_loopback_host,
 };
 use crate::net::token::RunToken;
 use crate::net::upstream::{UpstreamDialer, UpstreamError};
@@ -57,6 +58,58 @@ use crate::net::upstream::{UpstreamDialer, UpstreamError};
 /// share a single source of truth; no production call site consumes it yet
 /// (only tests reference it), so it is `#[allow(dead_code)]` until the D-5
 /// validator lands.
+/// The deny `reason` for a prompt consultation whose budget elapsed (P2.1).
+///
+/// One string, produced for both legs (CONNECT and the absolute-form forward):
+/// a forward request that had to ask the user and got no answer must read in the
+/// audit chain exactly like a CONNECT that did, because the policy answer is the
+/// same and the two legs differ only in how the client framed the request.
+/// Distinct from [`NO_DIALOG_BACKEND_REASON`] on purpose — a spent budget is this
+/// session's own term being consumed, which is what the supervisor's `timeout_ms`
+/// has to cover, while a missing backend is a machine with no dialog at all.
+pub const PROMPT_TIMEOUT_REASON: &str = "prompt_budget_exhausted";
+
+/// The deny `reason` for a consultation refused because no dialog backend
+/// exists (P2.1 review).
+///
+/// Distinct from [`PROMPT_TIMEOUT_REASON`] for the same reason that one is
+/// distinct from a bare "timeout or no dialog backend": a backend that cannot
+/// produce a decision at all is a property of the machine, not of this session's
+/// prompt budget. It is also the reason a *sticky* refusal carries when the latch
+/// was armed by consultations that found no dialog at all (see
+/// `prompt::NO_BACKEND_STICKY_AFTER`): the deny names the fact the workload
+/// experiences — there is nothing to ask.
+pub const NO_DIALOG_BACKEND_REASON: &str = "no_dialog_backend";
+
+/// The deny `reason` for a consultation the fast-fail skipped when the latch was
+/// armed by budgets that ELAPSED (P2.1 review round 2, item 8).
+///
+/// The sibling of [`NO_DIALOG_BACKEND_REASON`], never a synonym: here a dialog was
+/// shown and nobody answered it, so the backend demonstrably works and "run
+/// interactively" is the wrong remedy. Folding the two back together is exactly
+/// what made a session whose dialogs were on screen read as a machine with no
+/// desktop — and it is the string an operator greps to tell the two apart.
+pub const PROMPT_SUPPRESSED_REASON: &str = "prompt_suppressed_after_budget";
+
+/// The deny `reason` for a consultation refused because the abandoned pool is
+/// full ([`crate::net::prompt::MAX_ABANDONED_PROMPTS`]) — dialogs from earlier
+/// consultations are still on screen after their budgets elapsed.
+pub const PROMPT_ABANDONED_CAPACITY_REASON: &str = "prompt_abandoned_capacity";
+
+/// The deny `reason` for a consultation refused because every consultation slot
+/// is in flight ([G-28]). Kept as the prose it has always been — this one is the
+/// cap the ADR names, and its wording is what operators have seen since 3.6.
+pub const PROMPT_OVERLOAD_REASON: &str = "too many concurrent prompts";
+
+/// Name the pool that ran out (P2.1 review, item 4). Pure so both arms can be
+/// pinned without standing up eight live dialogs.
+fn overload_reason(cause: OverloadCause) -> &'static str {
+    match cause {
+        OverloadCause::ConsultationsHeld => PROMPT_OVERLOAD_REASON,
+        OverloadCause::AbandonedCapacity => PROMPT_ABANDONED_CAPACITY_REASON,
+    }
+}
+
 #[allow(dead_code)]
 pub const SOURCES: &[&str] = &[
     "hard-deny",
@@ -432,9 +485,43 @@ impl std::error::Error for EpochAlreadyOpen {}
 /// `Send + Sync` and **poison-tolerant**: a handler that panicked while holding
 /// the lock must not make the launch path panic (a poisoned `Mutex` would turn
 /// one broken connection into a process-wide abort of the proof gate).
+/// State a listener must reset at every LAUNCH (P2.1 review round 2, item 2).
+///
+/// The prompt fast-fail latch is the reason this exists: it lives on the
+/// coordinator, which is per listener and outlives a launch, so a listener that
+/// serves sequential launches would carry launch N's verdict into launch N+1 and
+/// deny prompts a session never got to ask.
+pub type LaunchReset = Arc<dyn Fn() + Send + Sync>;
+
+/// [`LaunchReset`] with a `Debug` impl: a closure is not printable, and the
+/// counters' own `Debug` must stay derivable.
+struct LaunchResetHook(LaunchReset);
+
+impl fmt::Debug for LaunchResetHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LaunchResetHook(..)")
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LaunchCounters {
     state: StdMutex<CounterState>,
+    /// Time this listener spent inside prompt consultations, in milliseconds
+    /// (P2.1).
+    ///
+    /// Reset at every epoch open, and deliberately outside the epoch lock: it is a
+    /// measurement, never a proof. The supervisor needs it to say *which* budget a
+    /// killed session spent — a session that dies at its deadline with 60 s of
+    /// prompt time behind it exhausted the prompt term, while one with no prompt
+    /// time ran out on the workload term or on the handshake. Without this the only
+    /// honest report is "timed out", and the causes would share one reason string.
+    /// The launch path still reads a DELTA around its run, so the reset and the
+    /// delta agree rather than depending on each other.
+    prompt_wait_millis: AtomicU64,
+    /// What a new launch must forget (P2.1 review round 2, item 2). `None` for
+    /// counters nothing shares launch-scoped state with (every test fixture that
+    /// only counts traffic).
+    launch_reset: StdMutex<Option<LaunchResetHook>>,
 }
 
 // With `mxc-backend` off nothing reads the epochs (no launch path is wired), so
@@ -445,6 +532,19 @@ impl LaunchCounters {
     /// A fresh registry, ready for its first epoch.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Register the state that is scoped to a LAUNCH and must be cleared when one
+    /// starts (P2.1 review round 2, item 2).
+    ///
+    /// The listener calls this once at [`spawn`] with its coordinator's
+    /// `begin_launch`, because the listener is the only place that owns both.
+    pub fn set_launch_reset(&self, reset: LaunchReset) {
+        let mut slot = self
+            .launch_reset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *slot = Some(LaunchResetHook(reset));
     }
 
     /// The lock, recovered from poisoning instead of panicking.
@@ -470,6 +570,23 @@ impl LaunchCounters {
         state.epochs.insert(epoch, EpochEntry::default());
         state.active = Some(epoch);
         state.prune();
+        // Item 2: a new launch starts with no prompt history. The epoch open is the
+        // one instant every launch path already goes through, so the reset cannot be
+        // forgotten by a caller, and the prompt clock restarts with it (the launch
+        // path reads a delta, so an inherited total could only ever be over-counted).
+        self.prompt_wait_millis.store(0, Ordering::Relaxed);
+        let reset = {
+            let slot = self
+                .launch_reset
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            slot.as_ref().map(|hook| Arc::clone(&hook.0))
+        };
+        // Fired after both locks are released: the callback belongs to another
+        // component, and holding a listener lock across it invites a deadlock.
+        if let Some(reset) = reset {
+            reset();
+        }
         Ok(epoch)
     }
 
@@ -514,6 +631,41 @@ impl LaunchCounters {
     /// reached this listener as a proxy).
     pub fn note_consultation(&self) {
         self.bump(|counters| counters.consultations += 1);
+    }
+
+    /// Add the wall clock ONE dialog cost (P2.1). Saturating in effect: `u64`
+    /// milliseconds is ~584 million years of prompt time.
+    ///
+    /// Called once per LEADER — the consultation that actually spawned the dialog,
+    /// which is what [`crate::net::prompt::PromptCoordinator::prompt_measured`]
+    /// reports and a coalesced follower does not. Crediting per REQUEST added one
+    /// dialog's wall clock K times (measured: 5.86x for six followers of one 155 ms
+    /// dialog), so four concurrent requests to one unlisted host credited 240 s for
+    /// 60 s of real blocking and a workload that genuinely overran was recorded as
+    /// `prompt_budget_exhausted`.
+    ///
+    /// Still an aggregate: consultations on DIFFERENT hosts run concurrently, so the
+    /// sum can legitimately exceed the session's wall clock. Anything that attributes
+    /// a session to a term must therefore clamp it — see
+    /// [`crate::net::mxc::SessionClock::measured`].
+    pub fn note_prompt_wait(&self, waited: std::time::Duration) {
+        let millis = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        self.prompt_wait_millis.fetch_add(millis, Ordering::Relaxed);
+    }
+
+    /// Time this listener's dialogs cost since the current launch began (P2.1): one
+    /// credit per LEADER, reset at every epoch open, and never a share of wall clock
+    /// (see [`LaunchCounters::note_prompt_wait`]). The launch path also takes a DELTA
+    /// around one session, so a listener that serves several sequential launches
+    /// attributes to each only its own prompt time.
+    ///
+    /// Read by the launch path (P2.1's session budget), which with the feature off
+    /// has no biter: nothing in the binary consumes it yet, so the allow is scoped
+    /// exactly like the epoch accessors above rather than hiding rot in the
+    /// feature-on build.
+    #[cfg_attr(not(any(test, feature = "mxc-backend")), allow(dead_code))]
+    pub fn prompt_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.prompt_wait_millis.load(Ordering::Relaxed))
     }
 
     /// Count one consultation whose **own upstream connection came up**. For
@@ -766,6 +918,13 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
     // listener behind; `claim` is disarmed only when the handle takes it over.
     let claim = LiveTokenClaim::claim(&token)?;
     let counters = LaunchCounters::new();
+    // P2.1 review round 2, item 2: the prompt fast-fail latch is per LISTENER but
+    // must be per LAUNCH. This listener is the one place that owns both objects, so
+    // it registers the coordinator's reset with the epoch machinery.
+    {
+        let coordinator = Arc::clone(&prompt.coordinator);
+        counters.set_launch_reset(Arc::new(move || coordinator.begin_launch()));
+    }
     let ctx = Arc::new(ConnCtx {
         token,
         deny: deny_domain,
@@ -1105,13 +1264,13 @@ fn outcome_audit(outcome: &PromptOutcome) -> OutcomeAudit {
             scope: None,
             wants_persist: false,
         },
-        PromptOutcome::Overloaded => OutcomeAudit {
+        PromptOutcome::Overloaded { .. } => OutcomeAudit {
             allowed: false,
             source: "prompt_overload",
             scope: None,
             wants_persist: false,
         },
-        PromptOutcome::Unavailable { allowed } => OutcomeAudit {
+        PromptOutcome::Unavailable { allowed, .. } => OutcomeAudit {
             allowed: *allowed,
             source: "unavailable",
             scope: None,
@@ -1298,11 +1457,26 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
     }
     // [G-17] Enrich the dialog with the agent's declared reason, if any.
     let reason = ctx.prompt.intent.lookup_host(host).await.map(|e| e.reason);
-    let outcome = ctx
+    // P2.1: the consultation's cost is attributed from what the coordinator
+    // measured, so a session killed by its deadline reports
+    // `prompt_budget_exhausted` only if a prompt really did eat its term. One
+    // measurement point because both legs — CONNECT and the absolute-form forward —
+    // reach the prompt through here.
+    //
+    // Round 2, item 1: the credit is the LEADER's and nobody else's. Timing this
+    // call (per REQUEST) made K coalesced followers of one dialog each add its wall
+    // clock — four concurrent requests to one host crediting 240 s for 60 s of
+    // blocking, which recorded a workload that genuinely overran as a prompt
+    // timeout. `None` means this request led no dialog (a follower, a skipped latch,
+    // a refused pool), so it has nothing to credit.
+    let (outcome, leader_wait) = ctx
         .prompt
         .coordinator
-        .prompt(host, port, reason, ctx.prompt.config)
+        .prompt_measured(host, port, reason, ctx.prompt.config)
         .await;
+    if let Some(waited) = leader_wait {
+        ctx.counters.note_prompt_wait(waited);
+    }
     // Outcome side effects that are not the decision itself.
     if let PromptOutcome::Decided(PromptResult::NeedsIntent) = &outcome {
         // omac's recovery loop: the "Explain more" click rides the intent
@@ -1310,9 +1484,27 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
         // agent's next GET /sandbox/intent observes the one-shot flag.
         ctx.prompt.intent.mark_explain_more(host).await;
     }
-    if let PromptOutcome::Unavailable { allowed: false } = &outcome {
-        // [G-19] one discoverable stderr line, once per process.
-        warn_no_dialog_once();
+    if let PromptOutcome::Unavailable {
+        allowed: false,
+        cause,
+    } = &outcome
+    {
+        // [G-19] one discoverable stderr line, once per process — and now one
+        // line per CAUSE (P2.1): "no dialog backend" and "the budget elapsed
+        // with no answer" are different failures with different remediations,
+        // and a headless run used to report the first while suffering the
+        // second.
+        match cause {
+            // Item 8: a suppressed latch that was armed by elapsed budgets is a
+            // budget fact, so it shares the budget line; only a missing backend
+            // warns about a missing backend.
+            UnavailableCause::BudgetElapsed | UnavailableCause::SuppressedAfterBudget => {
+                warn_prompt_budget_once(ctx.prompt.config.timeout)
+            }
+            UnavailableCause::NoDialogBackend | UnavailableCause::CallerGone => {
+                warn_no_dialog_once()
+            }
+        }
     }
     let audit = outcome_audit(&outcome);
     // Persist permanent decisions to the learned store [G-56]. The
@@ -1331,10 +1523,26 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
         PromptOutcome::Decided(PromptResult::NeedsIntent) => {
             Some("user requested a fuller intent (explain more)".into())
         }
-        PromptOutcome::Overloaded => Some("too many concurrent prompts".into()),
-        PromptOutcome::Unavailable { allowed: false } => {
-            Some("prompt unavailable (timeout or no dialog backend)".into())
-        }
+        // P2.1 review: the two pools are different facts, so the denial names
+        // which one ran out instead of reporting a concurrency limit for a
+        // session whose dialogs are merely unanswered.
+        PromptOutcome::Overloaded { cause } => Some(overload_reason(*cause).into()),
+        // P2.1: a spent budget and a backend that could not show a dialog are
+        // distinct reasons a reader can act on — the first says this session's
+        // prompt term was consumed (the supervisor budgets the container around
+        // it), the second says the machine has no dialog at all.
+        PromptOutcome::Unavailable {
+            allowed: false,
+            cause,
+        } => Some(match cause {
+            UnavailableCause::BudgetElapsed => PROMPT_TIMEOUT_REASON.into(),
+            // Item 8: the two arming causes keep their own strings. A suppressed
+            // budget is not a missing backend — the dialog was shown and nobody
+            // answered it — and an operator greps exactly this.
+            UnavailableCause::SuppressedAfterBudget => PROMPT_SUPPRESSED_REASON.into(),
+            UnavailableCause::NoDialogBackend => NO_DIALOG_BACKEND_REASON.into(),
+            UnavailableCause::CallerGone => "prompt unavailable (caller gone)".into(),
+        }),
         _ => None,
     };
     Decision {
@@ -1390,6 +1598,25 @@ fn warn_no_dialog_once() {
         eprintln!(
             "[sandbox] no dialog backend available — denying; pre-approve hosts via \
              --allow-domain, or set on_unavailable=allow (insecure); set SANDBOX_DIAG=1 for details"
+        );
+    }
+}
+
+/// P2.1: the same once-per-process courtesy for the OTHER cause — the prompt
+/// budget elapsed with the dialog unanswered.
+///
+/// The budget is the session's own prompt term (the container's `timeout_ms` is
+/// sized around it), so an elapsed budget on a headless request is a *policy*
+/// answer, not a broken machine: the request was denied on budget. Saying so
+/// once turns "the agent hung for a minute and then failed" into a line an
+/// operator can act on (pre-approve the host, or raise `promptTimeoutSecs`).
+fn warn_prompt_budget_once(budget: std::time::Duration) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!(
+            "[sandbox] prompt budget elapsed ({}s) with no answer — denying on budget; \
+             pre-approve hosts via --allow-domain, or raise promptTimeoutSecs",
+            budget.as_secs()
         );
     }
 }
@@ -4151,7 +4378,9 @@ mod tests {
 
     #[test]
     fn outcome_audit_overloaded() {
-        let a = super::outcome_audit(&PromptOutcome::Overloaded);
+        let a = super::outcome_audit(&PromptOutcome::Overloaded {
+            cause: OverloadCause::ConsultationsHeld,
+        });
         assert!(!a.allowed);
         assert_eq!(a.source, "prompt_overload");
         assert_eq!(a.scope, None);
@@ -4160,12 +4389,18 @@ mod tests {
 
     #[test]
     fn outcome_audit_unavailable_respects_policy() {
-        let deny = super::outcome_audit(&PromptOutcome::Unavailable { allowed: false });
+        let deny = super::outcome_audit(&PromptOutcome::Unavailable {
+            allowed: false,
+            cause: UnavailableCause::BudgetElapsed,
+        });
         assert!(!deny.allowed);
         assert_eq!(deny.source, "unavailable");
         assert_eq!(deny.scope, None);
 
-        let allow = super::outcome_audit(&PromptOutcome::Unavailable { allowed: true });
+        let allow = super::outcome_audit(&PromptOutcome::Unavailable {
+            allowed: true,
+            cause: UnavailableCause::BudgetElapsed,
+        });
         assert!(allow.allowed);
         assert_eq!(allow.source, "unavailable");
     }
@@ -4853,6 +5088,703 @@ mod tests {
         );
         let ev = last_connect_event(&t.sid);
         assert_eq!(ev["source"], "default");
+    }
+
+    // ---- P2.1: the prompt budget on BOTH legs (D3 addendum) ----------------
+
+    /// A dialog that is still up when the budget elapses: the coordinator
+    /// abandons it after `budget` and its late answer is discarded ([G-4]).
+    fn slow_dialog(up: Duration) -> DialogFn {
+        Arc::new(move |_req: &DialogRequest| {
+            std::thread::sleep(up);
+            Err(DialogUnavailable)
+        })
+    }
+
+    /// A dialog that never returns on its own: it blocks until the test drops the
+    /// gate, so the coordinator's orphans are *still up* while the test asserts —
+    /// the headless case, where nobody can answer the dialog at all.
+    fn gated_dialog() -> (DialogFn, std::sync::mpsc::Sender<()>) {
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Arc::new(StdMutex::new(wait));
+        let dialog: DialogFn = Arc::new(move |_req: &DialogRequest| {
+            let rx = wait.lock().unwrap_or_else(|poison| poison.into_inner());
+            let _ = rx.recv();
+            Err(DialogUnavailable)
+        });
+        (dialog, gate)
+    }
+
+    /// D3 addendum, first half: a **plain-HTTP absolute-form** request to a host
+    /// that reaches the prompt policy is bounded by the prompt budget exactly like
+    /// CONNECT, gets the deny on the wire, leaves exactly one leaf, and never
+    /// dials an origin.
+    ///
+    /// Before P2.1 the same request in a headless run stalled for the whole
+    /// budget with no answer available (measured as curl exit 28 at `-m 15`) and
+    /// the audit said "timeout or no dialog backend" — one string for two
+    /// different failures, and nothing that named the budget as the cause.
+    #[test]
+    fn forward_prompt_timeout_is_bounded_by_the_budget_and_never_dials() {
+        let fake = FakeUpstream::start(200);
+        let t = t36_setup_cfg(
+            "fwd-prompt-budget",
+            &[],
+            &[],
+            slow_dialog(Duration::from_millis(800)),
+            true,
+            Duration::from_millis(200),
+            PromptPolicy::Deny,
+            Some(dialer(&fake.url(), &[])),
+        );
+        let counters = t.handle.counters();
+        let epoch = counters.begin_epoch().expect("the launch's window");
+
+        let started = std::time::Instant::now();
+        let resp = exchange(t.port, &get_req("http://unlisted-forward.invalid/x"));
+        let elapsed = started.elapsed();
+
+        // The wire answer: the deny, promptly (bounded by the budget, not by the
+        // dialog's own 800 ms), and it names the spent budget as the reason.
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("X-Sandbox: denied"), "got: {resp}");
+        assert!(
+            resp.contains(PROMPT_TIMEOUT_REASON),
+            "the deny must name the spent budget ({PROMPT_TIMEOUT_REASON}), got: {resp}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "the forward leg must be bounded by the prompt budget, not by the dialog: {elapsed:?}"
+        );
+
+        // Exactly one leaf for the one timed-out request, with the reason a
+        // CONNECT timeout produces.
+        let leaves = connect_events(&t.sid);
+        assert_eq!(
+            leaves.len(),
+            1,
+            "one leaf per timed-out request: {leaves:?}"
+        );
+        assert_eq!(leaves[0]["host"], "unlisted-forward.invalid");
+        assert_eq!(leaves[0]["port"], 80);
+        assert_eq!(leaves[0]["disposition"], "deny");
+        assert_eq!(leaves[0]["reason"], PROMPT_TIMEOUT_REASON);
+        assert_eq!(leaves[0]["source"], "unavailable");
+
+        // Counters: it WAS a consultation (accepted), and nothing was
+        // tunnelled — the deny happened before any dial.
+        assert_eq!(
+            counters.counters(epoch),
+            Some(LaunchProofCounters {
+                consultations: 1,
+                upstream_established: 0,
+            }),
+            "a denied forward is an accepted consultation with no upstream"
+        );
+        // The observable proof that no origin was involved: the chaining dialer
+        // is the only outbound hop a forward can take, and it saw nothing.
+        assert!(
+            fake.heads().is_empty(),
+            "a denied forward must not reach an origin: {:?}",
+            fake.heads()
+        );
+        assert!(counters.close_epoch(epoch));
+    }
+
+    /// D3 addendum, second half: both legs produce the **same leaf shape** for the
+    /// same timeout outcome — same keys, same `reason`, same `source` — and one
+    /// leaf each. A forward deny must not be a second-class leaf: a consumer
+    /// filtering on `reason` cannot be asked to know which leg produced it.
+    #[test]
+    fn connect_and_forward_prompt_timeouts_emit_the_same_deny_leaf() {
+        let t = t36_setup_cfg(
+            "prompt-parity",
+            &[],
+            &[],
+            slow_dialog(Duration::from_millis(700)),
+            true,
+            Duration::from_millis(150),
+            PromptPolicy::Deny,
+            None,
+        );
+
+        let connect = exchange(t.port, &connect_req("parity-connect.invalid:443"));
+        let forward = exchange(t.port, &get_req("http://parity-forward.invalid/x"));
+        assert!(connect.starts_with("HTTP/1.1 403"), "got: {connect}");
+        assert!(forward.starts_with("HTTP/1.1 403"), "got: {forward}");
+        assert!(connect.contains(PROMPT_TIMEOUT_REASON), "got: {connect}");
+        assert!(forward.contains(PROMPT_TIMEOUT_REASON), "got: {forward}");
+
+        let leaves = connect_events(&t.sid);
+        assert_eq!(
+            leaves.len(),
+            2,
+            "one leaf per timed-out request, no doubles: {leaves:?}"
+        );
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v
+                .as_object()
+                .expect("leaf is an object")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(&leaves[0]),
+            keys(&leaves[1]),
+            "both legs must write the same leaf shape"
+        );
+        for field in [
+            "reason",
+            "source",
+            "disposition",
+            "scope",
+            "persisted",
+            "op",
+        ] {
+            assert_eq!(
+                leaves[0][field], leaves[1][field],
+                "`{field}` must be identical on both legs"
+            );
+        }
+        assert_eq!(leaves[0]["reason"], PROMPT_TIMEOUT_REASON);
+        // Not vacuous: the two leaves really are different requests.
+        assert_ne!(leaves[0]["host"], leaves[1]["host"]);
+        assert_eq!(leaves[0]["port"], 443);
+        assert_eq!(leaves[1]["port"], 80);
+    }
+
+    /// The measurement the session budget is attributed with (P2.1): the listener
+    /// times its own prompt consultations, so a session killed at its deadline can
+    /// say *which* term spent the time. The control is the important half — a
+    /// decision that never consulted a dialog must add nothing, or every session
+    /// would look prompt-bound.
+    #[test]
+    fn prompt_consultation_time_is_measured_and_a_static_decision_adds_none() {
+        let t = t36_setup(
+            "prompt-clock",
+            &["pre-approved.invalid"],
+            &[],
+            slow_dialog(Duration::from_millis(120)),
+        );
+        let counters = t.handle.counters();
+        assert_eq!(
+            counters.prompt_wait(),
+            Duration::ZERO,
+            "a fresh listener has spent no prompt time"
+        );
+
+        let resp = exchange(t.port, &connect_req("measured.invalid:443"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        let waited = counters.prompt_wait();
+        assert!(
+            waited >= Duration::from_millis(100),
+            "a dialog that took 120 ms must be measured, got {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(5), "got {waited:?}");
+
+        // A static answer (allow-list) consults no dialog: the measure must not move.
+        // (An allow-listed host is admitted and then fails at the dial — there is no
+        // such name on this network — but it is a `dns` decision, not a prompt.)
+        let resp = exchange(t.port, &get_req("http://pre-approved.invalid/x"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(
+            resp.contains("dns policy"),
+            "an allow-listed forward must be answered by the static layer: {resp}"
+        );
+        assert_eq!(
+            counters.prompt_wait(),
+            waited,
+            "a decision that never prompted must add no prompt time"
+        );
+    }
+
+    /// The resource-exhaustion half (P2.1) **and** the fast-fail that now
+    /// supersedes it (item 3): a timed-out consultation must not keep its
+    /// coordinator slot — eight of them used to consume all
+    /// `MAX_CONCURRENT_PROMPTS` permits for the life of the process, so the ninth
+    /// request was answered `prompt_overload` without its budget ever being
+    /// consulted — and after `NO_BACKEND_STICKY_AFTER` of them the session stops
+    /// paying the budget at all.
+    ///
+    /// Round 2, item 8: the skipped requests are answered on the cause that ARMED
+    /// the latch, not on the nearest-looking one. These dialogs were shown and
+    /// nobody answered them, so the reason is `prompt_suppressed_after_budget` —
+    /// `no_dialog_backend` would tell the operator to run interactively when the
+    /// interactive path demonstrably worked.
+    ///
+    /// Nine sequential requests, each with its dialog still up when the budget
+    /// elapses (the routine headless state). The first two are denied on budget,
+    /// the rest are denied immediately on `no_dialog_backend`, and *none* of them
+    /// is ever an overload denial: the path neither wedges nor keeps stalling.
+    #[test]
+    fn nine_unanswered_prompts_never_wedge_into_overload_and_stop_paying_the_budget() {
+        let budget = Duration::from_millis(80);
+        let (dialog, gate) = gated_dialog();
+        let t = t36_setup_cfg(
+            "prompt-slots",
+            &[],
+            &[],
+            dialog,
+            true,
+            budget,
+            PromptPolicy::Deny,
+            None,
+        );
+
+        let mut elapsed = Vec::new();
+        for i in 0..=crate::net::prompt::MAX_CONCURRENT_PROMPTS {
+            let host = format!("slot-{i}.invalid");
+            let started = std::time::Instant::now();
+            let resp = exchange(t.port, &get_req(&format!("http://{host}/x")));
+            elapsed.push(started.elapsed());
+            assert!(resp.starts_with("HTTP/1.1 403"), "host {i}: got {resp}");
+            assert!(
+                !resp.contains(PROMPT_OVERLOAD_REASON)
+                    && !resp.contains(PROMPT_ABANDONED_CAPACITY_REASON),
+                "host {i} must not be refused for capacity, no dialog is at fault: {resp}"
+            );
+            let ev = last_connect_event(&t.sid);
+            assert_eq!(
+                ev["source"], "unavailable",
+                "host {i} must reach the prompt layer, got {ev}"
+            );
+            let expected = if i < crate::net::prompt::NO_BACKEND_STICKY_AFTER {
+                PROMPT_TIMEOUT_REASON
+            } else {
+                PROMPT_SUPPRESSED_REASON
+            };
+            assert_eq!(
+                ev["reason"],
+                expected,
+                "host {i} must be denied on {}, got {ev}",
+                if i < crate::net::prompt::NO_BACKEND_STICKY_AFTER {
+                    "the budget"
+                } else {
+                    "the budget that armed the latch"
+                }
+            );
+            assert_eq!(ev["host"], host);
+        }
+        assert_eq!(
+            connect_events(&t.sid).len(),
+            crate::net::prompt::MAX_CONCURRENT_PROMPTS + 1,
+            "one leaf per request"
+        );
+        // The measured cost: the first `NO_BACKEND_STICKY_AFTER` pay the budget,
+        // the rest do not.
+        for (i, e) in elapsed.iter().enumerate() {
+            if i < crate::net::prompt::NO_BACKEND_STICKY_AFTER {
+                assert!(
+                    *e >= budget / 2,
+                    "request {i} must wait for its budget: {e:?}"
+                );
+            } else {
+                assert!(
+                    *e < budget / 2,
+                    "request {i} must be denied without waiting for the budget: {e:?}"
+                );
+            }
+        }
+        println!("EVIDENCE nine-headless budget={budget:?} elapsed={elapsed:?}");
+        // Release the orphans so no blocking thread outlives the test.
+        drop(gate);
+    }
+
+    /// A dialog that takes `up` and then answers: the ordinary interactive case,
+    /// where the consultation's cost is the user's own thinking time.
+    fn slow_deciding_dialog(up: Duration) -> (DialogFn, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let dialog: DialogFn = Arc::new(move |_req: &DialogRequest| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(up);
+            Ok(deny_once_result())
+        });
+        (dialog, calls)
+    }
+
+    /// **Item 1, sequential half: the counter is a per-listener total, so a session's
+    /// own prompt time is the DELTA across it.** Two consultations on one listener
+    /// must each be attributed their own wait; a session that inherited the total
+    /// would report twice its own budget (and, in the supervisor's arithmetic, claim
+    /// a prompt overrun that never happened).
+    #[test]
+    fn two_sequential_consultations_are_attributed_their_own_prompt_time() {
+        let (dialog, calls) = slow_deciding_dialog(Duration::from_millis(150));
+        let t = t36_setup("prompt-clock-sequential", &[], &[], dialog);
+        let counters = t.handle.counters();
+        assert_eq!(counters.prompt_wait(), Duration::ZERO);
+
+        let baseline = counters.prompt_wait();
+        let first = exchange(t.port, &connect_req("sequential-a.invalid:443"));
+        assert!(first.starts_with("HTTP/1.1 403"), "got: {first}");
+        let after_first = counters.prompt_wait();
+        let first_delta = after_first.saturating_sub(baseline);
+
+        let second = exchange(t.port, &connect_req("sequential-b.invalid:443"));
+        assert!(second.starts_with("HTTP/1.1 403"), "got: {second}");
+        let after_second = counters.prompt_wait();
+        let second_delta = after_second.saturating_sub(after_first);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "two hosts, two dialogs");
+        for (label, delta) in [("first", first_delta), ("second", second_delta)] {
+            assert!(
+                delta >= Duration::from_millis(120),
+                "the {label} consultation's own wait must be measured, got {delta:?}"
+            );
+            assert!(
+                delta < Duration::from_millis(700),
+                "the {label} consultation must not inherit the listener's total: {label} \
+                 delta {delta:?} of a total {after_second:?}"
+            );
+        }
+        println!(
+            "EVIDENCE sequential-prompt-time first={first_delta:?} second={second_delta:?} \
+             total={after_second:?}"
+        );
+    }
+
+    /// **Round 2, item 1: a coalesced follower set is credited ONE dialog.**
+    ///
+    /// `note_prompt_wait` ran per REQUEST, so K followers of one dialog each added
+    /// its wall clock: six followers of one 150 ms dialog measured 5.90x the
+    /// session, and with shipped defaults four concurrent requests to one unlisted
+    /// host credited 240 s for 60 s of blocking — which labelled a workload that
+    /// genuinely overran `prompt_budget_exhausted`. The coordinator credits the
+    /// consultation's LEADER only, so the aggregate is the time this listener spent
+    /// BLOCKED ON DIALOGS, not a share of the wall clock multiplied by whoever was
+    /// parked behind one.
+    #[test]
+    fn a_coalesced_follower_set_is_credited_its_one_dialog() {
+        // FOUR is the review's own scenario (four concurrent requests to one unlisted
+        // host credited 240 s for 60 s of blocking with shipped defaults); six is the
+        // round-1 measurement's worst case (5.90x). Each count gets its own listener,
+        // because the counter it reads is cumulative.
+        for followers in [4usize, 6] {
+            let (dialog, calls) = slow_deciding_dialog(Duration::from_millis(150));
+            let t = t36_setup(
+                &format!("prompt-clock-coalesced-{followers}"),
+                &[],
+                &[],
+                dialog,
+            );
+            let counters = t.handle.counters();
+
+            // One host, K concurrent requests: one dialog, one wait on it.
+            let request = connect_req("coalesced-one-host.invalid:443");
+            let started = std::time::Instant::now();
+            let leaders: Vec<_> = (0..followers)
+                .map(|_| {
+                    let req = request.clone();
+                    let port = t.port;
+                    std::thread::spawn(move || exchange(port, &req))
+                })
+                .collect();
+            for l in leaders {
+                let resp = l.join().expect("exchange thread");
+                assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+            }
+            let wall = started.elapsed();
+            let aggregate = counters.prompt_wait();
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one host means one dialog");
+            assert!(
+                aggregate >= Duration::from_millis(120),
+                "the one dialog that ran must be credited its own wall clock, got {aggregate:?}"
+            );
+            assert!(
+                aggregate <= wall * 2,
+                "{followers} followers of ONE dialog must not multiply it: aggregate \
+                 {aggregate:?} against a wall clock of {wall:?}"
+            );
+            println!(
+                "EVIDENCE coalesced-credit followers={followers} wall={wall:?} \
+                 aggregate={aggregate:?} ratio={:.2}",
+                aggregate.as_secs_f64() / wall.as_secs_f64()
+            );
+        }
+    }
+
+    /// **Round 2, item 2: the fast-fail latch is LAUNCH-scoped, not listener-scoped.**
+    ///
+    /// The latch lives on the coordinator, which is per LISTENER and outlives a
+    /// launch, and nothing reset it: one launch per process hid that, but the P1.4
+    /// epoch machinery exists precisely so a listener can serve sequential launches,
+    /// and then launch N's stalled prompts denied every prompt of launch N+1. The
+    /// listener now registers `PromptCoordinator::begin_launch` as its launch reset
+    /// and `begin_epoch` runs it as the attribution window opens.
+    #[test]
+    fn a_new_launch_on_the_same_listener_starts_with_an_unarmed_prompt_latch() {
+        let budget = Duration::from_millis(80);
+        let (dialog, gate) = gated_dialog();
+        let t = t36_setup_cfg(
+            "prompt-launch-scope",
+            &[],
+            &[],
+            dialog,
+            true,
+            budget,
+            PromptPolicy::Deny,
+            None,
+        );
+
+        // Launch 1 arms the latch: three unanswered consultations (the dialog stays
+        // up, which is the routine headless state).
+        for i in 0..crate::net::prompt::NO_BACKEND_STICKY_AFTER {
+            let resp = exchange(t.port, &get_req(&format!("http://launch-{i}.invalid/x")));
+            assert!(resp.starts_with("HTTP/1.1 403"), "host {i}: got {resp}");
+            assert_eq!(
+                last_connect_event(&t.sid)["reason"],
+                PROMPT_TIMEOUT_REASON,
+                "host {i} must still pay its budget before the latch arms"
+            );
+        }
+        let armed_started = std::time::Instant::now();
+        let resp = exchange(t.port, &get_req("http://launch-armed.invalid/x"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got {resp}");
+        assert_eq!(
+            last_connect_event(&t.sid)["reason"],
+            PROMPT_SUPPRESSED_REASON,
+            "the latch is armed, and by elapsed budgets"
+        );
+        assert!(
+            armed_started.elapsed() < budget / 2,
+            "an armed latch answers without paying: {:?}",
+            armed_started.elapsed()
+        );
+
+        // A SECOND launch on the same listener: the epoch machinery's own case.
+        let epoch = t
+            .handle
+            .counters()
+            .begin_epoch()
+            .expect("a second launch's window");
+        assert!(t.handle.counters().close_epoch(epoch));
+
+        // Launch 2's first unlisted host is consulted again: it pays its own budget
+        // instead of inheriting launch 1's verdict.
+        let second_started = std::time::Instant::now();
+        let resp = exchange(t.port, &get_req("http://launch2.invalid/x"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got {resp}");
+        assert_eq!(
+            last_connect_event(&t.sid)["reason"],
+            PROMPT_TIMEOUT_REASON,
+            "launch 2 must consult a dialog: it must not inherit launch 1's latch"
+        );
+        assert!(
+            second_started.elapsed() >= budget / 2,
+            "launch 2's consultation pays its own budget: {:?}",
+            second_started.elapsed()
+        );
+        // Release the orphans so no blocking thread outlives the test.
+        drop(gate);
+    }
+
+    /// A backend that reports "no decision" only after doing work of its own:
+    /// the headless shape the D3 addendum measured (a dialog nobody answers, and
+    /// a client that pays the budget for it). Every call is counted, because the
+    /// count is how the test sees that later consultations stopped calling it.
+    fn counting_slow_failing_dialog(up: Duration) -> (DialogFn, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let dialog: DialogFn = Arc::new(move |_req: &DialogRequest| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(up);
+            Err(DialogUnavailable)
+        });
+        (dialog, calls)
+    }
+
+    /// **The D3 addendum's symptom, closed.** A headless session has no dialog to
+    /// answer, so before the fast-fail every unlisted host cost the client the
+    /// whole prompt budget (measured as `curl -m 15` exit 28). Every consultation up
+    /// to `NO_BACKEND_STICKY_AFTER` still pays it — enough evidence that no decision
+    /// is obtainable, and three rather than two since round 2 item 5 — and from then on
+    /// the deny is immediate, audited with `no_dialog_backend` instead of
+    /// `prompt_budget_exhausted` (this latch was armed by a backend that failed, so
+    /// that is the arming cause — item 8), one leaf per request, and no further dialog
+    /// is spawned.
+    #[test]
+    fn headless_requests_stop_paying_the_budget_for_an_absent_backend() {
+        let budget = Duration::from_millis(400);
+        let (dialog, calls) = counting_slow_failing_dialog(Duration::from_millis(200));
+        let t = t36_setup_cfg(
+            "headless-fast-fail",
+            &[],
+            &[],
+            dialog,
+            true,
+            budget,
+            PromptPolicy::Deny,
+            None,
+        );
+
+        let mut elapsed = Vec::new();
+        for i in 0..5 {
+            let host = format!("unlisted-headless-{i}.invalid");
+            let started = std::time::Instant::now();
+            let resp = exchange(t.port, &connect_req(&format!("{host}:443")));
+            elapsed.push(started.elapsed());
+            assert!(resp.starts_with("HTTP/1.1 403"), "host {i}: got {resp}");
+            assert!(
+                resp.contains(NO_DIALOG_BACKEND_REASON),
+                "host {i} must name the missing backend, not the budget: {resp}"
+            );
+            let ev = last_connect_event(&t.sid);
+            assert_eq!(ev["host"], host);
+            assert_eq!(ev["source"], "unavailable");
+            assert_eq!(ev["reason"], NO_DIALOG_BACKEND_REASON);
+            assert_eq!(ev["disposition"], "deny");
+        }
+
+        // The measured claim: the consultations before the threshold pay the
+        // backend's own latency, the rest do not pay anything like it.
+        for (i, e) in elapsed
+            .iter()
+            .enumerate()
+            .take(crate::net::prompt::NO_BACKEND_STICKY_AFTER)
+        {
+            assert!(
+                *e >= Duration::from_millis(150),
+                "request {i} must wait on the backend: {e:?}"
+            );
+        }
+        for (i, e) in elapsed
+            .iter()
+            .enumerate()
+            .skip(crate::net::prompt::NO_BACKEND_STICKY_AFTER)
+        {
+            assert!(
+                *e < budget / 4,
+                "request {i} must be denied well inside the budget ({budget:?}), got {e:?}"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            crate::net::prompt::NO_BACKEND_STICKY_AFTER,
+            "a known-absent backend must not be consulted again"
+        );
+        assert_eq!(
+            connect_events(&t.sid).len(),
+            5,
+            "every request is audited, skipped dialog or not"
+        );
+
+        println!(
+            "EVIDENCE headless-fast-fail budget={budget:?} elapsed={:?} dialog_calls={}",
+            elapsed,
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Item 4's reason half: the two capacity pools deny with **different**
+    /// reasons, and both are greppable tokens a filter can select on.
+    #[test]
+    fn the_two_overload_pools_deny_with_different_reasons() {
+        let consultations = super::overload_reason(OverloadCause::ConsultationsHeld);
+        let abandoned = super::overload_reason(OverloadCause::AbandonedCapacity);
+        assert_eq!(consultations, PROMPT_OVERLOAD_REASON);
+        assert_eq!(abandoned, PROMPT_ABANDONED_CAPACITY_REASON);
+        assert_eq!(abandoned, "prompt_abandoned_capacity");
+        assert_ne!(
+            consultations, abandoned,
+            "a full abandoned pool must not read as a concurrency limit"
+        );
+        // The three prompt-side reasons are three distinct facts: a spent budget,
+        // no backend, and which pool ran out.
+        let mut all = vec![PROMPT_TIMEOUT_REASON, NO_DIALOG_BACKEND_REASON, abandoned];
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 3, "reason tokens must be distinct: {all:?}");
+        assert!(
+            !all.contains(&consultations),
+            "the consultation-cap prose is not one of the tokenised reasons"
+        );
+    }
+
+    /// A dialog that parks every call until the gate drops, counting them: the
+    /// 8-leader state the consultation cap exists for.
+    fn counting_gated_dialog() -> (DialogFn, Arc<AtomicUsize>, std::sync::mpsc::Sender<()>) {
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Arc::new(StdMutex::new(wait));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let dialog: DialogFn = Arc::new(move |_req: &DialogRequest| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let rx = wait.lock().unwrap_or_else(|poison| poison.into_inner());
+            let _ = rx.recv();
+            Err(DialogUnavailable)
+        });
+        (dialog, calls, gate)
+    }
+
+    /// Arm 1 at the wire: with every consultation slot held, a NEW host is
+    /// refused as `prompt_overload` whose reason names the consultation cap —
+    /// and, unlike the abandoned arm, nothing about abandoned dialogs.
+    #[test]
+    fn a_full_consultation_pool_denies_with_its_own_reason() {
+        let (dialog, calls, gate) = counting_gated_dialog();
+        let t = t36_setup_cfg(
+            "overload-consultations",
+            &[],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(30),
+            PromptPolicy::Deny,
+            None,
+        );
+        let port = t.port;
+
+        // Eight leaders, one per distinct host, all parked inside their dialogs.
+        // The request strings are built HERE: this listener's credential lives in
+        // a test thread-local, so a spawned thread must be handed a finished
+        // request rather than building one without it.
+        let requests: Vec<String> = (0..crate::net::prompt::MAX_CONCURRENT_PROMPTS)
+            .map(|i| connect_req(&format!("held-{i}.invalid:443")))
+            .collect();
+        let leaders: Vec<_> = requests
+            .into_iter()
+            .map(|req| std::thread::spawn(move || exchange(port, &req)))
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) < crate::net::prompt::MAX_CONCURRENT_PROMPTS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the eight leaders must reach their dialogs, saw {}",
+                calls.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let ninth = exchange(port, &connect_req("one-too-many.invalid:443"));
+        assert!(ninth.starts_with("HTTP/1.1 403"), "got: {ninth}");
+        assert!(
+            ninth.contains(PROMPT_OVERLOAD_REASON),
+            "the deny must name the consultation cap: {ninth}"
+        );
+        assert!(
+            !ninth.contains(PROMPT_ABANDONED_CAPACITY_REASON),
+            "no dialog was abandoned here: {ninth}"
+        );
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["host"], "one-too-many.invalid");
+        assert_eq!(ev["source"], "prompt_overload");
+        assert_eq!(ev["reason"], PROMPT_OVERLOAD_REASON);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            crate::net::prompt::MAX_CONCURRENT_PROMPTS,
+            "the refused consultation must not have shown a dialog"
+        );
+
+        // Release the leaders so no blocking thread outlives the test.
+        drop(gate);
+        for l in leaders {
+            let _ = l.join();
+        }
     }
 
     #[test]
