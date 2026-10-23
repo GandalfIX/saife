@@ -1,4 +1,4 @@
-//! Filter grammar for `sandbox audit show --filter "expr"`.
+//! Filter grammar for `saife audit show --filter "expr"`.
 //!
 //! Grammar (AC-4.13):
 //!   filter  := clause ( "&" clause )*

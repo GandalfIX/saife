@@ -111,7 +111,7 @@ fn group_attr_desc(attrs: u32) -> String {
     format!("{attrs:#010x} ({named})")
 }
 
-/// Dump the child token's identity SIDs to stderr, for SANDBOX_DIAG runs.
+/// Dump the child token's identity SIDs to stderr, for SAIFE_DIAG runs.
 ///
 /// whoami.exe, powershell.exe and _ctypes.pyd all die with 0xC0000142
 /// inside the AppContainer, so the supervisor — which holds the suspended
@@ -295,7 +295,7 @@ pub fn spawn(
         }
 
         if let Err(e) = result {
-            if std::env::var_os("SANDBOX_DIAG").is_some() {
+            if std::env::var_os("SAIFE_DIAG").is_some() {
                 eprintln!("[spawn] CreateProcessW failed: {e}");
             }
             return Err(e);
@@ -303,13 +303,13 @@ pub fn spawn(
 
         // Token-owner fixup while the child is suspended (see
         // set_child_token_owner_to_user). Non-fatal by design: log under
-        // SANDBOX_DIAG, but always resume the child either way.
+        // SAIFE_DIAG, but always resume the child either way.
         if let Err(e) = set_child_token_owner_to_user(pi.hProcess)
-            && std::env::var_os("SANDBOX_DIAG").is_some()
+            && std::env::var_os("SAIFE_DIAG").is_some()
         {
             eprintln!("[spawn] token-owner fixup failed (continuing): {e}");
         }
-        if std::env::var_os("SANDBOX_DIAG").is_some() {
+        if std::env::var_os("SAIFE_DIAG").is_some() {
             dump_child_token_diag("post-fixup", pi.hProcess);
         }
         let _ = ResumeThread(pi.hThread);

@@ -196,7 +196,7 @@ pub fn resolve_network_with(
         if let Some(builtin) = crate::net::profile::builtin_profile(name) {
             allow.extend(builtin);
         } else if name != "none" {
-            eprintln!("[sandbox] warning: unknown network profile `{name}`");
+            eprintln!("[saife] warning: unknown network profile `{name}`");
         }
     }
 
@@ -225,7 +225,7 @@ pub fn resolve_network_with(
         Some(v) if v == "deny" || v == "allow" => v.to_string(),
         Some(invalid) => {
             eprintln!(
-                "[sandbox] invalid onUnavailable value \"{invalid}\", defaulting to \"deny\""
+                "[saife] invalid onUnavailable value \"{invalid}\", defaulting to \"deny\""
             );
             "deny".to_string()
         }
@@ -251,7 +251,7 @@ pub fn resolve_network_with(
         Some(v) if v > 0 && v <= MAX_WORKLOAD_TIMEOUT_SECS => v,
         Some(invalid) => {
             eprintln!(
-                "[sandbox] invalid workloadTimeoutSecs value {invalid} (must be 1..=\
+                "[saife] invalid workloadTimeoutSecs value {invalid} (must be 1..=\
                  {MAX_WORKLOAD_TIMEOUT_SECS}), defaulting to {DEFAULT_WORKLOAD_TIMEOUT_SECS}"
             );
             DEFAULT_WORKLOAD_TIMEOUT_SECS

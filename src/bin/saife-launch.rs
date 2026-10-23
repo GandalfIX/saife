@@ -1,4 +1,4 @@
-//! `mxc-launch` — the supervisor-owned wrapper launcher for the MXC backend.
+//! `saife-launch` — the supervisor-owned wrapper launcher for the MXC backend.
 //!
 //! ## Why this exists (plan D1)
 //!
@@ -22,12 +22,12 @@
 //! `src/net/mxc.rs::launcher_command`)
 //!
 //! ```text
-//! mxc-launch.exe [--proxy-port <port>] [--env NAME=VALUE]... -- <real command line>
+//! saife-launch.exe [--proxy-port <port>] [--env NAME=VALUE]... -- <real command line>
 //! ```
 //!
 //! * `--proxy-port <port>` is the loopback port the supervisor's proxy (and,
 //!   on the same listener, its D-4 intent endpoints) listens on for this
-//!   session. The wrapper writes it to the child as `SANDBOX_PROXY_PORT`, the
+//!   session. The wrapper writes it to the child as `SAIFE_PROXY_PORT`, the
 //!   D-0.3 discovery variable (`src/sandbox/appcontainer.rs:1007` is the
 //!   AppContainer injector of the same name). Omitting the flag — a session
 //!   with no proxy — still writes the name, EMPTY, so a value inherited from
@@ -38,7 +38,7 @@
 //!   scrubs — every other variable belongs in `ContainerRequest::environment`.
 //!   A later `--env` for the same name wins. The proxy-variable family
 //!   (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`,
-//!   `SANDBOX_PROXY_PORT`, any case) is refused with [`EXIT_USAGE`]: see
+//!   `SAIFE_PROXY_PORT`, any case) is refused with [`EXIT_USAGE`]: see
 //!   [`RESERVED_ENV_NAMES`].
 //! * Everything after `--` is **one** argument: the workload's command line.
 //!   It is handed verbatim to `CreateProcessW`, so it means exactly what it
@@ -62,7 +62,7 @@
 //! not the wrapper's.
 //!
 //! The wrapper always sets `NO_PROXY` and `no_proxy` to
-//! [`LOOPBACK_NO_PROXY`], and `SANDBOX_PROXY_PORT` to the port named by
+//! [`LOOPBACK_NO_PROXY`], and `SAIFE_PROXY_PORT` to the port named by
 //! `--proxy-port` (empty when it names none), before starting the workload. This
 //! does not widen egress containment: every non-loopback destination still goes
 //! to the supervisor's proxy, and loopback reachability comes from the request's
@@ -72,7 +72,7 @@
 //! ## Exit codes
 //!
 //! * the workload's own exit code, propagated unchanged;
-//! * [`EXIT_CANT_START`] (`127`) **plus** a `mxc-launch: failed to start ...`
+//! * [`EXIT_CANT_START`] (`127`) **plus** a `saife-launch: failed to start ...`
 //!   line on stderr when the workload could not be started (or its wait
 //!   failed). The stderr line is the signature, not the number: a workload that
 //!   itself exits 127 propagates identically and writes no such line, so the
@@ -122,7 +122,7 @@ pub const LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,::1";
 /// three are the SDK's — `HTTP_PROXY`/`HTTPS_PROXY` point at the supervisor's
 /// proxy and `ALL_PROXY` is scrubbed for the same reason (plan invariant 5) — so
 /// a caller-set value would either bypass the proxy guardrail 1 proves or
-/// silently disable it. `SANDBOX_PROXY_PORT` is the wrapper's too (P2.4): it is
+/// silently disable it. `SAIFE_PROXY_PORT` is the wrapper's too (P2.4): it is
 /// the D-0.3 discovery variable, so a caller-set value would point a workload's
 /// intent POST at a port the supervisor does not own while everything else
 /// looked correct. The endpoint comes from `--proxy-port`, which only the
@@ -134,7 +134,7 @@ pub const RESERVED_ENV_NAMES: [&str; 5] = [
     "HTTPS_PROXY",
     "ALL_PROXY",
     "NO_PROXY",
-    "SANDBOX_PROXY_PORT",
+    "SAIFE_PROXY_PORT",
 ];
 
 /// Whether `name` belongs to the proxy-variable family that `--env` may not set.
@@ -146,7 +146,7 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 }
 
 /// The workload could not be started, or waiting for it failed. Always
-/// accompanied by a `mxc-launch: failed to start ...` line on stderr.
+/// accompanied by a `saife-launch: failed to start ...` line on stderr.
 ///
 /// Deliberately not 1, so it cannot be mistaken for a workload that ran and
 /// failed — but the **number alone is not a spawn-failure verdict**. A workload
@@ -165,7 +165,7 @@ pub struct LaunchPlan {
     /// command-line order (later entries win).
     pub env: Vec<(String, String)>,
     /// The supervisor's proxy port for this session (`--proxy-port`), written to
-    /// the workload as `SANDBOX_PROXY_PORT`. `None` for a session with no proxy.
+    /// the workload as `SAIFE_PROXY_PORT`. `None` for a session with no proxy.
     pub proxy_port: Option<u16>,
     /// The workload's command line, verbatim.
     pub command: String,
@@ -262,7 +262,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchPlan,
                     return Err(format!(
                         "`--env {name}=...` is reserved: the wrapper and the container \
                          backend own HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY/\
-                         SANDBOX_PROXY_PORT, and an override would defeat the loopback \
+                         SAIFE_PROXY_PORT, and an override would defeat the loopback \
                          NO_PROXY that keeps the intent endpoint reachable (the port comes \
                          from `--proxy-port`)"
                     ));
@@ -285,7 +285,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchPlan,
 /// `NO_PROXY` in both spellings (Windows variable names are case-insensitive,
 /// so both names reach the same slot; a case-sensitive POSIX-emulation client
 /// inside the container reads the lowercase spelling literally) and
-/// `SANDBOX_PROXY_PORT`, the D-0.3 discovery variable for the D-4 intent
+/// `SAIFE_PROXY_PORT`, the D-0.3 discovery variable for the D-4 intent
 /// endpoints (P2.4).
 ///
 /// The port is passed in from the command line rather than parsed out of
@@ -304,7 +304,7 @@ pub fn added_env(proxy_port: Option<u16>) -> Vec<(String, String)> {
         ("NO_PROXY".to_string(), LOOPBACK_NO_PROXY.to_string()),
         ("no_proxy".to_string(), LOOPBACK_NO_PROXY.to_string()),
         (
-            "SANDBOX_PROXY_PORT".to_string(),
+            "SAIFE_PROXY_PORT".to_string(),
             proxy_port.map(|port| port.to_string()).unwrap_or_default(),
         ),
     ]
@@ -404,9 +404,9 @@ fn main() {
     {
         Ok(plan) => plan,
         Err(message) => {
-            eprintln!("mxc-launch: {message}");
+            eprintln!("saife-launch: {message}");
             eprintln!(
-                "mxc-launch: usage: mxc-launch.exe [--env NAME=VALUE]... -- \
+                "saife-launch: usage: saife-launch.exe [--env NAME=VALUE]... -- \
                  \"<workload command line>\""
             );
             std::process::exit(EXIT_USAGE);
@@ -441,7 +441,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!(
-                "mxc-launch: failed to start `{}`: {e}",
+                "saife-launch: failed to start `{}`: {e}",
                 first_token(&plan.command)
             );
             std::process::exit(EXIT_CANT_START);
@@ -641,8 +641,8 @@ mod tests {
             // P2.4: the discovery variable is the wrapper's own fact. A caller
             // value would name a port the supervisor does not own, so the
             // workload would send its intent to somebody else's socket.
-            "SANDBOX_PROXY_PORT=1",
-            "sandbox_proxy_port=1",
+            "SAIFE_PROXY_PORT=1",
+            "saife_proxy_port=1",
         ] {
             let err = parse_args(args(&["--env", entry, "--", "run.exe"]))
                 .expect_err("a proxy variable must be refused");
@@ -665,7 +665,7 @@ mod tests {
         // An unpaired surrogate is exactly what `std::env::args()` panics on.
         let bad = OsString::from_wide(&[0xD800, 0x0041]);
         let err = unicode_args(vec![
-            OsString::from("mxc-launch.exe"),
+            OsString::from("saife-launch.exe"),
             OsString::from("--"),
             bad,
         ])
@@ -676,11 +676,11 @@ mod tests {
         // Well-formed argv passes through unchanged, program name included
         // (`main` is what skips it).
         let ok = unicode_args(vec![
-            OsString::from("mxc-launch.exe"),
+            OsString::from("saife-launch.exe"),
             OsString::from("--env"),
         ])
         .expect("unicode argv is accepted");
-        assert_eq!(ok, vec!["mxc-launch.exe".to_string(), "--env".to_string()]);
+        assert_eq!(ok, vec!["saife-launch.exe".to_string(), "--env".to_string()]);
     }
 
     #[test]
@@ -702,7 +702,7 @@ mod tests {
                 ("no_proxy".to_string(), LOOPBACK_NO_PROXY.to_string()),
                 // P2.4: present even when the session has no proxy, and empty —
                 // see `added_env`'s note on inherited values.
-                ("SANDBOX_PROXY_PORT".to_string(), String::new()),
+                ("SAIFE_PROXY_PORT".to_string(), String::new()),
             ]
         );
         assert_eq!(LOOPBACK_NO_PROXY, "localhost,127.0.0.1,::1");
@@ -711,17 +711,17 @@ mod tests {
     /// P2.4: the D-0.3 **discovery** contract.
     ///
     /// A workload written to D-0.3 finds the D-4 control plane from
-    /// `SANDBOX_PROXY_PORT` and nowhere else; the AppContainer path has injected
+    /// `SAIFE_PROXY_PORT` and nowhere else; the AppContainer path has injected
     /// it since Task 1.3 (`src/sandbox/appcontainer.rs:1007`), while this
     /// launcher did not, so under MXC the endpoint existed and was
     /// undiscoverable. The value is the supervisor's own bound port, so it must
     /// come from the command line — never be derived here from `HTTP_PROXY`,
     /// which would make the discovery contract depend on the SDK's URL shape.
     #[test]
-    fn injects_the_sandbox_proxy_port_the_workload_discovers() {
+    fn injects_the_saife_proxy_port_the_workload_discovers() {
         let env = added_env(Some(49_152));
         assert!(
-            env.contains(&("SANDBOX_PROXY_PORT".to_string(), "49152".to_string())),
+            env.contains(&("SAIFE_PROXY_PORT".to_string(), "49152".to_string())),
             "the workload must be able to discover the listener: {env:?}"
         );
         // Exactly three entries: the SDK owns HTTP_PROXY/HTTPS_PROXY (it strips
@@ -739,7 +739,7 @@ mod tests {
     fn clears_the_port_when_the_session_has_no_proxy() {
         let env = added_env(None);
         assert!(
-            env.contains(&("SANDBOX_PROXY_PORT".to_string(), String::new())),
+            env.contains(&("SAIFE_PROXY_PORT".to_string(), String::new())),
             "{env:?}"
         );
     }

@@ -99,7 +99,7 @@ fn main() {
             enable_loopback,
         } => {
             if let Err(e) = setup::check(check_only, grant_drive_root, enable_loopback) {
-                eprintln!("[sandbox] setup check failed: {e:#}");
+                eprintln!("[saife] setup check failed: {e:#}");
                 std::process::exit(1);
             }
             0
@@ -111,9 +111,9 @@ fn main() {
 fn ps_cmd(json: bool) -> i32 {
     // Minimal: list the most recent audit log's sid.
     let dir = match std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
-        Some(p) => p.join("sandbox").join("audit"),
+        Some(p) => p.join("saife").join("audit"),
         None => {
-            eprintln!("[sandbox] LOCALAPPDATA not set");
+            eprintln!("[saife] LOCALAPPDATA not set");
             return 1;
         }
     };
@@ -186,7 +186,7 @@ fn learned_cmd(action: cli::LearnedSub, profile: Option<String>) -> i32 {
     rc
 }
 
-/// Core of `sandbox learned`, rooted at `base` and returning the exit
+/// Core of `saife learned`, rooted at `base` and returning the exit
 /// code plus the stdout/stderr text (printed by [`learned_cmd`]). Split
 /// out so the behavior is unit-testable against temp dirs without
 /// capturing real process output.
@@ -203,7 +203,7 @@ fn learned_cmd_in(
                 if entries.is_empty() {
                     return (0, "(no learned entries)\n".to_string(), String::new());
                 }
-                // Aligned plain-text columns, no color codes (`sandbox ps`
+                // Aligned plain-text columns, no color codes (`saife ps`
                 // style). Suffix entries keep the `*.` prefix they are
                 // stored with, so `list` shows the exact revoke key.
                 let host_w = entries
@@ -239,21 +239,21 @@ fn learned_cmd_in(
                     1,
                     String::new(),
                     format!(
-                        "[sandbox] no learned entry for {host} \
-                         (run `sandbox learned list` to see stored keys)\n"
+                        "[saife] no learned entry for {host} \
+                         (run `saife learned list` to see stored keys)\n"
                     ),
                 ),
                 Err(e) => (
                     1,
                     String::new(),
-                    format!("[sandbox] failed to rewrite learned file: {e:#}\n"),
+                    format!("[saife] failed to rewrite learned file: {e:#}\n"),
                 ),
             },
             Err(e) => learned_load_failure(e),
         },
         LearnedSub::Clear => {
             // [G-5] recovery: a corrupt learned file hard-aborts
-            // `sandbox run`, and `clear` is the only non-editorial way
+            // `saife run`, and `clear` is the only non-editorial way
             // out — so it must succeed even when the file cannot be
             // loaded. Happy path reuses `LearnedStore::clear`; the
             // unloadable case rewrites the file empty directly.
@@ -266,7 +266,7 @@ fn learned_cmd_in(
                 Err(e) => (
                     1,
                     String::new(),
-                    format!("[sandbox] failed to clear learned file: {e:#}\n"),
+                    format!("[saife] failed to clear learned file: {e:#}\n"),
                 ),
             }
         }
@@ -280,8 +280,8 @@ fn learned_load_failure(e: anyhow::Error) -> (i32, String, String) {
         1,
         String::new(),
         format!(
-            "[sandbox] failed to load learned file: {e:#} \
-             (run `sandbox learned clear` to reset it)\n"
+            "[saife] failed to load learned file: {e:#} \
+             (run `saife learned clear` to reset it)\n"
         ),
     )
 }
@@ -485,14 +485,14 @@ fn run_cmd(
     let feature_enabled = cfg!(feature = "mxc-backend");
     let backend = backend.unwrap_or_else(|| {
         if !feature_enabled {
-            eprintln!("[sandbox] {}", cli::MXC_FEATURE_FALLBACK);
+            eprintln!("[saife] {}", cli::MXC_FEATURE_FALLBACK);
         }
         cli::default_backend(feature_enabled)
     });
     let backend = match cli::route_backend(backend, feature_enabled, MXC_SESSION_WIRED) {
             Ok(backend) => backend,
             Err(refusal) => {
-                eprintln!("[sandbox] {}", refusal.message());
+                eprintln!("[saife] {}", refusal.message());
                 return 2;
             }
         };
@@ -501,7 +501,7 @@ fn run_cmd(
     // without the feature never reaches this point (`route_backend` refuses), and
     // `run_inner` re-states that refusal rather than falling back.
     if let Err(e) = setup::check_runtime() {
-        eprintln!("[sandbox] {e:#}");
+        eprintln!("[saife] {e:#}");
         return 1;
     }
 
@@ -526,7 +526,7 @@ fn run_cmd(
     ) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("[sandbox] {e:#}");
+            eprintln!("[saife] {e:#}");
             1
         }
     }
@@ -631,7 +631,7 @@ fn run_inner(
     // would be a claim rather than a feature.
     if !plugins.is_empty() {
         eprintln!(
-            "[sandbox] plugin_unsupported_backend: --plugin {} (plugins are wired on --backend mxc only)",
+            "[saife] plugin_unsupported_backend: --plugin {} (plugins are wired on --backend mxc only)",
             plugins.join(", ")
         );
         return Ok(2);
@@ -657,7 +657,7 @@ fn run_inner(
     ) {
         Ok(j) => Some(j),
         Err(e) => {
-            eprintln!("[sandbox] warning: DACL journal unavailable: {e}");
+            eprintln!("[saife] warning: DACL journal unavailable: {e}");
             None
         }
     };
@@ -706,10 +706,10 @@ fn run_inner(
     if !net_cfg.is_blocked()
         && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
     {
-        eprintln!("[sandbox] warning: loopback exemption failed: {e}");
-        eprintln!("[sandbox]          Re-run 'sandbox run' as administrator (loopback is");
+        eprintln!("[saife] warning: loopback exemption failed: {e}");
+        eprintln!("[saife]          Re-run 'saife run' as administrator (loopback is");
         eprintln!(
-            "[sandbox]          registered automatically when elevated), or use --block-net."
+            "[saife]          registered automatically when elevated), or use --block-net."
         );
     }
 
@@ -743,7 +743,7 @@ fn run_inner(
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
 
     if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries, run_journal.as_ref()) {
-        eprintln!("[sandbox] warning: some ACL grants failed: {e}");
+        eprintln!("[saife] warning: some ACL grants failed: {e}");
     }
 
     let env_block = sandbox::build_env_block(&sid, &cwd, proxy.as_ref().map(|(_, env)| env));
@@ -862,12 +862,12 @@ fn run_mxc_session(
         return Ok(0);
     }
 
-    // (2) D1's wrapper. The container runs `mxc-launch.exe`, and that wrapper is
-    //     the only way `NO_PROXY` and `SANDBOX_PROXY_PORT` reach the child
+    // (2) D1's wrapper. The container runs `saife-launch.exe`, and that wrapper is
+    //     the only way `NO_PROXY` and `SAIFE_PROXY_PORT` reach the child
     //     (mxc-sdk 1.0.1 strips both from `request.environment`).
     let supervisor = std::env::current_exe().context("locate this supervisor binary")?;
     let Some(launcher) = net::mxc::launcher_beside(&supervisor) else {
-        eprintln!("[sandbox] {}", cli::MXC_LAUNCHER_MISSING);
+        eprintln!("[saife] {}", cli::MXC_LAUNCHER_MISSING);
         return Ok(2);
     };
 
@@ -898,7 +898,7 @@ fn run_mxc_session(
     ) {
             Ok(policy) => policy,
             Err(e) => {
-                eprintln!("[sandbox] mxc: {e}");
+                eprintln!("[saife] mxc: {e}");
                 return Ok(2);
             }
         };
@@ -942,7 +942,7 @@ fn run_mxc_session(
     //     in between answers `404`, never a stale allow.
     if !plugins.is_empty() && net_cfg.is_blocked() {
         eprintln!(
-            "[sandbox] plugin_requires_proxy: --plugin {} (--block-net starts no listener to route it)",
+            "[saife] plugin_requires_proxy: --plugin {} (--block-net starts no listener to route it)",
             plugins.join(", ")
         );
         return Ok(2);
@@ -967,20 +967,20 @@ fn run_mxc_session(
         let loaded = match plugin::load_plugin(name, &roots) {
             Ok(loaded) => loaded,
             Err(e) => {
-                eprintln!("[sandbox] plugin '{name}' refused: {e:#}");
+                eprintln!("[saife] plugin '{name}' refused: {e:#}");
                 return Ok(EXIT_PLUGIN_REFUSED);
             }
         };
         let sidecar = match plugin::sidecar::Sidecar::start(&loaded.dir, &loaded.manifest, sid) {
             Ok(sidecar) => sidecar,
             Err(e) => {
-                eprintln!("[sandbox] plugin '{name}' refused: {e:#}");
+                eprintln!("[saife] plugin '{name}' refused: {e:#}");
                 return Ok(EXIT_PLUGIN_REFUSED);
             }
         };
-        if std::env::var_os("SANDBOX_DIAG").is_some() {
+        if std::env::var_os("SAIFE_DIAG").is_some() {
             eprintln!(
-                "[sandbox] SANDBOX_DIAG: plugin '{}' healthy on 127.0.0.1:{} (pid {:?}, log {})",
+                "[saife] SAIFE_DIAG: plugin '{}' healthy on 127.0.0.1:{} (pid {:?}, log {})",
                 sidecar.mount(),
                 sidecar.port(),
                 sidecar.pid(),
@@ -990,7 +990,7 @@ fn run_mxc_session(
         // The mount goes live only now: a duplicate mount (two plugins asking to
         // answer for one name) refuses the session instead of picking a winner.
         if let Err(e) = facade.insert(sidecar.facade_target()) {
-            eprintln!("[sandbox] plugin '{name}' refused: {e:#}");
+            eprintln!("[saife] plugin '{name}' refused: {e:#}");
             return Ok(EXIT_PLUGIN_REFUSED);
         }
         sidecars.push(sidecar);
@@ -1018,7 +1018,7 @@ fn run_mxc_session(
         // block is AppContainer-specific: its `PATH`/`PYTHONPATH` shims point into
         // `.sandbox/<sid>` (which MXC does not use), and the proxy variables come
         // from the SDK's `runtimeConfig.networkProxy`.
-        environment: vec![("SANDBOX_SESSION_SID".to_string(), sid.to_string())],
+        environment: vec![("SAIFE_SESSION_SID".to_string(), sid.to_string())],
         filesystem,
         network: net::mxc::MxcNetworkInput {
             proxy_port,
@@ -1076,7 +1076,7 @@ fn run_mxc_session(
             audit::session_start::TierRefusal::tier_mismatch(mismatch.expected),
         )?;
         seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
-        eprintln!("[sandbox] mxc: {mismatch}");
+        eprintln!("[saife] mxc: {mismatch}");
         return Ok(EXIT_REFUSED);
     }
     session_start
@@ -1112,7 +1112,7 @@ fn run_mxc_session(
                 // existed, and it is not rewritten to say otherwise.
                 audit::session_start::append_refusal(&audit_writer, sid, refusal)?;
                 seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
-                eprintln!("[sandbox] mxc: {e}");
+                eprintln!("[saife] mxc: {e}");
                 return Ok(launch_failure_exit(&e));
             }
             // Nothing was established (no request, no container, no epoch, an SDK
@@ -1137,7 +1137,7 @@ fn run_mxc_session(
         )?;
         seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
         eprintln!(
-            "[sandbox] mxc: guardrail 2: the launch recorded tier `{}` (source `{}`) but this \
+            "[saife] mxc: guardrail 2: the launch recorded tier `{}` (source `{}`) but this \
              session's root already claims `{}` — a record that does not confirm the root \
              refuses the session, and the root is not rewritten",
             outcome.tier.tier.as_deref().unwrap_or("no tier"),
@@ -1156,20 +1156,20 @@ fn run_mxc_session(
     // the leg that catches a client stack which reached the proxy and could not
     // use it — so a refusal and a pass are auditable from the same line.
     eprintln!(
-        "[sandbox] mxc: guardrail 1 proof probes={} accepted={} tunnels={} unauthenticated={}",
+        "[saife] mxc: guardrail 1 proof probes={} accepted={} tunnels={} unauthenticated={}",
         outcome.proxy_proof.probes,
         outcome.proxy_proof.accepted,
         outcome.proxy_proof.tunnels,
         outcome.proxy_proof.unauthenticated
     );
     for warning in &outcome.warnings {
-        eprintln!("[sandbox] mxc: warning: {warning}");
+        eprintln!("[saife] mxc: warning: {warning}");
     }
     if let Some(reason) = outcome.timeout {
         // Decision 6: the reason token says whether the operator's command or the
         // supervisor ran the clock out — the two have different remedies.
         eprintln!(
-            "[sandbox] mxc: session ended at its deadline ({} ms = prompt {} s + workload {} s \
+            "[saife] mxc: session ended at its deadline ({} ms = prompt {} s + workload {} s \
              + slack {} s) — reason {reason}",
             budget.session().as_millis(),
             budget.prompt.as_secs(),
@@ -1342,7 +1342,7 @@ fn start_session_proxy(
             // proxy. A corrupt learned file is a hard error by design — the
             // user notices immediately and can fix or revoke it ([G-5]).
             let learned = net::learned::LearnedStore::load(profile_name.as_deref()).context(
-                "load learned policy file ('sandbox learned clear' resets a corrupt one)",
+                "load learned policy file ('saife learned clear' resets a corrupt one)",
             )?;
             // D-4 registry + D-3.5 coordinator: created in the supervisor
             // (all sync) before the proxy runtime exists and Arc-shared
@@ -1372,11 +1372,11 @@ fn start_session_proxy(
             // loopback-only proxy env we build for it.
             let (upstream_url, upstream_warn, upstream_source) =
                 select_upstream(upstream_proxy.as_deref(), |k| std::env::var(k).ok());
-            // [G-42] The override notice rides the SANDBOX_DIAG stream.
+            // [G-42] The override notice rides the SAIFE_DIAG stream.
             if let Some(w) = upstream_warn
-                && std::env::var_os("SANDBOX_DIAG").is_some()
+                && std::env::var_os("SAIFE_DIAG").is_some()
             {
-                eprintln!("[sandbox] SANDBOX_DIAG: {w}");
+                eprintln!("[saife] SAIFE_DIAG: {w}");
             }
             let upstream = match upstream_url {
                 Some(raw) => match net::upstream::UpstreamDialer::from_url(
@@ -1390,19 +1390,19 @@ fn start_session_proxy(
                         // and say why. A session that silently loses its
                         // egress proxy is a security-relevant degradation, so
                         // — like the journal / loopback / ACL warnings above —
-                        // this line is NOT SANDBOX_DIAG-gated; the gated line
+                        // this line is NOT SAIFE_DIAG-gated; the gated line
                         // below adds the parse detail. The reason is static
                         // and the endpoint redacted: the URL itself is never
                         // echoed ([G-30]).
                         if let Some(source) = upstream_source {
                             eprintln!(
-                                "[sandbox] warning: {}",
+                                "[saife] warning: {}",
                                 upstream_parse_failure_warning(source, &raw, &e)
                             );
                         }
-                        if std::env::var_os("SANDBOX_DIAG").is_some() {
+                        if std::env::var_os("SAIFE_DIAG").is_some() {
                             eprintln!(
-                                "[sandbox] SANDBOX_DIAG: ignoring upstream proxy {} ({e}); \
+                                "[saife] SAIFE_DIAG: ignoring upstream proxy {} ({e}); \
                                  dialing direct",
                                 redact_proxy_url(&raw)
                             );
@@ -1479,7 +1479,7 @@ fn seal_audit(
     if let Some(root) = captured_root
         && let Err(e) = commit_audit_root(sid, &root)
     {
-        eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
+        eprintln!("[saife] warning: failed to commit audit root: {e:#}");
         // The log is still readable; verify will report INCOMPLETE.
     }
 }
@@ -1990,7 +1990,7 @@ mod tests {
     /// still running"; with the root moved ahead of the launch it passes.
     #[cfg(feature = "mxc-backend")]
     #[test]
-    #[ignore = "launches a real ProcessContainer and hard-kills a real supervisor; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    #[ignore = "launches a real ProcessContainer and hard-kills a real supervisor; run: cargo test --features mxc-backend --bin saife -- --ignored"]
     fn a_supervisor_killed_mid_session_leaves_a_chain_verify_can_read() {
         use audit::verify::{VerifyOutcome, verify_inner};
         use std::time::Duration;
@@ -1999,21 +1999,21 @@ mod tests {
         let supervisor = exe
             .parent()
             .and_then(std::path::Path::parent)
-            .map(|profile| profile.join("sandbox.exe"))
+            .map(|profile| profile.join("saife.exe"))
             .expect("a profile directory above deps/");
         assert!(
             supervisor.is_file(),
-            "build it first: cargo build --features mxc-backend --bin sandbox ({})",
+            "build it first: cargo build --features mxc-backend --bin saife ({})",
             supervisor.display()
         );
         assert!(
             net::mxc::launcher_beside(&supervisor).is_some(),
-            "mxc-launch.exe must sit beside the supervisor: \
-             cargo build --features mxc-backend --bin mxc-launch"
+            "saife-launch.exe must sit beside the supervisor: \
+             cargo build --features mxc-backend --bin saife-launch"
         );
         // A spawned supervisor is evidence only if it was built from the sources
-        // under test: `cargo test --bin sandbox` builds the TEST harness and leaves
-        // `target/debug/sandbox.exe` alone, so a stale binary would answer for code
+        // under test: `cargo test --bin saife` builds the TEST harness and leaves
+        // `target/debug/saife.exe` alone, so a stale binary would answer for code
         // that has since changed — it inverted this very test's own RED probe.
         if let (Some(built), Some(source)) = (
             std::fs::metadata(&supervisor)
@@ -2024,7 +2024,7 @@ mod tests {
             assert!(
                 built >= source,
                 "{} is older than src/: rebuild it first \
-                 (`cargo build --features mxc-backend --bin sandbox`), or this run is \
+                 (`cargo build --features mxc-backend --bin saife`), or this run is \
                  measuring a binary that does not contain the code under test",
                 supervisor.display()
             );
@@ -2266,7 +2266,7 @@ mod tests {
     }
 
     /// [G-5] corrupt-file recovery: a corrupt learned file hard-aborts
-    /// `sandbox run`, and `clear` is the only non-editorial way out — so
+    /// `saife run`, and `clear` is the only non-editorial way out — so
     /// it must succeed even though the file cannot be loaded.
     #[test]
     fn learned_clear_resets_corrupt_file() {
@@ -2278,7 +2278,7 @@ mod tests {
         // recovery path.
         let (rc, _out, err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
         assert_eq!(rc, 1);
-        assert!(err.contains("sandbox learned clear"), "hint: {err}");
+        assert!(err.contains("saife learned clear"), "hint: {err}");
         // Clear is the recovery path and must succeed despite the corrupt file.
         let (rc, out, err) = learned_cmd_in(cli::LearnedSub::Clear, None, &tmp);
         assert_eq!(rc, 0, "stderr: {err}");

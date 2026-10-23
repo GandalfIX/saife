@@ -292,7 +292,7 @@ try {
     #    THIS run only: a reset account can carry a previous run's files, and
     #    an old elevated=true leaf would fail the lane for the wrong reason.
     # -----------------------------------------------------------------------
-    $auditDir = Join-Path $env:LOCALAPPDATA 'sandbox\audit'
+    $auditDir = Join-Path $env:LOCALAPPDATA 'saife\audit'
     $auditBefore = @()
     if (Test-Path -LiteralPath $auditDir) {
         $auditBefore = @(Get-ChildItem -LiteralPath $auditDir -Filter '*.ndjson' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })

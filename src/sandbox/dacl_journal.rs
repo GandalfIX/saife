@@ -166,13 +166,13 @@ pub fn recover_orphans(
     reaped
 }
 
-/// Default journal directory: `%LOCALAPPDATA%\sandbox\dacl-restore`
+/// Default journal directory: `%LOCALAPPDATA%\saife\dacl-restore`
 /// (sibling of the audit dir, same per-user convention).
 pub fn default_dir() -> PathBuf {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let dir = local.join("sandbox").join("dacl-restore");
+    let dir = local.join("saife").join("dacl-restore");
     let _ = fs::create_dir_all(&dir);
     dir
 }

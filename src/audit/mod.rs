@@ -44,7 +44,7 @@ pub fn audit_log_path(session_id: &str) -> PathBuf {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let dir = local.join("sandbox").join("audit");
+    let dir = local.join("saife").join("audit");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{session_id}.ndjson"))
 }
@@ -155,7 +155,7 @@ impl AuditWriter {
         let mut line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
         line.push('\n');
 
-        if std::env::var_os("SANDBOX_DIAG").is_some() {
+        if std::env::var_os("SAIFE_DIAG").is_some() {
             eprint!("[proxy] {line}");
         }
 

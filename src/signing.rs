@@ -1,6 +1,6 @@
 //! Ed25519 signing key for the audit trail root.
 //!
-//! The secret key is stored at `%LOCALAPPDATA%\sandbox\signing\ed25519-key`,
+//! The secret key is stored at `%LOCALAPPDATA%\saife\signing\ed25519-key`,
 //! DPAPI-encrypted (`CryptProtectData`, user scope — not LOCAL_MACHINE, so only
 //! the same user on the same machine can decrypt). The 32-byte secret is
 //! encrypted to a variable-length blob and written with a restrictive DACL
@@ -21,7 +21,7 @@ use windows::core::{HRESULT, HSTRING};
 
 /// Serializes first-time key creation within this process. The cross-process
 /// race is handled by the non-replacing atomic publish in `ensure()`. Without
-/// both, concurrent first-runs (two `sandbox run` processes on a fresh
+/// both, concurrent first-runs (two `saife run` processes on a fresh
 /// machine, or parallel unit tests in a fresh guest) each mint a key and
 /// overwrite the file; the losers' signatures then fail `audit verify` with
 /// BadSignature even though nothing was tampered.
@@ -119,7 +119,7 @@ pub fn key_path() -> Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .context("LOCALAPPDATA not set")?;
-    Ok(local.join("sandbox").join("signing").join("ed25519-key"))
+    Ok(local.join("saife").join("signing").join("ed25519-key"))
 }
 
 /// Does the key file exist? Used by `setup --check-only`.
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn key_path_is_under_localappdata() {
         let p = key_path().unwrap();
-        assert!(p.to_string_lossy().contains("sandbox"));
+        assert!(p.to_string_lossy().contains("saife"));
         assert!(p.to_string_lossy().contains("signing"));
         assert!(p.to_string_lossy().contains("ed25519-key"));
     }

@@ -102,7 +102,7 @@ pub fn resolve_groups(probe: &dyn EnvProbe, groups: &[String]) -> Vec<GroupGrant
             }
             _ => {
                 eprintln!(
-                    "[sandbox] warning: unknown security group `{g}` (skipped)"
+                    "[saife] warning: unknown security group `{g}` (skipped)"
                 );
                 Vec::new()
             }

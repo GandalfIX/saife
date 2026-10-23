@@ -721,7 +721,7 @@ mod tests {
             "sitecustomize.py must rewrite the 0o700 mode"
         );
         assert!(
-            content.contains("SANDBOX_SESSION_SID"),
+            content.contains("SAIFE_SESSION_SID"),
             "sitecustomize.py must gate on the session marker (venv-root copies stay inert outside the sandbox)"
         );
         assert!(
@@ -756,7 +756,7 @@ mod tests {
     /// `%APPDATA%` and `%LOCALAPPDATA%`, and on this host an ACL write to those
     /// directories does not return under that configuration: the session blocks
     /// inside `grant_access` BEFORE the child is spawned (observed as a
-    /// "teardown hang" — no child, a lone conhost, `sandbox.exe` alive forever;
+    /// "teardown hang" — no child, a lone conhost, `saife.exe` alive forever;
     /// instrumented runs show the ACE built with no kernel-write completion,
     /// the pre-fix binary hung >20 s and the post-fix binary exits in ~10 s).
     #[test]

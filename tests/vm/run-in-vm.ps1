@@ -12,7 +12,7 @@
     unit        -> cargo build --release, then cargo test --release
                    (both carry --features mxc-backend when -Backend mxc, so the
                    feature build is never clobbered by a feature-less test build)
-    integration -> cargo build --release (sandbox.exe), then a child
+    integration -> cargo build --release (saife.exe), then a child
                    pwsh -NoProfile -ExecutionPolicy Bypass -Command
                    "& <RepoDir>\tests\run-tests.ps1 -Only <ids>"
                    (-Only passthrough; run-tests.ps1 only ever exits
@@ -55,7 +55,7 @@
 .PARAMETER Backend
   Containment backend passed through to tests\run-tests.ps1 as -Backend:
   appcontainer (default) or mxc. mxc builds with --features mxc-backend (the DEFAULT
-  binary refuses --backend mxc without it, and mxc-launch.exe is
+  binary refuses --backend mxc without it, and saife-launch.exe is
   feature-gated in Cargo.toml).
 .PARAMETER Lane
   Which lane this run represents: admin (default) or standard-user. It is
@@ -179,11 +179,11 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Build (runs in every phase; integration needs sandbox.exe, unit needs
+    # Build (runs in every phase; integration needs saife.exe, unit needs
     # the compiled test binary).
     # -----------------------------------------------------------------------
     # --backend mxc needs BOTH the `mxc-backend` feature (src/cli.rs refuses the
-    # flag otherwise) and the feature-gated mxc-launch.exe, so the build and the
+    # flag otherwise) and the feature-gated saife-launch.exe, so the build and the
     # unit-test build carry the SAME feature set: `cargo test --release` builds
     # the bin target too, and a feature-less unit build would silently clobber
     # the binary the integration phase then runs.

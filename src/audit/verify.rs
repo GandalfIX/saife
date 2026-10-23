@@ -1,4 +1,4 @@
-//! `sandbox audit verify <sid>`
+//! `saife audit verify <sid>`
 //!
 //! Recompute the Merkle root from the .ndjson file, compare to the committed
 //! .root, check the Ed25519 signature on .sig. Prints OK / TAMPERED /
@@ -16,7 +16,7 @@ pub fn run_verify(session_id: &str) -> i32 {
         Ok(VerifyOutcome::Incomplete(reason)) => { println!("INCOMPLETE: {reason}"); 1 }
         Ok(VerifyOutcome::Tampered(reason)) => { println!("TAMPERED: {reason}"); 1 }
         Ok(VerifyOutcome::BadSignature(reason)) => { println!("BAD_SIGNATURE: {reason}"); 1 }
-        Err(e) => { eprintln!("[sandbox] audit verify: {e:#}"); 1 }
+        Err(e) => { eprintln!("[saife] audit verify: {e:#}"); 1 }
     }
 }
 

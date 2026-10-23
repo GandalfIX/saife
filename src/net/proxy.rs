@@ -1,6 +1,6 @@
 //! Localhost reverse proxy: tokio + hyper + rustls.
 //!
-//! Architecture: the supervisor (`sandbox.exe`) spawns the proxy on a
+//! Architecture: the supervisor (`saife.exe`) spawns the proxy on a
 //! random 127.0.0.1 port before launching the sandboxed process. The
 //! sandboxed process is configured (via env vars) to route HTTP(S)
 //! through this proxy. The proxy runs the full D-1 decision pipeline
@@ -1054,9 +1054,9 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         };
         let port = listener.local_addr().ok().map(|a| a.port()).unwrap_or(0);
         let _ = port_tx.send(port);
-        // Log the listening port under SANDBOX_DIAG so integration tests
+        // Log the listening port under SAIFE_DIAG so integration tests
         // (S-36, S-38) can parse it from stderr.
-        if std::env::var_os("SANDBOX_DIAG").is_some() {
+        if std::env::var_os("SAIFE_DIAG").is_some() {
             eprintln!("[proxy] listening on 127.0.0.1:{port}");
         }
 
@@ -1689,7 +1689,7 @@ fn record_learned(
         Ok(()) => true,
         Err(e) => {
             eprintln!(
-                "[sandbox] warning: failed to persist learned decision for {entry_host}: {e}"
+                "[saife] warning: failed to persist learned decision for {entry_host}: {e}"
             );
             false
         }
@@ -1703,8 +1703,8 @@ fn warn_no_dialog_once() {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         eprintln!(
-            "[sandbox] no dialog backend available — denying; pre-approve hosts via \
-             --allow-domain, or set on_unavailable=allow (insecure); set SANDBOX_DIAG=1 for details"
+            "[saife] no dialog backend available — denying; pre-approve hosts via \
+             --allow-domain, or set on_unavailable=allow (insecure); set SAIFE_DIAG=1 for details"
         );
     }
 }
@@ -1721,7 +1721,7 @@ fn warn_prompt_budget_once(budget: std::time::Duration) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         eprintln!(
-            "[sandbox] prompt budget elapsed ({}s) with no answer — denying on budget; \
+            "[saife] prompt budget elapsed ({}s) with no answer — denying on budget; \
              pre-approve hosts via --allow-domain, or raise promptTimeoutSecs",
             budget.as_secs()
         );

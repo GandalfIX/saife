@@ -27,7 +27,7 @@ shim exactly where pip is bootstrapped:
    venv invokes the ensurepip subprocess with `cwd = env_dir`, and
    `python -m` puts the cwd at `sys.path[0]`, so the env-stripped
    subprocess still imports the copy. The copy persists in the venv after
-   the run; it self-gates on the SANDBOX_SESSION_SID marker the sandbox
+   the run; it self-gates on the SAIFE_SESSION_SID marker the sandbox
    sets on every sandboxed process, so outside the sandbox it is inert.
 
 `_sandbox_sitecustomize_done` on the sys module makes every execution
@@ -90,10 +90,10 @@ def _sandbox_venv_hook():
 if os.name == "nt" and not getattr(sys, "_sandbox_sitecustomize_done", False):
     sys._sandbox_sitecustomize_done = True
     # Active mode only inside the sandbox: the sandbox sets
-    # SANDBOX_SESSION_SID on every sandboxed process, and the var survives
+    # SAIFE_SESSION_SID on every sandboxed process, and the var survives
     # venv's env sanitization (only PYTHONHOME/PYTHONPATH are stripped).
     # venv-root copies persist in user venvs and must stay inert outside.
-    if os.environ.get("SANDBOX_SESSION_SID"):
+    if os.environ.get("SAIFE_SESSION_SID"):
         _sandbox_install()
         _sandbox_venv_hook()
 

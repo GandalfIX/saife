@@ -7,16 +7,16 @@
 #
 # Answers three questions the suite summary cannot:
 #   1. Is the guest session ELEVATED? (the loopback exemption is admin-only)
-#   2. What does `sandbox run` print on stderr when it registers loopback?
+#   2. What does `saife run` print on stderr when it registers loopback?
 #   3. What exit code does the loopback probe actually get, and why?
 #
-# It changes nothing: one `sandbox run` with a 15 s curl timeout.
+# It changes nothing: one `saife run` with a 15 s curl timeout.
 
 $ErrorActionPreference = 'Continue'
 # script lives at <repo>\tests\vm\guest-probe.ps1 -> repo is THREE levels up
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = Split-Path -Parent (Split-Path -Parent $scriptDir)
-$exe = Join-Path $repo 'target\release\sandbox.exe'
+$exe = Join-Path $repo 'target\release\saife.exe'
 
 function Section($t) { Write-Output ''; Write-Output "== $t" }
 
@@ -36,8 +36,8 @@ Write-Output ("exe             : {0} (exists: {1})" -f $exe, (Test-Path -Literal
 $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 Write-Output ("curl.exe        : {0}" -f $curl)
 
-Section 'sandbox run with loopback probe (stderr shown)'
-$env:SANDBOX_DIAG = '1'
+Section 'saife run with loopback probe (stderr shown)'
+$env:SAIFE_DIAG = '1'
 $outFile = Join-Path $env:TEMP 'probe-out.txt'
 $errFile = Join-Path $env:TEMP 'probe-err.txt'
 if (-not (Test-Path -LiteralPath $exe)) {

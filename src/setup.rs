@@ -16,7 +16,7 @@ pub const MIN_BUILD: u32 = 16299;
 /// S-1-15-2-2 — "All RESTRICTED APPLICATION PACKAGES". Granting this SID on a
 /// resource lets every AppContainer process (not just our per-session SID)
 /// access it. We use it for the one-time drive-root grant because:
-///   (a) per-session SIDs would require re-granting on every `sandbox run`,
+///   (a) per-session SIDs would require re-granting on every `saife run`,
 ///       and the drive root is TrustedInstaller-owned so each grant needs
 ///       elevation anyway; and
 ///   (b) FILE_READ_ATTRIBUTES on a drive root is a read-only, low-sensitivity
@@ -50,7 +50,7 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
         // resulting state.
     } else if enable_loopback {
         // Diagnostic: list the current loopback exempt list. The actual
-        // per-session SID does not exist yet (it is created at `sandbox run`
+        // per-session SID does not exist yet (it is created at `saife run`
         // time), so we cannot pre-register it here. Runtime registration is
         // performed in `main.rs` after the AppContainer session is created;
         // it succeeds only when elevated and degrades to block-net otherwise.
@@ -74,11 +74,11 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
             }
         }
         println!("[loopback] loopback is registered automatically at runtime when");
-        println!("[loopback] `sandbox run` is invoked elevated. Unprivileged users");
+        println!("[loopback] `saife run` is invoked elevated. Unprivileged users");
         println!("[loopback] need to either run elevated or use --block-net.");
         // Fall through to the report.
     } else if !check_only {
-        eprintln!("[sandbox] `setup` without --check-only, --grant-drive-root, or --enable-loopback is not implemented in this slice.");
+        eprintln!("[saife] `setup` without --check-only, --grant-drive-root, or --enable-loopback is not implemented in this slice.");
     }
 
     let build = os_build_number()?;
@@ -347,7 +347,7 @@ fn drive_root_status() -> String {
     let root = format!("{system_drive}\\");
     match check_root_has_grant(&root) {
         Ok(true) => format!("present on {root}"),
-        Ok(false) => format!("absent on {root} (run `sandbox setup --grant-drive-root`)"),
+        Ok(false) => format!("absent on {root} (run `saife setup --grant-drive-root`)"),
         Err(e) => format!("unknown ({e})"),
     }
 }

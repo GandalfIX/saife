@@ -98,9 +98,9 @@ $guestCred = New-Object System.Management.Automation.PSCredential(
 Write-Host "[s9dbg] connecting to VM $VmName ..."
 $out = Invoke-Command -VMName $VmName -Credential $guestCred -ScriptBlock {
     $ErrorActionPreference = 'Continue'
-    $sbx = 'C:\sbx-repo\target\release\sandbox.exe'
+    $sbx = 'C:\sbx-repo\target\release\saife.exe'
     # Surface non-fatal spawn diagnostics (token-owner fixup outcome).
-    $env:SANDBOX_DIAG = '1'
+    $env:SAIFE_DIAG = '1'
     $work = Join-Path $env:TEMP ("s9dbg-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $work | Out-Null
     Set-Location -LiteralPath $work

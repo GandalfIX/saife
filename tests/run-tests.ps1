@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Integration test harness for sandbox.exe (MVP US-1 vertical slice).
+  Integration test harness for saife.exe (MVP US-1 vertical slice).
 .DESCRIPTION
-  Drives the real sandbox.exe binary through the filesystem-isolation
+  Drives the real saife.exe binary through the filesystem-isolation
   scenarios (ported from the spike harness S-1..S-13) plus new scenarios
   for profile loading, variable expansion, and setup --check-only.
 
@@ -95,7 +95,7 @@
   proxy's own DECISION - a child that never reaches the proxy FAILS there
   instead of being filtered into a skip.
 .PARAMETER SandboxExe
-  Path to sandbox.exe. Defaults to ..\target\release\sandbox.exe.
+  Path to saife.exe. Defaults to ..\target\release\saife.exe.
 .PARAMETER Cwd
   Optional working directory. If omitted, a fresh temp dir is created.
 .PARAMETER Keep
@@ -109,7 +109,7 @@
 .PARAMETER Strict
   Treat skips as failures.
 .PARAMETER Diag
-  Propagate SANDBOX_DIAG=1 to the child for verbose ACL diagnostics, and
+  Propagate SAIFE_DIAG=1 to the child for verbose ACL diagnostics, and
   enable the supervisor-side [G-42] upstream-override notice (S-86 leg b
   depends on it).
 .PARAMETER Backend
@@ -131,13 +131,13 @@ param(
     [switch]$Strict,
     [switch]$Diag,
     # Containment backend for every `run` invocation. `mxc` requires a binary
-    # built with the mxc-backend feature (now default) plus mxc-launch.exe; the VM
+    # built with the mxc-backend feature (now default) plus saife-launch.exe; the VM
     # lane builds that for you when it is given -Backend mxc.
     [ValidateSet('appcontainer', 'mxc')]
     [string]$Backend = 'appcontainer'
 )
 
-if ($Diag) { $env:SANDBOX_DIAG = '1' } else { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+if ($Diag) { $env:SAIFE_DIAG = '1' } else { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
 
 $ErrorActionPreference = 'Stop'
 $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -147,13 +147,13 @@ $script:ThisDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:Backend = $Backend
 
 if (-not $SandboxExe) {
-    $SandboxExe = Join-Path $script:ThisDir '..\target\release\sandbox.exe'
+    $SandboxExe = Join-Path $script:ThisDir '..\target\release\saife.exe'
     $SandboxExe = [System.IO.Path]::GetFullPath($SandboxExe)
 }
 
 if (-not (Test-Path -LiteralPath $SandboxExe)) {
     $sandboxDir = [System.IO.Path]::GetFullPath((Join-Path $script:ThisDir '..'))
-    Write-Host "[build] sandbox.exe not found at $SandboxExe" -ForegroundColor Yellow
+    Write-Host "[build] saife.exe not found at $SandboxExe" -ForegroundColor Yellow
     Write-Host "[build] running 'cargo build --release' in $sandboxDir" -ForegroundColor Yellow
     Push-Location -LiteralPath $sandboxDir
     try {
@@ -161,7 +161,7 @@ if (-not (Test-Path -LiteralPath $SandboxExe)) {
         $buildExit = $LASTEXITCODE
     } finally { Pop-Location }
     if ($buildExit -ne 0) { Write-Host "[build] cargo build failed (exit $buildExit)." -ForegroundColor Red; exit 1 }
-    if (-not (Test-Path -LiteralPath $SandboxExe)) { Write-Host "[build] sandbox.exe still missing: $SandboxExe" -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path -LiteralPath $SandboxExe)) { Write-Host "[build] saife.exe still missing: $SandboxExe" -ForegroundColor Red; exit 1 }
 }
 
 $script:OwnsCwd = $false
@@ -222,7 +222,7 @@ function Invoke-Sandbox {
         # `select_upstream` reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY from this
         # process — not from the sandboxed child, which always gets the
         # loopback-only proxy vars. A $null value REMOVES the variable (used to
-        # drop an inherited SANDBOX_DIAG). Default $null leaves every pre-4.3
+        # drop an inherited SAIFE_DIAG). Default $null leaves every pre-4.3
         # scenario's environment untouched.
         [hashtable]$Env = $null
     )
@@ -265,7 +265,7 @@ function Invoke-Sandbox {
     # BOUNDED wait: an unbounded WaitForExit turns any supervisor-teardown defect
     # into an indefinite harness hang (observed 2026-10-18: sessions whose child
     # talks to the proxy and ends abnormally — a TLS-abort RST, or a chained 502 —
-    # leave sandbox.exe alive; the whole suite stalled). A timed-out child is
+    # leave saife.exe alive; the whole suite stalled). A timed-out child is
     # killed and reported as ExitCode -2 so the scenario fails LOUDLY and fast.
     if (-not $proc.WaitForExit(120000)) {
         try { $proc.Kill() } catch { }
@@ -285,7 +285,7 @@ function Invoke-Sandbox {
 
 # Run a sandbox CLI subcommand with an overridden USERPROFILE — the S-63/
 # S-64/S-65 direct-invocation pattern, factored out for the Task 3.8 learned
-# scenarios, which must never touch the real %USERPROFILE%\.sandbox\learned\
+# scenarios, which must never touch the real %USERPROFILE%\.saife\learned\
 # store. Returns Stdout/Stderr as single strings + ExitCode.
 function Invoke-SandboxCliHome { param([string]$FakeHome, [string]$CliArgs)
     $pi = New-Object System.Diagnostics.ProcessStartInfo
@@ -310,7 +310,7 @@ function Invoke-SandboxCliHome { param([string]$FakeHome, [string]$CliArgs)
 
 # Flatten a captured stream into ONE line, trimmed to $Max characters. Detail
 # strings are written with Write-Host on a single line, so a multi-line stderr
-# dump (SANDBOX_DIAG runs are verbose) must be collapsed before it lands there.
+# dump (SAIFE_DIAG runs are verbose) must be collapsed before it lands there.
 function Get-LineHead { param([string[]]$Lines, [int]$Max = 240)
     $joined = ((@($Lines) | Where-Object { $_ -and $_.Trim() }) -join ' | ')
     $joined = $joined -replace "`r?`n", ' | '
@@ -321,7 +321,7 @@ function Get-LineHead { param([string[]]$Lines, [int]$Max = 240)
 # Inner script for the raw CONNECT probe below (ADR-0001 Task 4.3). It runs
 # INSIDE the sandbox (the S-75 wrapper-file precedent), so it needs no
 # arguments beyond the target host: the session token comes from the injected
-# HTTPS_PROXY userinfo and the proxy port from SANDBOX_PROXY_PORT.
+# HTTPS_PROXY userinfo and the proxy port from SAIFE_PROXY_PORT.
 #
 # Why a raw socket rather than curl: the D-2 upstream-failure response is a
 # `502` plus a diagnostic BODY, and a client-side curl on a failed CONNECT
@@ -335,7 +335,7 @@ param([string]$TargetHost)
 $m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
 if (-not $m.Success) { Write-Output 'CONNECT_PROBE_NO_TOKEN'; exit 3 }
 $cred = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
-$port = [int]$env:SANDBOX_PROXY_PORT
+$port = [int]$env:SAIFE_PROXY_PORT
 $c = New-Object System.Net.Sockets.TcpClient
 try { $c.Connect('127.0.0.1', $port) } catch { Write-Output 'CONNECT_PROBE_DIAL_FAILED'; exit 4 }
 $s = $c.GetStream()
@@ -400,7 +400,7 @@ function Get-Python { $py = Get-Command python -ErrorAction SilentlyContinue; if
 # and gets the value the supervisor must write.
 #
 # Why not the two tempting substitutes:
-#   * `sandbox setup --check-only` reports the feature matrix (build, capability,
+#   * `saife setup --check-only` reports the feature matrix (build, capability,
 #     drive-root grant, signing key) and NOT elevation, so it cannot answer this.
 #   * `[WindowsPrincipal]::IsInRole(Administrator)` reads GROUP MEMBERSHIP, a
 #     different signal (it is the filtered token's view, not TOKEN_ELEVATION).
@@ -575,7 +575,7 @@ function Test-LoopbackProxyReachable {
 }
 
 # Parse the proxy listening port from a sandbox stderr buffer (collected under
-# SANDBOX_DIAG=1). Returns the port (int) or $null.
+# SAIFE_DIAG=1). Returns the port (int) or $null.
 function Get-ProxyPortFromStderr { param([string[]]$Stderr)
     $joined = ($Stderr -join "`n")
     $m = [regex]::Match($joined, '127\.0\.0\.1:(\d+)')
@@ -624,7 +624,7 @@ function Write-GuestMetric {
             $commitPct = [int][math]::Round(100 * (1 - ($os.FreeVirtualMemory / $os.TotalVirtualMemorySize)))
         }
         $procs = @(Get-Process).Count
-        $sbx = @(Get-Process -Name 'sandbox*' -ErrorAction SilentlyContinue).Count
+        $sbx = @(Get-Process -Name 'saife*' -ErrorAction SilentlyContinue).Count
         $vmic = 0
         if (Get-Process -Name vmicvmsession -ErrorAction SilentlyContinue) { $vmic = 1 }
         $line = "{0} {1} S-{2} availMB={3} commitPct={4} procs={5} sbxProcs={6} vmicAlive={7}" -f `
@@ -1357,7 +1357,7 @@ function Invoke-Scenario-S35 {
 
 # S-36: AC-3.12 — no token → 407.
 # The child overrides the proxy URL with curl's -x, pointing at the injected
-# proxy port (SANDBOX_PROXY_PORT, set for the child) WITHOUT userinfo, so no
+# proxy port (SAIFE_PROXY_PORT, set for the child) WITHOUT userinfo, so no
 # Proxy-Authorization header is sent. The assertion is the supervisor's own
 # token gate, in two independent places: (a) the client must see 407 on the
 # CONNECT - %{http_connect}, with curl exit 97 or "407" on stderr accepted as
@@ -1382,10 +1382,10 @@ function Invoke-Scenario-S36 {
     $psid = Invoke-Sandbox -Args ($flags + @('--print-sid','--','cmd','/c','echo','init')) -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
     $sid = ($psid.Stdout -join '').Trim()
-    # %SANDBOX_PROXY_PORT% is a defined cmd variable and expands; cmd does NOT
+    # %SAIFE_PROXY_PORT% is a defined cmd variable and expands; cmd does NOT
     # expand %{http_connect} (undefined name), so it reaches curl intact -
     # verified with curl 8.18 + cmd.exe on the /c command line.
-    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 10 -x http://127.0.0.1:%SANDBOX_PROXY_PORT% -o NUL -w %{http_connect} https://api.anthropic.com/v1/messages')) -WorkingDirectory $d
+    $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','cmd','/c','curl.exe -s -m 10 -x http://127.0.0.1:%SAIFE_PROXY_PORT% -o NUL -w %{http_connect} https://api.anthropic.com/v1/messages')) -WorkingDirectory $d
     $connect = (($r.Stdout -join '') -replace '\s','')
     $stderr = ($r.Stderr -join "`n")
     $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
@@ -1416,15 +1416,15 @@ function Invoke-Scenario-S37 {
 
 # S-38: AC-3.14 — proxy port released on sandbox exit.
 # Run a sandboxed process with --allow-domain, capture the proxy port from
-# stderr (SANDBOX_DIAG). After the sandbox exits, the proxy handle is dropped
+# stderr (SAIFE_DIAG). After the sandbox exits, the proxy handle is dropped
 # (cancels the accept loop, shuts down the runtime) and the listening socket
 # is released. PASS if no TCP listener remains on the port.
 function Invoke-Scenario-S38 {
     if (-not (Get-Curl)) { return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$true; Skipped=$true; Detail='curl.exe not on PATH' } }
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$true; Skipped=$true; Detail='AppContainer loopback blocked — run tests elevated or with admin loopback exemption' } }
     $d = New-ScenarioDir 38
-    $oldDiag = $env:SANDBOX_DIAG
-    $env:SANDBOX_DIAG = '1'
+    $oldDiag = $env:SAIFE_DIAG
+    $env:SAIFE_DIAG = '1'
     $port = $null
     try {
         $errFile = Join-Path $d 'proxy-err.txt'
@@ -1437,7 +1437,7 @@ function Invoke-Scenario-S38 {
         $errContent = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
         $errLines = if ($errContent) { $errContent -split "`r?`n" } else { @() }
         $port = Get-ProxyPortFromStderr -Stderr $errLines
-    } finally { $env:SANDBOX_DIAG = $oldDiag }
+    } finally { $env:SAIFE_DIAG = $oldDiag }
     if (-not $port) { return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$false; Skipped=$false; Detail='could not parse proxy port from stderr' } }
     # Give the OS a moment to release the socket after the process exited.
     Start-Sleep -Seconds 1
@@ -1459,7 +1459,7 @@ function Invoke-Scenario-S39 {
 # GetVolumeInformationW("C:\"). The drive root (C:\) is TrustedInstaller-owned
 # and cannot be granted unprivileged, so the fix is a one-time admin grant of
 # FILE_READ_ATTRIBUTES for S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES) on
-# each fixed drive root, applied by `sandbox setup --grant-drive-root`.
+# each fixed drive root, applied by `saife setup --grant-drive-root`.
 #
 # These scenarios SKIP cleanly when the drive-root grant is absent (so the
 # suite stays green on unconfigured machines) and PASS once it has been
@@ -1495,14 +1495,14 @@ function Get-DriveRootOf { param([string]$Path)
 }
 
 # S-40: KI-1.1 — `cmd /c dir` lists the cwd (volume header + entries).
-# Requires the drive-root grant (run `sandbox setup --grant-drive-root` once).
+# Requires the drive-root grant (run `saife setup --grant-drive-root` once).
 function Invoke-Scenario-S40 {
     $d = New-ScenarioDir 40
     'ki11-marker' | Set-Content -LiteralPath (Join-Path $d 'marker.txt') -Encoding ASCII
     $root = Get-DriveRootOf $d
     if (-not (Test-DriveRootGranted $root)) {
         return @{ Num=40; Name='S-40 (KI-1.1 cmd dir)'; Passed=$true; Skipped=$true; DriveRootSkipped=$true
-                  Detail="drive root '$root' not granted; run 'sandbox setup --grant-drive-root' (admin)" }
+                  Detail="drive root '$root' not granted; run 'saife setup --grant-drive-root' (admin)" }
     }
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','dir') -WorkingDirectory $d
     $out = ($r.Stdout -join "`n")
@@ -1526,7 +1526,7 @@ function Invoke-Scenario-S41 {
     $root = Get-DriveRootOf $d
     if (-not (Test-DriveRootGranted $root)) {
         return @{ Num=41; Name='S-41 (KI-1.1 PS gci)'; Passed=$true; Skipped=$true; DriveRootSkipped=$true
-                  Detail="drive root '$root' not granted; run 'sandbox setup --grant-drive-root' (admin)" }
+                  Detail="drive root '$root' not granted; run 'saife setup --grant-drive-root' (admin)" }
     }
     $cmd = "Get-ChildItem -LiteralPath ([Environment]::CurrentDirectory) | Select-Object -ExpandProperty Name"
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','powershell','-NoProfile','-Command',$cmd) -WorkingDirectory $d
@@ -1580,7 +1580,7 @@ function Invoke-Scenario-S44 {
     $sid = ($psid.Stdout -join '').Trim()
     # Now run the real session — this emits SESSION_START + commits the root.
     $r = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d
-    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    $logPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.ndjson"
     $exists = Test-Path -LiteralPath $logPath
     $size = if ($exists) { (Get-Item -LiteralPath $logPath).Length } else { 0 }
     # SESSION_START leaf guarantees non-empty (size > 0).
@@ -1598,7 +1598,7 @@ function Invoke-Scenario-S45 {
     if ($psid.ExitCode -ne 0) { return @{ Num=45; Name='S-45 (AC-4.3)'; Passed=$false; Skipped=$false; Detail='print-sid failed' } }
     $sid = ($psid.Stdout -join '').Trim()
     Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
-    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    $logPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.ndjson"
     if (-not (Test-Path -LiteralPath $logPath)) { return @{ Num=45; Name='S-45 (AC-4.3)'; Passed=$false; Skipped=$false; Detail="no log at $logPath" } }
     $content = Get-Content -LiteralPath $logPath -Raw
     $lines = @($content.Trim() -split "`r?`n" | Where-Object { $_.Trim() })
@@ -1633,7 +1633,7 @@ function Invoke-Scenario-S45 {
 
 # S-46 (AC-4.6): CONNECT events appear in the audit log.
 # Runs a sandboxed curl against an allowed host (so the proxy emits a CONNECT
-# allow leaf), then `sandbox audit show <sid>` and checks the output contains
+# allow leaf), then `saife audit show <sid>` and checks the output contains
 # a CONNECT event. Uses the two-step --print-sid / --sid pattern so the audit
 # writer is created (the --print-sid-only path returns early before opening it).
 function Invoke-Scenario-S46 {
@@ -1672,7 +1672,7 @@ function Invoke-Scenario-S48 {
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
     $sid = ($psid.Stdout -join '').Trim()
     Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
-    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    $logPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.ndjson"
     if (-not (Test-Path -LiteralPath $logPath)) { return @{ Num=48; Name='S-48 (AC-4.9)'; Passed=$false; Skipped=$false; Detail='no log to tamper' } }
     # Read, flip one byte in the middle, write back.
     $bytes = [System.IO.File]::ReadAllBytes($logPath)
@@ -1707,7 +1707,7 @@ function Invoke-Scenario-S49 {
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
     $sid = ($psid.Stdout -join '').Trim()
     Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
-    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
+    $logPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.ndjson"
     if (-not (Test-Path -LiteralPath $logPath)) { return @{ Num=49; Name='S-49 (AC-4.10)'; Passed=$false; Skipped=$false; Detail='no log to truncate' } }
     $content = Get-Content -LiteralPath $logPath -Raw
     $lines = @($content.Trim() -split "`r?`n" | Where-Object { $_.Trim() })
@@ -1731,7 +1731,7 @@ function Invoke-Scenario-S50 {
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
     $sid = ($psid.Stdout -join '').Trim()
     Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','echo','hi') -WorkingDirectory $d | Out-Null
-    $rootPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.root"
+    $rootPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.root"
     # Replace with a different (well-formatted) 64-char hex root.
     $forged = '0' * 64
     Set-Content -LiteralPath $rootPath -Value $forged -NoNewline
@@ -1781,7 +1781,7 @@ function Invoke-Scenario-S52 {
 
 # S-53 (AC-4.14): first-run key generation.
 function Invoke-Scenario-S53 {
-    $keyPath = Join-Path $env:LOCALAPPDATA "sandbox\signing\ed25519-key"
+    $keyPath = Join-Path $env:LOCALAPPDATA "saife\signing\ed25519-key"
     $existedBefore = Test-Path -LiteralPath $keyPath
     $d = New-ScenarioDir 53
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
@@ -1797,7 +1797,7 @@ function Invoke-Scenario-S53 {
 
 # S-54 (AC-4.15): key file is DPAPI-encrypted (not a valid raw Ed25519 secret).
 function Invoke-Scenario-S54 {
-    $keyPath = Join-Path $env:LOCALAPPDATA "sandbox\signing\ed25519-key"
+    $keyPath = Join-Path $env:LOCALAPPDATA "saife\signing\ed25519-key"
     if (-not (Test-Path -LiteralPath $keyPath)) { return @{ Num=54; Name='S-54 (AC-4.15)'; Passed=$false; Skipped=$false; Detail='no key file (run S-53 first)' } }
     $bytes = [System.IO.File]::ReadAllBytes($keyPath)
     # A raw Ed25519 secret is exactly 32 bytes. DPAPI ciphertext is longer
@@ -1845,12 +1845,12 @@ function Invoke-Scenario-S55 {
         Stop-S55Child
         return @{ Num=55; Name='S-55 (AC-4.17)'; Passed=$false; Skipped=$false; Detail="sandbox exited early (exit=$($proc.ExitCode)); child did not stay alive" }
     }
-    # Force-kill sandbox.exe (the supervisor), not the child. The Job
+    # Force-kill saife.exe (the supervisor), not the child. The Job
     # Object's KILL_ON_JOB_CLOSE will then kill the python child.
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
-    $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
-    $rootPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.root"
+    $logPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.ndjson"
+    $rootPath = Join-Path $env:LOCALAPPDATA "saife\audit\$sid.root"
     $logReadable = Test-Path -LiteralPath $logPath
     $noRoot = -not (Test-Path -LiteralPath $rootPath)
     $v = Invoke-Sandbox -Args @('audit','verify',$sid)
@@ -1963,7 +1963,7 @@ function Invoke-Scenario-S61 {
 
 # S-62 (AC-5.6): extends cycle is detected and reported with the spec format.
 # Uses absolute paths in `extends` so the cycle detector sees the same string
-# on the second visit (bare names resolve to %USERPROFILE%\.sandbox\profiles\
+# on the second visit (bare names resolve to %USERPROFILE%\.saife\profiles\
 # and would not reach the local fixture).
 function Invoke-Scenario-S62 {
     $d = New-ScenarioDir 62
@@ -1986,7 +1986,7 @@ function Invoke-Scenario-S62 {
 function Invoke-Scenario-S63 {
     $d = New-ScenarioDir 63
     $fakeHome = Join-Path $d 'fake-home'
-    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    $profilesDir = Join-Path $fakeHome '.saife\profiles'
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $profilesDir 'alpha.json') -Value '{"meta":{"name":"alpha","schema_version":1}}' -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $profilesDir 'beta.json') -Value '{"meta":{"name":"beta","schema_version":1}}' -Encoding UTF8
@@ -2016,7 +2016,7 @@ function Invoke-Scenario-S63 {
 function Invoke-Scenario-S64 {
     $d = New-ScenarioDir 64
     $fakeHome = Join-Path $d 'fake-home'
-    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    $profilesDir = Join-Path $fakeHome '.saife\profiles'
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     $rawJson = '{"meta":{"name":"raw","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$CWD"]}}'
     Set-Content -LiteralPath (Join-Path $profilesDir 'raw.json') -Value $rawJson -Encoding UTF8
@@ -2041,7 +2041,7 @@ function Invoke-Scenario-S64 {
 function Invoke-Scenario-S65 {
     $d = New-ScenarioDir 65
     $fakeHome = Join-Path $d 'fake-home'
-    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    $profilesDir = Join-Path $fakeHome '.saife\profiles'
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     $rawJson = '{"meta":{"name":"expanded","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$CWD"]}}'
     Set-Content -LiteralPath (Join-Path $profilesDir 'expanded.json') -Value $rawJson -Encoding UTF8
@@ -2212,16 +2212,16 @@ function Get-SessionAceCount { param([string]$Path)
         -not $_.IsInherited }).Count
 }
 
-function Get-DaclJournalDir { return Join-Path $env:LOCALAPPDATA 'sandbox\dacl-restore' }
+function Get-DaclJournalDir { return Join-Path $env:LOCALAPPDATA 'saife\dacl-restore' }
 
 # S-73 (MXC F-C/F-D): teardown restores the host DACL — no session ACE remains.
 function Invoke-Scenario-S73 {
     $d = New-ScenarioDir 73
-    $wasDiag = $env:SANDBOX_DIAG
-    $env:SANDBOX_DIAG = '1'
+    $wasDiag = $env:SAIFE_DIAG
+    $env:SAIFE_DIAG = '1'
     try {
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--','cmd','/c','echo','restore-me') -WorkingDirectory $d
-    } finally { $env:SANDBOX_DIAG = $wasDiag }
+    } finally { $env:SAIFE_DIAG = $wasDiag }
     $stderr = ($r.Stderr -join "`n")
     $out = ($r.Stdout -join "`n")
     if ($stderr -match '\[grant\] WARN: allow:') {
@@ -2272,7 +2272,7 @@ function Invoke-Scenario-S74 {
     finally {
         # Never leak the pinging child, whatever the asserts did.
         Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Get-Process sandbox -ErrorAction SilentlyContinue | Where-Object { $_.Id -eq $proc.Id } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process saife -ErrorAction SilentlyContinue | Where-Object { $_.Id -eq $proc.Id } | Stop-Process -Force -ErrorAction SilentlyContinue
     }
 
     $journalStale = (Join-Path $journalDir $journal.Name)
@@ -2355,7 +2355,7 @@ function Invoke-Scenario-S75 {
 $m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
 if (-not $m.Success) { Write-Output 'S75_NO_TOKEN'; exit 3 }
 $port = 0
-if (-not [int]::TryParse([string]$env:SANDBOX_PROXY_PORT, [ref]$port) -or $port -le 0) { Write-Output 'S75_NO_PORT'; exit 3 }
+if (-not [int]::TryParse([string]$env:SAIFE_PROXY_PORT, [ref]$port) -or $port -le 0) { Write-Output 'S75_NO_PORT'; exit 3 }
 $creds = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
 # Exit 3 = the proxy was never reached (no connection, or no bytes back);
 # exit 4 = connected but nothing arrived inside the read timeout. The harness
@@ -2419,7 +2419,7 @@ exit 0
     $r = Invoke-Sandbox -Args ($flags + @('--sid',$sid,'--','powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',$innerScript)) -WorkingDirectory $d
     $out = ($r.Stdout -join "`n")
     if ($out -match 'S75_NO_TOKEN') { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail='inner script could not extract the session token from HTTPS_PROXY' } }
-    if ($out -match 'S75_NO_PORT') { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail='SANDBOX_PROXY_PORT missing or unparsable in the child env' } }
+    if ($out -match 'S75_NO_PORT') { return @{ Num=75; Name='S-75 (D-1 loopback CONNECT)'; Passed=$false; Skipped=$false; Detail='SAIFE_PROXY_PORT missing or unparsable in the child env' } }
     # Assert on the markers the inner script prints, not on curl stderr: an
     # exact status line (a stray numeric port or header containing "403" must
     # not satisfy it) plus the header-presence flag.
@@ -2497,7 +2497,7 @@ $m = [regex]::Match($env:HTTPS_PROXY, '://sandbox:([^@]+)@')
 if (-not $m.Success) { Write-Output 'POST_STATUS=NO_TOKEN'; exit 3 }
 $creds = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('sandbox:' + $m.Groups[1].Value))
 $port = 0
-if (-not [int]::TryParse([string]$env:SANDBOX_PROXY_PORT, [ref]$port) -or $port -le 0) { Write-Output 'POST_STATUS=NO_PORT'; exit 3 }
+if (-not [int]::TryParse([string]$env:SAIFE_PROXY_PORT, [ref]$port) -or $port -le 0) { Write-Output 'POST_STATUS=NO_PORT'; exit 3 }
 Write-Output "DIAG body=$BodyPath exists=$(Test-Path -LiteralPath $BodyPath)"
 # HttpClient rather than a native client: UseProxy=$false keeps the loopback
 # dial direct (the endpoint is reachable by NO_PROXY semantics, never by
@@ -2571,7 +2571,7 @@ function Invoke-Scenario-S78 {
         Detail='MANUAL APPROVAL required — interactive dialog click; see plan Task 3.8 / Checkpoint 3 items 3-4 (S-79 seeds this state for automation)' }
 }
 
-# S-79 (D-3): `sandbox learned list/revoke` round-trip. The plan runs this
+# S-79 (D-3): `saife learned list/revoke` round-trip. The plan runs this
 # after the MANUAL S-78 approval; since the harness cannot click dialogs,
 # this scenario SEEDS the exact state the S-78 "Allow permanently" click
 # persists (LearnedStore::record("github.com","suffix",allow=true) — the
@@ -2581,7 +2581,7 @@ function Invoke-Scenario-S78 {
 function Invoke-Scenario-S79 {
     $d = New-ScenarioDir 79
     $fakeHome = Join-Path $d 'fake-home'
-    $learnedDir = Join-Path $fakeHome '.sandbox\learned'
+    $learnedDir = Join-Path $fakeHome '.saife\learned'
     New-Item -ItemType Directory -Path $learnedDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $learnedDir 'default.json') -Value '{"schema":1,"allow":[{"host":"github.com","scope":"suffix"}],"deny":[]}' -Encoding ASCII
     $list1 = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned list'
@@ -2713,7 +2713,7 @@ function Invoke-Scenario-S83 {
 function Invoke-Scenario-S84 {
     $d = New-ScenarioDir 84
     $fakeHome = Join-Path $d 'fake-home'
-    $learnedDir = Join-Path $fakeHome '.sandbox\learned'
+    $learnedDir = Join-Path $fakeHome '.saife\learned'
     New-Item -ItemType Directory -Path $learnedDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $learnedDir 'default.json') -Value '{"schema":1,"allow":[{"host":"*.example.com","scope":"suffix"}],"deny":[]}' -Encoding ASCII
     $list1 = Invoke-SandboxCliHome -FakeHome $fakeHome -CliArgs 'learned list'
@@ -2756,7 +2756,7 @@ function Invoke-Scenario-S81 {
     $d = New-ScenarioDir 81
     # Isolate the learned store: USERPROFILE points at a fresh EMPTY directory
     # (the Invoke-SandboxCliHome pattern), so a learned deny/allow for either
-    # host in the real %USERPROFILE%\.sandbox\learned store cannot flip the
+    # host in the real %USERPROFILE%\.saife\learned store cannot flip the
     # verdict on a machine that has already answered a prompt.
     $fakeHome = Join-Path $d 'home'
     New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
@@ -2850,18 +2850,18 @@ function Invoke-Scenario-S85 {
 
 # S-86 (D-2; plan slot S-83, renumbered — see the numbering note above):
 # upstream-source detection and both diagnostics [G-10/G-42/G-30], three legs:
-#   (a) host HTTPS_PROXY only, NO profile value, SANDBOX_DIAG=1 -> there is
+#   (a) host HTTPS_PROXY only, NO profile value, SAIFE_DIAG=1 -> there is
 #       nothing to differ from, so NO "differs" line appears on stderr;
-#   (b) profile value AND a different host value, SANDBOX_DIAG=1 -> the [G-42]
+#   (b) profile value AND a different host value, SAIFE_DIAG=1 -> the [G-42]
 #       override notice appears, naming BOTH endpoints as host:port and saying
 #       the profile wins (never the URLs: a proxy URL may carry a password);
 #   (c) an `https://` upstream — rejected by design (no TLS-to-proxy) — is a
-#       security-relevant degradation, so its warning is NOT SANDBOX_DIAG-
-#       gated. Asserted WITHOUT SANDBOX_DIAG (the variable is removed, since
+#       security-relevant degradation, so its warning is NOT SAIFE_DIAG-
+#       gated. Asserted WITHOUT SAIFE_DIAG (the variable is removed, since
 #       any value including "0" satisfies var_os): the line names the source
 #       knob, redacts the URL to `(unparsable)`, never echoes the URL, and the
 #       run still succeeds on the direct fallback — and stderr carries no
-#       SANDBOX_DIAG marker at all, so a future diag-gating of that warning
+#       SAIFE_DIAG marker at all, so a future diag-gating of that warning
 #       cannot let this leg pass silently.
 # Every leg keeps the network active (an allow-list entry + --no-prompt): with
 # an empty allow-list and the prompt off the config resolves to Blocked, no
@@ -2872,7 +2872,7 @@ function Invoke-Scenario-S86 {
     # hangs — with register_loopback failed the supervisor still spawns the
     # child, and a lingering conhost holds the child's stdio pipes open, so the
     # supervisor waits for stdout EOF forever (observed 2026-10-18: leg (a) hung
-    # >5 minutes with only conhost left under sandbox.exe; every network
+    # >5 minutes with only conhost left under saife.exe; every network
     # scenario must stay elevation-guarded until that pre-existing supervisor
     # defect is fixed — candidate fix: CREATE_NO_WINDOW or explicit pipe
     # ownership on the child). The warnings themselves are elevation-independent;
@@ -2885,32 +2885,32 @@ function Invoke-Scenario-S86 {
     New-Item -ItemType Directory -Path $fakeHome -Force | Out-Null
     $base = @('run','--allow-cwd','--allow-domain','api.anthropic.com','--no-prompt')
     # (a) host env only: no override notice.
-    $a = Invoke-Sandbox -Args ($base + @('--','cmd','/c','echo','host-env-only')) -WorkingDirectory $d -Env @{ 'HTTPS_PROXY' = 'http://127.0.0.1:1'; 'SANDBOX_DIAG' = '1'; 'USERPROFILE' = $fakeHome }
+    $a = Invoke-Sandbox -Args ($base + @('--','cmd','/c','echo','host-env-only')) -WorkingDirectory $d -Env @{ 'HTTPS_PROXY' = 'http://127.0.0.1:1'; 'SAIFE_DIAG' = '1'; 'USERPROFILE' = $fakeHome }
     $aErr = ($a.Stderr -join "`n")
     $aOk = ($a.ExitCode -eq 0) -and ((($a.Stdout -join "`n")) -match 'host-env-only') -and (-not ($aErr -match 'differs from host'))
     # (b) profile value differs from host env: the G-42 notice.
     $pB = Join-Path $d 'upstream-profile.json'
     Set-Content -LiteralPath $pB -Value '{"meta":{"name":"s86-profile","schema_version":1},"network":{"upstreamProxy":"http://127.0.0.1:1"}}' -Encoding ASCII
-    $b = Invoke-Sandbox -Args (@('run','--allow-cwd','--profile',$pB,'--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','echo','profile-wins')) -WorkingDirectory $d -Env @{ 'HTTPS_PROXY' = 'http://127.0.0.1:2'; 'SANDBOX_DIAG' = '1'; 'USERPROFILE' = $fakeHome }
+    $b = Invoke-Sandbox -Args (@('run','--allow-cwd','--profile',$pB,'--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','echo','profile-wins')) -WorkingDirectory $d -Env @{ 'HTTPS_PROXY' = 'http://127.0.0.1:2'; 'SAIFE_DIAG' = '1'; 'USERPROFILE' = $fakeHome }
     $bErr = ($b.Stderr -join "`n")
-    $bWarn = $bErr.Contains('SANDBOX_DIAG: profile network.upstreamProxy (127.0.0.1:1) differs from host HTTPS_PROXY/HTTP_PROXY (127.0.0.1:2); using the profile value')
+    $bWarn = $bErr.Contains('SAIFE_DIAG: profile network.upstreamProxy (127.0.0.1:1) differs from host HTTPS_PROXY/HTTP_PROXY (127.0.0.1:2); using the profile value')
     $bOk = ($b.ExitCode -eq 0) -and ((($b.Stdout -join "`n")) -match 'profile-wins') -and $bWarn
     # (c) unparsable (https) profile value: unconditional warning.
     $pC = Join-Path $d 'upstream-https.json'
     Set-Content -LiteralPath $pC -Value '{"meta":{"name":"s86-https","schema_version":1},"network":{"upstreamProxy":"https://proxy.example:8080"}}' -Encoding ASCII
-    $c = Invoke-Sandbox -Args (@('run','--allow-cwd','--profile',$pC,'--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','echo','direct-fallback')) -WorkingDirectory $d -Env @{ 'SANDBOX_DIAG' = $null; 'USERPROFILE' = $fakeHome }
+    $c = Invoke-Sandbox -Args (@('run','--allow-cwd','--profile',$pC,'--allow-domain','api.anthropic.com','--no-prompt','--','cmd','/c','echo','direct-fallback')) -WorkingDirectory $d -Env @{ 'SAIFE_DIAG' = $null; 'USERPROFILE' = $fakeHome }
     $cErr = ($c.Stderr -join "`n")
-    $cWarn = $cErr.Contains('[sandbox] warning: the upstream proxy configured via profile network.upstreamProxy is unusable')
+    $cWarn = $cErr.Contains('[saife] warning: the upstream proxy configured via profile network.upstreamProxy is unusable')
     $cUnparsable = $cErr.Contains('(unparsable)')
     $cNoEcho = -not $cErr.Contains('proxy.example')
     # The marker must be absent ENTIRELY, not merely harmless: without this the
-    # leg passes identically whether SANDBOX_DIAG was removed or inherited, so a
+    # leg passes identically whether SAIFE_DIAG was removed or inherited, so a
     # future diag-gating of the parse-failure warning would go unnoticed.
-    $cNoDiag = -not $cErr.Contains('SANDBOX_DIAG')
+    $cNoDiag = -not $cErr.Contains('SAIFE_DIAG')
     $cOk = ($c.ExitCode -eq 0) -and ((($c.Stdout -join "`n")) -match 'direct-fallback') -and $cWarn -and $cUnparsable -and $cNoEcho -and $cNoDiag
     $passed = $aOk -and $bOk -and $cOk
     return @{ Num=86; Name='S-86 (D-2 host env detection)'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { 'host-only: no differs warning; differing values: G-42 notice names both endpoints; https upstream: unconditional (unparsable) warning, URL not echoed, no SANDBOX_DIAG marker' }
+        Detail = if ($passed) { 'host-only: no differs warning; differing values: G-42 notice names both endpoints; https upstream: unconditional (unparsable) warning, URL not echoed, no SAIFE_DIAG marker' }
                  else { "a=$aOk b=$bOk warnB=$bWarn c=$cOk warnC=$cWarn unparsable=$cUnparsable noEcho=$cNoEcho diagFree=$cNoDiag aErr=$(Get-LineHead -Lines @($aErr) -Max 140) bErr=$(Get-LineHead -Lines @($bErr) -Max 140) cErr=$(Get-LineHead -Lines @($cErr) -Max 140)" } }
 }
 
@@ -2993,13 +2993,13 @@ function Invoke-Scenario-S87 {
 # byte-shape `LearnedStore::record(host, "host", allow=false)` writes - the
 # ascii-LOWERCASED key form, because load() lowercases on read and `learned
 # list` shows the stored key (3.7 advisory #1) - under a per-scenario fake
-# USERPROFILE, so the real %USERPROFILE%\.sandbox\learned store is never
+# USERPROFILE, so the real %USERPROFILE%\.saife\learned store is never
 # touched (S-79's pattern).
 function Invoke-Scenario-S88 {
     if (-not (Test-LoopbackProxyReachable)) { return @{ Num=88; Name='S-88 (D-1 learned-deny beats blocklist)'; Passed=$true; Skipped=$true; Detail='proxy loopback probe failed - EITHER AppContainer loopback is blocked (run tests elevated or with the admin loopback exemption) OR curl.exe is not on PATH (the shared probe shells out to curl; these scenarios themselves speak CONNECT without it)' } }
     $d = New-ScenarioDir 88
     $fakeHome = Join-Path $d 'home'
-    $learnedDir = Join-Path $fakeHome '.sandbox\learned'
+    $learnedDir = Join-Path $fakeHome '.saife\learned'
     New-Item -ItemType Directory -Path $learnedDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $learnedDir 'default.json') -Value '{"schema":1,"allow":[],"deny":[{"host":"evil.example.com","scope":"host"}]}' -Encoding ASCII
     $envOverrides = @{ 'USERPROFILE' = $fakeHome }
@@ -3136,10 +3136,10 @@ function Invoke-Scenario-S91 {
 param([string]$TargetHost)
 # Deliberately NO Proxy-Authorization header: that absence is the test.
 if (-not $env:HTTP_PROXY) { Write-Output 'S91_NO_PROXY_ENV'; exit 5 }
-# Read the port as a STRING first: [int]$env:SANDBOX_PROXY_PORT throws a cast
+# Read the port as a STRING first: [int]$env:SAIFE_PROXY_PORT throws a cast
 # error on an empty or absent value, which would surface as a raw PowerShell
 # error instead of the clean NO_PROXY_PORT marker. Parse, then range-check.
-$portRaw = $env:SANDBOX_PROXY_PORT
+$portRaw = $env:SAIFE_PROXY_PORT
 $port = 0
 if (-not [int]::TryParse([string]$portRaw, [ref]$port)) { Write-Output 'S91_NO_PROXY_PORT'; exit 3 }
 $m = [regex]::Match($env:HTTP_PROXY, '://(?:[^@/]*@)?([^:/]+):')
@@ -3228,7 +3228,7 @@ exit 0
 # is the one verified at plan Task 3.8 Checkpoint 3 item 7.
 function Invoke-Scenario-S92 {
     return @{ Num=92; Name='S-92 (D-3 prompt_overload)'; Passed=$true; Skipped=$true
-        Detail='MANUAL APPROVAL required - 8 dialogs must be counted by eye (plan Task 3.8 Checkpoint 3 item 7). Recipe: ONE session with the prompt ENABLED (no --no-prompt) and --allow-domain api.anthropic.com; inside it run: curl --parallel --parallel-max 9 -s -m 40 -o NUL <nine https URLs, n1.example.com..n9.example.com> (repeat -o NUL once per URL). Expect exactly 8 dialogs and the 9th request denied; confirm with sandbox audit show <sid> --json -> one CONNECT leaf with source=prompt_overload, disposition=deny. The DENIED HOST IS WHICHEVER REQUEST LOSES THE RACE, not necessarily n9, so a different denied host is NOT a failure: the invariant is exactly 8 dialogs + exactly one prompt_overload leaf (source=prompt_overload)' }
+        Detail='MANUAL APPROVAL required - 8 dialogs must be counted by eye (plan Task 3.8 Checkpoint 3 item 7). Recipe: ONE session with the prompt ENABLED (no --no-prompt) and --allow-domain api.anthropic.com; inside it run: curl --parallel --parallel-max 9 -s -m 40 -o NUL <nine https URLs, n1.example.com..n9.example.com> (repeat -o NUL once per URL). Expect exactly 8 dialogs and the 9th request denied; confirm with saife audit show <sid> --json -> one CONNECT leaf with source=prompt_overload, disposition=deny. The DENIED HOST IS WHICHEVER REQUEST LOSES THE RACE, not necessarily n9, so a different denied host is NOT a failure: the invariant is exactly 8 dialogs + exactly one prompt_overload leaf (source=prompt_overload)' }
 }
 
 # S-94 (P2.4): a real session SUCCEEDS, and its SESSION_START leaf reports the
@@ -3387,7 +3387,7 @@ $script:AppContainerOnlyScenarios = @{
     20 = 'asserts a path ACE granted to the AppContainer SID by the node_runtime security group; no AppContainer SID on the mxc path'
     21 = 'wrapper confinement is the restricted-token + inherited-DACL property; there is no AppContainer token on the mxc path'
     35 = 'asserts TWO CONCURRENT sessions; the mxc backend refuses more than one concurrent run by design (MXC_CONCURRENCY_REFUSED, src/cli.rs)'
-    40 = 'needs the drive-root ACE for S-1-15-2-2 (All Application Packages) that sandbox setup --grant-drive-root writes; the mxc path has no such subject'
+    40 = 'needs the drive-root ACE for S-1-15-2-2 (All Application Packages) that saife setup --grant-drive-root writes; the mxc path has no such subject'
     41 = 'same drive-root S-1-15-2-2 ACE as S-40; no AppContainer SIDs on the mxc path'
     42 = 'regression guard on the same drive-root ACE (the grant must not weaken an unrelated denial)'
     73 = 'asserts DACL-journal teardown restore; the mxc path writes no ACLs, so there is no journal and no restore to observe'

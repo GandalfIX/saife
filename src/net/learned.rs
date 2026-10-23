@@ -5,7 +5,7 @@
 //! pipeline (D-3.6). Our own camelCase format ([G-20, G-39]).
 //!
 //! The store is wired into the release binary by D-3.6 (run-path load +
-//! proxy lookup/record) and D-3.7 (`sandbox learned` CLI: list/revoke/
+//! proxy lookup/record) and D-3.7 (`saife learned` CLI: list/revoke/
 //! clear). The USERPROFILE-rooted `learned_file_path` helper is still
 //! not called from the release binary, so the module keeps
 //! `#![allow(dead_code)]` to keep `cargo build --release` clean.
@@ -84,13 +84,13 @@ impl LearnedStore {
     }
 
     /// Load the learned file for `profile_name` rooted at `base` (the
-    /// `%USERPROFILE%\.sandbox\learned\` parent). Test-friendly + used by
+    /// `%USERPROFILE%\.saife\learned\` parent). Test-friendly + used by
     /// `load`. Same semantics as `load` otherwise: missing file → empty
     /// store, corrupt file → error, schema mismatch → error.
     ///
     /// Validates `profile_name` via [`validate_profile_name`] before
     /// constructing the path, so a malicious/typo'd name cannot escape the
-    /// `.sandbox/learned/` directory (path-traversal defense).
+    /// `.saife/learned/` directory (path-traversal defense).
     pub fn load_in(base: &Path, profile_name: Option<&str>) -> Result<Self> {
         if let Some(name) = profile_name {
             validate_profile_name(name)?;
@@ -180,7 +180,7 @@ impl LearnedStore {
         self.persist()
     }
 
-    /// Remove an entry (for `sandbox learned revoke`). Atomically rewrites.
+    /// Remove an entry (for `saife learned revoke`). Atomically rewrites.
     /// Returns `true` if an entry was present and removed.
     pub fn revoke(&mut self, host: &str) -> Result<bool> {
         let h = host.trim_end_matches('.').to_ascii_lowercase();
@@ -192,14 +192,14 @@ impl LearnedStore {
         Ok(was_in_allow || was_in_deny)
     }
 
-    /// Remove all entries (for `sandbox learned clear`).
+    /// Remove all entries (for `saife learned clear`).
     pub fn clear(&mut self) -> Result<()> {
         self.allow.clear();
         self.deny.clear();
         self.persist()
     }
 
-    /// Iterate all entries for `sandbox learned list`. Returns
+    /// Iterate all entries for `saife learned list`. Returns
     /// `(host, scope, allow)` triples sorted by host.
     pub fn entries(&self) -> Vec<(String, String, bool)> {
         let mut out = Vec::new();
@@ -242,10 +242,10 @@ impl LearnedStore {
 }
 
 /// Clear the learned file for `profile_name` WITHOUT loading it — the
-/// [G-5] recovery path, used by `sandbox learned clear`. A corrupt or
+/// [G-5] recovery path, used by `saife learned clear`. A corrupt or
 /// schema-mismatched file cannot be loaded, but `clear` is the only
 /// non-editorial way out of a learned file that hard-aborts every
-/// `sandbox run`, so this validates the profile name and atomically
+/// `saife run`, so this validates the profile name and atomically
 /// rewrites the file empty regardless of its current contents.
 pub fn clear_learned_file_in(base: &Path, profile_name: Option<&str>) -> Result<()> {
     if let Some(name) = profile_name {
@@ -260,7 +260,7 @@ pub fn clear_learned_file_in(base: &Path, profile_name: Option<&str>) -> Result<
 }
 
 /// Validate a learned-file profile name. Rejects anything that could
-/// escape the `.sandbox/learned/` directory or corrupt the path:
+/// escape the `.saife/learned/` directory or corrupt the path:
 /// - path separators (`/` or `\`)
 /// - `..` as a path component (parent-directory traversal)
 /// - NUL bytes (Win32 path terminator)
@@ -298,7 +298,7 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Compute the learned file path: `%USERPROFILE%\.sandbox\learned\<name>.json`.
+/// Compute the learned file path: `%USERPROFILE%\.saife\learned\<name>.json`.
 /// Unnamed → `default.json` ([G-5]).
 ///
 /// Does **not** validate `profile_name` — callers passing untrusted input
@@ -312,7 +312,7 @@ pub fn learned_file_path(profile_name: Option<&str>) -> PathBuf {
 }
 
 /// Compute the learned file path rooted at `base`:
-/// `<base>\.sandbox\learned\<name>.json`. Unnamed → `default.json` ([G-5]).
+/// `<base>\.saife\learned\<name>.json`. Unnamed → `default.json` ([G-5]).
 /// Pure (no env read) so tests can drive it deterministically.
 ///
 /// Does **not** validate `profile_name` — callers passing untrusted input
@@ -325,7 +325,7 @@ pub fn learned_file_path_in(base: &Path, profile_name: Option<&str>) -> PathBuf 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("default");
-    base.join(".sandbox").join("learned").join(format!("{name}.json"))
+    base.join(".saife").join("learned").join(format!("{name}.json"))
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
@@ -553,7 +553,7 @@ mod tests {
     }
 
     /// Path-traversal defense: `validate_profile_name` rejects names that
-    /// could escape `.sandbox/learned/` or corrupt the path.
+    /// could escape `.saife/learned/` or corrupt the path.
     #[test]
     fn validate_profile_name_accepts_valid_names() {
         assert!(validate_profile_name("developer").is_ok());

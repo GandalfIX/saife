@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Containment backend for `sandbox run`.
+/// Containment backend for `saife run`.
 ///
 /// The default is the in-repo AppContainer supervisor: P0 adds the MXC backend
 /// behind a flag without changing any existing behaviour (P3 flips the default).
@@ -39,7 +39,7 @@ refusing rather than falling back to `appcontainer`";
 /// true: the child then sees a TTY exactly when the supervisor does, which is
 /// what an interactive workload (opencode's TUI) needs and what a captured-pipes
 /// launch can never provide. It is chosen AUTOMATICALLY — both of this process's
-/// standard streams must be terminals — so the common case (`sandbox run --
+/// standard streams must be terminals — so the common case (`saife run --
 /// opencode`) needs no flag.
 ///
 /// `--no-interactive` forces the captured mode, which is the shape a script
@@ -56,7 +56,7 @@ pub fn inherit_console(no_interactive: bool, stdin_is_tty: bool, stdout_is_tty: 
     !no_interactive && stdin_is_tty && stdout_is_tty
 }
 
-/// Refusal when `mxc-launch.exe` does not sit beside the supervisor binary.
+/// Refusal when `saife-launch.exe` does not sit beside the supervisor binary.
 ///
 /// `#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]`: the only caller
 /// is the MXC session path.
@@ -66,8 +66,8 @@ pub fn inherit_console(no_interactive: bool, stdin_is_tty: bool, stdout_is_tty: 
 /// launcher the child cannot reach the D-4 control plane on loopback — the
 /// reason D1 exists at all.
 #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
-pub const MXC_LAUNCHER_MISSING: &str = "`--backend mxc` needs `mxc-launch.exe` beside the \
-sandbox binary: rebuild with `cargo build --release --features mxc-backend` (the wrapper is a \
+pub const MXC_LAUNCHER_MISSING: &str = "`--backend mxc` needs `saife-launch.exe` beside the \
+saife binary: rebuild with `cargo build --release --features mxc-backend` (the wrapper is a \
 required bin of that feature)";
 
 /// Decide whether a run may use the selected backend, or explain the refusal.
@@ -141,7 +141,7 @@ impl BackendRefusal {
     }
 }
 
-/// Route a `sandbox run` to a backend, or refuse it — fail-closed, before
+/// Route a `saife run` to a backend, or refuse it — fail-closed, before
 /// anything is spawned or created.
 ///
 /// Pure and table-testable: `feature_enabled` and `wired` are parameters rather
@@ -169,9 +169,13 @@ pub fn route_backend(
 
 #[derive(Parser)]
 #[command(
-    name = "sandbox",
+    name = "SAIFE Sandbox",
     version,
-    about = "Native Windows process sandbox for AI agents"
+    about = "Isolate and audit AI agents with production-grade Windows containment policies.",
+    // The default clap template never prints the command name, so `--help`
+    // would show only the description. The product name belongs in the header:
+    // `saife --help` must say who it is, exactly as `--version` does.
+    help_template = "{name} {version}\n{about-with-newline}\n{usage-heading} {usage}\n\n{all-args}{after-help}"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -182,7 +186,7 @@ pub struct Cli {
 pub enum Cmd {
     /// Run a command in the sandbox.
     Run {
-        /// Profile name (resolves to %USERPROFILE%\.sandbox\profiles\<name>.json)
+        /// Profile name (resolves to %USERPROFILE%\.saife\profiles\<name>.json)
         /// or a path to a profile JSON file.
         #[arg(long, value_name = "NAME|PATH")]
         profile: Option<String>,
@@ -257,7 +261,7 @@ pub enum Cmd {
 
         /// Load a plugin sidecar for this session (repeatable). Plugins are looked
         /// up as `<root>/<name>/plugin.json`, searching each `--plugin-dir` in the
-        /// order given and then `%USERPROFILE%\.sandbox\plugins`; the first hit
+        /// order given and then `%USERPROFILE%\.saife\plugins`; the first hit
         /// for a name wins. A plugin that cannot be loaded, spawned or made
         /// healthy refuses the session (exit 5).
         #[arg(long, value_name = "NAME")]
@@ -267,7 +271,7 @@ pub enum Cmd {
         /// path directly holds `<name>/plugin.json`. A name found here shadows the
         /// global copy; it is never merged with it. Nothing inside the workspace
         /// is discovered implicitly: a cloned repository must never gain host-side
-        /// code execution from the act of running `sandbox run` in it, so
+        /// code execution from the act of running `saife run` in it, so
         /// repo-local plugins are usable only when the operator names the directory
         /// here.
         #[arg(long, value_name = "PATH")]
@@ -303,7 +307,7 @@ pub enum Cmd {
     /// Manage the learned allow/deny store (permanent prompt decisions).
     Learned {
         /// Learned-file profile name (selects
-        /// %USERPROFILE%\.sandbox\learned\<name>.json; defaults to
+        /// %USERPROFILE%\.saife\learned\<name>.json; defaults to
         /// default.json). Must be given before the subcommand.
         #[arg(long, value_name = "NAME")]
         profile: Option<String>,
@@ -331,7 +335,7 @@ pub enum Cmd {
         /// Diagnostic: list the current Windows Firewall loopback exempt list.
         /// --allow-domain / --network-profile require loopback access to reach
         /// the proxy. Loopback is registered automatically at runtime when
-        /// `sandbox run` is elevated; unprivileged runs degrade to block-net.
+        /// `saife run` is elevated; unprivileged runs degrade to block-net.
         /// Use this command to check the current exempt state.
         #[arg(long)]
         enable_loopback: bool,
@@ -374,7 +378,7 @@ pub enum LearnedSub {
     List,
     /// Remove the learned entry for a host.
     Revoke {
-        /// Host whose entry to remove (as shown by `sandbox learned list`).
+        /// Host whose entry to remove (as shown by `saife learned list`).
         host: String,
     },
     /// Remove all learned entries. The designated recovery path for a
@@ -438,12 +442,12 @@ impl RunArgs {
     }
 }
 
-/// Where profile files live (`%USERPROFILE%\.sandbox\profiles`).
+/// Where profile files live (`%USERPROFILE%\.saife\profiles`).
 pub fn profiles_dir() -> PathBuf {
     let userprofile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    userprofile.join(".sandbox").join("profiles")
+    userprofile.join(".saife").join("profiles")
 }
 
 #[cfg(test)]
@@ -454,14 +458,14 @@ mod tests {
     #[test]
     fn run_accepts_repeatable_plugin_and_plugin_dir() {
         let cli = Cli::parse_from([
-            "sandbox",
+            "saife",
             "run",
             "--plugin",
             "tngtech",
             "--plugin",
             "jira",
             "--plugin-dir",
-            r"C:\repo\.sandbox\plugins",
+            r"C:\repo\.saife\plugins",
             "--plugin-dir",
             "rel",
             "--",
@@ -479,7 +483,7 @@ mod tests {
         assert_eq!(plugin, vec!["tngtech".to_string(), "jira".to_string()]);
         assert_eq!(
             plugin_dir,
-            vec![r"C:\repo\.sandbox\plugins".to_string(), "rel".to_string()],
+            vec![r"C:\repo\.saife\plugins".to_string(), "rel".to_string()],
             "the order the operator gave is the discovery order"
         );
         assert_eq!(cmd, vec!["cmd".to_string()]);
@@ -487,7 +491,7 @@ mod tests {
 
     #[test]
     fn parse_learned_list() {
-        let cli = Cli::parse_from(["sandbox", "learned", "list"]);
+        let cli = Cli::parse_from(["saife", "learned", "list"]);
         let Cmd::Learned {
             subcommand,
             profile,
@@ -501,7 +505,7 @@ mod tests {
 
     #[test]
     fn parse_learned_revoke_host() {
-        let cli = Cli::parse_from(["sandbox", "learned", "revoke", "evil.example.com"]);
+        let cli = Cli::parse_from(["saife", "learned", "revoke", "evil.example.com"]);
         let Cmd::Learned {
             subcommand,
             profile,
@@ -518,7 +522,7 @@ mod tests {
 
     #[test]
     fn parse_learned_clear() {
-        let cli = Cli::parse_from(["sandbox", "learned", "clear"]);
+        let cli = Cli::parse_from(["saife", "learned", "clear"]);
         let Cmd::Learned {
             subcommand,
             profile,
@@ -532,7 +536,7 @@ mod tests {
 
     #[test]
     fn parse_learned_profile_flag_before_subcommand() {
-        let cli = Cli::parse_from(["sandbox", "learned", "--profile", "dev", "revoke", "a.com"]);
+        let cli = Cli::parse_from(["saife", "learned", "--profile", "dev", "revoke", "a.com"]);
         let Cmd::Learned {
             subcommand,
             profile,
@@ -546,23 +550,23 @@ mod tests {
 
     #[test]
     fn parse_learned_revoke_requires_host() {
-        assert!(Cli::try_parse_from(["sandbox", "learned", "revoke"]).is_err());
+        assert!(Cli::try_parse_from(["saife", "learned", "revoke"]).is_err());
     }
 
     #[test]
     fn parse_learned_unknown_subcommand_rejected() {
-        assert!(Cli::try_parse_from(["sandbox", "learned", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["saife", "learned", "bogus"]).is_err());
     }
 
     /// The `--profile` flag lives on the `learned` level (plan Step 1), so
     /// it must be given before the subcommand — clap rejects it after.
     #[test]
     fn parse_learned_profile_after_subcommand_rejected() {
-        assert!(Cli::try_parse_from(["sandbox", "learned", "list", "--profile", "dev"]).is_err());
+        assert!(Cli::try_parse_from(["saife", "learned", "list", "--profile", "dev"]).is_err());
     }
 
     fn run_backend(args: &[&str]) -> Option<Backend> {
-        let mut argv = vec!["sandbox", "run"];
+        let mut argv = vec!["saife", "run"];
         argv.extend_from_slice(args);
         argv.extend(["--", "cmd", "/c", "exit", "0"]);
         let cli = Cli::parse_from(argv);
@@ -602,7 +606,7 @@ mod tests {
     /// not as some other parse error that would also satisfy `is_err()`.
     #[test]
     fn run_rejects_an_unknown_backend() {
-        let argv = ["sandbox", "run", "--backend", "sandboxie", "--", "cmd"];
+        let argv = ["saife", "run", "--backend", "sandboxie", "--", "cmd"];
         let err = match Cli::try_parse_from(argv) {
             Ok(_) => panic!("an unknown backend must be rejected"),
             Err(err) => err,
@@ -800,5 +804,29 @@ mod tests {
                 Ok(Backend::Mxc)
             );
         }
+    }
+
+    /// The CLI identity is product surface: `--version` must print
+    /// `SAIFE Sandbox 0.2.0` and `--help` must name the product and its
+    /// one-line purpose. Asserted on the clap command itself (the same tree
+    /// `--version`/`--help` render from), so a rename that misses either the
+    /// name or the version fails here instead of at a shell prompt.
+    #[test]
+    fn cli_identity_is_saife_sandbox_with_the_release_version() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        assert_eq!(
+            cmd.render_version().to_string().trim_end(),
+            "SAIFE Sandbox 0.2.0"
+        );
+        let help = cmd.render_help().to_string();
+        assert!(
+            help.contains("SAIFE Sandbox"),
+            "help must name the product: {help}"
+        );
+        assert!(
+            help.contains("Isolate and audit AI agents with production-grade Windows containment policies."),
+            "help must carry the one-line description: {help}"
+        );
     }
 }

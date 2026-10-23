@@ -1,4 +1,4 @@
-//! `sandbox audit show <sid> [--json] [--filter "expr"]`
+//! `saife audit show <sid> [--json] [--filter "expr"]`
 
 use std::io::Write;
 use anyhow::{bail, Result};
@@ -9,7 +9,7 @@ pub fn run_show(session_id: &str, json: bool, filter_expr: Option<&str>) -> i32 
     match run_show_inner(session_id, json, filter_expr) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("[sandbox] audit show: {e:#}");
+            eprintln!("[saife] audit show: {e:#}");
             1
         }
     }

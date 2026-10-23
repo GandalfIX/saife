@@ -1,6 +1,6 @@
 //! Diagnostic binary: probes which Win32 calls `cmd /c dir` depends on fail
 //! under the AppContainer. Run inside the sandbox:
-//!   sandbox run --allow-cwd -- dirprobe
+//!   saife run --allow-cwd -- dirprobe
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE};
 use windows::Win32::Storage::FileSystem::{

@@ -27,7 +27,7 @@ windows::core::link!(
 );
 
 /// Register loopback for the AppContainer SID. Best-effort: failures are
-/// logged under `SANDBOX_DIAG` but not propagated — direct connects to
+/// logged under `SAIFE_DIAG` but not propagated — direct connects to
 /// the proxy would simply fail closed (kernel denies non-exempted
 /// loopback), which is a worse failure mode but not a security one.
 ///
@@ -35,7 +35,7 @@ windows::core::link!(
 /// gets loopback access but no internet capability SIDs — direct
 /// internet connects fail closed.
 pub fn register_loopback(ac_sid: &PSID) -> Result<()> {
-    let diag = std::env::var_os("SANDBOX_DIAG").is_some();
+    let diag = std::env::var_os("SAIFE_DIAG").is_some();
     unsafe {
         let sids = [SID_AND_ATTRIBUTES {
             Sid: *ac_sid,

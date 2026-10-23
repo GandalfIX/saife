@@ -12,7 +12,7 @@ pub struct ProfileEntry {
 }
 
 /// List all profiles in the user-global directory (AC-5.14).
-/// Reads `%USERPROFILE%\.sandbox\profiles\*.json`, parsing each just enough
+/// Reads `%USERPROFILE%\.saife\profiles\*.json`, parsing each just enough
 /// to extract `meta.name` (falling back to the filename stem). Non-`.json`
 /// files and unparseable JSON are skipped silently — `list` is best-effort.
 pub fn list_profiles() -> Vec<ProfileEntry> {
@@ -37,14 +37,14 @@ fn name_from_profile_file(path: &Path) -> Option<String> {
     raw.meta.and_then(|m| if m.name.is_empty() { None } else { Some(m.name) })
 }
 
-/// `sandbox profile show <name> [--expanded]`.
+/// `saife profile show <name> [--expanded]`.
 /// - Raw view (default): prints the file contents verbatim (AC-5.15).
 /// - Expanded view (`--expanded`): prints the fully-resolved JSON.
 pub fn show_profile(name: &str, expanded: bool) -> i32 {
     match show_profile_inner(name, expanded) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("[sandbox] profile show: {e:#}");
+            eprintln!("[saife] profile show: {e:#}");
             1
         }
     }
@@ -238,7 +238,7 @@ pub fn validate_schema_version(raw: &RawProfile) -> Result<()> {
     };
     if v != SUPPORTED_SCHEMA_VERSION {
         bail!(
-            "Unsupported profile schema version {v}. This build of sandbox supports schema version {SUPPORTED_SCHEMA_VERSION}."
+            "Unsupported profile schema version {v}. This build of SAIFE supports schema version {SUPPORTED_SCHEMA_VERSION}."
         );
     }
     Ok(())
@@ -463,7 +463,7 @@ fn load_raw_chain(name: &str, cwd: &Path, seen: &mut Vec<String>) -> Result<RawP
 }
 
 /// Resolve a profile name to a file path.
-/// - `--profile claude-code` -> %USERPROFILE%\.sandbox\profiles\claude-code.json
+/// - `--profile claude-code` -> %USERPROFILE%\.saife\profiles\claude-code.json
 /// - `--profile ./relative/path.json` -> resolved against cwd
 /// - `--profile C:\abs\path.json` -> as-is
 fn resolve_profile_path(name: &str, _cwd: &Path) -> Result<PathBuf> {
@@ -471,12 +471,12 @@ fn resolve_profile_path(name: &str, _cwd: &Path) -> Result<PathBuf> {
     if p.is_absolute() || name.ends_with(".json") {
         return Ok(p.to_path_buf());
     }
-    // Bare name: look in %USERPROFILE%\.sandbox\profiles\<name>.json
+    // Bare name: look in %USERPROFILE%\.saife\profiles\<name>.json
     let userprofile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     Ok(userprofile
-        .join(".sandbox")
+        .join(".saife")
         .join("profiles")
         .join(format!("{name}.json")))
 }
@@ -920,7 +920,7 @@ mod tests {
     fn list_profiles_returns_user_global_json_files() {
         let _env = crate::env_lock();
         let tmp = std::env::temp_dir().join(format!("sb-list-test-{}", std::process::id()));
-        let profiles_dir = tmp.join(".sandbox").join("profiles");
+        let profiles_dir = tmp.join(".saife").join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();
         std::fs::write(profiles_dir.join("alpha.json"), r#"{"meta":{"name":"alpha","schema_version":1}}"#).unwrap();
         std::fs::write(profiles_dir.join("beta.json"), r#"{"meta":{"name":"beta","schema_version":1}}"#).unwrap();

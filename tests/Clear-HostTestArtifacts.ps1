@@ -5,7 +5,7 @@
 # runs are exempt by construction - they touch a disposable differencing disk,
 # not the host - but a host-side run of the AppContainer path writes real ACEs
 # (per-session S-1-15-2-* SIDs) on the profile chain and journals them under
-# %LOCALAPPDATA%\sandbox\dacl-restore.
+# %LOCALAPPDATA%\saife\dacl-restore.
 #
 # The MXC live tests were checked: src/net/mxc.rs and src/net/proxy.rs contain
 # no SetSecurityInfo/icacls call, so that path writes no ACEs. It does leave
@@ -60,14 +60,14 @@ function Remove-SessionAces([string]$path) {
 }
 
 # --- 1. stray processes -----------------------------------------------------
-Write-Step 'stray sandbox / mxc-launch processes'
-$stray = @(Get-Process sandbox, mxc-launch -ErrorAction SilentlyContinue)
+Write-Step 'stray saife / saife-launch processes'
+$stray = @(Get-Process saife, saife-launch -ErrorAction SilentlyContinue)
 if ($stray.Count -eq 0) {
     Write-Host '  none'
 }
 elseif ($NoKill) {
     Write-Host ("  {0} running (not killed: -NoKill): {1}" -f $stray.Count, (($stray | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', '))
-    Add-Problem "$($stray.Count) sandbox process(es) still running"
+    Add-Problem "$($stray.Count) saife process(es) still running"
 }
 else {
     foreach ($p in $stray) {
@@ -78,7 +78,7 @@ else {
 
 # --- 2. every path a DACL journal ever granted ------------------------------
 Write-Step 'paths named by DACL journals'
-$journalDir = Join-Path $env:LOCALAPPDATA 'sandbox\dacl-restore'
+$journalDir = Join-Path $env:LOCALAPPDATA 'saife\dacl-restore'
 $journals = @()
 $journalPaths = @{}
 if (Test-Path -LiteralPath $journalDir) {
@@ -168,8 +168,8 @@ if ($removedZips -gt 0) { Write-Host "  removed $removedZips staging archive(s)"
 
 # --- 6. session + audit state ----------------------------------------------
 Write-Step 'session and audit state'
-$sessions = Join-Path $env:LOCALAPPDATA 'sandbox\sessions'
-$audit = Join-Path $env:LOCALAPPDATA 'sandbox\audit'
+$sessions = Join-Path $env:LOCALAPPDATA 'saife\sessions'
+$audit = Join-Path $env:LOCALAPPDATA 'saife\audit'
 $sessionCount = if (Test-Path -LiteralPath $sessions) { @(Get-ChildItem -LiteralPath $sessions -File -ErrorAction SilentlyContinue).Count } else { 0 }
 $auditCount = if (Test-Path -LiteralPath $audit) { @(Get-ChildItem -LiteralPath $audit -File -ErrorAction SilentlyContinue).Count } else { 0 }
 Write-Host "  session records: $sessionCount; audit files: $auditCount"

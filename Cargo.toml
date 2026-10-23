@@ -1,11 +1,11 @@
 [package]
 name = "sandbox"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Native Windows process sandbox for AI agents"
 
 [[bin]]
-name = "sandbox"
+name = "saife"
 path = "src/main.rs"
 
 [[bin]]
@@ -16,8 +16,8 @@ path = "src/bin/breakaway-helper.rs"
 # container (mxc-sdk 1.0.1 scrubs it from `request.environment`). Only needed by
 # the MXC backend, so it is built only when that feature is on.
 [[bin]]
-name = "mxc-launch"
-path = "src/bin/mxc-launch.rs"
+name = "saife-launch"
+path = "src/bin/saife-launch.rs"
 required-features = ["mxc-backend"]
 
 [dependencies]

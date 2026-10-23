@@ -1,7 +1,7 @@
 //! Plugins: host-side sidecars a sandboxed workload reaches only through the
 //! session proxy.
 //!
-//! A plugin is a directory under a *plugin root* — `%USERPROFILE%\.sandbox\plugins\<name>\`
+//! A plugin is a directory under a *plugin root* — `%USERPROFILE%\.saife\plugins\<name>\`
 //! by default, plus any `--plugin-dir <PATH>` the operator names, in the order
 //! given — holding a `plugin.json` manifest and whatever its sidecar needs beside
 //! it (the POC sample is `python sidecar.py`). The supervisor reads the manifest,
@@ -22,7 +22,7 @@
 //! first hit for a name wins and a later root is *shadowed*, never merged.
 //!
 //! Nothing inside a workspace is discovered implicitly. A cloned repository must
-//! never gain host-side process execution from the act of running `sandbox run`
+//! never gain host-side process execution from the act of running `saife run`
 //! in it, so repo-local plugins are usable only when the operator names the
 //! directory on the command line.
 //!
@@ -65,7 +65,7 @@ pub const FACADE_SUFFIX: &str = ".sandbox.invalid";
 pub const PLUGIN_ENTRY: &str = "plugin.json";
 
 /// The label printed for the global root in refusals and docs.
-pub const GLOBAL_ROOT_LABEL: &str = r"%USERPROFILE%\.sandbox\plugins";
+pub const GLOBAL_ROOT_LABEL: &str = r"%USERPROFILE%\.saife\plugins";
 
 /// One plugin's parsed `plugin.json`.
 ///
@@ -263,7 +263,7 @@ pub fn validate_mount(mount: &str) -> Result<()> {
     Ok(())
 }
 
-/// The global plugin root, `%USERPROFILE%\.sandbox\plugins`.
+/// The global plugin root, `%USERPROFILE%\.saife\plugins`.
 ///
 /// `USERPROFILE` rather than a hardcoded account: this file ships to machines
 /// whose user is not the developer's.
@@ -271,7 +271,7 @@ pub fn global_plugins_root() -> Result<PathBuf> {
     let profile = std::env::var_os("USERPROFILE").context(
         "plugin_roots_unresolved: USERPROFILE is not set, so the global plugin root has no location",
     )?;
-    Ok(PathBuf::from(profile).join(".sandbox").join("plugins"))
+    Ok(PathBuf::from(profile).join(".saife").join("plugins"))
 }
 
 /// The roots for one session, in discovery order: `--plugin-dir` values exactly

@@ -12,8 +12,8 @@
 //!   itself: `mxc-sdk 1.0.1` scrubs `NO_PROXY` from `request.environment`, and
 //!   without it a proxy-honouring client that is asked to call the D-4 intent
 //!   endpoint would send that request into the proxy (plan decision **D1**).
-//!   [`launcher_command`] builds `mxc-launch.exe -- "<real command line>"`;
-//!   `src/bin/mxc-launch.rs` sets `NO_PROXY`, starts the workload with inherited
+//!   [`launcher_command`] builds `saife-launch.exe -- "<real command line>"`;
+//!   `src/bin/saife-launch.rs` sets `NO_PROXY`, starts the workload with inherited
 //!   stdio and propagates its exit code.
 //! * [`MxcBackend`] is a **state-carrying** launch context — proof source, proxy
 //!   port, wrapper launcher and run budget — so a request can never describe a
@@ -141,8 +141,8 @@ pub fn is_blocked_env_key(key: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// File name of the wrapper launcher, deployed beside the supervisor's own
-/// executable (`src/bin/mxc-launch.rs`).
-pub const LAUNCHER_EXE_NAME: &str = "mxc-launch.exe";
+/// executable (`src/bin/saife-launch.rs`).
+pub const LAUNCHER_EXE_NAME: &str = "saife-launch.exe";
 
 /// The directory the container must be granted to execute the launcher.
 ///
@@ -168,8 +168,8 @@ pub fn launcher_grant(launcher: &Path) -> Option<String> {
 ///
 /// **Exposure, recorded not hidden:** MXC grants *directories*, not files, so
 /// this is the launcher's whole **parent** directory — not just
-/// `mxc-launch.exe`. The launcher is deployed beside the supervisor
-/// (`target\debug\mxc-launch.exe` in this repo), which means every container
+/// `saife-launch.exe`. The launcher is deployed beside the supervisor
+/// (`target\debug\saife-launch.exe` in this repo), which means every container
 /// gets a read-only view of the directory the binary was built into: the build
 /// directory, and for this repository that is `<repo>\target\debug` plus every
 /// sibling of the executable. When the supervisor itself is installed under
@@ -483,7 +483,7 @@ fn proxy_url(port: u16, token: Option<&str>) -> Result<String, RequestError> {
 /// have had as the container command itself.
 ///
 /// `--proxy-port` (P2.4) is the supervisor's bound port, which the wrapper writes
-/// to the child as `SANDBOX_PROXY_PORT` — the D-0.3 discovery variable the
+/// to the child as `SAIFE_PROXY_PORT` — the D-0.3 discovery variable the
 /// AppContainer path has always injected (`src/sandbox/appcontainer.rs:1007`).
 /// Without it a workload written to D-0.3 could not find the D-4 intent endpoint
 /// under this backend at all. The port is the value from the same
@@ -504,7 +504,7 @@ pub fn launcher_command(launcher: &Path, real_command: &str, proxy_port: Option<
 
 /// The wrapper launcher that must ship beside the supervisor binary (P3.0).
 ///
-/// D1 makes `mxc-launch.exe` the command the container actually runs, and the
+/// D1 makes `saife-launch.exe` the command the container actually runs, and the
 /// release build puts every bin in the same directory, so "beside this exe" is
 /// where it is. `None` when it is not there: the caller refuses by name
 /// ([`crate::cli::MXC_LAUNCHER_MISSING`]) rather than launching a session whose
@@ -2980,7 +2980,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Stand-in launcher path: the mapping is pure, so it never has to exist.
-    const TEST_LAUNCHER: &str = r"C:\tools\sandbox\mxc-launch.exe";
+    const TEST_LAUNCHER: &str = r"C:\tools\sandbox\saife-launch.exe";
 
     fn build(input: &MxcSessionInput) -> ExecutionRequest {
         build_request(input, Path::new(TEST_LAUNCHER)).expect("launchable request")
@@ -3078,7 +3078,7 @@ mod tests {
         assert_eq!(
             launcher_command(Path::new(TEST_LAUNCHER), "cmd /c echo hi", None),
             format!(r#"{TEST_LAUNCHER} -- "cmd /c echo hi""#),
-            "no flag means the wrapper writes SANDBOX_PROXY_PORT empty"
+            "no flag means the wrapper writes SAIFE_PROXY_PORT empty"
         );
         // The request's own command carries the port it will also put in
         // `networkProxy`: `input()` configures 54321 for both.
@@ -3093,11 +3093,11 @@ mod tests {
     #[test]
     fn launcher_command_quotes_a_launcher_path_with_spaces() {
         let command = launcher_command(
-            Path::new(r"C:\Program Files\sb\mxc-launch.exe"),
+            Path::new(r"C:\Program Files\sb\saife-launch.exe"),
             "x.exe",
             None,
         );
-        assert_eq!(command, r#""C:\Program Files\sb\mxc-launch.exe" -- x.exe"#);
+        assert_eq!(command, r#""C:\Program Files\sb\saife-launch.exe" -- x.exe"#);
     }
 
     #[test]
@@ -3185,7 +3185,7 @@ mod tests {
             Some(r"C:\tools\sandbox")
         );
         assert_eq!(
-            launcher_grant(Path::new("mxc-launch.exe")),
+            launcher_grant(Path::new("saife-launch.exe")),
             None,
             "a bare file name has no directory to grant"
         );
@@ -4939,7 +4939,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        let supervisor = dir.join("sandbox.exe");
+        let supervisor = dir.join("saife.exe");
         assert_eq!(launcher_beside(&supervisor), None, "nothing is written yet");
         let launcher = dir.join(LAUNCHER_EXE_NAME);
         std::fs::write(&launcher, b"stub").expect("stub launcher");
@@ -5132,7 +5132,7 @@ mod tests {
     #[test]
     fn a_bare_launcher_file_name_adds_no_grant() {
         let mut fs = MxcFilesystemInput::default();
-        assert!(!ensure_launcher_grant(&mut fs, Path::new("mxc-launch.exe")));
+        assert!(!ensure_launcher_grant(&mut fs, Path::new("saife-launch.exe")));
         assert!(
             fs.readonly_paths.is_empty(),
             "there is no directory to grant, and an empty path in the request would be worse"
@@ -5387,7 +5387,7 @@ mod tests {
             &[],
             &[here.display().to_string()],
             None,
-            Path::new(r"tools\sandbox\mxc-launch.exe"),
+            Path::new(r"tools\sandbox\saife-launch.exe"),
         )
         .expect_err("the current directory is an ancestor of the resolved launcher directory");
         assert_eq!(
@@ -5482,7 +5482,7 @@ mod tests {
     #[test]
     fn build_request_resolves_a_relative_launcher_in_the_command_line() {
         let here = std::env::current_dir().expect("current directory");
-        let request = build_request(&input(), Path::new(r"bin\mxc-launch.exe"))
+        let request = build_request(&input(), Path::new(r"bin\saife-launch.exe"))
             .expect("a relative launcher resolves");
         let resolved_dir = here.join("bin").display().to_string();
         assert!(
@@ -5951,7 +5951,7 @@ mod tests {
 /// fast:
 ///
 /// ```text
-/// cargo build --features mxc-backend --bin mxc-launch
+/// cargo build --features mxc-backend --bin saife-launch
 /// cargo test  --features mxc-backend -- --ignored
 /// ```
 ///
@@ -6196,7 +6196,7 @@ mod live {
     }
 
     /// The wrapper exe beside the test binary (`target/<profile>/`), built by
-    /// `cargo build --features mxc-backend --bin mxc-launch`.
+    /// `cargo build --features mxc-backend --bin saife-launch`.
     fn launcher_under_test() -> PathBuf {
         let exe = std::env::current_exe().expect("current test exe");
         let deps = exe.parent().expect("deps directory");
@@ -6211,7 +6211,7 @@ mod live {
         }
         panic!(
             "{LAUNCHER_EXE_NAME} not found near {}: run `cargo build --features mxc-backend \
-             --bin mxc-launch` first",
+             --bin saife-launch` first",
             exe.display()
         );
     }
@@ -7864,7 +7864,7 @@ mod live {
             "a failed spawn must be its own non-zero code: {outcome:?}"
         );
         assert!(
-            err_out.contains("mxc-launch: failed to start"),
+            err_out.contains("saife-launch: failed to start"),
             "the failure must be named on stderr: {err_out:?}"
         );
 
@@ -8683,7 +8683,7 @@ mod live {
     /// counted nor audited, and closing one session leaves the other's counters
     /// and service untouched.
     ///
-    /// Run: `cargo test --features mxc-backend --bin sandbox -- --ignored --nocapture`
+    /// Run: `cargo test --features mxc-backend --bin saife -- --ignored --nocapture`
     #[test]
     #[ignore = "launches two real ProcessContainers; run: cargo test --features mxc-backend -- --ignored"]
     fn two_concurrent_sessions_prove_only_their_own_traffic_and_refuse_each_others_tokens() {
@@ -9363,10 +9363,10 @@ mod live {
     /// what the leg proves. The MXC launcher injects
     /// `HTTP_PROXY=http://sandbox:<token>@127.0.0.1:<port>`,
     /// `NO_PROXY=localhost,127.0.0.1,::1` and — since P2.4 —
-    /// `SANDBOX_PROXY_PORT=<port>`, the D-0.3 discovery variable the
+    /// `SAIFE_PROXY_PORT=<port>`, the D-0.3 discovery variable the
     /// AppContainer path has always injected. The script below deliberately keeps
     /// deriving the endpoint from `HTTP_PROXY` rather than reading the discovery
-    /// variable: the env leg asserts that the two agree (`SANDBOX_PROXY_PORT` ==
+    /// variable: the env leg asserts that the two agree (`SAIFE_PROXY_PORT` ==
     /// this listener's port), and a second, independent derivation is what makes
     /// that agreement evidence instead of a tautology. `cmd.exe` cannot
     /// base64, so the credential comes from `certutil`: one PEM block whose
@@ -9513,7 +9513,7 @@ exit /b 0
     ///    `foreign_token` refusal (`host: "<unknown>"`), and nothing names a host
     ///    or allows anything — an intent call is not a decision.
     #[test]
-    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin saife -- --ignored"]
     fn d4_intent_roundtrip_from_inside_the_container_is_proven() {
         let launcher = launcher_under_test();
         let proxy = LiveProxy::start(&[]);
@@ -9560,16 +9560,16 @@ exit /b 0
             .map(|line| line.trim().to_string())
             .unwrap_or_default();
         // P2.4: the D-0.3 **discovery** contract, not just the proxy URL. The
-        // AppContainer path injects `SANDBOX_PROXY_PORT`
+        // AppContainer path injects `SAIFE_PROXY_PORT`
         // (`src/sandbox/appcontainer.rs:1007`); until P2.4 the MXC launcher did
         // not, so a workload written to D-0.3 (`GET
-        // http://127.0.0.1:$SANDBOX_PROXY_PORT/sandbox/intent`) could not find
+        // http://127.0.0.1:$SAIFE_PROXY_PORT/sandbox/intent`) could not find
         // the endpoint at all under this backend. The value must be THIS
         // listener's port: an inherited or stale number would point the
         // workload at a socket the supervisor does not own.
         let proxy_port_var = env_dump
             .lines()
-            .find(|line| line.starts_with("SANDBOX_PROXY_PORT="))
+            .find(|line| line.starts_with("SAIFE_PROXY_PORT="))
             .map(|line| line.trim().to_string())
             .unwrap_or_default();
         println!(
@@ -9610,7 +9610,7 @@ exit /b 0
         assert_eq!(
             port_var_value,
             proxy.port().to_string(),
-            "the child must carry SANDBOX_PROXY_PORT naming this listener's port \
+            "the child must carry SAIFE_PROXY_PORT naming this listener's port \
              (D-0.3 discovery); absent or a different port makes the D-4 endpoint \
              undiscoverable by a workload that only knows that contract: {proxy_port_var:?}"
         );
@@ -9862,7 +9862,7 @@ exit /b 0
     /// really reached the decision pipeline, i.e. that the reason was not observed
     /// by some shortcut the product does not take.
     #[test]
-    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin saife -- --ignored"]
     fn a_declared_intent_is_the_prompt_reason_from_inside_the_container() {
         let launcher = launcher_under_test();
         let seen: DialogCalls = Arc::new(Mutex::new(Vec::new()));
@@ -10026,10 +10026,10 @@ exit /b 0
     /// listener: `probes == 1` with `accepted == 0, tunnels == 0`.
     ///
     /// This is the leg that was refused before the amendment, and refusing it is
-    /// a product cliff: `sandbox run --allow-domain api.anthropic.com -- echo hi`
+    /// a product cliff: `saife run --allow-domain api.anthropic.com -- echo hi`
     /// failed a user who did nothing wrong.
     #[test]
-    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin saife -- --ignored"]
     fn a_launch_whose_workload_makes_no_request_passes_on_the_wrapper_probe() {
         let launcher = launcher_under_test();
         let proxy = LiveProxy::start(&[]);
@@ -10155,7 +10155,7 @@ exit /b 0
     /// are that listener's own epoch, opened for this launch and never probed —
     /// not a fake that cannot count.
     #[test]
-    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin sandbox -- --ignored"]
+    #[ignore = "launches a real ProcessContainer; run: cargo test --features mxc-backend --bin saife -- --ignored"]
     fn a_launch_whose_probe_never_arrives_is_refused_with_proxy_probe_unmet() {
         let launcher = launcher_under_test();
         let proxy = LiveProxy::start(&[]);

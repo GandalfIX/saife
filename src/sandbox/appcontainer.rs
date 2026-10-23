@@ -155,7 +155,7 @@ pub fn grant_access(
     entries: &[AllowEntry],
     journal: Option<&DaclJournal>,
 ) -> Result<()> {
-    let diag = std::env::var_os("SANDBOX_DIAG").is_some();
+    let diag = std::env::var_os("SAIFE_DIAG").is_some();
     for e in entries {
         if let Err(err) = grant_one(ac_sid, e, journal) {
             if diag {
@@ -301,11 +301,11 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry, journal: Option<&DaclJournal>) -> Re
             let stats = propagate_grant(ac_sid, e, journal, PROPAGATE_MAX_OBJECTS);
             if stats.truncated {
                 eprintln!(
-                    "[sandbox] warning: grant propagation for {:?} truncated at {PROPAGATE_MAX_OBJECTS} objects; pre-existing files deeper in the tree may be unreadable inside the sandbox",
+                    "[saife] warning: grant propagation for {:?} truncated at {PROPAGATE_MAX_OBJECTS} objects; pre-existing files deeper in the tree may be unreadable inside the sandbox",
                     e.win32_path
                 );
             }
-            if std::env::var_os("SANDBOX_DIAG").is_some() {
+            if std::env::var_os("SAIFE_DIAG").is_some() {
                 eprintln!(
                     "[grant] {:>16}  propagated: applied={} failed={} skipped={}",
                     if e.deny {
@@ -630,10 +630,10 @@ pub fn restore_or_warn(journal: &DaclJournal) -> bool {
         Ok(()) => true,
         Err(e) => {
             eprintln!(
-                "[sandbox] warning: DACL restore failed; journal retained for retry at next start: {}",
+                "[saife] warning: DACL restore failed; journal retained for retry at next start: {}",
                 journal.path().display()
             );
-            eprintln!("[sandbox]          {e:#}");
+            eprintln!("[saife]          {e:#}");
             false
         }
     }
@@ -967,7 +967,7 @@ pub(crate) fn allocate_private_network_capability_sid() -> Option<PSID> {
 /// `proxy: Some(ProxyEnv)` injects `HTTP_PROXY`/`HTTPS_PROXY` with the proxy
 /// URL containing userinfo (`http://sandbox:<token>@127.0.0.1:<port>`) so
 /// standard HTTP clients auto-send `Proxy-Authorization: Basic`. Also sets
-/// `SANDBOX_PROXY_PORT` (for discoverability) and `NO_PROXY=localhost,127.0.0.1,::1`
+/// `SAIFE_PROXY_PORT` (for discoverability) and `NO_PROXY=localhost,127.0.0.1,::1`
 /// so the child can reach intent endpoints directly (bypassing the proxy —
 /// routing through it would loop).
 /// `proxy: None` (block-net case) explicitly clears all four vars so a
@@ -1004,7 +1004,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     const PROXY_VARS: [&str; 4] = [
         "HTTP_PROXY",
         "HTTPS_PROXY",
-        "SANDBOX_PROXY_PORT",
+        "SAIFE_PROXY_PORT",
         "NO_PROXY",
     ];
 
@@ -1028,8 +1028,8 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         }
         // Session marker for the pyshim's active mode (see sitecustomize.py):
         // survives child-side env sanitization (venv strips PYTHONPATH but
-        // copies every other var). A nested sandbox run overrides it.
-        if k.eq_ignore_ascii_case("SANDBOX_SESSION_SID") {
+        // copies every other var). A nested saife run overrides it.
+        if k.eq_ignore_ascii_case("SAIFE_SESSION_SID") {
             vars.push((k, sid.to_string()));
             session_sid_overridden = true;
             continue;
@@ -1059,7 +1059,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         vars.push(("PYTHONPATH".to_string(), pyshim_path));
     }
     if !session_sid_overridden {
-        vars.push(("SANDBOX_SESSION_SID".to_string(), sid.to_string()));
+        vars.push(("SAIFE_SESSION_SID".to_string(), sid.to_string()));
     }
     // Append any proxy vars that were not present in the parent env.
     let proxy_values = [http_proxy, https_proxy, sandbox_proxy_port, no_proxy];
@@ -1396,7 +1396,7 @@ mod env_block_tests {
         // Session marker: gates the pyshim's active mode and survives
         // child-side env sanitization (venv strips PYTHONPATH but copies
         // every other var).
-        assert_eq!(get("SANDBOX_SESSION_SID"), "testsid");
+        assert_eq!(get("SAIFE_SESSION_SID"), "testsid");
     }
 
     /// P1.6(c): the proxy variables carry *this run's* typed credential.
@@ -1442,7 +1442,7 @@ mod env_block_tests {
             want,
             "both proxy vars carry the same URL"
         );
-        assert_eq!(get("SANDBOX_PROXY_PORT"), "49152");
+        assert_eq!(get("SAIFE_PROXY_PORT"), "49152");
         assert_eq!(get("NO_PROXY"), "localhost,127.0.0.1,::1");
     }
 }

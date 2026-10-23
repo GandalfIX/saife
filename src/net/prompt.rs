@@ -129,7 +129,7 @@
 //! - `TaskDialogIndirect` is resolved at RUNTIME (`LoadLibraryW` +
 //!   `GetProcAddress` inside a Common-Controls-v6 activation context
 //!   built from a generated `%TEMP%` manifest), NOT via the crate's
-//!   static import. The sandbox binary embeds no manifest (adding one
+//!   static import. The saife binary embeds no manifest (adding one
 //!   needs a build.rs, outside this task's file set), so a static
 //!   comctl32 import resolves against the in-box **v5** DLL and the
 //!   whole exe then fails to load with STATUS_ENTRYPOINT_NOT_FOUND —
@@ -179,7 +179,7 @@
 //!   `unavailable`; `Disabled` (zero timeout) → 403, source `default`.
 //! - [G-19] first-denial diagnostic: on the FIRST
 //!   `Unavailable { allowed: false }`, emit a discoverable one-line
-//!   `SANDBOX_DIAG` stderr diagnostic (ADR D-3): "no dialog backend
+//!   `SAIFE_DIAG` stderr diagnostic (ADR D-3): "no dialog backend
 //!   available; all non-allow-listed hosts denied; use `--allow-domain`
 //!   or `--network-profile` to pre-approve, or set
 //!   `on_unavailable=allow` (insecure)".

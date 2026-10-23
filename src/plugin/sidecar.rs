@@ -4,7 +4,7 @@
 //! gets a free loopback port, a fresh 32-hex facade token, the mount name and the
 //! manifest's non-secret `config` entries in its environment, and nothing else —
 //! no secret value exists in the POC. Its stdout/stderr go to
-//! `%LOCALAPPDATA%\sandbox\sidecar-logs\<sid>-<mount>.log` instead of the
+//! `%LOCALAPPDATA%\saife\sidecar-logs\<sid>-<mount>.log` instead of the
 //! session's console, so a chatty sidecar cannot corrupt the workload's output.
 //!
 //! No shell is involved: `command` is spawned directly, `command[0]` is resolved
@@ -251,7 +251,7 @@ fn is_batch(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
 }
 
-/// The sidecar's log, under `%LOCALAPPDATA%\sandbox\sidecar-logs`.
+/// The sidecar's log, under `%LOCALAPPDATA%\saife\sidecar-logs`.
 ///
 /// Both halves of the file name are sanitised: `--sid` is operator input and a
 /// mount is a validated label, but a log path is a filesystem write and neither
@@ -259,7 +259,7 @@ fn is_batch(path: &Path) -> bool {
 fn sidecar_log_path(sid: &str, mount: &str) -> Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .context("sidecar_log_unavailable: LOCALAPPDATA is not set")?;
-    let dir = PathBuf::from(local).join("sandbox").join("sidecar-logs");
+    let dir = PathBuf::from(local).join("saife").join("sidecar-logs");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("sidecar_log_unavailable: create {}", dir.display()))?;
     let stem = format!("{}-{}", sanitize(sid), sanitize(mount));
@@ -399,12 +399,12 @@ mod tests {
     /// relay, and a real kill.
     ///
     /// Requires (a) the plugin installed at
-    /// `%USERPROFILE%\.sandbox\plugins\tngtech\` (copy `plugins/tngtech/` from
+    /// `%USERPROFILE%\.saife\plugins\tngtech\` (copy `plugins/tngtech/` from
     /// this repo there) and (b) **working internet**, because the sidecar fetches
     /// `https://www.tngtech.com/`. Both are LOUD failures on purpose: this leg
     /// never skips, because a leg that silently skips measures nothing.
     ///
-    /// Run: `cargo test --bin sandbox plugin:: -- --ignored`
+    /// Run: `cargo test --bin saife plugin:: -- --ignored`
     #[ignore = "starts a real python sidecar; needs the tngtech plugin installed and internet"]
     #[test]
     fn the_tngtech_sidecar_answers_through_the_facade_and_dies_on_drop() {
@@ -420,7 +420,7 @@ mod tests {
 
         let sid = format!("plugin-live-{}-{}", std::process::id(), nanos());
         let loaded = crate::plugin::load_plugin("tngtech", &[]).expect(
-            "the tngtech plugin must be installed under %USERPROFILE%\\.sandbox\\plugins\\tngtech",
+            "the tngtech plugin must be installed under %USERPROFILE%\\.saife\\plugins\\tngtech",
         );
         assert_eq!(loaded.manifest.mount, "tngtech");
 
