@@ -995,32 +995,57 @@ impl DialogBackend {
     }
 }
 
-/// Fire the courtesy toast on a separate thread ([G-2, G-3]). Fire and
-/// forget — every error is swallowed by design. The toast is a
-/// secondary, non-intrusive channel and may legitimately no-op (no
-/// interactive desktop, toasts disabled, AUMID quirks for unpackaged
-/// console apps); the dialog alone carries the decision.
-fn spawn_toast(host: &str, port: u16) {
-    let host = host.to_string();
-    let _ = std::thread::Builder::new()
-        .name("sandbox-prompt-toast".to_string())
-        .spawn(move || {
-            let _ = fire_toast(&host, port);
-        });
+/// The toast queue: ONE process-lifetime STA apartment, lazily created.
+///
+/// Every toast used to own its thread and `CoUninitialize` it on exit, while the
+/// `windows` crate caches the WinRT activation factory in a process-wide static.
+/// The second toast therefore reached `IGenericFactory::ActivateInstance` with a
+/// factory whose apartment was already gone: `0xC0000005`, reproduced by two
+/// toasts 700 ms apart (`successive_toasts_do_not_kill_the_process`) and observed
+/// five times in production dumps, each stack `fire_toast ->
+/// FactoryCache<XmlDocument>::call`. A *burst* of toasts does NOT reproduce it -
+/// they share one live apartment - which is why the first version of that test
+/// was green on broken code.
+///
+/// One apartment for the process keeps every cached factory valid; the thread
+/// lives until the process does, so `CoUninitialize` is deliberately never
+/// called. This is not an optimisation: it is the only arrangement in which the
+/// crate's factory cache cannot outlive its apartment.
+fn toast_channel() -> Option<&'static std::sync::mpsc::Sender<(String, u16)>> {
+    use std::sync::OnceLock;
+    static TX: OnceLock<Option<std::sync::mpsc::Sender<(String, u16)>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, u16)>();
+        std::thread::Builder::new()
+            .name("sandbox-prompt-toasts".to_string())
+            .spawn(move || {
+                let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+                    // No apartment on this thread: dropping `rx` makes every
+                    // `send` fail, so toasts become a no-op, as documented.
+                    return;
+                }
+                while let Ok((host, port)) = rx.recv() {
+                    let _ = toast_inner(&host, port);
+                }
+                if hr.is_ok() {
+                    unsafe { CoUninitialize() };
+                }
+            })
+            .ok()?;
+        Some(tx)
+    })
+    .as_ref()
 }
 
-/// Toast body ([G-2, G-3]); runs on the toast thread, best-effort.
-fn fire_toast(host: &str, port: u16) -> windows::core::Result<()> {
-    // WinRT activation needs an apartment on this thread.
-    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
-        return Err(hr.into());
+/// Fire the courtesy toast ([G-2, G-3]). Fire and forget — every error is
+/// swallowed by design. The toast is a secondary, non-intrusive channel and may
+/// legitimately no-op (no interactive desktop, toasts disabled, AUMID quirks for
+/// unpackaged console apps); the dialog alone carries the decision.
+fn spawn_toast(host: &str, port: u16) {
+    if let Some(tx) = toast_channel() {
+        let _ = tx.send((host.to_string(), port));
     }
-    let result = toast_inner(host, port);
-    if hr.is_ok() {
-        unsafe { CoUninitialize() };
-    }
-    result
 }
 
 fn toast_inner(host: &str, port: u16) -> windows::core::Result<()> {
@@ -1653,6 +1678,29 @@ fn unavailable_from(config: &PromptConfig, cause: UnavailableCause) -> PromptOut
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    /// Regression (2026-10-23): every toast used to own its own STA thread and
+    /// `CoUninitialize` it on exit, while the `windows` crate caches the WinRT
+    /// factory in a process-wide static. The SECOND toast then dereferenced a
+    /// factory whose apartment had been torn down: `0xC0000005` with the stack
+    /// `fire_toast -> FactoryCache<XmlDocument>::call -> IGenericFactory::
+    /// ActivateInstance`, observed five times in `%LOCALAPPDATA%\CrashDumps` and
+    /// reproduced by a workload that opened several prompts at once (opencode's
+    /// five parallel fetches). The toast is best-effort, but "best-effort" must
+    /// not mean "kills the supervisor": this test fires several in a burst and
+    /// only survives if the WinRT apartment outlives each individual toast.
+    #[test]
+    fn successive_toasts_do_not_kill_the_process() {
+        // SEQUENTIAL with a gap, not a burst: the crash needs the previous
+        // toast's apartment to be GONE before the next one activates, which is
+        // what production does (prompts arrive seconds apart). A burst of eight
+        // passes even on the broken code, because they all share one live
+        // apartment - that is why the first version of this test was green.
+        for i in 0..4 {
+            spawn_toast(&format!("host{i}.example"), 443);
+            std::thread::sleep(Duration::from_millis(700));
+        }
+    }
     use std::sync::Condvar;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
