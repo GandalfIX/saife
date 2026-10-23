@@ -1,15 +1,15 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
-PackageIdentifier: TNG.SAIFE-Sandbox
+PackageIdentifier: GandalfIX.SAIFE-Sandbox
 PackageVersion: 0.1.0
 PackageLocale: en-US
-Publisher: TNG Technology Consulting GmbH
-PublisherUrl: https://www.tngtech.com/
-PublisherSupportUrl: https://github.com/TNG/saife-sandbox/issues
-Author: TNG Technology Consulting GmbH
+Publisher: GandalfIX
+PublisherUrl: https://github.com/GandalfIX
+PublisherSupportUrl: https://github.com/GandalfIX/saife/issues
+Author: GandalfIX
 PackageName: SAIFE Sandbox
-PackageUrl: https://github.com/TNG/saife-sandbox
+PackageUrl: https://github.com/GandalfIX/saife
 License: Proprietary
-Copyright: Copyright (c) 2026 TNG Technology Consulting GmbH
+Copyright: Copyright (c) 2026 GandalfIX
 Moniker: saife
 ShortDescription: Isolate and audit AI agents with production-grade Windows containment policies.
 Description: >-
@@ -28,7 +28,7 @@ Tags:
   - audit
   - isolation
   - cli
-ReleaseNotesUrl: https://github.com/TNG/saife-sandbox/releases
+ReleaseNotesUrl: https://github.com/GandalfIX/saife/releases
 InstallationNotes: >-
   Requires Windows 11 24H2 (build 26100) or newer, x64. No administrator rights
   and no service are needed for the default backend. Verify the installation with
