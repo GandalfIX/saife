@@ -424,9 +424,9 @@ forward (`respond_deny` is shared) — recorded, not fixed.
   `prompt_receives_declared_intent_reason`. **S-77 parity, item by item:** S-77
   asserts POST 204, GET 200, the reason, the normalized host,
   `hint: "declared"` and the child's exit 0, with the credential taken from
-  `SANDBOX_PROXY_PORT` + the `HTTPS_PROXY` userinfo and a direct dial enforced by
+  `SAIFE_PROXY_PORT` + the `HTTPS_PROXY` userinfo and a direct dial enforced by
   `UseProxy = $false`; the new leg reproduces every one of those except
-  `SANDBOX_PROXY_PORT`, which the MXC launcher does not inject (recorded gap: a
+  `SAIFE_PROXY_PORT`, which the MXC launcher does not inject (recorded gap: a
   workload that only knows the D-0.3 contract cannot discover the endpoint under
   MXC until P3), and it adds what S-77 does not check — the explain one-shot, the
   404/400/407 negatives, the three NO_PROXY spellings, the counter proof and the
@@ -472,18 +472,18 @@ forward (`respond_deny` is shared) — recorded, not fixed.
   (the property is pinned meanwhile by an `#[ignore]`d live leg). Suite total:
   **93 scenarios** (numbers 1..=94, with 93 RESERVED out of the run), so the
   recorded VM baseline moves 92 -> 93.
-  **Product gap CLOSED — `SANDBOX_PROXY_PORT` under MXC.** The AppContainer path
+  **Product gap CLOSED — `SAIFE_PROXY_PORT` under MXC.** The AppContainer path
   injects it (`src/sandbox/appcontainer.rs:1007`) and nothing did under MXC, so a
   workload written to D-0.3 could not discover the D-4 endpoint at all. The
-  wrapper now owns it: `mxc-launch.exe --proxy-port <port>` (built by
+  wrapper now owns it: `saife-launch.exe --proxy-port <port>` (built by
   `launcher_command` from the same `input.network.proxy_port` that becomes the
   request's `networkProxy`, so the variable and the proxy URL cannot name
-  different listeners), written into the child as `SANDBOX_PROXY_PORT`; the
+  different listeners), written into the child as `SAIFE_PROXY_PORT`; the
   no-proxy arm writes the name EMPTY, as the AppContainer `None` arm does for its
   four variables, so an inherited profile value cannot point a workload at a
-  socket nobody owns. `--env SANDBOX_PROXY_PORT=` is refused as reserved, so only
+  socket nobody owns. `--env SAIFE_PROXY_PORT=` is refused as reserved, so only
   `--proxy-port` can set it. Asserted in the P2.2 live leg's env evidence
-  (`EVIDENCE child_env … "SANDBOX_PROXY_PORT=<port>"` == the listener's port),
+  (`EVIDENCE child_env … "SAIFE_PROXY_PORT=<port>"` == the listener's port),
   whose RED was the variable absent from the child's own `cmd /c set` dump.
   **Guardrail 1's NEGATIVE case** (ADR-0004: `warnings: []` is not evidence, a
   session must not be reported successful unless the child provably reached the
@@ -664,7 +664,7 @@ run of a network session works with no UAC anywhere.
   the AppContainer fallback after one release of MXC-by-default.
 
 **Acceptance:** `cargo test` green with the reduced suite; VM suite 0 fail on
-both images; `sandbox run --allow-domain …` works unelevated on the host.
+both images; `saife run --allow-domain …` works unelevated on the host.
 
 ---
 

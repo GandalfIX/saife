@@ -229,7 +229,7 @@ smoke test confirms the path-aliasing works.
 $sid = (spike.exe run --print-sid -- cmd /c echo init).Trim()
 spike.exe run --sid $sid -- cmd /c copy C:\Windows\System32\where.exe .sandbox\$sid\bin\where.exe
 spike.exe persist $sid --as my-tools
-# Assert: %USERPROFILE%\.sandbox\stores\my-tools\bin\where.exe exists
+# Assert: %USERPROFILE%\.saife\stores\my-tools\bin\where.exe exists
 
 # New session reuses the persisted store (read-only by default).
 $sid2 = (spike.exe run --print-sid --reuse my-tools -- cmd /c echo init).Trim()
@@ -410,7 +410,7 @@ sandbox/spike/
 - **Profile format** — the spike hard-codes the allow-list. The US-5
   profile format is unaffected, except: per the CR-10 decision, the
   repo-local profile search path (`./.sandbox/profiles/`) is **dropped** —
-  profiles live only in `%USERPROFILE%\.sandbox\profiles\`, outside the
+  profiles live only in `%USERPROFILE%\.saife\profiles\`, outside the
   writable workspace.
 
 ## Decision tree

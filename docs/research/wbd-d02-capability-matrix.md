@@ -1,6 +1,6 @@
 # WBD D-02: BaseContainer/PSEC capability matrix
 
-Status: COMPLETE. Ticket: `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` D-02
+Status: COMPLETE. Ticket: `input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md` D-02
 (line 447). All verdict cells cite fetched artifacts from the canonical run;
 all source references cite the pinned MXC tree (`5d7a475a…`) fetched via
 `raw.githubusercontent.com` at the exact pin (file paths and line numbers are

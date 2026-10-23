@@ -176,12 +176,12 @@ it is not always the file's `seq 0` (the listener is bound first, and a reused
   every network-enabled session whose workload makes no request: the four P3.1
   scenarios (S-55, S-77, S-86, S-91 — an intent roundtrip, an audit-log check,
   `cmd /c echo`, a raw 407 probe), and in the product
-  `sandbox run --allow-domain api.anthropic.com -- echo hi`, which failed a user
+  `saife run --allow-domain api.anthropic.com -- echo hi`, which failed a user
   who did nothing wrong. A gate must prove the **path**, never the workload's use
   of it.
 
   Guardrail 1's evidence is now an **in-container pre-flight probe**. Before it
-  starts the payload, `mxc-launch` sends ONE origin-form `GET /sandbox/probe` to
+  starts the payload, `saife-launch` sends ONE origin-form `GET /sandbox/probe` to
   `127.0.0.1:<proxy-port>`, carrying the `Basic` credential it derives from its
   **own** `HTTP_PROXY` — never from a command-line flag, because the wrapper's
   command line is part of the child's, where a token is visible to anything that

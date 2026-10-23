@@ -1,4 +1,4 @@
-# PRD: `sandbox` — Native Windows Process Sandbox for AI Agents
+# PRD: `saife` — Native Windows Process Sandbox for AI Agents
 
 > **STATUS NOTE (2026-07-24):** The AppContainer + Option E spike
 > (`../spike-appcontainer-option-e.md`) has **PASSED**. The gate test
@@ -20,7 +20,7 @@
 >   execution. Plus opt-in `persist`/`reuse` for caching. See
 >   `../critical-review.md` Option E. **Validated by S-6 and S-13.**
 > - **Profiles location (FR-5.1)**: confirmed user-global only
->   (`%USERPROFILE%\.sandbox\profiles\`); no repo-local search path
+>   (`%USERPROFILE%\.saife\profiles\`); no repo-local search path
 >   (CR-10 config-based sandbox escape).
 > - **WSL2 backend**: rejected — native Windows only.
 > The PRD body below will be updated to reflect these decisions once the
@@ -28,7 +28,7 @@
 
 ## Introduction / Overview
 
-`sandbox` is a native Windows process-sandboxing tool that lets a user run
+`saife` is a native Windows process-sandboxing tool that lets a user run
 **any** program — primarily AI coding agents (Claude Code, OpenCode, Codex,
 etc.) and the toolchains they spawn (gradle, python, npm, cargo, …) — with
 **only the resources the user has explicitly granted**. The goal is a native
@@ -57,13 +57,13 @@ that powers it. That works, but:
   running on Windows) — only Linux processes inside WSL.
 - Cross-filesystem access (`/mnt/c`) adds overhead and semantic gaps.
 
-`sandbox` targets the Windows kernel directly so it can sandbox **native Win32
+`saife` targets the Windows kernel directly so it can sandbox **native Win32
 and console processes** that real Windows developers actually run.
 
 ## Goals
 
 - **G1. Run any native Windows process in a sandbox** — console apps, GUI apps,
-  agent CLIs, build tools, interpreters — started by `sandbox run -- <cmd>`.
+  agent CLIs, build tools, interpreters — started by `saife run -- <cmd>`.
 - **G2. Irrevocable filesystem allow-list** — the sandboxed process and all
   children can only touch paths the user explicitly granted; rules cannot be
   loosened at runtime, only tightened.
@@ -80,8 +80,8 @@ and console processes** that real Windows developers actually run.
 - **G6. Domain-level network filtering** — default-deny outbound network with
   an explicit allow-list of domains; optional full block (`--block-net`); the
   sandboxed process is restricted to a localhost proxy port.
-- **G7. nono-compatible CLI surface** — `sandbox run`, `sandbox ps`,
-  `sandbox audit`, `sandbox rollback` (stub for MVP), so nono users feel at
+- **G7. nono-compatible CLI surface** — `saife run`, `saife ps`,
+  `saife audit`, `saife rollback` (stub for MVP), so nono users feel at
   home and migration is mechanical.
 - **G8. Composable JSON profiles** — local, git-versionable profile files
   ($HOME/.sandbox/profiles/*.json) with `$HOME` / `$CWD` variable expansion,
@@ -91,7 +91,7 @@ and console processes** that real Windows developers actually run.
 
 ### US-1: Run a coding agent safely
 > As a solo developer running Claude Code on my Windows machine, I want to
-> start it with `sandbox run --profile claude-code --allow-cwd -- claude` so
+> start it with `saife run --profile claude-code --allow-cwd -- claude` so
 > that it can read and write my project directory and reach the Anthropic API,
 > but it cannot read my `~/.ssh`, `~/.aws/credentials`, `.env` files in other
 > projects, or connect to anything but the LLM endpoint.
@@ -109,7 +109,7 @@ and console processes** that real Windows developers actually run.
 
 ### US-4: Verify what the agent did
 > As a developer, after a sandboxed session ends I want to run
-> `sandbox audit show <session-id>` to see every file the agent touched, every
+> `saife audit show <session-id>` to see every file the agent touched, every
 > network call it attempted (allowed and denied), and every child process it
 > spawned — and I want a Merkle-root proof that the log was not tampered with.
 
@@ -119,28 +119,28 @@ and console processes** that real Windows developers actually run.
 > scope, reviewed in PRs alongside the code.
 
 ### US-6: Reject unsigned instructions (future)
-> As a developer, I want `sandbox` to refuse to run if `AGENTS.md` /
+> As a developer, I want `saife` to refuse to run if `AGENTS.md` /
 > `CLAUDE.md` in the working directory is not signed by a trusted identity
 > (deferred to post-MVP — provenance feature).
 
 ## Functional Requirements
 
 ### FR-1 — Command Line Interface
-- **FR-1.1** Single executable `sandbox.exe` (Rust, single static binary,
+- **FR-1.1** Single executable `saife.exe` (Rust, single static binary,
   `x86_64-pc-windows-msvc`).
 - **FR-1.2** Subcommands:
-  - `sandbox run [--profile <name>] [--allow <path>...] [--allow-cwd]
+  - `saife run [--profile <name>] [--allow <path>...] [--allow-cwd]
     [--read-only <path>...] [--block-net | --allow-domain <d>...] |
     --network-profile <name>] [--audit] [--json] -- <command> [args...]`
-  - `sandbox ps [--all] [--json]` — list sessions (MVP: returns the single
+  - `saife ps [--all] [--json]` — list sessions (MVP: returns the single
     running session or empty; full ghost-session support is post-MVP).
-  - `sandbox audit show <session-id> [--json] [--filter <expr>]`
-  - `sandbox audit verify <session-id>` — recompute Merkle root, compare to
+  - `saife audit show <session-id> [--json] [--filter <expr>]`
+  - `saife audit verify <session-id>` — recompute Merkle root, compare to
     committed root, report OK/TAMPERED.
-  - `sandbox profile list` / `sandbox profile show <name>`
-  - `sandbox setup --check-only` — report AppContainer/WFP availability,
+  - `saife profile list` / `saife profile show <name>`
+  - `saife setup --check-only` — report AppContainer/WFP availability,
     Windows version, feature matrix.
-  - `sandbox --version`, `sandbox --help`.
+  - `saife --version`, `saife --help`.
 - **FR-1.3** `run` is the only command that spawns a sandboxed process; all
   other commands are read-only metadata / log accessors.
 
@@ -175,7 +175,7 @@ and console processes** that real Windows developers actually run.
   - access mode: `read`, `write`, `readwrite`, `execute`
   - variable expansion: `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`
 - **FR-2.4** **Irrevocability**: the RuleSet is committed before the process
-  executes its first instruction; no API path in `sandbox.exe` exposes a way to
+  executes its first instruction; no API path in `saife.exe` exposes a way to
   loosen it. (Tightening — adding more deny entries at runtime — is deferred to
   the Runtime Supervisor phase, post-MVP.)
 - **FR-2.5** **Inheritance**: child processes spawned by the sandboxed process
@@ -184,7 +184,7 @@ and console processes** that real Windows developers actually run.
   python -c "open(r'C:\Users\marku\.ssh\id_rsa').read()"` and asserts it fails.
   (Spike S-10 confirmed denial at depth 3: `cmd /c cmd /c cmd /c type …`.)
 - **FR-2.6** A **Job Object** is attached with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-  so that when the parent `sandbox.exe` exits, all descendants are killed — no
+  so that when the parent `saife.exe` exits, all descendants are killed — no
   orphaned sandboxed processes survive. `JOB_OBJECT_LIMIT_BREAKAWAY_OK` is
   **not** set, so children cannot escape the job. (Spike S-11 confirmed the
   kill-the-tree property; S-12 breakaway-blocking is deferred pending a
@@ -232,7 +232,7 @@ races, no cross-session poisoning.
   is withheld; the process cannot `connect()` to any host. Verified by test.
 - **FR-3.2** `--allow-domain` / `--network-profile` mode: a localhost HTTP(S)
   **reverse proxy** is started on a random `127.0.0.1` port inside
-  `sandbox.exe` (Tokio + `hyper`). The sandboxed process is configured
+  `saife.exe` (Tokio + `hyper`). The sandboxed process is configured
   (via environment variables `HTTP_PROXY` / `HTTPS_PROXY` and a session token
   `X-Sandbox-Token`) to route all outbound traffic through it.
 - **FR-3.3** The proxy resolves the target host and enforces the domain
@@ -257,7 +257,7 @@ races, no cross-session poisoning.
 - **FR-4.1** Every sandboxed session has a unique 64-bit session id
   (`YYYYMMDD-HHMMSS-NNNNN`).
 - **FR-4.2** The audit log is an append-only file at
-  `%LOCALAPPDATA%\sandbox\audit\<session-id>.ndjson` — one JSON object per
+  `%LOCALAPPDATA%\saife\audit\<session-id>.ndjson` — one JSON object per
   line, each line a Merkle leaf.
 - **FR-4.3** Recorded event types: `FILE_READ`, `FILE_WRITE`, `FILE_CREATE`,
   `FILE_DELETE`, `CONNECT`, `EXEC`, `POLICY_VIOLATION`.
@@ -275,17 +275,17 @@ races, no cross-session poisoning.
   **Merkle root** of the session.
 - **FR-4.5** At session end, the chain root is committed to a sidecar file
   `<session-id>.root` and signed with an Ed25519 keypair stored in
-  `%LOCALAPPDATA%\sandbox\signing-key` (generated on first run, protected by
-  DPAPI at rest). `sandbox audit verify` recomputes the root and checks the
+  `%LOCALAPPDATA%\saife\signing-key` (generated on first run, protected by
+  DPAPI at rest). `saife audit verify` recomputes the root and checks the
   signature.
-- **FR-4.6** `sandbox audit show <id>` prints a human-readable summary
+- **FR-4.6** `saife audit show <id>` prints a human-readable summary
   (session header, event count, deny count, changed-files list, root + sig
   status). `--json` emits the structured log for SIEM / jq pipelines.
 - **FR-4.7** `--filter` supports `op=`, `disposition=`, `path~=`,
   `host~=`, `ts>=`, `ts<=`.
 
 ### FR-5 — Profiles
-- **FR-5.1** Profile files live in `%USERPROFILE%\.sandbox\profiles\*.json`.
+- **FR-5.1** Profile files live in `%USERPROFILE%\.saife\profiles\*.json`.
   A `--profile <name>` resolves to `<name>.json`. A `--profile
   ./relative/path.json` or absolute path is also accepted.
 - **FR-5.2** Profile JSON schema (v1):
@@ -310,7 +310,7 @@ races, no cross-session poisoning.
 - **FR-5.3** `"extends"` merges: child keys override parent; `filesystem.allow`
   and `network.allow_domain` arrays concatenate (de-duplicated).
 - **FR-5.4** **Security groups** are built-in named path sets maintained by
-  `sandbox` itself, expanded at profile-load time:
+  `saife` itself, expanded at profile-load time:
   - `node_runtime` — `node.exe`, `npm`/`pnpm`/`yarn` bin dirs, `npm-cache`,
     `%APPDATA%\npm`, `%LOCALAPPDATA%\pnpm`
   - `python_runtime` — `python.exe` location, `%LOCALAPPDATA%\Programs\Python`,
@@ -321,13 +321,13 @@ races, no cross-session poisoning.
   profile; flag paths append to profile allow-lists.
 
 ### FR-6 — Setup & Compatibility
-- **FR-6.1** `sandbox setup --check-only` reports: Windows build number,
+- **FR-6.1** `saife setup --check-only` reports: Windows build number,
   AppContainer availability, RuleSet support (build ≥ 16299), WFP availability
   (for future network hardening), ETW provider permissions, signing-key
   presence. Exits non-zero if any MVP-required capability is missing.
 - **FR-6.2** Minimum supported OS: **Windows 10 1709 (build 16299)** — the
   first build with `CreateAppContainerProfile` + RuleSet capability rules.
-- **FR-6.3** `sandbox` is a single `sandbox.exe`, statically linked Rust,
+- **FR-6.3** `saife` is a single `saife.exe`, statically linked Rust,
   ~10–15 MB, no runtime dependencies, no installer required (drop in `PATH`).
 
 ## Non-Goals (Out of Scope for MVP)
@@ -343,7 +343,7 @@ races, no cross-session poisoning.
   Windows Credential Manager integration are post-MVP. The MVP blocks network
   by default and allows domains explicitly; the agent itself is responsible
   for its own auth headers.
-- **NG-4. No Ghost Sessions / detach-attach.** `sandbox ps` exists but
+- **NG-4. No Ghost Sessions / detach-attach.** `saife ps` exists but
   returns only the current session. Detached sessions via Job Object +
   named-pipe IPC are post-MVP.
 - **NG-5. No Runtime Supervisor / dynamic permission expansion.** No
@@ -375,7 +375,7 @@ same architectural choice nono makes on Linux when Landlock ABI < v4.
 
 ```
 +-----------------------+         +-------------------------+
-| sandboxed process     | HTTP(S) | sandbox.exe supervisor  |
+| sandboxed process     | HTTP(S) | saife.exe supervisor  |
 | (AppContainer token)  |-------->| (outside AppContainer)  |
 | only 127.0.0.1:PORT   |         | - domain allow-list      |
 | reachable             |         | - always-deny list       |
@@ -395,7 +395,7 @@ the AppContainer network cap denial.
 ### Irrevocability
 
 AppContainer profiles and the applied token are immutable for the lifetime of
-the process tree. `sandbox.exe` exposes no API to mutate them after
+the process tree. `saife.exe` exposes no API to mutate them after
 `CreateProcessW` returns. This matches nono's Landlock irrevocability
 guarantee. (Future Runtime Supervisor will use a **second, looser** AppContainer
 for the supervisor itself and IPC for the agent to request expansions — never
@@ -410,7 +410,7 @@ providers, scoped to the Job Object's process set. ETW requires no driver and
 runs unprivileged for the consumer session (admin only for some kernel
 providers; see Technical Considerations). Network events come from the proxy
 directly (no ETW needed). The hash-chain + Ed25519 root signature is computed
-in userspace by `sandbox.exe` as events stream in.
+in userspace by `saife.exe` as events stream in.
 
 ## Technical Considerations
 
@@ -466,7 +466,7 @@ sandbox/
 ### Test strategy
 
 - **Unit tests** in each module (Rust `#[test]`).
-- **Integration tests** in PowerShell: spawn `sandbox run --allow <tmp> -- cmd
+- **Integration tests** in PowerShell: spawn `saife run --allow <tmp> -- cmd
   /c echo hi`, assert exit code; spawn with a path outside allow-list, assert
   access denied; spawn with `--block-net`, assert `Test-NetConnection` fails;
   run audit verify, assert OK; tamper with the log, assert verify fails.
@@ -490,10 +490,10 @@ sandbox/
 - **SM-2.** A sandboxed `python -c "import urllib.request;
   urllib.request.urlopen('https://evil.example.com')"` is denied and logged
   when `--block-net` is set, in 100% of runs.
-- **SM-3.** `sandbox audit verify <id>` returns `OK` for an untampered log and
+- **SM-3.** `saife audit verify <id>` returns `OK` for an untampered log and
   `TAMPERED` for a log with one byte flipped, in 100% of runs.
 - **SM-4.** Sandbox init latency < 50 ms (p95) on a reference machine.
-- **SM-5.** `sandbox setup --check-only` runs to completion without admin
+- **SM-5.** `saife setup --check-only` runs to completion without admin
   rights on Windows 10 22H2 and reports a usable feature matrix.
 - **SM-6.** A child process spawned by the sandboxed process
   (`cmd /c cmd /c type …`) is still denied access to disallowed paths, in
@@ -517,9 +517,9 @@ sandbox/
    acceptable for MVP, or do we need a SOCKS5 proxy mode? Recommend: HTTP/HTTPS
    only for MVP, SOCKS5 post-MVP.
 4. **Profile registry** — MVP is local files only. Do we want to reserve the
-   `sandbox profile pull <url>` namespace now so a future registry fits
+   `saife profile pull <url>` namespace now so a future registry fits
    cleanly? Recommend: yes, reserve but no-op.
 5. **Signing key backup** — the Ed25519 audit-signing key is generated on first
-   run and DPAPI-protected. Should `sandbox setup` offer to export a
+   run and DPAPI-protected. Should `saife setup` offer to export a
    recovery-encrypted backup? Recommend: out of MVP scope, document as
    post-MVP.

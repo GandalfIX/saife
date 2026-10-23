@@ -9,7 +9,7 @@ As a solo developer running Claude Code (or OpenCode, Codex, …) on my Windows
 machine, I want to start it with
 
 ```
-sandbox run --profile claude-code --allow-cwd -- claude
+saife run --profile claude-code --allow-cwd -- claude
 ```
 
 so that the agent can read and write my project directory and reach the LLM
@@ -58,15 +58,15 @@ In scope:
 - **Per-session isolation**: two concurrent sandboxed processes in the same
   `$CWD` get distinct `$SID`-scoped install trees; neither can read the
   other's. See `docs/design/critical-review.md` "Per-session isolation".
-- **Opt-in caching via persist/reuse**: `sandbox persist <sid> [--as <name>]`
+- **Opt-in caching via persist/reuse**: `saife persist <sid> [--as <name>]`
   promotes a session's install tree to a named durable store;
-  `sandbox run --reuse <name> -- …` starts a new session aliased to that
+  `saife run --reuse <name> -- …` starts a new session aliased to that
   store (read-only by default; `--reuse-rw` for writable). Reused stores
-  live under `%USERPROFILE%\.sandbox\stores\<name>\` (outside any
+  live under `%USERPROFILE%\.saife\stores\<name>\` (outside any
   workspace). See `docs/design/critical-review.md` "Caching via persist / reuse".
 - `--allow`, `--read-only`, `--allow-cwd` CLI flags on top of profile.
 - Profile loading (`--profile <name>` resolves to
-  `%USERPROFILE%\.sandbox\profiles\<name>.json`) — full profile schema is
+  `%USERPROFILE%\.saife\profiles\<name>.json`) — full profile schema is
   US-5; here we only need the filesystem slice.
 
 Out of scope (covered by other US):
@@ -81,12 +81,12 @@ Out of scope (covered by other US):
 
 ### AC-1.1 — Happy path: agent starts and runs
 **Given** a valid profile `claude-code.json` exists in
-`%USERPROFILE%\.sandbox\profiles\` with `filesystem.allow: ["$CWD",
+`%USERPROFILE%\.saife\profiles\` with `filesystem.allow: ["$CWD",
 "$HOME/.claude"]`,
-**When** the user runs `sandbox run --profile claude-code --allow-cwd --
+**When** the user runs `saife run --profile claude-code --allow-cwd --
 claude` from `C:\Users\marku\projekte\myapp`,
 **Then** `claude` starts, prints its normal prompt, accepts input, and exits
-with the same exit code it would have without `sandbox`.
+with the same exit code it would have without `saife`.
 
 ### AC-1.2 — Disallowed file read is denied
 **Given** a sandboxed process started with an allow-list that does not include
@@ -116,34 +116,34 @@ succeed.
 
 ### AC-1.6 — Irrevocability
 **Given** a sandboxed process is running,
-**When** the process calls any `sandbox.exe` subcommand or any Win32 API that
+**When** the process calls any `saife.exe` subcommand or any Win32 API that
 would attempt to loosen the AppContainer RuleSet,
 **Then** no change to the running process's effective allow-list is possible.
-There is no code path in `sandbox.exe` that exposes a "loosen" operation.
+There is no code path in `saife.exe` that exposes a "loosen" operation.
 
 ### AC-1.7 — Variable expansion across users
 **Given** the same profile is used by two different users on the same machine,
-**When** each runs `sandbox run --profile X --allow-cwd -- cmd`,
+**When** each runs `saife run --profile X --allow-cwd -- cmd`,
 **Then** `$HOME` expands to each user's own profile directory and neither
 user can reach the other's files unless explicitly listed by absolute path.
 
 ### AC-1.8 — Job Object kills descendants on parent exit
 **Given** a sandboxed process has spawned child processes,
-**When** `sandbox.exe` (the supervisor) exits — normally or via `Ctrl-C`,
+**When** `saife.exe` (the supervisor) exits — normally or via `Ctrl-C`,
 **Then** all descendant processes are terminated by the Job Object
 (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) within 1 second, leaving no orphans.
 
 ### AC-1.9 — Setup check fails fast on unsupported OS
-**Given** `sandbox` is run on Windows 10 build 15063 (pre-1709),
-**When** the user runs `sandbox run -- …`,
+**Given** `saife` is run on Windows 10 build 15063 (pre-1709),
+**When** the user runs `saife run -- …`,
 **Then** the command exits non-zero with a clear error message: *"AppContainer
 RuleSet requires Windows 10 1709 (build 16299) or later. Detected build 15063."*
 before any process is spawned.
 
 ### AC-1.10 — Init latency budget
 **Given** a reference machine (SSD, 8 GB RAM, Win10 22H2),
-**When** `sandbox run` is invoked,
-**Then** the time from `sandbox.exe` entry to `CreateProcessW` returning is
+**When** `saife run` is invoked,
+**Then** the time from `saife.exe` entry to `CreateProcessW` returning is
 under 50 ms (p95) for a profile with ≤ 20 allow-list entries.
 
 ### AC-1.11 — Option E: agent can install a binary and run it
@@ -157,7 +157,7 @@ admin. The agent can extend its own toolset at runtime within the sanctioned
 dir.
 
 ### AC-1.12 — Per-session isolation: two sessions get distinct install trees
-**Given** two `sandbox run` invocations started concurrently in the same
+**Given** two `saife run` invocations started concurrently in the same
 `$CWD`, producing session ids `$SID_A` and `$SID_B`,
 **When** session A writes `.sandbox\$SID_A\bin\tool.exe`,
 **Then** (a) `$SID_A` ≠ `$SID_B`, (b) the file exists only under
@@ -177,31 +177,31 @@ PATH.
 **Given** a session has ended (normally or via `Ctrl-C`),
 **When** the user lists `$CWD\.sandbox\`,
 **Then** the `.sandbox\$SID\` tree is removed (default retention: wipe on
-session end) **unless** `sandbox persist <sid>` was called for that session,
+session end) **unless** `saife persist <sid>` was called for that session,
 in which case the tree has been moved to
-`%USERPROFILE%\.sandbox\stores\<name>\` and `.sandbox\$SID\` no longer exists
+`%USERPROFILE%\.saife\stores\<name>\` and `.sandbox\$SID\` no longer exists
 in the workspace.
 
 ### AC-1.15 — `persist` promotes a session tree to a named store
 **Given** a session `$SID` has installed tools in `.sandbox\$SID\bin\`,
-**When** the user runs `sandbox persist $SID --as my-tools`,
-**Then** the tree is moved to `%USERPROFILE%\.sandbox\stores\my-tools\` and
+**When** the user runs `saife persist $SID --as my-tools`,
+**Then** the tree is moved to `%USERPROFILE%\.saife\stores\my-tools\` and
 a manifest of file hashes is written at
-`%USERPROFILE%\.sandbox\stores\my-tools\.manifest.json`. The original
+`%USERPROFILE%\.saife\stores\my-tools\.manifest.json`. The original
 `.sandbox\$SID\` is removed.
 
 ### AC-1.16 — `--reuse` runs a new session against a persisted store (read-only)
 **Given** a persisted store `my-tools` exists,
-**When** the user runs `sandbox run --reuse my-tools --allow-cwd -- cmd`,
+**When** the user runs `saife run --reuse my-tools --allow-cwd -- cmd`,
 **Then** the new session's install dirs alias to
-`%USERPROFILE%\.sandbox\stores\my-tools\bin\` etc.; the sandboxed process
+`%USERPROFILE%\.saife\stores\my-tools\bin\` etc.; the sandboxed process
 can read and execute tools from the store, but **cannot write to it** (writes
 return `Access is denied`). The audit log records that the session reused
 `my-tools`.
 
 ### AC-1.17 — `--reuse-rw` makes the store writable (single-writer)
 **Given** a persisted store `my-tools` exists,
-**When** the user runs `sandbox run --reuse-rw my-tools --allow-cwd -- cmd`,
+**When** the user runs `saife run --reuse-rw my-tools --allow-cwd -- cmd`,
 **Then** the session can write new tools into the store (incremental
 accumulation). If a second `--reuse-rw` against the same store is started
 concurrently, it is denied with a clear error: *"store 'my-tools' is in
@@ -211,10 +211,10 @@ read-write use by session $SID_X; wait for it to finish or use --reuse
 
 ### AC-1.18 — `--reuse` verifies the store manifest
 **Given** a persisted store `my-tools` with a `.manifest.json`,
-**When** the user runs `sandbox run --reuse my-tools -- …`,
-**Then** `sandbox` recomputes the hash of every file in the store and
+**When** the user runs `saife run --reuse my-tools -- …`,
+**Then** `saife` recomputes the hash of every file in the store and
 compares to the manifest. If any file has been tampered with externally,
-`sandbox` exits non-zero with: *"store 'my-tools' manifest mismatch: file
+`saife` exits non-zero with: *"store 'my-tools' manifest mismatch: file
 'bin/jq.exe' hash differs from manifest"* — refusing to run the session
 with a corrupted store.
 
@@ -222,7 +222,7 @@ with a corrupted store.
 
 ### What we match
 
-- **`run` subcommand shape**: `sandbox run --profile X --allow-cwd -- <cmd>`
+- **`run` subcommand shape**: `saife run --profile X --allow-cwd -- <cmd>`
   mirrors `nono run --profile X --allow-cwd -- <cmd>`. The `--` separator,
   `--profile`, `--allow`, `--allow-cwd`, `--read-only` flags have identical
   semantics.
@@ -318,11 +318,11 @@ TODO: exact Win32 calls, data structures, error codes, test commands.
 ### KI-1.1 — `cmd /c dir` fails with "Access is denied" under `--allow-cwd`
 
 **Status:** Resolved. Root cause confirmed by direct Win32 probing; fix
-shipped as `sandbox setup --grant-drive-root` (one-time, elevated).
+shipped as `saife setup --grant-drive-root` (one-time, elevated).
 
 **Reproduce:**
 ```powershell
-sandbox run --allow-cwd -- cmd /c dir
+saife run --allow-cwd -- cmd /c dir
 # -> "Zugriff verweigert" (Access is denied), exit 1
 ```
 
@@ -364,9 +364,9 @@ unprivileged. `SeChangeNotifyPrivilege` (bypass traverse checking) is already
 enabled in the child token, so ancestor traversal is **not** the issue — the
 original KI-1.1 hypothesis ("ancestor traversal") was incomplete.
 
-**Fix — `sandbox setup --grant-drive-root` (one-time, elevated):**
+**Fix — `saife setup --grant-drive-root` (one-time, elevated):**
 
-`sandbox setup --grant-drive-root` (run from an Administrator shell) grants
+`saife setup --grant-drive-root` (run from an Administrator shell) grants
 `S-1-15-2-2` (All RESTRICTED APPLICATION PACKAGES) `FILE_READ_ATTRIBUTES` on
 every fixed drive root (`C:\`, `D:\`, …). `FILE_READ_ATTRIBUTES` is the
 narrowest mask that satisfies `GetVolumeInformationW` — it does **not** include
@@ -376,7 +376,7 @@ already do). The grant uses `S-1-15-2-2` (not the per-session SID) so it is
 applied once and applies to every future session; the per-session SID would
 require re-granting on every `run` and each grant needs elevation anyway.
 
-`sandbox setup --check-only` reports the grant status:
+`saife setup --check-only` reports the grant status:
 
 ```
 Drive-root grant (KI-1.1)  : present on C:\
@@ -427,11 +427,11 @@ investigation of cmd + PowerShell builtins under `--allow-cwd`).
 
 **Reproduce:**
 ```powershell
-sandbox run --allow-cwd -- powershell -NoProfile -Command "Get-Location"
+saife run --allow-cwd -- powershell -NoProfile -Command "Get-Location"
 # -> Path: C:\   (expected: the real cwd)
-sandbox run --allow-cwd -- powershell -NoProfile -Command "Get-ChildItem | Select-Object Name"
+saife run --allow-cwd -- powershell -NoProfile -Command "Get-ChildItem | Select-Object Name"
 # -> lists C:\ contents (e.g. WINDOWS.~BT, XboxGames) — NOT the cwd
-sandbox run --allow-cwd -- powershell -NoProfile -Command "Get-Content marker.txt"
+saife run --allow-cwd -- powershell -NoProfile -Command "Get-Content marker.txt"
 # -> PathNotFound C:\marker.txt   (file exists in cwd; resolved against C:\)
 ```
 
@@ -482,10 +482,10 @@ explicit paths are unaffected.
 
 **Reproduce:**
 ```powershell
-sandbox run --allow-cwd -- cmd /c "echo x > file.txt"          # OK (write)
-sandbox run --allow-cwd -- cmd /c "del file.txt"               # Access is denied
-sandbox run --allow-cwd -- cmd /c "ren file.txt other.txt"     # Access is denied
-sandbox run --allow-cwd -- cmd /c "rmdir sub"                  # Access is denied
+saife run --allow-cwd -- cmd /c "echo x > file.txt"          # OK (write)
+saife run --allow-cwd -- cmd /c "del file.txt"               # Access is denied
+saife run --allow-cwd -- cmd /c "ren file.txt other.txt"     # Access is denied
+saife run --allow-cwd -- cmd /c "rmdir sub"                  # Access is denied
 ```
 
 **Root cause:** the cwd is granted `RWX = FILE_GENERIC_READ | FILE_GENERIC_WRITE
@@ -516,9 +516,9 @@ on user-owned files — needs verification).
 
 **Reproduce:**
 ```powershell
-sandbox run --allow-cwd -- cmd /c "fc /b marker.txt marker.txt"
+saife run --allow-cwd -- cmd /c "fc /b marker.txt marker.txt"
 # -> FC: Kann MARKER.TXT nicht öffnen - Datei oder Ordner nicht vorhanden (exit 2)
-sandbox run --allow-cwd -- cmd /c "where cmd"
+saife run --allow-cwd -- cmd /c "where cmd"
 # -> INFORMATION: Es konnten keine Dateien … gefunden werden (exit 1)
 ```
 
@@ -557,7 +557,7 @@ equivalents (`Get-Command`). Workaround: `Get-Command cmd` in PowerShell, or
 
 **Reproduce:**
 ```powershell
-sandbox run --allow-cwd -- powershell -NoProfile -Command "Get-Acl marker.txt"
+saife run --allow-cwd -- powershell -NoProfile -Command "Get-Acl marker.txt"
 # -> CommandNotFoundException: Microsoft.PowerShell.Security module could not be autoloaded
 ```
 

@@ -1,10 +1,10 @@
 # Impact Analysis: Windows CLI Sandbox Work Breakdown (WBD) on the Current Plan and Implementation
 
 > **Status:** Analysis, 2026-10-04.
-> **Input:** `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` (referred to below as
+> **Input:** `input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md` (referred to below as
 > "the WBD" — 2,337 lines, sections 0–17, tickets D-01…Q-07, releases R0–R4,
 > gates G0/G0S/G1–G5).
-> **Scope of this document:** What the WBD changes for (a) the current `sandbox`
+> **Scope of this document:** What the WBD changes for (a) the current `saife`
 > product plan (PRD, specs, in-flight plans), (b) the current state of
 > implementation, and (c) our process — most concretely the binding amendment
 > that **all host-dependent testing moves into a disposable VM**, with a new
@@ -58,7 +58,7 @@
 | DACL hygiene | Crash-safe journal + teardown restore + orphan recovery just landed (`dacl_journal.rs`, commits `e794e7b`, `9970ef4`); `tests/cleanup-session-aces.ps1` rollback script exists |
 | Network | `--block-net` fully working unprivileged (capability SID withheld). `--allow-domain`: proxy + matcher + token implemented, but loopback gate is admin-only (`NetworkIsolationSetAppContainerConfig`), so the flag currently **downgrades to block-net semantics with a warning**. ADR-0001 hardening in flight in a worktree (mid Phase 3; capability-SID `privateNetworkClientServer` work, upstream dialer, learned approvals, prompt dialog; resumes at task 3.4) |
 | Audit | Proxy `CONNECT` events, hash chain, Ed25519 signing, `audit show/verify`, `--filter` implemented. Kernel file/exec capture (PRD FR-4.3) **not** implemented (Tier-3 hard part) |
-| Profiles | JSON, user-global only (`%USERPROFILE%\.sandbox\profiles\`), `extends` merge, security groups; workspace files cannot widen grants (matches WBD stance) |
+| Profiles | JSON, user-global only (`%USERPROFILE%\.saife\profiles\`), `extends` merge, security groups; workspace files cannot widen grants (matches WBD stance) |
 | Doctor | `setup --check-only` (build, AppContainer, Job, network report) |
 | MXC-derived hardening plan | Tasks 0, 3A, 3B done. Task 1 (ingress warning) and Task 2 (`--lpac`) open |
 | Tests | `cargo test` unit suite; `tests/run-tests.ps1` scenarios S-1…S-74 run **on the dev host** and mutate ACLs/profiles; documented host-mutation bugs (SetEntriesInAclW hang; python store alias) |
@@ -145,7 +145,7 @@ construction (VM deletion / checkpoint revert).
 
 ### A2 — Documentation split
 
-- `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` stays **unmodified** as external
+- `input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md` stays **unmodified** as external
   input (repo convention: inputs are read-only).
 - The WBD is treated as the authoritative plan **for the new product**, subject
   to the amendments recorded here (currently only A1). Any further local

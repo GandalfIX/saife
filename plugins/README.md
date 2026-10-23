@@ -6,7 +6,7 @@ supervisor's side, and is reachable from inside only through the session proxy
 at `http://<mount>.sandbox.invalid/`.
 
 This directory holds **samples**. The copy that actually runs is the installed
-one — `%USERPROFILE%\.sandbox\plugins\<name>\` — or a directory the operator
+one — `%USERPROFILE%\.saife\plugins\<name>\` — or a directory the operator
 names explicitly with `--plugin-dir <PATH>`.
 
 ## Layout
@@ -24,7 +24,7 @@ directory, so `"command": ["python", "sidecar.py"]` is self-contained.
 Discovery order for a name:
 
 1. every `--plugin-dir <PATH>` on the command line, in the order given;
-2. `%USERPROFILE%\.sandbox\plugins\`.
+2. `%USERPROFILE%\.saife\plugins\`.
 
 The **first** root that holds `<name>/plugin.json` wins. A later root that also
 defines that name is *shadowed*, never merged. There is no deduplication by
@@ -32,12 +32,12 @@ content and no fallback: a broken manifest in the winning root is a refusal, not
 an invitation to try the next one.
 
 **A workspace `.sandbox/plugins` directory is NOT discovered automatically.**
-That is deliberate: cloning a repository and running `sandbox run` in it must
+That is deliberate: cloning a repository and running `saife run` in it must
 never execute host-side code the repository shipped. Repo-local plugins are
 usable only when the operator explicitly names the directory:
 
 ```
-sandbox run --plugin-dir .\.sandbox\plugins --plugin tngtech -- <workload>
+saife run --plugin-dir .\.saife\plugins --plugin tngtech -- <workload>
 ```
 
 ## Manifest fields
@@ -89,7 +89,7 @@ the internet, which is the entire point (the container cannot). It is therefore 
   request. A later allowlist enforcement reads `operations`; today the sample
   sidecar enforces its own path list.
 * A plugin's stdout/stderr go to
-  `%LOCALAPPDATA%\sandbox\sidecar-logs\<sid>-<mount>.log`. No secret value may
+  `%LOCALAPPDATA%\saife\sidecar-logs\<sid>-<mount>.log`. No secret value may
   be written there (the POC passes none).
 
 ## Agent skills: how an agent learns a sidecar exists
@@ -151,8 +151,8 @@ It exists to prove the transport before any secret handling does.
 ```
 mkdir -p "$USERPROFILE/.sandbox/plugins"
 cp -r plugins/tngtech "$USERPROFILE/.sandbox/plugins/"
-cargo build --bin sandbox --bin mxc-launch
-target/debug/sandbox.exe run --no-prompt --plugin tngtech -- cmd /c \
+cargo build --bin saife --bin saife-launch
+target/debug/saife.exe run --no-prompt --plugin tngtech -- cmd /c \
   "curl.exe -s -o NUL -w facade=%{http_code} http://tngtech.sandbox.invalid/ & curl.exe -s -o NUL -w direct=%{http_connect} https://www.tngtech.com/"
 ```
 
@@ -166,5 +166,5 @@ entry that admits the host.
 
 No secret resolution (`secrets` is parsed, never read), no non-GET methods, no
 per-operation enforcement by the supervisor, no AppContainer wiring (plugins are
-`--backend mxc` only), no SSE size/keep-alive policy, no `sandbox plugin list`,
+`--backend mxc` only), no SSE size/keep-alive policy, no `saife plugin list`,
 and no redaction of sidecar log output (there is nothing to redact yet).

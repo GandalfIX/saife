@@ -1,6 +1,6 @@
 # User guide
 
-How to run things under `sandbox`, and what to do when it says no.
+How to run things under `saife`, and what to do when it says no.
 
 For building the binary see `README.md`; for changing the code see
 `docs/DEVELOPERS.md`. Every example below was run on this repository's release
@@ -20,21 +20,21 @@ A run gets **only what you grant it**:
   no proxy at all; `--allow-domain` and profiles open specific hosts;
   `--block-net` refuses everything.
 - **Everything is audited**: each run writes a hash-chained, signed log you can
-  inspect afterwards (`sandbox audit show|verify`).
+  inspect afterwards (`saife audit show|verify`).
 
 The program you run is unchanged; it just cannot reach anything you did not
 grant.
 
 ```powershell
-sandbox run --allow-cwd -- cmd /c echo hello
+saife run --allow-cwd -- cmd /c echo hello
 ```
 
 ```text
 hello
-[sandbox] mxc: guardrail 1 proof probes=0 accepted=0 tunnels=0 unauthenticated=0
+[saife] mxc: guardrail 1 proof probes=0 accepted=0 tunnels=0 unauthenticated=0
 ```
 
-The `[sandbox] mxc: guardrail 1 proof ...` line is the supervisor telling you
+The `[saife] mxc: guardrail 1 proof ...` line is the supervisor telling you
 what it proved about this run — see §6.
 
 ---
@@ -45,7 +45,7 @@ what it proved about this run — see §6.
 
 ```powershell
 cd C:\work\myproject
-sandbox run --allow-cwd -- cmd /c build.bat
+saife run --allow-cwd -- cmd /c build.bat
 ```
 
 ### 2.2 Build tools (cargo, npm, …)
@@ -54,7 +54,7 @@ The toolchain lives **outside** the workspace, and every path outside the
 workspace is denied by default. Grant it read-only:
 
 ```powershell
-sandbox run --allow-cwd `
+saife run --allow-cwd `
   --read-only C:\Users\<you>\.cargo `
   --read-only C:\Users\<you>\.rustup `
   -- cmd /c C:\Users\<you>\.cargo\bin\cargo.exe build
@@ -64,7 +64,7 @@ Verified here:
 
 ```text
 cargo 1.98.1 (797e8a9bc 2026-08-05)
-[sandbox] mxc: guardrail 1 proof probes=0 accepted=0 tunnels=0 unauthenticated=0
+[saife] mxc: guardrail 1 proof probes=0 accepted=0 tunnels=0 unauthenticated=0
 ```
 
 > **If you see `failed to start 'cargo': ... file not found (0x80070002)`**, the
@@ -76,7 +76,7 @@ cargo 1.98.1 (797e8a9bc 2026-08-05)
 Same rule: grant the interpreter's directory and call it by absolute path.
 
 ```powershell
-sandbox run --allow-cwd --read-only C:\Python312 -- C:\Python312\python.exe .\script.py
+saife run --allow-cwd --read-only C:\Python312 -- C:\Python312\python.exe .\script.py
 ```
 
 ### 2.4 PowerShell one-liners
@@ -86,7 +86,7 @@ on the `mxc` backend (`InitializeDefaultDrives ... FileSystem provider`); it com
 from the container's restricted filesystem view, not from your command.
 
 ```powershell
-sandbox run --allow-cwd -- powershell -NoProfile -Command "Get-ChildItem | Measure-Object"
+saife run --allow-cwd -- powershell -NoProfile -Command "Get-ChildItem | Measure-Object"
 ```
 
 ### 2.5 An AI coding agent
@@ -94,7 +94,7 @@ sandbox run --allow-cwd -- powershell -NoProfile -Command "Get-ChildItem | Measu
 Give the agent its project and the hosts it may talk to:
 
 ```powershell
-sandbox run --allow-cwd `
+saife run --allow-cwd `
   --allow-domain api.anthropic.com `
   --allow-domain github.com `
   --allow-domain '*.githubusercontent.com' `
@@ -104,12 +104,12 @@ sandbox run --allow-cwd `
 An agent that only needs local work gets no network at all:
 
 ```powershell
-sandbox run --allow-cwd --block-net -- opencode
+saife run --allow-cwd --block-net -- opencode
 ```
 
 Two hard limits worth knowing before you put an agent behind this:
 
-- **One run per supervisor process.** A second concurrent `sandbox run` on the
+- **One run per supervisor process.** A second concurrent `saife run` on the
   same listener is refused; start a second supervisor instead.
 - **GUI / system-proxy applications** (WinINet, PowerShell 5.1, .NET Framework)
   cannot use the proxy: they reach it and never authenticate, so the session is
@@ -131,10 +131,10 @@ Two hard limits worth knowing before you put an agent behind this:
 Read-only grants are enforced by the container's policy, not by hope:
 
 ```powershell
-sandbox run --allow-cwd --read-only C:\data -- powershell -NoProfile -Command "Get-Content C:\data\notes.txt"
+saife run --allow-cwd --read-only C:\data -- powershell -NoProfile -Command "Get-Content C:\data\notes.txt"
 # secret-data
 
-sandbox run --allow-cwd --read-only C:\data -- powershell -NoProfile -Command "Set-Content C:\data\new.txt x"
+saife run --allow-cwd --read-only C:\data -- powershell -NoProfile -Command "Set-Content C:\data\new.txt x"
 # UnauthorizedAccessException: Access to the path 'C:\data\new.txt' is denied.
 ```
 
@@ -144,7 +144,7 @@ opencode, for instance, writes `~/.local/share/opencode`, `~/.cache/opencode`,
 `~/.config/opencode` and `~/.local/state/opencode`:
 
 ```powershell
-sandbox run --profile opencode --allow $HOME\.local\share\opencode `
+saife run --profile opencode --allow $HOME\.local\share\opencode `
             --allow $HOME\.cache\opencode --allow $HOME\.config\opencode `
             --allow $HOME\.local\state\opencode -- opencode
 ```
@@ -168,7 +168,7 @@ outside the sandbox:
 
 ```powershell
 # opencode, verified 2026-10-22: TUI renders, keys work, egress authenticated
-sandbox run --profile opencode --allow-cwd -- opencode
+saife run --profile opencode --allow-cwd -- opencode
 ```
 
 Start it **at the project's git root** — the directory `git rev-parse
@@ -182,7 +182,7 @@ is granted read-only — measured all three ways with the same binary and profil
 
 ```powershell
 # from a subdirectory: let it see the repository root, read-only
-sandbox run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
+saife run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
 ```
 
 The shipped profile allow-lists only the **provider** (`*.trustedtokens.eu`).
@@ -195,7 +195,7 @@ refusing the provider when the provider was never contacted. For a headless or
 unattended run, allow the catalogue explicitly:
 
 ```powershell
-sandbox run --profile opencode --allow-cwd --allow-domain models.opencode.ai `
+saife run --profile opencode --allow-cwd --allow-domain models.opencode.ai `
   --allow-domain models.dev -- opencode
 ```
 
@@ -251,7 +251,7 @@ nothing changes for existing callers.
 ### 4.1 Nothing at all
 
 ```powershell
-sandbox run --allow-cwd --block-net -- cmd /c echo offline
+saife run --allow-cwd --block-net -- cmd /c echo offline
 ```
 
 No proxy is started and every `connect()` is kernel-denied.
@@ -259,13 +259,13 @@ No proxy is started and every `connect()` is kernel-denied.
 ### 4.2 Allowing hosts
 
 ```powershell
-sandbox run --allow-cwd --allow-domain api.anthropic.com --no-prompt -- `
+saife run --allow-cwd --allow-domain api.anthropic.com --no-prompt -- `
   cmd /c C:\Windows\System32\curl.exe -sS --ssl-no-revoke -o NUL -w "http_code=%{http_code}" https://api.anthropic.com/
 ```
 
 ```text
 http_code=404
-[sandbox] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=1 unauthenticated=0
+[saife] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=1 unauthenticated=0
 ```
 
 `404` is the origin answering — the sandbox admitted the tunnel (`tunnels=1`).
@@ -275,7 +275,7 @@ origin's status.**
 ### 4.3 Denying wins
 
 ```powershell
-sandbox run --allow-cwd --allow-domain '*.anthropic.com' --deny-domain api.anthropic.com --no-prompt -- `
+saife run --allow-cwd --allow-domain '*.anthropic.com' --deny-domain api.anthropic.com --no-prompt -- `
   cmd /c C:\Windows\System32\curl.exe -sS -o NUL https://api.anthropic.com/
 ```
 
@@ -304,7 +304,7 @@ For a host that is neither allowed nor denied, the interactive prompt asks:
 | Explain more | the agent's declared intent is shown (D-4), then the prompt returns |
 
 Decisions can be remembered permanently (`learned` store), and shown again with
-`sandbox learned list`.
+`saife learned list`.
 
 `--no-prompt` disables the dialog entirely: unlisted hosts are denied (or
 allowed, per the profile's `onUnavailable`). In a headless context — CI, a
@@ -316,7 +316,7 @@ immediately instead of waiting out the prompt budget per host.
 
 ## 5. Profiles
 
-A profile is a JSON file in `%USERPROFILE%\.sandbox\profiles\<name>.json`:
+A profile is a JSON file in `%USERPROFILE%\.saife\profiles\<name>.json`:
 
 ```json
 {
@@ -340,13 +340,13 @@ Paths may use `$CWD`, `$HOME`, `$USERPROFILE`, `$TEMP`, `$LOCALAPPDATA`,
 `$APPDATA` and `$SID`; anything else (including `%VAR%`) is taken literally, and a
 path that is neither absolute nor expandable is resolved against the working
 directory — which is how a typo turns into a grant nobody intended, so it is
-worth checking with `sandbox audit show <sid> --filter 'op=SESSION_START'`.
+worth checking with `saife audit show <sid> --filter 'op=SESSION_START'`.
 
 ```powershell
-sandbox profile list
-sandbox profile show demo                # the file as written
-sandbox profile show demo --expanded     # extends flattened, variables expanded
-sandbox run --profile demo --allow-cwd -- cmd /c C:\Users\you\.cargo\bin\cargo.exe --version
+saife profile list
+saife profile show demo                # the file as written
+saife profile show demo --expanded     # extends flattened, variables expanded
+saife run --profile demo --allow-cwd -- cmd /c C:\Users\you\.cargo\bin\cargo.exe --version
 ```
 
 ### 5.0 Composing profiles
@@ -390,7 +390,7 @@ path and host, and the verified status of each:
 | `jvm.json` | JDK, Gradle, Maven (`~/.gradle`, `~/.m2`) | `javac`/`java` yes; **Gradle no** — its daemon needs loopback |
 | `opencode.json` | the opencode TUI and its state directories | TUI renders, keys work, model round-trip |
 
-Copy one to `%USERPROFILE%\.sandbox\profiles\` and use `--profile <name>`. Two
+Copy one to `%USERPROFILE%\.saife\profiles\` and use `--profile <name>`. Two
 Windows facts they document: batch shims (`npm`, `gradle`, `mvn`, `npx`) need
 `cmd /c "npm ..."`, because the launcher does not apply `PATHEXT`; and Gradle's
 daemon cannot connect over loopback under this backend, so Gradle builds belong
@@ -409,7 +409,7 @@ the container.
 A plugin is a directory with a manifest:
 
 ```
-%USERPROFILE%\.sandbox\plugins\<name>\plugin.json
+%USERPROFILE%\.saife\plugins\<name>\plugin.json
 ```
 
 `--plugin <name>` loads one (repeatable). `--plugin-dir <PATH>` adds another
@@ -417,11 +417,11 @@ root, searched **before** the global one, in the order given (repeatable). The
 first root that holds the name wins; a later copy is shadowed, never merged.
 
 **Nothing inside a workspace is discovered automatically.** A cloned repository
-must not gain host-side code execution from the act of running `sandbox run` in
+must not gain host-side code execution from the act of running `saife run` in
 it, so repo-local plugins are usable only when you name the directory:
 
 ```powershell
-sandbox run --plugin-dir .\.sandbox\plugins --plugin tngtech -- <workload>
+saife run --plugin-dir .\.saife\plugins --plugin tngtech -- <workload>
 ```
 
 Plugins are wired on `--backend mxc` (the default) only, and they need the
@@ -434,10 +434,10 @@ session proxy: `--block-net` refuses `--plugin`.
 proves the transport end to end before any secret handling exists.
 
 ```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.sandbox\plugins" | Out-Null
-Copy-Item -Recurse -Force plugins\tngtech "$env:USERPROFILE\.sandbox\plugins\"
-cargo build --bin sandbox --bin mxc-launch
-target\debug\sandbox.exe run --no-prompt --plugin tngtech -- cmd /c "curl.exe -s -o NUL -w facade=%{http_code} http://tngtech.sandbox.invalid/ & curl.exe -s -o NUL -w direct=%{http_connect} https://www.tngtech.com/"
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.saife\plugins" | Out-Null
+Copy-Item -Recurse -Force plugins\tngtech "$env:USERPROFILE\.saife\plugins\"
+cargo build --bin saife --bin saife-launch
+target\debug\saife.exe run --no-prompt --plugin tngtech -- cmd /c "curl.exe -s -o NUL -w facade=%{http_code} http://tngtech.sandbox.invalid/ & curl.exe -s -o NUL -w direct=%{http_connect} https://www.tngtech.com/"
 ```
 
 Expected, in one session: `facade=200` (the homepage came through the facade) and
@@ -447,7 +447,7 @@ was granted). The session's proof line agrees: `tunnels=0`.
 `--no-prompt` is there to keep the deny half deterministic. An unattended run has
 no dialog to answer, and a prompt that IS answered with "allow and remember this
 host" writes a learned entry that legitimately admits it — check
-`sandbox learned list`, and `sandbox learned clear` resets it.
+`saife learned list`, and `saife learned clear` resets it.
 
 Requirements: working internet, a `python` on `PATH` (resolved as
 `python.exe`; `.cmd`/`.bat` entry points are refused), and the plugin installed
@@ -456,7 +456,7 @@ under `%USERPROFILE%` — the sidecar runs on the host, not in the container.
 A plugin that cannot be loaded, spawned or made healthy **refuses the session**
 with exit code **5** and one line naming the plugin and the reason, e.g.
 `sidecar_unhealthy{tngtech}: …` or
-`plugin_not_found: tngtech (searched: --plugin-dir C:\x\plugins, %USERPROFILE%\.sandbox\plugins)`.
+`plugin_not_found: tngtech (searched: --plugin-dir C:\x\plugins, %USERPROFILE%\.saife\plugins)`.
 There is no "run without it" fallback. Sidecars are killed on every exit path,
 before the proxy that routes to them goes away.
 
@@ -466,11 +466,11 @@ and `CONNECT <mount>.sandbox.invalid:443` is `403 facade_requires_http` so TLS
 cannot be tunnelled past the check. Every facade request writes one audit leaf:
 
 ```powershell
-sandbox audit show <sid> --filter 'op=FACADE'
+saife audit show <sid> --filter 'op=FACADE'
 ```
 
 Not in this POC: secret resolution, non-GET methods, per-operation enforcement by
-the supervisor, AppContainer wiring, and `sandbox plugin list`.
+the supervisor, AppContainer wiring, and `saife plugin list`.
 
 ---
 
@@ -479,7 +479,7 @@ the supervisor, AppContainer wiring, and `sandbox plugin list`.
 Every successful session prints, on stderr:
 
 ```text
-[sandbox] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=1 unauthenticated=0
+[saife] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=1 unauthenticated=0
 ```
 
 | Field | Meaning |
@@ -498,14 +498,14 @@ remedy: `--backend appcontainer`).
 
 ## 8. Audit
 
-Every run writes `%LOCALAPPDATA%\sandbox\audit\<sid>.ndjson` plus a signed root.
+Every run writes `%LOCALAPPDATA%\saife\audit\<sid>.ndjson` plus a signed root.
 
 ```powershell
-sandbox run --allow-cwd --print-sid -- cmd /c echo audit-demo     # prints the session id
-sandbox run --allow-cwd --sid 20261022-205214-43984 -- cmd /c echo audit-demo
-sandbox audit show 20261022-205214-43984
-sandbox audit show 20261022-205214-43984 --json --filter 'disposition=deny'
-sandbox audit verify 20261022-205214-43984
+saife run --allow-cwd --print-sid -- cmd /c echo audit-demo     # prints the session id
+saife run --allow-cwd --sid 20261022-205214-43984 -- cmd /c echo audit-demo
+saife audit show 20261022-205214-43984
+saife audit show 20261022-205214-43984 --json --filter 'disposition=deny'
+saife audit verify 20261022-205214-43984
 ```
 
 `show` gives a per-session summary and the events by type; `--filter` takes
@@ -525,8 +525,8 @@ instead of from the profile on disk (which is not necessarily what the launch
 used):
 
 ```powershell
-sandbox audit show 20261022-224340-89068 --json --filter 'fs_deny~=.ssh'
-sandbox audit show 20261022-224340-89068 --json --filter 'fs_readwrite~=opencode'
+saife audit show 20261022-224340-89068 --json --filter 'fs_deny~=.ssh'
+saife audit show 20261022-224340-89068 --json --filter 'fs_readwrite~=opencode'
 ```
 
 * `fs_workspace` — the working directory the session ran in.
@@ -549,9 +549,9 @@ a `SESSION_REFUSED` leaf naming the reason.
 Learned (permanent) prompt decisions:
 
 ```powershell
-sandbox learned list
-sandbox learned revoke api.example.com
-sandbox learned clear
+saife learned list
+saife learned revoke api.example.com
+saife learned clear
 ```
 
 ---

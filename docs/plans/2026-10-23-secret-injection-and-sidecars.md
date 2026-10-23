@@ -3,7 +3,7 @@
 **Goal:** let a sandboxed workload use credentialed services (Jira, Confluence, later Slack/IMAP/GitHub) **without the secret ever entering the container**, by giving each capability a host-side sidecar process that the session reaches through the proxy on a reserved mount name.
 
 **Architecture (one paragraph):** a *plugin* — a directory with a manifest, installed under
-`%USERPROFILE%\.sandbox\plugins\<name>\` — declares a sidecar command, a mount name, the secret names it needs, and a health probe. The supervisor starts the sidecar **outside** the container, in its own job object, with the secrets resolved from the Windows credential store and placed only in that process's environment. Inside the container the workload addresses the capability as plain HTTP to `<mount>.sandbox.invalid`; the session proxy recognises the reserved suffix, authenticates the request with the session token, and relays it to the sidecar on host loopback. The workload holds no credential, the audit records which alias was used and which upstream was touched, and the sidecar — not the worker — decides which upstream operations are allowlisted.
+`%USERPROFILE%\.saife\plugins\<name>\` — declares a sidecar command, a mount name, the secret names it needs, and a health probe. The supervisor starts the sidecar **outside** the container, in its own job object, with the secrets resolved from the Windows credential store and placed only in that process's environment. Inside the container the workload addresses the capability as plain HTTP to `<mount>.sandbox.invalid`; the session proxy recognises the reserved suffix, authenticates the request with the session token, and relays it to the sidecar on host loopback. The workload holds no credential, the audit records which alias was used and which upstream was touched, and the sidecar — not the worker — decides which upstream operations are allowlisted.
 
 **Tech stack:** Rust (existing crate, bin-only, no new async runtime), `windows` crate for Credential Manager + DPAPI, `mxc-sdk`/proxy as shipped, XAML-free plain-HTTP facade over the existing absolute-form forward path (`src/net/proxy.rs:3033`).
 
@@ -37,7 +37,7 @@ Requests to `http://<mount>.sandbox.invalid[:port]/…` are the only way into a 
 The workload is untrusted; anything the sidecar exposes, the workload can call. Therefore sidecars expose **explicit operations** (`GET /jira/issue/:key`, `GET /jira/search?jql=`), never a transparent pass-through proxy, and every request is checked against an allowlist of `(method, path pattern)` before it reaches the upstream. The manifest cannot widen this at runtime. This is the confused-deputy boundary and the plan's central security rule.
 
 **D-4 — Secrets live in Windows Credential Manager, keyed `sandbox/<skill>/<NAME>`.**
-Written once by `sandbox secret set`, read by the supervisor at launch, injected only into the sidecar's environment, zeroised after spawn where the platform allows. The profile and the manifest reference **names**, never values. A `Secret`/`SecretValue` type (like `RunToken`) redacts `Debug`/`Display` and refuses `Serialize`, so a value cannot reach the audit or a `--json` dump by accident.
+Written once by `saife secret set`, read by the supervisor at launch, injected only into the sidecar's environment, zeroised after spawn where the platform allows. The profile and the manifest reference **names**, never values. A `Secret`/`SecretValue` type (like `RunToken`) redacts `Debug`/`Display` and refuses `Serialize`, so a value cannot reach the audit or a `--json` dump by accident.
 
 **D-5 — Fail closed, always.**
 A declared skill whose sidecar does not become healthy within its `health.timeout_ms` refuses the session (`sidecar_unhealthy`, exit 5) — there is no "run without the sidecar" fallback for a capability the caller asked for. This mirrors `--allow-domain`'s posture: asking for a capability and silently not getting it is the failure mode this project exists to prevent.
@@ -49,7 +49,7 @@ Start order: proxy bound → secrets resolved → sidecars spawned (job object, 
 New leaves: `op=SIDECAR` at spawn/exit (`mount`, `pid`, `health`, `secrets` as **names only**), and one leaf per facade request (`mount`, `path`, `upstream_host`, `status`). `audit show` gains the keys; `KNOWN_KEYS` and the docs taxonomy are updated in the same change. A secret value must be unrepresentable in the leaf type, not merely unprinted.
 
 **D-8 — Plugins live under the user's sandbox home, and are extensible by the operator.**
-`%USERPROFILE%\.sandbox\plugins\<name>\plugin.json` + its `scripts/`, so adding a capability is a
+`%USERPROFILE%\.saife\plugins\<name>\plugin.json` + its `scripts/`, so adding a capability is a
 filesystem drop-in that needs no rebuild and no admin (the user's decision, 2026-10-23). Repo samples
 mirror the built-in ones under `sandbox/plugins/` for review; the *installed* copy is what runs. A
 plugin's directory is its cwd, so `command: ["python", "sidecar.py"]` is self-contained. The manifest fields mirror omac's, minus the macOS/Linux bits: `name`, `mount`, `command`, `secrets[]` (name/required/pattern), `config{}` (typed, non-secret), `health{path,timeout_ms,interval_ms}`, `operations[]` (the D-3 allowlist), `upstream` (fixed base URL per operation set).
@@ -64,7 +64,7 @@ A sidecar runs outside the container and therefore outside the session's network
 
 A dummy plugin proves the transport end-to-end before any secret handling exists:
 
-- `~/.sandbox/plugins/tngtech/` — `plugin.json` + `sidecar.py` (stdlib only). It fetches
+- `~/.saife/plugins/tngtech/` — `plugin.json` + `sidecar.py` (stdlib only). It fetches
   `https://www.tngtech.com/` and serves it at `GET /`; `GET /status` is the health probe; every other
   path and every request without the per-session `X-Facade-Token` is refused.
 - Rust: plugin discovery, sidecar spawn (host-side, job-scoped), health gate, façade routing for
@@ -91,18 +91,18 @@ AppContainer-path plumbing, SSE size limits.
 
 ## 4. Phases and tasks
 
-Each task is TDD: red first, watch it fail, minimal implementation, green, gates, commit. Gates are the standing ones (bin-only `cargo test --bin sandbox`, both feature states, clippy 0, CRLF, live legs with a rebuilt `target/debug/sandbox.exe`).
+Each task is TDD: red first, watch it fail, minimal implementation, green, gates, commit. Gates are the standing ones (bin-only `cargo test --bin saife`, both feature states, clippy 0, CRLF, live legs with a rebuilt `target/debug/saife.exe`).
 
 ### P1 — Skill manifest and registry
 - **T1.1** `src/skill/manifest.rs`: parse `skill.json` into `SkillManifest` (`name`, `mount`, `command`, `secrets`, `config`, `health`, `operations`, `upstream`). Test: malformed mount (`^[a-z0-9][a-z0-9-]{0,30}$`, reserved names refused), unknown fields refused, missing `schema_version` refused.
-- **T1.2** `src/skill/registry.rs`: load from `~/.sandbox/skills/*/skill.json`, deterministic order, duplicate mount refused, `--skill <name>` on `run` selects a set.
-- **T1.3** CLI: `sandbox skill list|show <name>`; `run --skill a --skill b` (this is where multiple capabilities compose, unlike `--profile`).
+- **T1.2** `src/skill/registry.rs`: load from `~/.saife/skills/*/skill.json`, deterministic order, duplicate mount refused, `--skill <name>` on `run` selects a set.
+- **T1.3** CLI: `saife skill list|show <name>`; `run --skill a --skill b` (this is where multiple capabilities compose, unlike `--profile`).
 - **T1.4** Profile integration: `network.facade.enabled` default **false**; a session with `--skill` implies it.
 
 ### P2 — Secret store
 - **T2.1** `src/secret/store.rs` over `CredReadW`/`CredWriteW` (generic credentials, target `sandbox/<skill>/<NAME>`), with a trait so tests inject an in-memory store.
 - **T2.2** `SecretValue` type: redacting `Debug`/`Display`, no `Serialize`, `Zeroize` on drop; test asserts `format!("{:?}")` and `to_string()` contain no value bytes.
-- **T2.3** CLI: `sandbox secret set|list|delete` (list shows alias + `sha256(prefix)[:8]` fingerprint, never the value), mirroring omac's `/whoami` proof idea.
+- **T2.3** CLI: `saife secret set|list|delete` (list shows alias + `sha256(prefix)[:8]` fingerprint, never the value), mirroring omac's `/whoami` proof idea.
 - **T2.4** Resolution at launch: manifest `secrets[]` → store lookup; missing required secret refuses with `secret_missing: <NAME>` before any process starts.
 
 ### P3 — Sidecar supervisor
@@ -129,7 +129,7 @@ Each task is TDD: red first, watch it fail, minimal implementation, green, gates
 - **T6.3** Grep for stale claims: README/AGENTS/USER-GUIDE/DEVELOPERS wording that says secrets are unsupported.
 
 ### P7 — Optional, only if asked
-- AF_UNIX transport alternative; `1password://`/`apple-password://` resolvers; `--env-credential` mode; per-operation rate limits; secret rotation (`sandbox secret rotate`).
+- AF_UNIX transport alternative; `1password://`/`apple-password://` resolvers; `--env-credential` mode; per-operation rate limits; secret rotation (`saife secret rotate`).
 
 ## 5. Files likely to change
 
@@ -153,7 +153,7 @@ docs/tasks/secret-injection/PROGRESS.md
 
 - Unit: manifest validation matrix, secret redaction, facade routing table, relay header rules.
 - Live (`#[ignore]`, unelevated): echo sidecar round-trip, SSE frames, sidecar death mid-request, teardown closes the port, unknown mount, token refusal.
-- Audit: `sandbox audit show <sid> --filter 'op=SIDECAR'` and `--filter 'mount=jira'` return the leaves; no leaf contains a secret (a test greps the whole log for the known fixture value).
+- Audit: `saife audit show <sid> --filter 'op=SIDECAR'` and `--filter 'mount=jira'` return the leaves; no leaf contains a secret (a test greps the whole log for the known fixture value).
 - Host clean: `tests/Clear-HostTestArtifacts.ps1` must stay `HOST-CLEAN` — sidecars are processes, so the script's stray-process pass gains a `sidecar-*` pattern.
 - VM lane: facade scenarios must classify as backend-specific only if the *mechanism* is backend-specific; both backends should pass the echo round-trip.
 

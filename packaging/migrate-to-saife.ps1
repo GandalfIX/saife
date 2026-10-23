@@ -64,6 +64,7 @@ $checks = @(
     @{ Label = 'profiles'; Path = (Join-Path $env:USERPROFILE '.saife\profiles'); Kind = 'dir' },
     @{ Label = 'plugins';  Path = (Join-Path $env:USERPROFILE '.saife\plugins');  Kind = 'dir' },
     @{ Label = 'audit logs'; Path = (Join-Path $env:LOCALAPPDATA 'saife\audit');  Kind = 'dir' },
+    @{ Label = 'dacl journals'; Path = (Join-Path $env:LOCALAPPDATA 'saife\dacl-restore'); Kind = 'dir' },
     @{ Label = 'signing key'; Path = (Join-Path $env:LOCALAPPDATA 'saife\signing\ed25519-key'); Kind = 'file' }
 )
 foreach ($c in $checks) {

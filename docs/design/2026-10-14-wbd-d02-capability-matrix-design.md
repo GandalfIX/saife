@@ -2,7 +2,7 @@
 
 > **Date:** 2026-10-14
 > **Status:** approved design (maintainer), pending spec review
-> **WBD source:** `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md`, D-02
+> **WBD source:** `input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md`, D-02
 > **Depends on:** D-01 (complete), the image-B evidence lane (complete)
 
 ## 1. Goal

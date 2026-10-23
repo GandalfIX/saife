@@ -2,7 +2,7 @@
 
 > **Analyzed:** `https://github.com/microsoft/mxc` @ `e7940f7` (2026-09-16, shallow clone)
 > **Method:** Direct source read of the Windows `process_container` backend and shared
-> crates, cross-referenced against our `sandbox` implementation (main + ADR-0001 worktree).
+> crates, cross-referenced against our `saife` implementation (main + ADR-0001 worktree).
 > **Why:** assess maturity (see `docs/design/comparison-agent-win-sandbox.md` lineage), evaluate
 > whether MXC's technology can replace ours, and extract techniques.
 > **Companion plan:** `docs/plans/2026-09-16-mxc-derived-hardening.md`
@@ -76,7 +76,7 @@
    `ALL APPLICATION PACKAGES` read grants. Without it our read confinement is weaker
    than our CR-4 claim (plan Task 2).
 5. **MXC's crash-safe DACL journaling solves the exact problem our AGENTS.md tracks
-   as an unimplemented follow-up** ("per-session cleanup (Rust): sandbox run should
+   as an unimplemented follow-up** ("per-session cleanup (Rust): saife run should
    remove the ACEs it added on exit — not yet implemented"). Their `filesystem_dacl.rs`
    (3,138 lines) is the reference design (plan Task 3).
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the US-4a cryptographic audit core — hash-chain NDJSON leaves, Ed25519 root signing with DPAPI-protected key, `sandbox audit show` (human + `--json` + `--filter`), `sandbox audit verify` (tamper-evidence), and a minimal `sandbox ps` — so that CONNECT events already emitted by the US-3 proxy gain full tamper-evident verification.
+**Goal:** Implement the US-4a cryptographic audit core — hash-chain NDJSON leaves, Ed25519 root signing with DPAPI-protected key, `saife audit show` (human + `--json` + `--filter`), `saife audit verify` (tamper-evidence), and a minimal `saife ps` — so that CONNECT events already emitted by the US-3 proxy gain full tamper-evident verification.
 
 **Architecture:** US-3's `emit_connect` (`src/audit.rs`) currently writes raw NDJSON lines without `hash`/`parent`. US-4a replaces the writer with an `AuditWriter` that computes the SHA-256 hash chain on every append (canonical = leaf minus `hash`+`parent`, keys sorted alphabetically via `BTreeMap`, compact serialization). At clean child exit the supervisor commits the chain root (last leaf's hash) to `<sid>.root` and signs it with an Ed25519 keypair generated on first run, DPAPI-encrypted at rest. `audit verify` recomputes the root and checks the signature; any mutation, truncation, or forged root is detected. `audit show` prints a human summary or dumps the raw NDJSON for `--json`, with optional `--filter` clauses. FILE_*/EXEC event capture (ETW or userspace hook) is **out of scope** — that is US-4b.
 
@@ -24,7 +24,7 @@
 - ETW consumer + userspace hook fallback (AC-4.16) — US-4b.
 - `setup --check-only` audit-fidelity reporting beyond the Ed25519 key probe — US-4b.
 - Merkle inclusion proofs, SIEM forwarder, key rotation — future-ideas.
-- True "running" detection in `sandbox ps` (PID/heartbeat) — 4a reports `running:false`.
+- True "running" detection in `saife ps` (PID/heartbeat) — 4a reports `running:false`.
 - CONNECT-event end-to-end integration tests (blocked by US-3 loopback downgrade) — deferred with US-3.
 
 ---
@@ -226,7 +226,7 @@ git commit -m "feat(us-4a): leaf canonicalization + sha256 hex (pure logic, TDD)
 Create `src/audit/filter.rs` with the complete, compilable implementation below. (Uses `anyhow::Result` + `bail!` — consistent with the existing `src/net/matcher.rs` style. No `thiserror` dep needed.)
 
 ```rust
-//! Filter grammar for `sandbox audit show --filter "expr"`.
+//! Filter grammar for `saife audit show --filter "expr"`.
 //!
 //! Grammar (AC-4.13):
 //!   filter  := clause ( "&" clause )*
@@ -489,7 +489,7 @@ Create `src/signing.rs`. The signing logic is: generate a keypair if no key file
 ```rust
 //! Ed25519 signing key for the audit trail root.
 //!
-//! The secret key is stored at `%LOCALAPPDATA%\sandbox\signing\ed25519-key`,
+//! The secret key is stored at `%LOCALAPPDATA%\saife\signing\ed25519-key`,
 //! DPAPI-encrypted (`CryptProtectData`, user scope — not LOCAL_MACHINE, so only
 //! the same user on the same machine can decrypt). The 32-byte secret is
 //! encrypted to a variable-length blob and written with a restrictive DACL
@@ -754,7 +754,7 @@ Add an `AuditWriter` struct and refactor `emit_connect` to delegate to it. New `
 //! US-4a audit core: hash-chain NDJSON leaves + Ed25519 root signing.
 //!
 //! The audit log is an append-only `.ndjson` file at
-//! `%LOCALAPPDATA%\sandbox\audit\<session-id>.ndjson`. Each line is a Merkle
+//! `%LOCALAPPDATA%\saife\audit\<session-id>.ndjson`. Each line is a Merkle
 //! leaf: the event payload plus `seq`, `ts`, `hash`, `parent`. `hash` is
 //! SHA-256 of the leaf canonicalized (keys sorted alphabetically, `hash` and
 //! `parent` removed, compact serialization). `parent` is the previous leaf's
@@ -910,7 +910,7 @@ impl AuditWriter {
         let mut line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
         line.push('\n');
 
-        if std::env::var_os("SANDBOX_DIAG").is_some() {
+        if std::env::var_os("SAIFE_DIAG").is_some() {
             eprint!("[proxy] {line}");
         }
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&self.path) {
@@ -1098,7 +1098,7 @@ Expected: builds. US-3's `emit_connect` callers in `src/net/proxy.rs` still work
 
 - [ ] **Step 4: Run the existing US-3 integration tests to confirm no regression**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Skip 43,44,45,46,47,48,49,50,51,52,53,54,55,56`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Skip 43,44,45,46,47,48,49,50,51,52,53,54,55,56`
 Expected: S-1..S-42 all pass (the audit changes are internal — CONNECT events still get written, just now with hash/parent fields).
 
 - [ ] **Step 5: Commit**
@@ -1207,7 +1207,7 @@ Expected: all pass.
 
 - [ ] **Step 6: Run integration tests (no regression)**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Skip 43,44,45,46,47,48,49,50,51,52,53,54,55,56`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Skip 43,44,45,46,47,48,49,50,51,52,53,54,55,56`
 Expected: S-1..S-42 all pass. (CONNECT events now have hash/parent fields — S-25 etc. that check the audit log shape may need adjustment if they assert specific field sets. Inspect S-25..S-38 first; if any assert "no hash field", update them.)
 
 - [ ] **Step 7: Commit**
@@ -1227,7 +1227,7 @@ git commit -m "refactor(us-4a): thread AuditWriter through proxy (replaces emit_
 - [ ] **Step 1: Implement `run_show`**
 
 ```rust
-//! `sandbox audit show <sid> [--json] [--filter "expr"]`
+//! `saife audit show <sid> [--json] [--filter "expr"]`
 
 use std::io::Write;
 use anyhow::{bail, Result};
@@ -1238,7 +1238,7 @@ pub fn run_show(session_id: &str, json: bool, filter_expr: Option<&str>) -> i32 
     match run_show_inner(session_id, json, filter_expr) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("[sandbox] audit show: {e:#}");
+            eprintln!("[saife] audit show: {e:#}");
             1
         }
     }
@@ -1412,7 +1412,7 @@ Expected: 1 test passes (show_missing_session_errors).
 
 ```bash
 git add src/audit/show.rs
-git commit -m "feat(us-4a): sandbox audit show (human + --json + --filter)"
+git commit -m "feat(us-4a): saife audit show (human + --json + --filter)"
 ```
 
 ---
@@ -1425,7 +1425,7 @@ git commit -m "feat(us-4a): sandbox audit show (human + --json + --filter)"
 - [ ] **Step 1: Implement `run_verify`**
 
 ```rust
-//! `sandbox audit verify <sid>`
+//! `saife audit verify <sid>`
 //!
 //! Recompute the Merkle root from the .ndjson file, compare to the committed
 //! .root, check the Ed25519 signature on .sig. Prints OK / TAMPERED /
@@ -1443,7 +1443,7 @@ pub fn run_verify(session_id: &str) -> i32 {
         Ok(VerifyOutcome::Incomplete(reason)) => { println!("INCOMPLETE: {reason}"); 1 }
         Ok(VerifyOutcome::Tampered(reason)) => { println!("TAMPERED: {reason}"); 1 }
         Ok(VerifyOutcome::BadSignature(reason)) => { println!("BAD_SIGNATURE: {reason}"); 1 }
-        Err(e) => { eprintln!("[sandbox] audit verify: {e:#}"); 1 }
+        Err(e) => { eprintln!("[saife] audit verify: {e:#}"); 1 }
     }
 }
 
@@ -1712,13 +1712,13 @@ Expected: builds.
 Run: `cargo test --lib audit::verify`
 Expected: 5 tests pass (missing, no-root, clean, tampered, forged).
 
-Note: these tests touch the real filesystem under `%LOCALAPPDATA%\sandbox\audit\` and the real signing key. They use fresh sids (timestamp+pid+nanos) to avoid collisions. The signing key file may be created on first run — that's expected and tested in Task 4.
+Note: these tests touch the real filesystem under `%LOCALAPPDATA%\saife\audit\` and the real signing key. They use fresh sids (timestamp+pid+nanos) to avoid collisions. The signing key file may be created on first run — that's expected and tested in Task 4.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add src/audit/verify.rs
-git commit -m "feat(us-4a): sandbox audit verify (root + Ed25519 signature check)"
+git commit -m "feat(us-4a): saife audit verify (root + Ed25519 signature check)"
 ```
 
 ---
@@ -1769,7 +1769,7 @@ drop(audit_writer);
 
 if let Some(root) = captured_root {
     if let Err(e) = commit_audit_root(&sid, &root) {
-        eprintln!("[sandbox] warning: failed to commit audit root: {e:#}");
+        eprintln!("[saife] warning: failed to commit audit root: {e:#}");
         // The log is still readable; verify will report INCOMPLETE.
     }
 }
@@ -1825,7 +1825,7 @@ fn ps_cmd(json: bool) -> i32 {
     // Minimal: list the most recent audit log's sid.
     let dir = match std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
         Some(p) => p.join("sandbox").join("audit"),
-        None => { eprintln!("[sandbox] LOCALAPPDATA not set"); return 1; }
+        None => { eprintln!("[saife] LOCALAPPDATA not set"); return 1; }
     };
     let mut entries: Vec<(std::time::SystemTime, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1887,12 +1887,12 @@ Expected: all pass.
 
 ```bash
 cargo build --release
-$SID = & target\release\sandbox.exe run --allow-cwd --block-net --print-sid -- cmd /c echo hi
-target\release\sandbox.exe run --allow-cwd --block-net --sid $SID -- cmd /c echo hi
-target\release\sandbox.exe audit show $SID
-target\release\sandbox.exe audit verify $SID
-target\release\sandbox.exe ps
-target\release\sandbox.exe ps --json
+$SID = & target\release\saife.exe run --allow-cwd --block-net --print-sid -- cmd /c echo hi
+target\release\saife.exe run --allow-cwd --block-net --sid $SID -- cmd /c echo hi
+target\release\saife.exe audit show $SID
+target\release\saife.exe audit verify $SID
+target\release\saife.exe ps
+target\release\saife.exe ps --json
 ```
 
 Expected: `audit verify` prints `OK`; `audit show` prints a summary with at least the session header and total events; `ps` prints the sid; `ps --json` prints the JSON line.
@@ -1933,7 +1933,7 @@ Leave the ETW line unchanged (`not yet implemented in this slice`) — that's US
 
 ```bash
 cargo build --release
-target\release\sandbox.exe setup --check-only
+target\release\saife.exe setup --check-only
 ```
 
 Expected: the Ed25519 line reports `absent (will be generated on first run)` if no session has been run yet, or `present` after a session.
@@ -2198,11 +2198,11 @@ function Invoke-Scenario-S55 {
     $d = New-ScenarioDir 55
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--block-net','--print-sid','--','cmd','/c','echo','hi') -WorkingDirectory $d
     $sid = ($psid.Stdout -join '').Trim()
-    # Start a session that blocks (ping with -t won't block sandbox.exe...
+    # Start a session that blocks (ping with -t won't block saife.exe...
     # we need a long-running child). Use `cmd /c ping -n 30 127.0.0.1 > NUL`.
     $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--block-net','--sid',$sid,'--','cmd','/c','ping','-n','30','127.0.0.1','>','NUL') -WorkingDirectory $d -PassThru -NoNewWindow
     Start-Sleep -Seconds 2
-    # Force-kill sandbox.exe (the supervisor), not the child.
+    # Force-kill saife.exe (the supervisor), not the child.
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
     $logPath = Join-Path $env:LOCALAPPDATA "sandbox\audit\$sid.ndjson"
@@ -2246,7 +2246,7 @@ Also add the SKIP scenarios for the deferred ACs (AC-4.4, 4.5, 4.7) as no-op SKI
 
 ```bash
 cargo build --release
-pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe
+pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe
 ```
 
 Expected: S-1..S-42 pass (no regression), S-43..S-55 pass, S-56 skips. Some may skip due to no python (S-45, S-46, S-52) — that's the existing pattern.
@@ -2258,7 +2258,7 @@ Common issues:
 
 - S-48 (tamper) depends on finding an alphabetic byte to case-flip. If the log is very short this may fail; the test falls back gracefully.
 
-- S-55 (crash) requires a long-running child. `ping -n 30` works; ensure `sandbox.exe` is killed, not `ping.exe`. The child will be killed by the Job Object's `KILL_ON_JOB_CLOSE` when sandbox.exe dies.
+- S-55 (crash) requires a long-running child. `ping -n 30` works; ensure `saife.exe` is killed, not `ping.exe`. The child will be killed by the Job Object's `KILL_ON_JOB_CLOSE` when saife.exe dies.
 
 - [ ] **Step 5: Commit**
 
@@ -2276,7 +2276,7 @@ git commit -m "test(us-4a): integration scenarios S-43..S-55 (AC-4.1,4.2,4.3,4.6
 ```bash
 cargo test --lib
 cargo build --release
-pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe
+pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe
 ```
 
 Expected: all Rust unit tests pass; all PowerShell scenarios pass or skip cleanly.
@@ -2319,14 +2319,14 @@ Before declaring US-4a complete, confirm:
 - [ ] `cargo test --lib` — all unit tests pass.
 - [ ] `cargo clippy --all-targets` — no new warnings.
 - [ ] `pwsh -File tests/run-tests.ps1` — S-1..S-42 pass (no US-3 regression), S-43..S-55 pass, S-56 skips.
-- [ ] Manual smoke test: `sandbox audit verify <sid>` returns `OK` after a clean session.
+- [ ] Manual smoke test: `saife audit verify <sid>` returns `OK` after a clean session.
 - [ ] Manual smoke test: flipping a byte in the `.ndjson` makes `audit verify` return `TAMPERED`.
-- [ ] Manual smoke test: `sandbox ps` and `sandbox ps --json` print the last session id.
-- [ ] Manual smoke test: `sandbox setup --check-only` reports the Ed25519 key as `present` after a session.
-- [ ] The Ed25519 key file at `%LOCALAPPDATA%\sandbox\signing\ed25519-key` is larger than 32 bytes (DPAPI-encrypted).
-- [ ] `sandbox audit show <sid> --json` output pipes cleanly to `jq -c`.
-- [ ] `sandbox audit show <sid> --filter "op=SESSION_START"` returns only SESSION_START events.
-- [ ] After `Stop-Process -Name sandbox -Force`, `sandbox audit verify <sid>` reports `INCOMPLETE` and `sandbox audit show <sid>` still works.
+- [ ] Manual smoke test: `saife ps` and `saife ps --json` print the last session id.
+- [ ] Manual smoke test: `saife setup --check-only` reports the Ed25519 key as `present` after a session.
+- [ ] The Ed25519 key file at `%LOCALAPPDATA%\saife\signing\ed25519-key` is larger than 32 bytes (DPAPI-encrypted).
+- [ ] `saife audit show <sid> --json` output pipes cleanly to `jq -c`.
+- [ ] `saife audit show <sid> --filter "op=SESSION_START"` returns only SESSION_START events.
+- [ ] After `Stop-Process -Name sandbox -Force`, `saife audit verify <sid>` reports `INCOMPLETE` and `saife audit show <sid>` still works.
 
 ---
 

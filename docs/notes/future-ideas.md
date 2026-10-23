@@ -1,4 +1,4 @@
-# Future Ideas — Post-MVP Roadmap for `sandbox`
+# Future Ideas — Post-MVP Roadmap for `saife`
 
 This document captures the features explicitly deferred in the MVP PRD
 (`prd-sandbox.md`, Non-Goals NG-1 through NG-10) plus additional ideas that
@@ -19,7 +19,7 @@ the target object's DACL.
 user does not own (no `WRITE_DAC`). This blocks:
 
 - `C:\` (drive root, TrustedInstaller-owned) — causes KI-1.1; currently worked
-  around by the one-time elevated `sandbox setup --grant-drive-root` (F-style
+  around by the one-time elevated `saife setup --grant-drive-root` (F-style
   setup step, grants `S-1-15-2-2:FILE_READ_ATTRIBUTES` on fixed drive roots).
 - `C:\Users`, `C:\Users\<user>` (SYSTEM-owned) — causes KI-1.2 (PowerShell
   no-path commands resolve to `C:\` because `Set-Location` can't walk
@@ -57,7 +57,7 @@ traversal/listing for `Set-Location`), KI-1.4 partially (`System32` access for
 ### F-22. Ancestor traverse grants (admin, per-user)
 
 Companion to F-21 for environments where the RuleSet API is not yet available.
-A `sandbox setup --grant-ancestors <workspace-root>` step (elevated) grants
+A `saife setup --grant-ancestors <workspace-root>` step (elevated) grants
 `S-1-15-2-2` `FILE_TRAVERSE` (traverse-only, **no** `FILE_LIST_DIRECTORY`) on
 each ancestor directory of the configured workspace root up to the drive root,
 plus `FILE_LIST_DIRECTORY` on the drive root (already done by
@@ -105,7 +105,7 @@ cheap, kernel-enforced, and independent of the filesystem/network policy.
   (available 23H2+).
 - Expose as profile `ui.*` slice plus CLI (e.g. `--ui-lockdown`,
   `--no-clipboard`). Effective mask = `requested & supported_for_build`.
-- `sandbox setup --check-only` reports which UI limits the host can enforce
+- `saife setup --check-only` reports which UI limits the host can enforce
   (equivalent to MXC's `wxc-exec --probe` output).
 
 **Scope:** contained — touches Job Object creation + process-attribute
@@ -135,15 +135,15 @@ write correctly.
 
 **Design:**
 
-- New `sandbox audit <profile> -- <cmd>` subcommand (separate from
-  `sandbox run` so the permissive mode is opt-in and explicit, never a
+- New `saife audit <profile> -- <cmd>` subcommand (separate from
+  `saife run` so the permissive mode is opt-in and explicit, never a
   default).
 - Backend A (no OS changes, ship first): run the child *without* the DACL
   deny-by-default (grants-only), attach an ETW file-access + `connect()`
   listener (US-4 plumbing already planned), emit
   `.\.sandbox\<sid>\audit\denials.json` listing every path/host the child
   touched that was *not* in the profile. Fail-closed alternatives stay in
-  `sandbox run` only.
+  `saife run` only.
 - Backend B (later, if a capable Windows build is present): key off the OS
   BaseContainer Learning-Mode export set MXC probes for
   (`StartLearningModeTrace` / `StopLearningModeTrace` / `CloseLearningModeTrace`,
@@ -171,11 +171,11 @@ and everything under `$HOME`" profile-bloat antipattern.
 ### F-1. Undo & Rollback
 SHA-256 content-addressed snapshots of every file in the sandbox scope taken
 **before** the agent starts and **after** it exits. Stored in a deduplicating
-content store under `%LOCALAPPDATA%\sandbox\contentstore\`.
+content store under `%LOCALAPPDATA%\saife\contentstore\`.
 
-- `sandbox rollback list` — sessions with file-change counts.
-- `sandbox rollback restore <id>` — atomically restore pre-session state.
-- `sandbox rollback show <id> --diff` — file/line-level diff.
+- `saife rollback list` — sessions with file-change counts.
+- `saife rollback restore <id>` — atomically restore pre-session state.
+- `saife rollback show <id> --diff` — file/line-level diff.
 - `--rollback-exclude` profile key (default excludes `node_modules`,
   `target`, `.gradle`, `__pycache__`, `.next`).
 - Optional VSS (Volume Shadow Copy) backend for large trees — requires admin
@@ -201,15 +201,15 @@ Detached sessions that persist after the user closes the terminal, using
 **Job Object + named-pipe IPC** between the supervisor and the attachable
 client.
 
-- `sandbox run --detached -- …` — start in background, print session id.
-- `sandbox ps [--all] [--json]` — list running and exited sessions.
-- `sandbox attach <id>` / `sandbox detach <id>` — connect/drop a terminal.
+- `saife run --detached -- …` — start in background, print session id.
+- `saife ps [--all] [--json]` — list running and exited sessions.
+- `saife attach <id>` / `saife detach <id>` — connect/drop a terminal.
   Default detach key sequence `Ctrl-] d` (configurable in
-  `%USERPROFILE%\.sandbox\config.toml`).
-- `sandbox stop <id> [--force] [--timeout <s>]` — graceful / forceful stop.
-- `sandbox inspect <id> [--json]` — session metadata (profile, pid, started,
+  `%USERPROFILE%\.saife\config.toml`).
+- `saife stop <id> [--force] [--timeout <s>]` — graceful / forceful stop.
+- `saife inspect <id> [--json]` — session metadata (profile, pid, started,
     cwd, audit path).
-- `sandbox prune [--older-than <d>] [--keep <n>] [--dry-run]`.
+- `saife prune [--older-than <d>] [--keep <n>] [--dry-run]`.
 - Security model: local-only, same-user only; named pipe ACL set to current
   user SID; kernel peer-credential checks on connect.
 
@@ -218,7 +218,7 @@ Dynamic permission expansion at runtime so the agent can ask the operator for
 new file/network/command access mid-session instead of failing hard.
 
 - IPC channel (named pipe) between sandboxed process and supervisor.
-- `sandbox run --supervised -- …` enables it.
+- `saife run --supervised -- …` enables it.
 - Approval prompts via terminal, webhook, or API; responses are
   session-scoped (do not persist after exit) and audit-logged.
 - Capabilities: `FILE_EXPANSION` (grant new paths, pattern-constrained),
@@ -242,13 +242,13 @@ Verify that instruction files (`AGENTS.md`, `CLAUDE.md`, `SKILLS.md`,
 `scripts/*.py` referenced by agent config) were signed by a trusted identity
 before the sandboxed process is allowed to start.
 
-- `sandbox trust sign --keyless <file>…` — Sigstore keyless signing via OIDC
+- `saife trust sign --keyless <file>…` — Sigstore keyless signing via OIDC
   (GitHub Actions / Google / Microsoft identity), Fulcio cert, Rekor
   transparency log. Uses `sigstore-rs` crate, fully cross-platform.
 - Trust policy per profile: `trust_policy.json` with `publishers` (issuer,
   repository, workflow, ref-pattern), `blocklist` (digests),
   `enforcement: deny|warn`.
-- At `sandbox run`, every instruction file in the workdir is verified; unsigned
+- At `saife run`, every instruction file in the workdir is verified; unsigned
   or untrusted-identity files block startup (or warn, per policy).
 - `--trust-override` escape hatch (discouraged, audit-logged).
 
@@ -294,14 +294,14 @@ large-project case).
 A public registry of signed, versioned profiles — equivalent to
 `registry.nono.sh`. Reserve the namespace now (per PRD Open Question 4).
 
-- `sandbox profile pull <url>` — fetch and verify a signed profile into the
+- `saife profile pull <url>` — fetch and verify a signed profile into the
   local cache.
-- `sandbox profile publish` — sign with Sigstore and upload.
+- `saife profile publish` — sign with Sigstore and upload.
 - Registry runs as a static site + Sigstore Rekor entries; no central server
   authority needed.
 
 ### F-10. PowerShell Module
-A `Sandbox` PowerShell module wrapping `sandbox.exe` to expose cmdlet-style
+A `Sandbox` PowerShell module wrapping `saife.exe` to expose cmdlet-style
 usage: `Start-Sandbox`, `Get-SandboxSession`, `Stop-Sandbox`,
 `Show-SandboxAudit`, `Restore-Sandbox`. Better Windows-native fit for users
 who live in PowerShell.
@@ -309,11 +309,11 @@ who live in PowerShell.
 ### F-11. SDKs
 - `sandbox-python` — launch and control sandboxes from Python.
 - `sandbox-typescript` — same for Node.js, via a small bundled binary.
-- `sandbox-dotnet` — native C# binding via P/Invoke into `sandbox.exe` or a
+- `sandbox-dotnet` — native C# binding via P/Invoke into `saife.exe` or a
   linked `sandbox.dll`.
 
 ### F-12. TUI / GUI Console
-A `sandbox tui` mode (ratatui) showing live sessions, audit stream, and
+A `saife tui` mode (ratatui) showing live sessions, audit stream, and
 supervisor prompts; plus an optional WPF/WinUI GUI for users who want a
 managed console. Deferred indefinitely — CLI is the priority.
 
@@ -326,14 +326,14 @@ managed console. Deferred indefinitely — CLI is the priority.
 
 ### F-14. Windows Sandbox (lightweight VM) Backend
 Windows 10 Pro+ ships with **Windows Sandbox** — a disposable, lightweight
-Hyper-V VM that runs Win32 apps. `sandbox run --backend wsb` could generate a
+Hyper-V VM that runs Win32 apps. `saife run --backend wsb` could generate a
 `.wsb` config, launch the VM, mount the project as a read-only shared folder,
 and run the agent inside. Stronger isolation (full VM boundary) at the cost of
 ~5 s startup and a Windows Pro/Enterprise license. Useful for running truly
 untrusted binaries the user does not want in their AppContainer scope.
 
 ### F-15. Multi-User / Server Mode
-Run `sandbox` as a service accepting per-user session requests, for shared
+Run `saife` as a service accepting per-user session requests, for shared
 Windows jump-boxes or CI fleets. Named-pipe ACLs per user, central audit
 store, quota enforcement. Out of scope for the solo-developer MVP target but
 kept here for the future enterprise case.
@@ -369,7 +369,7 @@ on rollback (F-1) and a deterministic exec recorder.
 ### F-20. Cross-Platform Convergence
 Long-term: factor the codebase so the Windows backend is one of several, with
 Linux (Landlock) and macOS (Seatbelt) backends sharing the profile format,
-audit trail, and CLI. This would make `sandbox` a true cross-platform nono
+audit trail, and CLI. This would make `saife` a true cross-platform nono
 equivalent. Very long-term; mentioned so the architecture does not lock in
 Windows-only assumptions (e.g. keep paths as a generic `OsPath` abstraction,
 not `\\`-hardcoded strings).
@@ -378,7 +378,7 @@ not `\\`-hardcoded strings).
 
 > **Status: superseded for the network case by ADR-0004.** The MXC
 > `processcontainer` backend runs the proxy path with no administrator rights at
-> all (`sandbox run` is unelevated, guardrail 1 proves the child's path), so the
+> all (`saife run` is unelevated, guardrail 1 proves the child's path), so the
 > broker/install-time designs below are NOT needed to obtain unelevated egress
 > and must not be built for that purpose. They remain relevant only for the
 > AppContainer backend, which still needs the loopback exemption for network

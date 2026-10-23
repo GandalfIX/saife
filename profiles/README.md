@@ -1,7 +1,7 @@
 # Sample profiles
 
-Copy the one you need to `%USERPROFILE%\.sandbox\profiles\` and run
-`sandbox run --profile <name> --allow-cwd -- <command>`.
+Copy the one you need to `%USERPROFILE%\.saife\profiles\` and run
+`saife run --profile <name> --allow-cwd -- <command>`.
 
 Paths use the variables the loader expands: `$CWD`, `$HOME`, `$USERPROFILE`,
 `$TEMP`, `$LOCALAPPDATA`, `$APPDATA`, `$SID`. (`$LOCALAPPDATA`/`$APPDATA` were
@@ -12,14 +12,14 @@ one was exercised in a real sandboxed run, not just parsed.
 
 ## Windows caveat: `.cmd` and `.bat` entry points
 
-`sandbox`, `npm`, `npx`, `gradle`, `mvn`, `yarn` and `pnpm` are batch shims on
+`saife`, `npm`, `npx`, `gradle`, `mvn`, `yarn` and `pnpm` are batch shims on
 Windows (`npm.cmd`, `gradle.bat`, ...). The launcher starts the program directly
 and does **not** apply `PATHEXT`, so:
 
 ```powershell
-sandbox run --profile node --allow-cwd -- npm --version        # fails: file not found
-sandbox run --profile node --allow-cwd -- cmd /c "npm --version"   # works
-sandbox run --profile node --allow-cwd -- npm.cmd --version    # also works
+saife run --profile node --allow-cwd -- npm --version        # fails: file not found
+saife run --profile node --allow-cwd -- cmd /c "npm --version"   # works
+saife run --profile node --allow-cwd -- npm.cmd --version    # also works
 ```
 
 Use `cmd /c "..."` (or the explicit extension). This is a known launcher gap, not

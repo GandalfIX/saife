@@ -9,8 +9,8 @@ to install on the target machine.
 
 Contents
 --------
-  sandbox.exe                         the supervisor (x64)
-  mxc-launch.exe                      the wrapper launcher - MUST stay beside sandbox.exe
+  saife.exe                         the supervisor (x64)
+  saife-launch.exe                      the wrapper launcher - MUST stay beside saife.exe
   profiles/demo.json                  portable example profile
   profiles/node.json                  Node.js / npm (cache, nvm trees, registry hosts)
   profiles/jvm.json                   JDK / Gradle / Maven (caches, Maven Central)
@@ -35,12 +35,12 @@ Requirements on the target machine
 Install (2 minutes)
 -------------------
   1. Copy this whole folder somewhere permanent, e.g. C:\tools\sandbox\bin
-     Keep sandbox.exe and mxc-launch.exe in the SAME directory.
+     Keep saife.exe and saife-launch.exe in the SAME directory.
   2. Copy the profiles you want:
-         profiles\*.json  ->  %USERPROFILE%\.sandbox\profiles\
+         profiles\*.json  ->  %USERPROFILE%\.saife\profiles\
      (the folder is created on first use if it does not exist)
   3. Optional, plugins:
-         plugins\tngtech  ->  %USERPROFILE%\.sandbox\plugins\tngtech
+         plugins\tngtech  ->  %USERPROFILE%\.saife\plugins\tngtech
      A plugin runs OUTSIDE the sandbox, with your rights, and owns the network on
      the workload's behalf. Only install plugins you have read.
   4. Optional, for opencode: copy
@@ -51,30 +51,30 @@ Install (2 minutes)
 
 Verify the installation
 -----------------------
-  .\sandbox.exe setup --check-only
+  .\saife.exe setup --check-only
       Expect the Windows build number, "AppContainer + RuleSet: available",
       "Job Object: available", and "Audit (hash-chain + Ed25519): available".
       The audit key is generated automatically on first use.
 
-  .\sandbox.exe run --allow-cwd --block-net -- cmd /c echo ok
+  .\saife.exe run --allow-cwd --block-net -- cmd /c echo ok
       Expect: ok
 
-  .\sandbox.exe run --allow-cwd --allow-domain api.anthropic.com --no-prompt -- ^
+  .\saife.exe run --allow-cwd --allow-domain api.anthropic.com --no-prompt -- ^
       curl.exe -sS -o NUL -w "connect=%{http_connect}\n" https://api.anthropic.com/
       Expect: connect=200  (the tunnel was admitted; a TLS failure after that is a
       host/CRL condition, not a policy decision)
 
   The last line of every run is the guardrail proof, e.g.
-      [sandbox] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=1 unauthenticated=0
+      [saife] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=1 unauthenticated=0
 
 
 Running something
 -----------------
-  .\sandbox.exe run --allow-cwd -- cmd /c dir
-  .\sandbox.exe run --allow-cwd --allow-domain api.anthropic.com -- claude
-  .\sandbox.exe run --profile opencode --allow-cwd -- opencode
-  .\sandbox.exe run --profile node --allow-cwd -- cmd /c "npm install"
-  .\sandbox.exe run --allow-cwd --block-net -- powershell -NoProfile -Command "Get-Date"
+  .\saife.exe run --allow-cwd -- cmd /c dir
+  .\saife.exe run --allow-cwd --allow-domain api.anthropic.com -- claude
+  .\saife.exe run --profile opencode --allow-cwd -- opencode
+  .\saife.exe run --profile node --allow-cwd -- cmd /c "npm install"
+  .\saife.exe run --allow-cwd --block-net -- powershell -NoProfile -Command "Get-Date"
 
   Windows batch shims (npm, npx, gradle, mvn) need cmd /c "..." because the
   launcher does not apply PATHEXT.
@@ -88,7 +88,7 @@ Plugins (sidecars)
 ------------------
   A plugin is reached from inside the sandbox ONLY at its mount name:
 
-      .\sandbox.exe run --plugin tngtech --allow-cwd -- ^
+      .\saife.exe run --plugin tngtech --allow-cwd -- ^
           cmd /c "curl.exe -s http://tngtech.sandbox.invalid/"
 
   The workload never talks to the real host and never holds a credential: the
@@ -101,13 +101,13 @@ Plugins (sidecars)
 
 What NOT to copy from another machine
 -------------------------------------
-  * %LOCALAPPDATA%\sandbox\signing\ed25519-key
+  * %LOCALAPPDATA%\saife\signing\ed25519-key
         DPAPI-encrypted for that user on that machine; it cannot be decrypted
         here, and copying it is pointless. A fresh key is generated on first use.
         Audit chains are per-host by design.
-  * %LOCALAPPDATA%\sandbox\audit, dacl-restore, sidecar-logs
+  * %LOCALAPPDATA%\saife\audit, dacl-restore, sidecar-logs
         runtime state of that machine's sessions.
-  * %USERPROFILE%\.sandbox\learned\default.json
+  * %USERPROFILE%\.saife\learned\default.json
         that user's remembered allow/deny decisions. Shipping it would
         pre-approve hosts on someone else's machine.
 
@@ -117,7 +117,7 @@ What NOT to copy from another machine
 
 Uninstall
 ---------
-  Delete this folder, %USERPROFILE%\.sandbox and %LOCALAPPDATA%\sandbox.
+  Delete this folder, %USERPROFILE%\.saife and %LOCALAPPDATA%\saife.
   Nothing is registered in the registry or installed as a service.
 
 
@@ -129,7 +129,7 @@ Troubleshooting
         granted workspace, and reports the directory you asked it to open rather
         than the one it could not reach. Either start it at the git root
         (git rev-parse --show-toplevel) or grant that root read-only:
-            .\sandbox.exe run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
+            .\saife.exe run --profile opencode --allow-cwd --allow <repo-root>:read -- opencode
 
   "failed to start npm" (or npx, gradle, mvn, yarn, pnpm):
         Those are .cmd/.bat shims and the launcher does not apply PATHEXT.
@@ -143,5 +143,5 @@ Troubleshooting
         the supervisor died mid-session; the leaves that exist are still valid.
 
   Every run prints a guardrail line, e.g.
-        [sandbox] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=0 unauthenticated=0
+        [saife] mxc: guardrail 1 proof probes=1 accepted=1 tunnels=0 unauthenticated=0
         probes=0 under --block-net is correct (there is no proxy to probe).

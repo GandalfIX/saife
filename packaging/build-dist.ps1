@@ -28,7 +28,7 @@ if (-not $SkipBuild) {
     $env:RUSTFLAGS = '-C target-feature=+crt-static'
     Push-Location $root
     try {
-        & cargo build --release --bin sandbox --bin mxc-launch
+        & cargo build --release --bin saife --bin saife-launch
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
     } finally {
         Pop-Location
@@ -38,7 +38,7 @@ if (-not $SkipBuild) {
 }
 
 $bin = Join-Path $staticTarget 'release'
-foreach ($exe in 'sandbox.exe', 'mxc-launch.exe') {
+foreach ($exe in 'saife.exe', 'saife-launch.exe') {
     if (-not (Test-Path (Join-Path $bin $exe))) {
         throw "$exe not found in $bin - run without -SkipBuild once"
     }
@@ -48,7 +48,7 @@ Write-Host '== assembling dist/'
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Path (Join-Path $dist 'profiles'), (Join-Path $dist 'plugins') | Out-Null
 
-Copy-Item (Join-Path $bin 'sandbox.exe'), (Join-Path $bin 'mxc-launch.exe') -Destination $dist
+Copy-Item (Join-Path $bin 'saife.exe'), (Join-Path $bin 'saife-launch.exe') -Destination $dist
 Copy-Item (Join-Path $root 'profiles/opencode.json'), (Join-Path $root 'profiles/node.json'),
           (Join-Path $root 'profiles/jvm.json') -Destination (Join-Path $dist 'profiles')
 
@@ -89,8 +89,8 @@ $version = @(
     "built:       $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC"
     'target:      x86_64-pc-windows-msvc'
     'runtime:     static C runtime (no VC++ redistributable)'
-    "sandbox.exe: $((Get-Item (Join-Path $dist 'sandbox.exe')).Length) bytes"
-    "mxc-launch:  $((Get-Item (Join-Path $dist 'mxc-launch.exe')).Length) bytes"
+    "saife.exe:   $((Get-Item (Join-Path $dist 'saife.exe')).Length) bytes"
+    "saife-launch: $((Get-Item (Join-Path $dist 'saife-launch.exe')).Length) bytes"
 ) -join "`r`n"
 Set-Content -Path (Join-Path $dist 'VERSION.txt') -Value $version
 
@@ -128,10 +128,9 @@ if ($ReleaseVersion) {
     if (Test-Path $relStage) { Remove-Item $relStage -Recurse -Force }
     New-Item -ItemType Directory -Path $relStage | Out-Null
 
-    # The binary ships under its brand name; the launcher keeps its own name and is
-    # found beside the supervisor.
-    Copy-Item (Join-Path $bin 'sandbox.exe') -Destination (Join-Path $relStage 'saife.exe')
-    Copy-Item (Join-Path $bin 'mxc-launch.exe') -Destination $relStage
+    # Both ship under their brand names; the launcher is found beside the supervisor.
+    Copy-Item (Join-Path $bin 'saife.exe') -Destination $relStage
+    Copy-Item (Join-Path $bin 'saife-launch.exe') -Destination $relStage
     Copy-Item (Join-Path $dist 'profiles'), (Join-Path $dist 'plugins') -Destination $relStage -Recurse
     Copy-Item (Join-Path $dist 'README.txt') -Destination $relStage
 

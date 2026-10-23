@@ -2,12 +2,12 @@
 
 > **Status:** Proposed (2026-07-30) — specification complete, awaiting plan + implementation
 > **Scope:** Cross-cutting. Touches US-3, US-4, and future-ideas F-1 / F-2 / F-4.
-> **Origin:** Analysis of [`TNG/oh-my-agentic-coder`](https://github.com/TNG/oh-my-agentic-coder) (`omac`), a Go sandbox facade+supervisor for agentic coders. omac wraps Seatbelt (macOS) / bubblewrap+Landlock (Linux) the way our `sandbox` wraps AppContainer. Its `internal/netproxy`, `internal/netprompt`, `internal/intent`, and `internal/audit` packages implement patterns directly applicable to our deferred features.
+> **Origin:** Analysis of [`TNG/oh-my-agentic-coder`](https://github.com/TNG/oh-my-agentic-coder) (`omac`), a Go sandbox facade+supervisor for agentic coders. omac wraps Seatbelt (macOS) / bubblewrap+Landlock (Linux) the way our `saife` wraps AppContainer. Its `internal/netproxy`, `internal/netprompt`, `internal/intent`, and `internal/audit` packages implement patterns directly applicable to our deferred features.
 > **Grilling:** 60 design questions resolved in a structured review session. Decisions are marked **[G-N]** where N is the question number. This document is the authoritative specification; the implementation plan derives from it.
 
 ## Context
 
-Our `sandbox` MVP ships three pillars: AppContainer FS isolation (US-1/US-2 + Option E), an audit trail (US-4), and network filtering (US-3). US-3's spec is fully drafted but its `--allow-domain`/`--network-profile` path is **non-functional unprivileged** today: the chosen loopback-exemption API (`NetworkIsolationSetAppContainerConfig`) is admin-only and system-wide, so the proxy, token plumbing, and filter logic are implemented and unit-tested but cannot be exercised end-to-end without admin. The unprivileged fix (`privateNetworkClientServer` capability SID on the AppContainer token) is tracked as a follow-up in the US-3 spec.
+Our `saife` MVP ships three pillars: AppContainer FS isolation (US-1/US-2 + Option E), an audit trail (US-4), and network filtering (US-3). US-3's spec is fully drafted but its `--allow-domain`/`--network-profile` path is **non-functional unprivileged** today: the chosen loopback-exemption API (`NetworkIsolationSetAppContainerConfig`) is admin-only and system-wide, so the proxy, token plumbing, and filter logic are implemented and unit-tested but cannot be exercised end-to-end without admin. The unprivileged fix (`privateNetworkClientServer` capability SID on the AppContainer token) is tracked as a follow-up in the US-3 spec.
 
 Several adjacent features are explicitly deferred to `future-ideas.md`:
 - **F-1** — upstream corporate proxy chaining, raw TCP/SOCKS5, per-endpoint filtering, `--open-port`/`--listen-port` IPC.
@@ -22,10 +22,10 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 ### D-0. Capability SID fix (task zero — unblocks D-1, D-3, D-4)
 
-**[G-1, G-21, G-34, G-53, G-58]** Replace the admin-only `NetworkIsolationSetAppContainerConfig` loopback exemption with a `privateNetworkClientServer` capability SID on the AppContainer token. This is a runtime token attribute (passed to `CreateProcessW` via `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`), not a system-wide config call — no admin required, no `sandbox setup` step.
+**[G-1, G-21, G-34, G-53, G-58]** Replace the admin-only `NetworkIsolationSetAppContainerConfig` loopback exemption with a `privateNetworkClientServer` capability SID on the AppContainer token. This is a runtime token attribute (passed to `CreateProcessW` via `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`), not a system-wide config call — no admin required, no `saife setup` step.
 
 - **Remove `src/net/loopback.rs` entirely** and the downgrade-to-`--block-net` logic. The admin-only API was system-wide (modifies a global loopback-allow list for *all* AppContainers) — keeping it as a fallback would be a security regression (broader scope than the per-process capability SID). **[G-58]**
-- **No `sandbox setup` step for network.** `setup --check-only` reports the effective network posture but performs no admin action for network. The only setup steps remain the existing FS-related ones (drive-root grant, signing key generation). **[G-53]**
+- **No `saife setup` step for network.** `setup --check-only` reports the effective network posture but performs no admin action for network. The only setup steps remain the existing FS-related ones (drive-root grant, signing key generation). **[G-53]**
 - **Intranet leak (documented limitation):** the `privateNetworkClientServer` capability grants loopback **+ intranet** (e.g. `192.168.*`, `10.*`, `fc00::/7`), not public internet. Raw-socket apps can reach LAN hosts directly without proxy filtering. `--block-net` (zero capability SIDs) remains the strong-isolation escape hatch. The WFP callout driver (F-6) is the real fix for this gap. Documented in `setup --check-only` with an explicit warning. **[G-21, G-34]** **Bidirectional (validated by MXC source, 2026-09-16):** the capability also grants **inbound** private-network access — a sandboxed process that calls `listen()` accepts connections from LAN peers. MXC's AppContainer fallback *rejects* ingress-allow policies while this capability is present ("privateNetworkClientServer grants bidirectional private-network access", `appcontainer_runner.rs:1747`). Mitigation identical to the egress case: documented limitation, `--block-net` escape hatch, F-6 (WFP) the real fix; a future `allowedProxyPeer`-style PSEC loopback grant is the interim once the OS APIs reach stable Windows. See `docs/research/mxc-source-analysis.md` (F-A).
 
 **Sequencing:** D-0 is task zero. D-1, D-3, and D-4 cannot be exercised end-to-end without it (they live in the proxy path, which receives zero traffic unprivileged until the capability SID lands). D-2 and D-5 can be written against unit tests independently but should integrate after D-0. **[G-1]**
@@ -65,7 +65,7 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 **Precedence:** profile `network.upstreamProxy` > host env `HTTPS_PROXY`/`HTTP_PROXY` (read at launch, never forwarded to child) > none (direct dial). **[G-10]**
 
-**Warning on override:** if profile `upstreamProxy` is set *and* host `HTTPS_PROXY` is also set and they differ, emit a `SANDBOX_DIAG` warning. **[G-42]**
+**Warning on override:** if profile `upstreamProxy` is set *and* host `HTTPS_PROXY` is also set and they differ, emit a `SAIFE_DIAG` warning. **[G-42]**
 
 **Child env isolation:** the child always gets our loopback-only `HTTP_PROXY`/`HTTPS_PROXY` (`http://sandbox:<token>@127.0.0.1:<port>`) and `NO_PROXY=localhost,127.0.0.1,::1` — never the upstream's env vars. The upstream chaining is entirely a supervisor-side concern. **[G-10]**
 
@@ -105,7 +105,7 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 **Coalescing:** concurrent requests for the same host share one dialog (mutex + `tokio::sync::oneshot`; followers park on the leader's result). Keyed by hostname only (not host:port), consistent with the host-based allow-list. **[G-6]**
 
-**Headless/no-dialog-backend:** `onUnavailable` policy applies. Default `deny` with a discoverable `SANDBOX_DIAG` stderr diagnostic on first denial: "no dialog backend available; all non-allow-listed hosts denied; use `--allow-domain` or `--network-profile` to pre-approve, or set `on_unavailable=allow` (insecure)." **[G-19]**
+**Headless/no-dialog-backend:** `onUnavailable` policy applies. Default `deny` with a discoverable `SAIFE_DIAG` stderr diagnostic on first denial: "no dialog backend available; all non-allow-listed hosts denied; use `--allow-domain` or `--network-profile` to pre-approve, or set `on_unavailable=allow` (insecure)." **[G-19]**
 
 **Prompt enablement:** `network.promptEnabled` profile field. Default `true` when network is active (i.e. not `--block-net`). Network active implies prompt active unless explicitly disabled via `network.promptEnabled: false` or `--no-prompt`. **[G-47, G-59]**
 
@@ -119,11 +119,11 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 **Learned persistence:**
 - Permanent decisions (host or suffix scope) persisted immediately and atomically (write-temp + `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` with 3x retry + 50ms backoff for AV locks, fallback to direct write). **[G-56]**
-- Stored at `%USERPROFILE%\.sandbox\learned\<profile-name>.json` (outside `$CWD`, CR-10 defense). Unnamed profile → `learned/default.json`. **[G-5]**
+- Stored at `%USERPROFILE%\.saife\learned\<profile-name>.json` (outside `$CWD`, CR-10 defense). Unnamed profile → `learned/default.json`. **[G-5]**
 - **Our own format** (not nono-compatible), aligned with US-5 camelCase conventions: `{"schema":1,"allow":[{"host":"...","scope":"host"|"suffix"}],"deny":[{"host":"...","scope":"host"|"suffix"}]}`. Uses `disposition` (matching US-4 audit field naming), not omac's `decision`. **[G-20, G-39]**
 - Loaded into the filter on every launch (steps 2 and 4 of the D-1 pipeline). **[G-33]**
 
-**`sandbox learned` CLI subcommand:** `sandbox learned list` / `sandbox learned revoke <host>` / `sandbox learned clear`. Discoverable revocation — the user doesn't need to edit JSON. The learned file remains human-editable as a fallback. **[G-51]**
+**`saife learned` CLI subcommand:** `saife learned list` / `saife learned revoke <host>` / `saife learned clear`. Discoverable revocation — the user doesn't need to edit JSON. The learned file remains human-editable as a fallback. **[G-51]**
 
 **Deny response shape:** `403 Forbidden` with `X-Sandbox: denied` header + plain-text body naming the host, the policy reason, and remediation paths (profile, allow-list, learned file). For intent-related denials, add `X-Sandbox-Intent-Hint` header (since HTTPS clients discard the body). Dual-channel: body for humans, headers for machines. **[G-52]**
 
@@ -136,7 +136,7 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 - `GET /sandbox/intent?host=<host>` → `200 OK` with `{"host":"api.anthropic.com","reason":"fetching model list","ts":"2026-07-30T..."}` or `404 Not Found`. **[G-57]**
 - `POST /sandbox/intent/explain` — body: `{"host":"..."}` → `204 No Content`. Records one-shot "Explain more" flag. **[G-57]**
 
-**Same listener, same token:** the child reaches these via `NO_PROXY=localhost,127.0.0.1,::1` bypass (direct, not through the proxy). A `SANDBOX_PROXY_PORT` env var is injected for discoverability. **[G-7, G-35]**
+**Same listener, same token:** the child reaches these via `NO_PROXY=localhost,127.0.0.1,::1` bypass (direct, not through the proxy). A `SAIFE_PROXY_PORT` env var is injected for discoverability. **[G-7, G-35]**
 
 **Normalization:** target is canonicalized to lowercased hostname (port stripped, path stripped, URL form → hostname, `host:port` → host). Accepts URL / `host:port` / bare host. Consistent with D-3's host-only coalescing. **[G-8]**
 
@@ -179,9 +179,9 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 ### Negative
 
-- **Adds UI surface.** D-3 introduces a native dialog; on headless/CI hosts it falls back to `onUnavailable=deny` with a `SANDBOX_DIAG` diagnostic. The `--no-prompt` flag is the explicit opt-out.
+- **Adds UI surface.** D-3 introduces a native dialog; on headless/CI hosts it falls back to `onUnavailable=deny` with a `SAIFE_DIAG` diagnostic. The `--no-prompt` flag is the explicit opt-out.
 - **Intranet leak (D-0).** The `privateNetworkClientServer` capability grants loopback + intranet. Raw-socket apps can reach LAN hosts without proxy filtering. `--block-net` is the strong-isolation escape hatch; F-6 (WFP driver) is the real fix. Documented in `setup --check-only`. The leak is **bidirectional** (validated by MXC source, 2026-09-16): the capability also grants **inbound** private-network access — a sandboxed process that calls `listen()` accepts connections from LAN peers, and MXC's AppContainer fallback *rejects* ingress-allow policies while this capability is present ("privateNetworkClientServer grants bidirectional private-network access", `appcontainer_runner.rs:1747`). Mitigation identical to the egress case — documented limitation, `--block-net` escape hatch, F-6 (WFP) the real fix; a future `allowedProxyPeer`-style PSEC loopback grant is the interim once the OS APIs reach stable Windows. See `docs/research/mxc-source-analysis.md` (F-A).
-- **D-3's learned-policy file** is a new config-based-sandbox-escape vector if stored inside the writable workspace. Mitigated by storing under `%USERPROFILE%\.sandbox\learned\` (CR-10 defense).
+- **D-3's learned-policy file** is a new config-based-sandbox-escape vector if stored inside the writable workspace. Mitigated by storing under `%USERPROFILE%\.saife\learned\` (CR-10 defense).
 - **D-2's NTLM/Kerberos gap** — users behind NTLM proxies need a local `cntlm`/`px` bridge. A `winhttp` spike is tracked as a follow-up.
 - **Porting effort:** D-1+D-2+D-3+D-4 are roughly 1000–1500 lines of Rust. D-5 is ~100 lines. Bounded, with a working reference for every behavior.
 - **Orphaned dialogs on timeout** — the dialog stays on screen until the user clicks; the result is discarded. Accepted quirk, matching omac.

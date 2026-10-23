@@ -15,7 +15,7 @@ Three facts that are easy to get wrong here, each of which the manifest encodes:
 1. The release archive must be FLAT (no wrapper directory), because
    `NestedInstallerFiles[].RelativeFilePath` is resolved against the archive root.
    `packaging/build-dist.ps1 -ReleaseVersion <v>` produces exactly that.
-2. `mxc-launch.exe` is extracted but deliberately NOT given a
+2. `saife-launch.exe` is extracted but deliberately NOT given a
    `PortableCommandAlias`: the supervisor finds it beside itself, and putting it
    on PATH would invite running the launcher directly.
 3. `InstallerSha256` must be the hash of the release asset, not of the human

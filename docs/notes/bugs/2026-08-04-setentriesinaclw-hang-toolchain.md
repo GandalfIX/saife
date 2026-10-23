@@ -1,16 +1,16 @@
-# BUG: `sandbox run` hangs in `SetEntriesInAclW` — toolchain regression after VS Build Tools reinstall
+# BUG: `saife run` hangs in `SetEntriesInAclW` — toolchain regression after VS Build Tools reinstall
 
 > **Status:** **RESOLVED** (2026-08-15) — root cause was `SetNamedSecurityInfoW` hanging on large profile directories (Defender real-time scanning), NOT a toolchain regression. See "Resolution" below.
 > **Reported:** 2026-08-04
 > **Resolved:** 2026-08-15 (commit `5192dfc` on `feature/adr-0001-network-hardening`)
-> **Severity:** Blocker — `sandbox run` was completely unusable (all modes, including `--block-net`)
-> **Affects:** `sandbox run --block-net`, `--allow-domain`, `--network-profile` (every path that calls `grant_access`)
+> **Severity:** Blocker — `saife run` was completely unusable (all modes, including `--block-net`)
+> **Affects:** `saife run --block-net`, `--allow-domain`, `--network-profile` (every path that calls `grant_access`)
 
 ---
 
 ## Summary
 
-`sandbox run --allow-cwd --block-net -- cmd /c echo hello` **hangs forever** before spawning the child process. Diagnostics show the supervisor deadlocks inside `grant_access()` while writing a DACL — specifically on the call to `SetEntriesInAclW` for the ancestor grant on `C:\Users\marku\AppData\Local`.
+`saife run --allow-cwd --block-net -- cmd /c echo hello` **hangs forever** before spawning the child process. Diagnostics show the supervisor deadlocks inside `grant_access()` while writing a DACL — specifically on the call to `SetEntriesInAclW` for the ancestor grant on `C:\Users\marku\AppData\Local`.
 
 **The source code is NOT the cause.** The same source (commit `244da75`) produces:
 - a **working** binary when built on **2026-07-28** (before VS Build Tools were reinstalled), and
@@ -22,12 +22,12 @@ This points to a **build toolchain regression** introduced by the Visual Studio 
 
 ## Symptoms
 
-1. `.\target\release\sandbox.exe run --allow-cwd --block-net -- cmd /c echo hello`
+1. `.\target\release\saife.exe run --allow-cwd --block-net -- cmd /c echo hello`
    - Expected: prints `hello`, exits 0.
-   - Actual: process stays alive and responsive but **never spawns the child** (`cmd.exe` never appears as a child of `sandbox.exe`), no further output, hangs indefinitely.
+   - Actual: process stays alive and responsive but **never spawns the child** (`cmd.exe` never appears as a child of `saife.exe`), no further output, hangs indefinitely.
 2. Same hang for `--allow-domain` and `--network-profile`.
-3. `sandbox --print-sid` works (everything up to `sandbox::spawn` works: session creation, ACL grants up to a point).
-4. `sandbox setup --check-only` works (no grant path there).
+3. `saife --print-sid` works (everything up to `sandbox::spawn` works: session creation, ACL grants up to a point).
+4. `saife setup --check-only` works (no grant path there).
 5. All 101 Rust unit tests pass. `cargo build --release` and `cargo clippy --release -- -D warnings` are clean.
 
 ---
@@ -53,7 +53,7 @@ This points to a **build toolchain regression** introduced by the Visual Studio 
 cargo build --release
 mkdir $env:TEMP\sb-repro -Force
 cd $env:TEMP\sb-repro
-& <built-sandbox.exe> run --allow-cwd --block-net -- cmd /c echo hello
+& <built-saife.exe> run --allow-cwd --block-net -- cmd /c echo hello
 # hangs forever; no cmd.exe child is ever created
 ```
 
@@ -70,7 +70,7 @@ cargo clean; cargo build --release
 
 ### 1. Where it hangs (added temporary `eprintln` tracing)
 
-Execution trace (with `SANDBOX_DIAG=1`):
+Execution trace (with `SAIFE_DIAG=1`):
 
 ```
 [trace] net_cfg resolved
@@ -99,7 +99,7 @@ The ACL on `AppData\Local` is small and healthy: 6–7 ACEs (`SYSTEM:(I)(F)`, `A
 ### 2. It is NOT a source regression (bisect + rebuild evidence)
 
 - `git bisect run` between `244da75` (baseline) and HEAD flagged `0f3e163` (Task 1.1, capability SID) as first bad — **but that was a false positive**: the baseline itself, when rebuilt fresh today, also hangs.
-- Original repo binary at `C:\Users\marku\tools\sandbox\target\release\sandbox.exe` (built 2026-07-28) **works**.
+- Original repo binary at `C:\Users\marku\tools\sandbox\target\release\saife.exe` (built 2026-07-28) **works**.
 - Rebuilding the SAME baseline source in the SAME original repo today (`cargo clean; cargo build --release`) produces a binary that **hangs**.
 - Conclusion: identical source, different build dates → different behavior. The regression is in the build environment, not the code.
 
@@ -155,13 +155,13 @@ This is consistent with user reports of `SetNamedSecurityInfo*` APIs being sensi
 2. **Force-link against the previous exact toolset** (via `vcvars` targeting a specific SDK, or installing the exact older MSVC toolset version 14.4x) and verify the binary stops hanging.
 3. If a specific older toolset works, **pin it** in `.cargo/config.toml` (e.g. explicit linker + SDK paths) so builds are reproducible regardless of global VS state.
 4. As a defensive measure, replace the raw `SetEntriesInAclW` DACL-merge path with a safer pattern (e.g. `AddAccessAllowedAceEx`-style construction via `BuildExplicitAccessWithName` + `SetEntriesInAcl`) — the current code passes the live DACL pointer from a security descriptor that is freed via `LocalFree` immediately after; worth a correctness review independent of this bug.
-5. Verify breakpoint-level inside `SetEntriesInAclW` (e.g. via WinDbg or VS debugger attached to a hanging `sandbox.exe`) to confirm which internal DLL path deadlocks (advapi32 → sechost RPC to the local security subsystem?).
+5. Verify breakpoint-level inside `SetEntriesInAclW` (e.g. via WinDbg or VS debugger attached to a hanging `saife.exe`) to confirm which internal DLL path deadlocks (advapi32 → sechost RPC to the local security subsystem?).
 
 ---
 
 ## Workarounds in the meantime
 
-- Use the pre-regression binary: `C:\Users\marku\tools\sandbox\target\release\sandbox.exe` (built 2026-07-28) — **it still works**.
+- Use the pre-regression binary: `C:\Users\marku\tools\sandbox\target\release\saife.exe` (built 2026-07-28) — **it still works**.
   - Caveat: it does not contain the ADR-0001 changes (capability SID, `Proxy-Authorization`, loopback restore, etc.).
 - No source-code workaround is possible — the code path is identical to the working build.
 

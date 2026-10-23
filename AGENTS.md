@@ -1,6 +1,6 @@
 # sandbox
 
-`sandbox` is a native Windows process-sandboxing tool that runs any program —
+`saife` is a native Windows process-sandboxing tool that runs any program —
 primarily AI coding agents (Claude Code, OpenCode, Codex, …) and their build
 toolchains — with only the resources the user has explicitly granted.
 
@@ -92,8 +92,8 @@ physical host, the rollback-script rule above remains mandatory.
   carried by host live legs. The standard-user lane that would close this is
   PARKED (no non-interactive second-account launch works from a PS-Direct
   session) - see PROGRESS.md, "P3.1 blocker".
-- Live (`#[ignore]`) legs execute `target/debug/sandbox.exe`, not the test
-  binary: run `cargo build --features mxc-backend --bin sandbox` first or the
+- Live (`#[ignore]`) legs execute `target/debug/saife.exe`, not the test
+  binary: run `cargo build --features mxc-backend --bin saife` first or the
   kill-leg's freshness guard fails the lane.
 
 ### ACL / ACE cleanup after every test run
@@ -104,14 +104,14 @@ ancestor directories (e.g. `$env:TEMP`, `AppData\Local`) via
 exits — they are never removed automatically. Over many test runs they
 accumulate until the ACL on the ancestor directory becomes so large that
 `SetNamedSecurityInfoW` / `GetNamedSecurityInfoW` hangs (observed at ~40+ ACEs
-on `AppData\Local`, causing `sandbox run --block-net` to deadlock in
+on `AppData\Local`, causing `saife run --block-net` to deadlock in
 `grant_access`).
 
-**Rule:** every test run that exercises `sandbox run` (or anything that calls
+**Rule:** every test run that exercises `saife run` (or anything that calls
 `grant_access` / `build_allowlist`) MUST clean up the ACEs it created
 afterwards. Two complementary mechanisms:
 
-1. **Per-session cleanup (Rust):** `sandbox run` should remove the ACEs it
+1. **Per-session cleanup (Rust):** `saife run` should remove the ACEs it
    added to the CWD ancestor directories on exit (after the child process
    returns, before the supervisor exits). The per-session `.sandbox\<sid>`
    directory is also removed. This is the primary defense — it runs

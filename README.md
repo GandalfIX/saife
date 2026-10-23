@@ -21,7 +21,7 @@ MVP, under active development. Implemented pillars:
   same pipeline. Unelevated by default (see
   [Backends and privileges](#backends-and-privileges)).
 - **Audit trail** (US-4) - a tamper-evident hash chain per session, signed with
-  an Ed25519 key, with `sandbox audit show|verify` and a session-start leaf that
+  an Ed25519 key, with `saife audit show|verify` and a session-start leaf that
   records the containment tier, elevation and proxy endpoint. `verify` reports
   `INCOMPLETE` for a session that did not end cleanly rather than silently
   accepting it.
@@ -62,7 +62,7 @@ for those.
 Every successful proxied session prints its proof to stderr:
 
 ```text
-[sandbox] mxc: guardrail 1 proof probes=1 accepted=0 tunnels=0 unauthenticated=0
+[saife] mxc: guardrail 1 proof probes=1 accepted=0 tunnels=0 unauthenticated=0
 ```
 
 `probes` is this run's own pre-flight probe (the child's path to the proxy
@@ -80,11 +80,11 @@ profile for long builds or downloads; there is no unlimited mode.
 
 ```powershell
 cargo build --release
-.\target\release\sandbox.exe setup --check-only
+.\target\release\saife.exe setup --check-only
 ```
 
-The default build includes the `mxc-backend` feature, so `sandbox run` starts the
-unelevated MXC backend (and builds `mxc-launch.exe` beside it). To build an
+The default build includes the `mxc-backend` feature, so `saife run` starts the
+unelevated MXC backend (and builds `saife-launch.exe` beside it). To build an
 AppContainer-only binary — bootstrap without the SDK, or a host older than
 Windows 11 24H2 — opt out explicitly:
 
@@ -92,7 +92,7 @@ Windows 11 24H2 — opt out explicitly:
 cargo build --release --no-default-features   # prints a notice at startup
 ```
 
-Gates: `cargo test --bin sandbox` is 611 tests in the default build and 490 with
+Gates: `cargo test --bin saife` is 611 tests in the default build and 490 with
 `--no-default-features`; `cargo clippy --all-targets` must be warning-free in
 both.
 
@@ -106,7 +106,7 @@ capability is missing.
 ### Run a command in the sandbox
 
 ```powershell
-sandbox run --allow-cwd -- cmd /c echo hello
+saife run --allow-cwd -- cmd /c echo hello
 ```
 
 `--allow-cwd` grants read+write+execute on the current working directory.
@@ -118,13 +118,13 @@ not explicitly listed.
 
 ```powershell
 # Read+write+execute (default):
-sandbox run --allow-cwd --allow $HOME\.claude -- claude
+saife run --allow-cwd --allow $HOME\.claude -- claude
 
 # Read-only:
-sandbox run --allow-cwd --read-only $HOME\.gitconfig -- cmd /c type %USERPROFILE%\.gitconfig
+saife run --allow-cwd --read-only $HOME\.gitconfig -- cmd /c type %USERPROFILE%\.gitconfig
 
 # Read-only with explicit mode:
-sandbox run --allow-cwd --allow $HOME\.npm:read -- npm install
+saife run --allow-cwd --allow $HOME\.npm:read -- npm install
 ```
 
 `--allow <path>` (repeatable) grants access on an additional path. Format:
@@ -137,7 +137,7 @@ The leading `C:` drive-letter colon is NOT treated as a mode separator.
 ### Block all network access
 
 ```powershell
-sandbox run --allow-cwd --block-net -- cmd /c echo no-network
+saife run --allow-cwd --block-net -- cmd /c echo no-network
 ```
 
 `--block-net` removes the AppContainer network capability entirely. Every
@@ -153,15 +153,15 @@ leaves the machine.
 ### Profiles
 
 ```powershell
-sandbox run --profile claude-code --allow-cwd -- claude
+saife run --profile claude-code --allow-cwd -- claude
 ```
 
-`--profile <name>` resolves to `%USERPROFILE%\.sandbox\profiles\<name>.json`
+`--profile <name>` resolves to `%USERPROFILE%\.saife\profiles\<name>.json`
 (or a path ending in `.json`). The profile JSON can specify `filesystem`
 and `network` slices. CLI flags merge on top of the profile (arrays
 concatenate, CLI overrides for scalars).
 
-Example profile (`%USERPROFILE%\.sandbox\profiles\claude-code.json`):
+Example profile (`%USERPROFILE%\.saife\profiles\claude-code.json`):
 
 ```json
 {
@@ -190,7 +190,7 @@ Variables expanded in paths: `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`,
 
 ### Per-session install directories (Option E)
 
-Every `sandbox run` invocation gets a unique session id of the form
+Every `saife run` invocation gets a unique session id of the form
 `YYYYMMDD-HHMMSS-NNNNN` and a per-session install tree under
 `.\.sandbox\<sid>\bin\` (and `venv\`). The sandboxed process can install
 arbitrary binaries into these dirs at runtime and execute them — no
@@ -204,7 +204,7 @@ session's install tree (its RuleSet + per-session dirs).
 ### Setup check
 
 ```powershell
-sandbox setup --check-only
+saife setup --check-only
 ```
 
 Reports the Windows build number, AppContainer + Job Object availability,
@@ -240,14 +240,14 @@ host, and the refusal reason says which happened
 
 ## How it works
 
-1. `sandbox.exe` creates an AppContainer profile with a per-session SID.
+1. `saife.exe` creates an AppContainer profile with a per-session SID.
 2. It writes explicit DACL Allow ACEs on the allow-listed directories
    (the AppContainer SID is a restricting identity, so anything without
    an ACE is denied).
 3. It spawns the child under the AppContainer SID + a Job Object
    (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, no `BREAKAWAY_OK`).
 4. The child and all its descendants inherit the restrictions. The whole
-   tree dies when `sandbox.exe` exits (or is killed via Ctrl-C).
+   tree dies when `saife.exe` exits (or is killed via Ctrl-C).
 5. For `--block-net`, no network capability is granted — every
    `connect()` is kernel-denied. For `--allow-domain` (once the
    loopback fix lands), a localhost reverse proxy is started on a random
@@ -257,7 +257,7 @@ host, and the refusal reason says which happened
    metadata endpoints, link-local CIDRs) and emits `CONNECT` audit
    events.
 6. Every ACE grant is journaled before it is applied; on exit the
-   journal is replayed to restore the host. If `sandbox.exe` is killed,
+   journal is replayed to restore the host. If `saife.exe` is killed,
    the next run reaps and restores orphaned journals (quarantining
    unparseable ones as `.corrupt`).
 
@@ -271,7 +271,7 @@ cargo test --release
 pwsh -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
-The integration suite drives the real `sandbox.exe` binary through
+The integration suite drives the real `saife.exe` binary through
 filesystem-isolation, Job-Object, breakaway, per-session, profile-loading,
 and network scenarios. Python/curl-dependent scenarios skip cleanly when
 those binaries aren't on `PATH`.
@@ -306,5 +306,5 @@ rule in `docs/design/testing-principles.md`.
 - `docs/plans/2026-10-04-vm-test-infrastructure.md` — VM-01:
   disposable-VM test harness (binding default for Tier 2/3 tests).
 - `docs/research/impact-analysis-windows-cli-sandbox-wbd.md` — impact analysis of the
-  external work breakdown in `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md`
+  external work breakdown in `input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md`
   (MXC BaseContainer/PSEC track, two-track recommendation, VM amendment).

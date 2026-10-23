@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Complete the US-5 profile system — strict schema validation with typo suggestions, `schema_version` enforcement, `git_runtime` + `dotnet_runtime` security groups, formatted cycle-detection errors, and the `sandbox profile list` / `sandbox profile show [--expanded]` subcommands — so that all 17 US-5 acceptance criteria pass.
+**Goal:** Complete the US-5 profile system — strict schema validation with typo suggestions, `schema_version` enforcement, `git_runtime` + `dotnet_runtime` security groups, formatted cycle-detection errors, and the `saife profile list` / `saife profile show [--expanded]` subcommands — so that all 17 US-5 acceptance criteria pass.
 
 **Architecture:** The profile loader (`src/profile.rs`) and security-group resolver (`src/security_groups.rs`) already exist from US-1/US-2 and cover AC-5.1–5.5, 5.8, 5.10, 5.11, 5.17. This plan layers on the missing pieces: (a) tighten the serde schema with `deny_unknown_fields` + a Levenshtein-1 typo suggester; (b) add `meta.schema_version` + version-gate; (c) two new security groups; (d) a structured cycle-error message; (e) the `profile` subcommand (currently a stub returning exit 2) with a `--expanded` view that emits fully-resolved JSON. Each task is TDD and independently committable.
 
@@ -13,7 +13,7 @@
 **Branch:** `feature/windows-sandbox` (current). All work continues on this branch — US-1..US-4a landed here too. A worktree is optional (see skill `using-git-worktrees`); not required because the changes are additive and non-conflicting with in-flight work.
 
 **Out of scope for this plan:**
-- Profile registry / `sandbox profile pull` (future-ideas F-9, namespace reserved, no-op).
+- Profile registry / `saife profile pull` (future-ideas F-9, namespace reserved, no-op).
 - Profile Sigstore signing (future F-5).
 - `add_deny_commands` (future F-16).
 - GUI/TUI profile editor (future F-12).
@@ -133,7 +133,7 @@ pub struct Meta {
 
 > **Existing-test fixup:** `src/profile.rs::merge_extends_child_overrides_meta` (lines ~423–442) constructs `Meta` as a struct literal. Adding `#[derive(Default)]` to `Meta` lets those literals use `..Default::default()` for the new field — but they currently spell out every field. Update both `Meta { ... }` literals in that test to append `..Default::default()` so they compile against the new struct. Alternatively, add `schema_version: None,` to each — `..Default::default()` is more future-proof.
 
-/// The schema version this build of `sandbox` understands.
+/// The schema version this build of `saife` understands.
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Validate that the profile declares a supported `meta.schema_version`.
@@ -211,7 +211,7 @@ Then find the `$scenarios = @(...)` array registration (search for `Invoke-Scena
 
 - [ ] **Step 8: Run the integration suite (only S-57 + a regression spot-check)**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Only 16,57`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Only 16,57`
 Expected: S-16 (profile load regression) and S-57 both pass.
 
 - [ ] **Step 9: Commit**
@@ -499,7 +499,7 @@ Register both in the `$scenarios` array.
 
 - [ ] **Step 9: Run the new scenarios + regression**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Only 16,57,58,59`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Only 16,57,58,59`
 Expected: all four pass.
 
 - [ ] **Step 10: Commit**
@@ -689,7 +689,7 @@ Register both in the `$scenarios` array.
 
 - [ ] **Step 7: Run the new scenarios + regression**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Only 16,19,60,61`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Only 16,19,60,61`
 Expected: S-16, S-19 pass; S-60/S-61 pass OR skip cleanly depending on host install.
 
 - [ ] **Step 8: Commit**
@@ -816,7 +816,7 @@ Register in `$scenarios`.
 
 - [ ] **Step 7: Run + commit**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Only 16,62`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Only 16,62`
 Expected: both pass.
 
 ```bash
@@ -879,7 +879,7 @@ pub struct ProfileEntry {
 }
 
 /// List all profiles in the user-global directory (AC-5.14).
-/// Reads `%USERPROFILE%\.sandbox\profiles\*.json`, parsing each just enough
+/// Reads `%USERPROFILE%\.saife\profiles\*.json`, parsing each just enough
 /// to extract `meta.name` (falling back to the filename stem). Non-`.json`
 /// files and unparseable JSON are skipped silently — `list` is best-effort.
 pub fn list_profiles() -> Vec<ProfileEntry> {
@@ -958,9 +958,9 @@ In `src/cli.rs`, modify the `ProfileAction::Show` variant:
 In `src/profile.rs`, add a stub (to be filled in Task 6):
 
 ```rust
-/// `sandbox profile show <name> [--expanded]`. Filled in by Task 6.
+/// `saife profile show <name> [--expanded]`. Filled in by Task 6.
 pub fn show_profile(_name: &str, _expanded: bool) -> i32 {
-    eprintln!("[sandbox] profile show: not implemented in this slice");
+    eprintln!("[saife] profile show: not implemented in this slice");
     2
 }
 ```
@@ -978,7 +978,7 @@ function Invoke-Scenario-S63 {
     $d = New-ScenarioDir 63
     # Point USERPROFILE at a temp dir with known profiles.
     $fakeHome = Join-Path $d 'fake-home'
-    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    $profilesDir = Join-Path $fakeHome '.saife\profiles'
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $profilesDir 'alpha.json') -Value '{"meta":{"name":"alpha","schema_version":1}}' -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $profilesDir 'beta.json') -Value '{"meta":{"name":"beta","schema_version":1}}' -Encoding UTF8
@@ -1005,7 +1005,7 @@ function Invoke-Scenario-S63 {
 
 - [ ] **Step 8: Run + commit**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Only 63`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Only 63`
 Expected: S-63 passes.
 
 ```bash
@@ -1120,14 +1120,14 @@ fn expand_groups_for_show(sec_groups: &[String]) -> Vec<(String, Vec<std::path::
     by_group.into_iter().collect()
 }
 
-/// `sandbox profile show <name> [--expanded]`.
+/// `saife profile show <name> [--expanded]`.
 /// - Raw view (default): prints the file contents verbatim (AC-5.15).
 /// - Expanded view (`--expanded`): prints the fully-resolved JSON.
 pub fn show_profile(name: &str, expanded: bool) -> i32 {
     match show_profile_inner(name, expanded) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("[sandbox] profile show: {e:#}");
+            eprintln!("[saife] profile show: {e:#}");
             1
         }
     }
@@ -1196,7 +1196,7 @@ Expected: test passes; build clean. **Also:** now that `to_expanded_json` reads 
 function Invoke-Scenario-S64 {
     $d = New-ScenarioDir 64
     $fakeHome = Join-Path $d 'fake-home'
-    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    $profilesDir = Join-Path $fakeHome '.saife\profiles'
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     $rawJson = '{"meta":{"name":"raw","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$CWD"]}}'
     Set-Content -LiteralPath (Join-Path $profilesDir 'raw.json') -Value $rawJson -Encoding UTF8
@@ -1220,7 +1220,7 @@ function Invoke-Scenario-S64 {
 function Invoke-Scenario-S65 {
     $d = New-ScenarioDir 65
     $fakeHome = Join-Path $d 'fake-home'
-    $profilesDir = Join-Path $fakeHome '.sandbox\profiles'
+    $profilesDir = Join-Path $fakeHome '.saife\profiles'
     New-Item -ItemType Directory -Path $profilesDir -Force | Out-Null
     $rawJson = '{"meta":{"name":"expanded","schema_version":1},"security":{"groups":["python_runtime"]},"filesystem":{"allow":["$CWD"]}}'
     Set-Content -LiteralPath (Join-Path $profilesDir 'expanded.json') -Value $rawJson -Encoding UTF8
@@ -1245,7 +1245,7 @@ Register both in `$scenarios`.
 
 - [ ] **Step 6: Run + commit**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Only 63,64,65`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Only 63,64,65`
 Expected: all three pass.
 
 ```bash
@@ -1260,7 +1260,7 @@ git commit -m "feat(us-5): profile show + --expanded view (AC-5.15)"
 **Files:**
 - Modify: `tests/run-tests.ps1` (S-66..S-71)
 
-**Why:** Several ACs are covered by existing unit tests (extends merge, variable expansion) but lack an integration scenario that exercises the real `sandbox.exe` binary end-to-end. This task adds the integration coverage for completeness and to catch regressions in the wiring layer (CLI → profile loader → allowlist). AC-5.9 (`windows_common` always present) currently has no test at all — even a unit test — so it gets one too.
+**Why:** Several ACs are covered by existing unit tests (extends merge, variable expansion) but lack an integration scenario that exercises the real `saife.exe` binary end-to-end. This task adds the integration coverage for completeness and to catch regressions in the wiring layer (CLI → profile loader → allowlist). AC-5.9 (`windows_common` always present) currently has no test at all — even a unit test — so it gets one too.
 
 - [ ] **Step 1: Add a unit test for AC-5.9 (windows_common always present)**
 
@@ -1395,7 +1395,7 @@ Register S-66..S-71 in `$scenarios`. Update the suite header comment.
 
 - [ ] **Step 3: Run the full integration suite**
 
-Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Skip 8,9,12,14,15,46,52,56`
+Run: `cargo build --release && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Skip 8,9,12,14,15,46,52,56`
 Expected: all non-skipped scenarios pass (S-1..S-71 minus the skipped set). The skips are pre-existing (python-dependent, deferred).
 
 - [ ] **Step 4: Final clippy + unit-test sweep**
@@ -1433,7 +1433,7 @@ Implemented in `docs/plans/2026-07-28-us-5-reusable-version-controlled-policy.md
 - **Variable expansion:** `expand_vars` — `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`. Forward slashes normalized to backslashes.
 - **Security groups:** `resolve_groups` in `src/security_groups.rs` — `python_runtime`, `node_runtime`, `rust_runtime`, `java_runtime`, `git_runtime`, `dotnet_runtime`. `windows_common` is implicit (added by `sandbox::allowlist::build_allowlist`, not expandable here).
 - **Cycle detection:** `check_cycle` formats `Profile cycle detected: a → b → a` (U+2192 arrow) per AC-5.6.
-- **Search-path resolution:** `resolve_profile_path` — absolute path or `*.json`-suffixed name used as-is; bare name → `%USERPROFILE%\.sandbox\profiles\<name>.json`.
+- **Search-path resolution:** `resolve_profile_path` — absolute path or `*.json`-suffixed name used as-is; bare name → `%USERPROFILE%\.saife\profiles\<name>.json`.
 - **`profile list`:** `list_profiles` reads `*.json` from the user-global dir, extracts `meta.name` (falls back to filename stem), sorts alphabetically.
 - **`profile show`:** raw view prints the file verbatim (AC-5.15); `--expanded` emits `to_expanded_json` — a single JSON object with `extends` flattened, `security.groups` expanded to per-group concrete path lists, variables expanded.
 - **Error message format:** `anyhow` chains with `with_context`; parse errors carry serde's line/col; cycle + schema-version errors use the exact spec wording.
@@ -1441,7 +1441,7 @@ Implemented in `docs/plans/2026-07-28-us-5-reusable-version-controlled-policy.md
 
 - [ ] **Step 2: Verify the suite one final time**
 
-Run: `cargo build --release && cargo clippy -- -D warnings && cargo test --lib && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\sandbox.exe -Skip 8,9,12,14,15,46,52,56`
+Run: `cargo build --release && cargo clippy -- -D warnings && cargo test --lib && pwsh -File tests/run-tests.ps1 -SandboxExe target\release\saife.exe -Skip 8,9,12,14,15,46,52,56`
 Expected: zero warnings; all unit tests pass; all non-skipped integration scenarios pass.
 
 - [ ] **Step 3: Commit**

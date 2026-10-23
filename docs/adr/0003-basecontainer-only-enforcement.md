@@ -5,7 +5,7 @@
 > posture for `processcontainer` (unelevated on GA Windows), with ADR-0004's two guardrails as hard
 > requirements. The upstream asks (created-not-running/pre-resume, atomic require-tier) remain open; this
 > ADR's residual-exposure wording applies verbatim.
-> **Scope:** WBD ticket D-04 (`input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` line 494, criteria lines 500-508). Depends on D-03 (ADR-0002, selected surface: **mxc-sdk in-process**). Binds the product's launch gate and every D-08/control-implementation ticket.
+> **Scope:** WBD ticket D-04 (`input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md` line 494, criteria lines 500-508). Depends on D-03 (ADR-0002, selected surface: **mxc-sdk in-process**). Binds the product's launch gate and every D-08/control-implementation ticket.
 > **Origin:** `docs/design/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.3; implementation plan `docs/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
 > **Evidence rule:** same as ADR-0002 — fetched artifacts (SHA256-verified per run manifest) or `file:line` at pin `5d7a475a…`; blockers recorded, never waved away.
 

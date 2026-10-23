@@ -13,7 +13,7 @@ container, so the managed legs are re-measured in
 ## The question
 
 `mxc-sdk` delivers the proxy **only** as `HTTP_PROXY` / `HTTPS_PROXY`, with the run
-token as URL userinfo, plus `NO_PROXY` which our `mxc-launch` wrapper injects because
+token as URL userinfo, plus `NO_PROXY` which our `saife-launch` wrapper injects because
 the SDK scrubs it. Which client stacks inside the container honour that, and which
 bypass it?
 
@@ -21,7 +21,7 @@ bypass it?
 
 A scratch harness (`%LOCALAPPDATA%/hermes/cache/scratch/p15`) launched real
 ProcessContainers through `mxc_sdk::v1::run`, with the production request shape:
-`mxc-launch` as the container command, `egress.default = deny`,
+`saife-launch` as the container command, `egress.default = deny`,
 `ingress.hostLoopback = allow`, `networkProxy = http://sandbox:<token>@127.0.0.1:<port>`,
 `inherit_default_environment = true`, workspace readwrite, `C:\Windows` + runtimes
 readonly. The listening proxy is a token-gated stand-in that records every
@@ -167,7 +167,7 @@ would also be the only stacks whose env handling is documented to work).
 ## Reproduce
 
 ```text
-cargo build --features mxc-backend --bin mxc-launch        # the wrapper the harness launches
+cargo build --features mxc-backend --bin saife-launch        # the wrapper the harness launches
 # scratch harness (not in the repo):
 #   p15/probe      -> p15probe.exe : containers, proxy, targets, legs
 #   p15/http       -> p15http.exe  : native WinHTTP / WinINet / registry probe
@@ -385,7 +385,7 @@ issued, credential retried and accepted on this run"), or the audit doc must say
 ### Reproduce (P1.8)
 
 ```text
-cargo build --features mxc-backend --bin mxc-launch
+cargo build --features mxc-backend --bin saife-launch
 # scratch harness (not in the repo):
 #   p18/probe   -> p18probe.exe  : containers, both listeners, all legs
 #   p18/client  -> p18client.dll : .NET 8 probe (default | noproxy | explicit-uri |

@@ -2,7 +2,7 @@
 
 > **Date:** 2026-10-14
 > **Status:** approved design (maintainer), pending spec review
-> **WBD source:** `input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md`, D-03 (line 474), D-04 (line 494)
+> **WBD source:** `input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md`, D-03 (line 474), D-04 (line 494)
 > **Depends on:** D-01 (complete), D-02 (complete — `docs/research/wbd-d02-capability-matrix.md`)
 > **Thread structure (decided in-session):** one shared spec, **two PRs** — D-03 first, D-04 second (one
 > ticket per agent per PR, per impact-analysis §3.3; D-04 depends on D-03)
@@ -112,7 +112,7 @@ blocker row. Scenarios, each producing one artifact + one summary row:
 
 | # | Scenario | Expected evidence |
 |---|---|---|
-| A1 | `launch-exit` | `cmd.exe /d /s /c exit 0` and `exit 7` — exit codes 0 and 7; **nonzero is a workload outcome, not a sandbox setup error** (B-04 criterion) |
+| A1 | `launch-exit` | `cmd.exe /d /s /c exit 0` and `exit 7` — exit codes 0 and 7; **nonzero is a workload outcome, not a saife setup error** (B-04 criterion) |
 | A2 | `stdio` | distinct markers on stdout and stderr, both captured separately; a small stdin-forwarding test (executors "reserve standard input, output, and error for the workload" — README) |
 | A3 | `timeout` | request-level `timeoutMs` (schema location verified at implementation) vs a sleeping workload — timeout enforcement, exit path, teardown |
 | A4 | `cancellation` | long-running workload, terminate the executor process — process-tree teardown evidence: does the contained child die with the executor? |

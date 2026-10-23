@@ -33,7 +33,7 @@ Two enforcement layers compose:
 
 1. **AppContainer network capability**: by default the sandboxed process has
    no network capability at all — direct `connect()` to any host is denied by
-   the kernel. The supervisor `sandbox.exe`, running **outside** the
+   the kernel. The supervisor `saife.exe`, running **outside** the
    AppContainer, starts a localhost HTTP(S) reverse proxy on a random
    `127.0.0.1` port.
 2. **Loopback exemption**: the sandboxed process's token is granted a loopback
@@ -72,7 +72,7 @@ In scope:
 - `--network-profile <name>` with built-in profiles `minimal`, `developer`,
   `none` (alias for `--block-net`).
 - Profile `network.allow_domain` array, merged with CLI flags.
-- Localhost reverse proxy (Tokio + hyper + rustls) started by `sandbox.exe`
+- Localhost reverse proxy (Tokio + hyper + rustls) started by `saife.exe`
   before the sandboxed process launches.
 - `HTTP_PROXY` / `HTTPS_PROXY` / `X-Sandbox-Token` env vars injected into the
   sandboxed process.
@@ -97,7 +97,7 @@ Out of scope:
 ## Acceptance Criteria
 
 ### AC-3.1 — `--block-net` denies all connections
-**Given** `sandbox run --allow-cwd --block-net -- cmd`,
+**Given** `saife run --allow-cwd --block-net -- cmd`,
 **When** the sandboxed process executes
 `python -c "import urllib.request; urllib.request.urlopen('https://api.openai.com')"`,
 **Then** `urlopen` raises `URLError`/`ConnectionError`; the OS denied the
@@ -111,7 +111,7 @@ Out of scope:
 equivalent). No packet leaves the machine.
 
 ### AC-3.3 — `--allow-domain` permits the listed host
-**Given** `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd`,
+**Given** `saife run --allow-cwd --allow-domain api.anthropic.com -- cmd`,
 **When** the sandboxed process does
 `curl https://api.anthropic.com/v1/messages` (and curl honors
 `HTTPS_PROXY`),
@@ -165,7 +165,7 @@ CLI flag `--allow-domain github.com`,
 **Then** both are allowed.
 
 ### AC-3.11 — Proxy port is randomized
-**Given** two concurrent `sandbox run` invocations,
+**Given** two concurrent `saife run` invocations,
 **When** each starts its proxy,
 **Then** they bind to different random `127.0.0.1` ports; neither fails with
 `EADDRINUSE`.
@@ -188,7 +188,7 @@ injected,
 
 ### AC-3.14 — Proxy shuts down with the sandbox
 **Given** a sandboxed session is running with the proxy active,
-**When** `sandbox.exe` exits — normally or via `Ctrl-C`,
+**When** `saife.exe` exits — normally or via `Ctrl-C`,
 **Then** the proxy port is released within 1 second (no lingering listener).
 
 ### AC-3.15 — Loopback-only scope
@@ -357,7 +357,7 @@ list cannot `connect()` to anything (kernel returns `WSAEACCES` /
   a `oneshot::Sender`) is held by the supervisor; on `Drop` of the
   `ProxyHandle` the token is cancelled, the listener stops accepting,
   in-flight connections are given 200 ms to drain, then the port is
-  released (AC-3.14). The handle is dropped when `sandbox.exe` returns
+  released (AC-3.14). The handle is dropped when `saife.exe` returns
   or panics, and the Job Object's `KILL_ON_JOB_CLOSE` handles
   Ctrl-C / forced kill.
 
@@ -466,8 +466,8 @@ pub fn emit_connect(session_id: &str, host: &str, port: u16,
 ```
 
 For US-3, this writes one NDJSON line to
-`%LOCALAPPDATA%\sandbox\audit\<sid>.ndjson` (creating the dir if
-missing) and also to stderr under `SANDBOX_DIAG`. The line shape matches
+`%LOCALAPPDATA%\saife\audit\<sid>.ndjson` (creating the dir if
+missing) and also to stderr under `SAIFE_DIAG`. The line shape matches
 the US-4 `CONNECT` schema:
 
 ```json
@@ -483,20 +483,20 @@ sign the root. US-3 deliberately does not compute the hash chain.)
 
 | AC | Scenario | Command in harness | Assert |
 |---|---|---|---|
-| 3.1 | S-25 | `sandbox run --allow-cwd --block-net -- cmd /c python -c "import urllib.request,sys; urllib.request.urlopen('https://api.openai.com')"` (skip if no python) | exit ≠ 0, stderr matches `(?i)(access is denied|connection|urLError|PermissionError)` |
-| 3.2 | S-26 | `sandbox run --allow-cwd --block-net -- cmd /c python -c "import socket; socket.create_connection(('169.254.169.254',80))"` (skip if no python) | exit ≠ 0, no packet leaves |
-| 3.3 | S-27 | `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s -o NUL -w "%{http_code}" https://api.anthropic.com/v1/messages` (skip if no curl) | http_code in 4xx (anthropic returns 401 without auth — the *connection* succeeded) |
-| 3.4 | S-28 | same as 3.3 but `--allow-domain api.anthropic.com` and `curl https://evil.example.com` | curl exits non-zero, proxy log shows `DENY CONNECT evil.example.com:443 reason=domain_not_allowed` (under `SANDBOX_DIAG`) |
+| 3.1 | S-25 | `saife run --allow-cwd --block-net -- cmd /c python -c "import urllib.request,sys; urllib.request.urlopen('https://api.openai.com')"` (skip if no python) | exit ≠ 0, stderr matches `(?i)(access is denied|connection|urLError|PermissionError)` |
+| 3.2 | S-26 | `saife run --allow-cwd --block-net -- cmd /c python -c "import socket; socket.create_connection(('169.254.169.254',80))"` (skip if no python) | exit ≠ 0, no packet leaves |
+| 3.3 | S-27 | `saife run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s -o NUL -w "%{http_code}" https://api.anthropic.com/v1/messages` (skip if no curl) | http_code in 4xx (anthropic returns 401 without auth — the *connection* succeeded) |
+| 3.4 | S-28 | same as 3.3 but `--allow-domain api.anthropic.com` and `curl https://evil.example.com` | curl exits non-zero, proxy log shows `DENY CONNECT evil.example.com:443 reason=domain_not_allowed` (under `SAIFE_DIAG`) |
 | 3.5 | S-29 | `--allow-domain *.anthropic.com`, curl `api.anthropic.com` and `console.anthropic.com` then `anthropic.com.evil.io` | first two connect, third denied |
 | 3.6 | S-30 | `--allow-domain 169.254.169.254 --allow-domain api.anthropic.com`, connect to `169.254.169.254` | denied with `reason=denied_cidr` in the diag log |
 | 3.7 | S-31 | any profile, connect to `metadata.google.internal` | denied with `reason=denied_dns` |
 | 3.8 | S-32 | `--network-profile minimal`, connect to `api.openai.com`, `api.anthropic.com`, `generativelanguage.googleapis.com`, then `github.com` | first three connect, github denied |
 | 3.9 | S-33 | `--network-profile developer`, connect to all of the above plus `registry.npmjs.org`, `github.com` | all connect |
 | 3.10 | S-34 | profile JSON with `network.allowDomain=["api.anthropic.com"]` + CLI `--allow-domain github.com`, connect to both | both connect |
-| 3.11 | S-35 | two concurrent `sandbox run` invocations | proxy ports differ, neither fails with EADDRINUSE |
+| 3.11 | S-35 | two concurrent `saife run` invocations | proxy ports differ, neither fails with EADDRINUSE |
 | 3.12 | S-36 | sandboxed process knows port but not token, sends request without `X-Sandbox-Token` | proxy responds `407` |
 | 3.13 | S-37 | `--allow-domain api.openai.com`, sandboxed raw-socket python app ignores `HTTPS_PROXY` and `connect()`s directly | `connect()` raises `PermissionError`; log records `DENY CONNECT api.openai.com:443 reason=direct_connect_blocked` (this is the AppContainer network cap, not the proxy) |
-| 3.14 | S-38 | start sandbox w/ proxy, kill `sandbox.exe`, check the proxy port is released within 1 s | port closed (next `Test-NetConnection` or `Get-NetTCPConnection` returns no listener) |
+| 3.14 | S-38 | start sandbox w/ proxy, kill `saife.exe`, check the proxy port is released within 1 s | port closed (next `Test-NetConnection` or `Get-NetTCPConnection` returns no listener) |
 | 3.15 | (SKIP) | — | `Detail='deferred to F-6 (WFP driver)'` |
 
 Tests that need python/curl skip cleanly when the binary is missing,
@@ -529,7 +529,7 @@ mirroring the existing S-8/S-9/S-19 pattern.
   hex-encode.
 - `src/net/loopback.rs` (new) — `register_loopback(ac_sid)` via
   `NetworkIsolationSetAppContainerConfig`. (Best-effort; failures
-  logged under `SANDBOX_DIAG`.)
+  logged under `SAIFE_DIAG`.)
 - `src/audit.rs` (new) — `emit_connect(...)`. Thin; US-4 owns the rest.
 - `src/sandbox/appcontainer.rs` — `build_env_block` gains optional
   `ProxyConfig { port, token }`.

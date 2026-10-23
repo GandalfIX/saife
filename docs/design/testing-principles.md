@@ -1,4 +1,4 @@
-# Testing Principles for `sandbox`
+# Testing Principles for `saife`
 
 > **Status:** Principles established pre-implementation. Apply when writing any
 > test; review this doc before starting each user-story implementation.
@@ -74,15 +74,15 @@ decision logic* and are the place TDD pays off most.
 Not unit-testable (kernel state involved), but each AC maps to one concrete
 spawn-and-assert test. The PRD's PowerShell integration suite already sketches
 these. They require Windows runners (GitHub Actions `windows-latest` works) and
-a real `sandbox.exe` build.
+a real `saife.exe` build.
 
 - **AppContainer + RuleSet enforcement** — AC-1.2 / 1.3 / 1.5:
-  `sandbox run --allow <tmp> -- cmd /c type <denied>` → assert
+  `saife run --allow <tmp> -- cmd /c type <denied>` → assert
   `Access is denied`. The kernel is the oracle; you cannot mock it.
 - **Inheritance** — AC-1.12 / 1.13, SM-6: `cmd /c cmd /c type …` still denied.
   Two concurrent `run` invocations, distinct SIDs, cross-read denied.
 - **Job Object kill-on-close** — AC-1.8: start a child, `Stop-Process
-  sandbox.exe`, assert no orphans via `Get-CimInstance Win32_Process`.
+  saife.exe`, assert no orphans via `Get-CimInstance Win32_Process`.
 - **Option E install dirs** — AC-1.11: drop a binary in
   `.sandbox/$SID/bin/`, exec it, assert success.
 - **`persist` / `--reuse` / `--reuse-rw`** — AC-1.15–1.18: filesystem moves +
@@ -134,13 +134,13 @@ Don't pretend TDD covers these. Document the gap, mitigate where possible.
   design target, not a CI assertion.
 - **Irrevocability** (AC-1.6) — you cannot *prove* no loosening path exists by
   testing; it is a property of the code surface. Cover with: a CLI test
-  asserting `sandbox.exe` exposes no `loosen` / `expand` / `grant` subcommand,
+  asserting `saife.exe` exposes no `loosen` / `expand` / `grant` subcommand,
   plus a code-review checklist item. Kernel immutability holds by construction.
 - **Cross-user behavior** (true two-user isolation) — needs two real user
   profiles; impractical in CI. Unit-test the expansion logic (Tier 1) and
   document the cross-user property as a manual `--self-test` step.
 - **DPAPI at-rest protection** (AC-4.15) — assert the key file bytes are *not*
-  a raw Ed25519 secret (length / prefix check) and that `sandbox` can still
+  a raw Ed25519 secret (length / prefix check) and that `saife` can still
   load + use it. "Only DPAPI can decrypt" is not meaningfully testable beyond
   just calling DPAPI.
 - **Crash behavior** (AC-4.17) — `Stop-Process -Force` the supervisor
@@ -161,7 +161,7 @@ Don't pretend TDD covers these. Document the gap, mitigate where possible.
 3. **For Tier 3, write the test that's honest, not the test that looks good.**
    A flaky ETW count assertion is worse than a robust content assertion with a
    timeout. Mark latency tests as benchmarks, not unit tests.
-4. **`sandbox --self-test` command** runs the Tier-2 battery against a temp
+4. **`saife --self-test` command** runs the Tier-2 battery against a temp
    profile on the user's own machine. This is how we get confidence on the
    ETW/hook and AppContainer paths *on the actual deployment machine*, where CI
    cannot reach. (Already mentioned in the PRD.)

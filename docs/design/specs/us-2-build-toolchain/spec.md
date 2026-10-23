@@ -13,7 +13,7 @@ compromised dependency cannot escape the boundary the agent was given.
 
 ## Narrative
 
-The agent is started under `sandbox run` and decides on its own to spawn
+The agent is started under `saife run` and decides on its own to spawn
 helpers: it shells out to `gradle`, runs `pytest`, calls `npm ci`. From the
 agent's perspective these are ordinary subprocess launches and they all work
 normally — they can read/write the project directory, reach the package
@@ -100,18 +100,18 @@ restricted token regardless of which interpreter it shells out to.
 ### AC-2.7 — Job Object kills the whole tree
 **Given** a sandboxed agent has spawned a 4-level deep tree including gradle
 daemons and a `python -m http.server` background process,
-**When** the user kills `sandbox.exe` with `Ctrl-C`,
+**When** the user kills `saife.exe` with `Ctrl-C`,
 **Then** every process in the tree — including background daemons that
 re-parented — is terminated within 1 second.
 
 ### AC-2.8 — Exit code propagation
 **Given** a sandboxed child exits with code N,
-**When** `sandbox run` returns,
-**Then** `sandbox.exe` exits with the same code N (so CI / scripts can react).
+**When** `saife run` returns,
+**Then** `saife.exe` exits with the same code N (so CI / scripts can react).
 
 ### AC-2.9 — Security groups make toolchains actually usable
 **Given** a profile with `security.groups: ["python_runtime"]`,
-**When** the user runs `sandbox run --profile P --allow-cwd -- python -m
+**When** the user runs `saife run --profile P --allow-cwd -- python -m
 pytest`,
 **Then** python starts successfully (can read its own install dir and pip
 cache). Without the group, the same command would fail to start with
@@ -132,7 +132,7 @@ cache). Without the group, the same command would fail to start with
   `CreateProcessW` with that flag returns `ERROR_ACCESS_DENIED`.
 - **Security groups for toolchain paths**: nono's `node_runtime`,
   `python_runtime`, `rust_runtime` groups map directly to our equivalents.
-  Same concept: `sandbox` maintains the path lists so profiles stay concise
+  Same concept: `saife` maintains the path lists so profiles stay concise
   as toolchain layouts change.
 - **`add_deny_commands` / deny-list commands**: nono profiles can deny
   specific commands (`docker`, `kubectl`). Our MVP does **not** implement
@@ -151,7 +151,7 @@ cache). Without the group, the same command would fail to start with
 | Toolchain group contents | Linux paths: `/usr/bin`, `/usr/lib`, `~/.npm`, `~/.cache/pip`, `~/.cargo/bin` | Windows paths: `%ProgramFiles%\nodejs`, `%APPDATA%\npm`, `%LOCALAPPDATA%\Programs\Python\Python312`, `%USERPROFILE%\.cargo\bin`, `%USERPROFILE%\.gradle`, JDK under `%ProgramFiles%\Java\*` |
 | Process tree kill | nono: children die when nono exits (Landlock is per-process) | Windows: daemons can re-parent to `services.exe` and survive parent death. Job Object with `KILL_ON_JOB_CLOSE` is **required** to guarantee whole-tree kill (AC-2.7). nono doesn't need this because Linux orphans die when their parent does (modulo re-parenting to init, which nono handles by scope). |
 | `CREATE_BREAKAWAY_FROM_JOB` | No analog | Explicitly blocked — Windows-specific escape vector. |
-| Exit code propagation | nono exits with the child's code | Same — `sandbox.exe` calls `GetExitCodeProcess` and returns it. |
+| Exit code propagation | nono exits with the child's code | Same — `saife.exe` calls `GetExitCodeProcess` and returns it. |
 | Toolchain process models | Linux: gradle daemon, npm cache, pip — all file-system based | Windows: same tools exist but use different cache paths (e.g. `%USERPROFILE%\.gradle` vs `~/.gradle`) and different binary locations. Group contents differ; concept is identical. |
 
 ### What we add that nono doesn't have
@@ -193,7 +193,7 @@ acceptance-criterion verification matrix.
 Reference: `sandbox/src/sandbox/job.rs`.
 
 - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` **is** set. When the Job Object handle
-  is released (i.e. `sandbox.exe` exits, including via `Ctrl-C`), every process
+  is released (i.e. `saife.exe` exits, including via `Ctrl-C`), every process
   assigned to the job — including re-parented daemons — is terminated.
 - `JOB_OBJECT_LIMIT_BREAKAWAY_OK` **is NOT** set. Consequently any
   `CreateProcessW` call inside the sandbox that passes
@@ -339,14 +339,14 @@ are added under their assigned numbers.
 - **AC-2.1** (direct child inherits) — already covered by **S-2**.
   Command:
   ```powershell
-  sandbox run --allow-cwd -- cmd /c type $env:USERPROFILE\.ssh\id_rsa
+  saife run --allow-cwd -- cmd /c type $env:USERPROFILE\.ssh\id_rsa
   ```
   Assert: exit code ≠ 0, stderr contains `Access is denied.`
 
 - **AC-2.2** (grandchild depth N) — already covered by **S-10** (depth 3).
   Command:
   ```powershell
-  sandbox run --allow-cwd -- cmd /c cmd /c cmd /c type <denied path>
+  saife run --allow-cwd -- cmd /c cmd /c cmd /c type <denied path>
   ```
   Assert: read denied at depth 4.
 
@@ -356,7 +356,7 @@ are added under their assigned numbers.
   scenario skips cleanly if `java -version` and `gradle -version` both fail.
   Command:
   ```powershell
-  sandbox run --profile gradle-test --allow-cwd -- gradle build
+  saife run --profile gradle-test --allow-cwd -- gradle build
   ```
   Assert: build succeeds, and a worker forked by gradle is denied a read of
   `$env:USERPROFILE\.ssh\id_rsa`.
@@ -373,7 +373,7 @@ are added under their assigned numbers.
   error code. The helper is built as a small separate Rust binary under
   `tests/fixtures/breakaway-helper/`. Command:
   ```powershell
-  sandbox run --allow-cwd -- breakaway-helper.exe
+  saife run --allow-cwd -- breakaway-helper.exe
   ```
   Assert: helper prints `ERROR_ACCESS_DENIED (5)`.
 
@@ -384,7 +384,7 @@ are added under their assigned numbers.
   ```
   Then runs:
   ```powershell
-  sandbox run --allow-cwd -- cmd /c .\wrapper.bat
+  saife run --allow-cwd -- cmd /c .\wrapper.bat
   ```
   Assert: the `Get-Content` is denied (exit ≠ 0, stderr contains
   `Access is denied.`).
@@ -394,22 +394,22 @@ are added under their assigned numbers.
 - **AC-2.8** (exit code propagation) — **new scenario S-24**.
   Command:
   ```powershell
-  sandbox run --allow-cwd -- cmd /c exit 42
+  saife run --allow-cwd -- cmd /c exit 42
   ```
-  Assert: `sandbox.exe` exits with code `42`.
+  Assert: `saife.exe` exits with code `42`.
 
 - **AC-2.9** (security groups make toolchain usable) — **new scenarios
   S-19 and S-20**.
   Both skip cleanly if the toolchain is absent.
   - **S-19** (python_runtime):
     ```powershell
-    sandbox run --profile python-runtime-test --allow-cwd -- python -c "print('ok')"
+    saife run --profile python-runtime-test --allow-cwd -- python -c "print('ok')"
     ```
     Assert: stdout contains `ok`. Without the `python_runtime` group in the
     profile, the same command would fail to start (cannot read stdlib).
   - **S-20** (node_runtime):
     ```powershell
-    sandbox run --profile node-runtime-test --allow-cwd -- node -e "console.log('ok')"
+    saife run --profile node-runtime-test --allow-cwd -- node -e "console.log('ok')"
     ```
     Assert: stdout contains `ok`. Without the `node_runtime` group, `node`
     cannot start.

@@ -255,7 +255,7 @@ should apply to the sandbox itself.
 The agentpatterns doc cites Cymulate (2026) on "Configuration-Based Sandbox
 Escape": writing the CLI's own config from inside the sandbox turns startup
 into an escape primitive. If the sandboxed agent can write to
-`~/.sandbox/profiles/` or `~/.config/sandbox/`, it can rewrite the policy
+`~/.saife/profiles/` or `~/.config/sandbox/`, it can rewrite the policy
 that will be applied to the *next* session. Our PRD's profile search path
 includes `./.sandbox/profiles/` (repo-local, inside the workspace) — if the
 workspace is writable by the agent, the agent can write a malicious profile
@@ -341,7 +341,7 @@ to maintain the allow-list.
 
 Ship both: an unprivileged AppContainer mode (Option B) for the common case
 and an elevated OpenAI-style mode (Option A) for users who need open-ended
-binary execution with strong network. `sandbox setup --check-only` reports
+binary execution with strong network. `saife setup --check-only` reports
 which mode is active and why.
 
 **Pros:**
@@ -420,17 +420,17 @@ This gives:
 
 Lifecycle commands:
 
-- `sandbox persist <sid> [--as <name>]` — promote a session's install tree
+- `saife persist <sid> [--as <name>]` — promote a session's install tree
   to a named, durable store. The session's `.sandbox/<sid>/` is moved (or
-  hardlinked) to `%USERPROFILE%\.sandbox\stores\<name>\`, which is outside
+  hardlinked) to `%USERPROFILE%\.saife\stores\<name>\`, which is outside
   the writable workspace of any future session by default. A manifest of
   file hashes is recorded for later integrity checking.
-- `sandbox run --reuse <name> -- …` — start a new session whose install
+- `saife run --reuse <name> -- …` — start a new session whose install
   roots are bind-mounted (or path-aliased) to the named store instead of a
   fresh `.sandbox/<new-sid>/`. The reused store is **read-only** by default
   (the agent can call its tools but cannot modify them); a `--reuse-rw`
   flag opts into a writable reused store for incremental accumulation.
-- `sandbox store list` / `sandbox store rm <name>` — manage durable stores.
+- `saife store list` / `saife store rm <name>` — manage durable stores.
 - Default retention for unnamed session trees: wiped at session end (or
   after a configurable TTL, e.g. 7 days, to allow `persist` after the fact).
 
@@ -446,7 +446,7 @@ Why this design:
   Sigstore provenance F-5).
 - **No per-tool semantics needed**: unlike a "share cargo cache but not
   arbitrary exes" split, the user persists the whole session tree as a
-  unit. Simpler model, no tool-specific knowledge in `sandbox`.
+  unit. Simpler model, no tool-specific knowledge in `saife`.
 
 #### How this resolves CR-1
 
@@ -487,7 +487,7 @@ Option E is **mechanism-agnostic** — it works with either:
   reads unconfined as per the token model.
 
 For `--reuse <name>`: the RuleSet (or token) simply points at
-`%USERPROFILE%\.sandbox\stores\<name>\bin\` instead of
+`%USERPROFILE%\.saife\stores\<name>\bin\` instead of
 `.sandbox/<sid>/bin\`. Read-only by default (no Write capability on the
 store dir); `--reuse-rw` adds Write.
 
@@ -690,7 +690,7 @@ holds**.
    workspace, or both?~~ **DECIDED (2026-07-23): option (b) — keep profiles
    outside the writable workspace.** Drop the repo-local profile search path
    (`./.sandbox/profiles/`) introduced in US-5. Profiles live only in
-   `%USERPROFILE%\.sandbox\profiles\`, which the sandboxed process cannot
+   `%USERPROFILE%\.saife\profiles\`, which the sandboxed process cannot
    write to. The agent therefore cannot rewrite the policy that will be
    applied to the next session. (Hash-pinning in the session record remains
    a possible future hardening, but is not needed for MVP since the writable

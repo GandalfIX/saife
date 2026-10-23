@@ -1,4 +1,4 @@
-# Comparison: `agent-win-sandbox` vs. our `sandbox`
+# Comparison: `agent-win-sandbox` vs. our `saife`
 
 > **Reviewed:** 2026-09-16 · Repo: <https://github.com/fmuecke/agent-win-sandbox>
 > (MIT, PowerShell). Sources: README, `docs/threat-model.md`, **and full code
@@ -21,7 +21,7 @@ logon session, and workspace, protected by conventional ACLs and account-scoped
 firewall rules. It is explicitly positioned as *blast-radius reduction, not
 hard containment*.
 
-Our `sandbox` is **capability-based isolation**: keep the agent in the user's
+Our `saife` is **capability-based isolation**: keep the agent in the user's
 session but strip its token to a deny-by-default AppContainer identity where
 every filesystem access and network connect must be explicitly granted at the
 kernel.
@@ -80,7 +80,7 @@ enough that a solo project shipped the identity-split alone.
 
 ## Side-by-side
 
-| Axis | agent-win-sandbox | our `sandbox` |
+| Axis | agent-win-sandbox | our `saife` |
 |---|---|---|
 | Primitive | Separate user identity, default ACLs, firewall | AppContainer SID + RuleSet/DACL allow-lists, Job Object |
 | Admin needed | Setup, removal, policy changes | None for FS + `--block-net` (admin-for-setup accepted for future network work) |
@@ -91,10 +91,10 @@ enough that a solo project shipped the identity-split alone.
 | Credentials | Separate Credential Manager/Kerberos/git/PATs from the developer's; sandbox-owned, scoped PATs; plaintext env var storage (documented risk) | Agent must have its credential dirs *granted in* (e.g. `--allow $HOME\.claude`), so the LLM credential is inside the boundary; credential injection is out of MVP scope |
 | Logon session/desktop | Independent logon session, noninteractive desktop, ConPTY; "verified broker boundary" | Child runs in the developer's session (AppContainer restricting SIDs should deny cross-process handle opens, but we haven't documented/tested this — see actions) |
 | Process tree | No job object, no resource limits (DoS is a documented residual risk) | Job Object `KILL_ON_JOB_CLOSE`, no `BREAKAWAY_OK` |
-| Parallelism | One active sandbox session; every process of the sandbox user can read the whole sandbox profile (incl. the PAT) | Per-session SIDs, distinct install trees, `PROTECTED_DACL` cross-session isolation; session B cannot even *read* session A's tree |
-| Open-ended binaries | Trivial: whole sandbox profile is writable, any per-user install works | Option E: sanctioned per-session dirs (`.sandbox/<sid>/bin/…`), bounded, no re-profiling |
-| Config escape (CR-10) | Agent config locked admin-write; covers the files they thought of | Profiles live in `%USERPROFILE%\.sandbox\profiles\` — outside *any* writable workspace, enforced by the sandbox boundary itself |
-| Workflow | Repos must live in the fixed `C:\AgentSandbox`; separate terminal/identity | `sandbox run` in the real checkout, in place |
+| Parallelism | One active sandbox session; every process of the sandbox user can read the whole saife profile (incl. the PAT) | Per-session SIDs, distinct install trees, `PROTECTED_DACL` cross-session isolation; session B cannot even *read* session A's tree |
+| Open-ended binaries | Trivial: whole saife profile is writable, any per-user install works | Option E: sanctioned per-session dirs (`.sandbox/<sid>/bin/…`), bounded, no re-profiling |
+| Config escape (CR-10) | Agent config locked admin-write; covers the files they thought of | Profiles live in `%USERPROFILE%\.saife\profiles\` — outside *any* writable workspace, enforced by the sandbox boundary itself |
+| Workflow | Repos must live in the fixed `C:\AgentSandbox`; separate terminal/identity | `saife run` in the real checkout, in place |
 | Audit | None (documented residual risk) | Planned: Merkle + Ed25519, proxy `CONNECT` events |
 | Agent integrations | Ships today: claude/copilot wrappers, managed settings, checker, attack-surface test | MVP: profiles, no per-agent policy yet |
 
@@ -158,7 +158,7 @@ enough that a solo project shipped the identity-split alone.
    close, no breakaway; they have neither (DoS residual risk).
 6. **Parallel sessions with cross-session poisoning protection.** They
    allow one session, and any process of the sandbox user can read the
-   entire sandbox profile including stored tokens.
+   entire saife profile including stored tokens.
 7. **In-place workflow.** No fixed workspace, no separate terminal
    identity, no moving repos to `C:\AgentSandbox`.
 8. **Audit (planned).** They have none and list it as a residual risk;
@@ -261,7 +261,7 @@ for our own test suite.
 Two honest designs with different centers of gravity. agent-win-sandbox is
 the pragmatic, ships-today, low-friction answer for "don't let the agent be
 *me*" — at the cost of an ACL-hygiene-dependent boundary, open HTTPS egress,
-no read confinement, and admin for lifecycle. Our `sandbox` is the stronger
+no read confinement, and admin for lifecycle. Our `saife` is the stronger
 *boundary* — kernel-enforced, default-deny, irrevocable, unprivileged — but
 still an MVP, with the allow-list network mode deferred and credential
 handling unresolved (their strongest argument against our model).

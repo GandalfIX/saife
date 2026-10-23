@@ -27,9 +27,9 @@
 | `src/net/matcher.rs` | Create | `matches(host, entry)`, `is_allowed(host, &allow_list)`, `is_always_denied(host_or_ip)`. Pure. Unit-tested. |
 | `src/net/profile.rs` | Create | `builtin_profile(name) -> Option<Vec<String>>` for `minimal`/`developer`/`none`. |
 | `src/net/token.rs` | Create | `gen_token() -> String` (256-bit hex via `BCryptGenRandom`). |
-| `src/net/loopback.rs` | Create | `register_loopback(ac_sid) -> Result<()>` via `NetworkIsolationSetAppContainerConfig`. Best-effort; failures logged under `SANDBOX_DIAG`. |
+| `src/net/loopback.rs` | Create | `register_loopback(ac_sid) -> Result<()>` via `NetworkIsolationSetAppContainerConfig`. Best-effort; failures logged under `SAIFE_DIAG`. |
 | `src/net/proxy.rs` | Create | tokio+hyper+rustls CONNECT proxy. `ProxyHandle` (Drop cancels token, releases port). `spawn(token, allow_list, audit_sink) -> Result<ProxyHandle>` returns the bound port. |
-| `src/audit.rs` | Create | `emit_connect(sid, host, port, disposition, reason)`. Writes NDJSON to `%LOCALAPPDATA%\sandbox\audit\<sid>.ndjson` and to stderr under `SANDBOX_DIAG`. US-4 will own hashing/signing. |
+| `src/audit.rs` | Create | `emit_connect(sid, host, port, disposition, reason)`. Writes NDJSON to `%LOCALAPPDATA%\saife\audit\<sid>.ndjson` and to stderr under `SAIFE_DIAG`. US-4 will own hashing/signing. |
 | `src/sandbox/appcontainer.rs` | Modify | `build_env_block` gains `proxy: Option<ProxyConfig>` param; sets `HTTP_PROXY`/`HTTPS_PROXY`/`X-Sandbox-Token`/`NO_PROXY`. |
 | `src/main.rs` | Modify | `run_inner` resolves `NetworkConfig`, starts proxy (or not), registers loopback (or not), passes proxy port+token into `build_env_block`. Remove the stub "accepted, logged, ignored" messages. |
 | `src/setup.rs` | Modify | `setup --check-only` reports proxy/network-cap status (replace "not yet implemented" lines for the network row). |
@@ -569,7 +569,7 @@ pub fn resolve_network(
             allow.extend(builtin);
         } else if name != "none" {
             // Unknown profile name: warn but continue with empty allow-list.
-            eprintln!("[sandbox] warning: unknown network profile `{name}`");
+            eprintln!("[saife] warning: unknown network profile `{name}`");
         }
     }
 
@@ -675,7 +675,7 @@ pub fn emit_connect(
         reason = match reason { Some(r) => format!(",\"reason\":\"{}\"", r.replace('"', "\\\"\"")), None => String::new() }
     );
 
-    if std::env::var_os("SANDBOX_DIAG").is_some() {
+    if std::env::var_os("SAIFE_DIAG").is_some() {
         eprint!("[proxy] {line}");
     }
     let path = audit_log_path(session_id);
@@ -765,11 +765,11 @@ use windows::Win32::Security::Isolation::*;
 use windows::core::*;
 
 /// Register loopback for the AppContainer SID. Best-effort: failures are
-/// logged under `SANDBOX_DIAG` but not propagated — direct connects to
+/// logged under `SAIFE_DIAG` but not propagated — direct connects to
 /// the proxy would simply fail closed (kernel denies non-exempted
 /// loopback), which is a worse failure mode but not a security one.
 pub fn register_loopback(ac_sid: &PSID) -> Result<()> {
-    let diag = std::env::var_os("SANDBOX_DIAG").is_some();
+    let diag = std::env::var_os("SAIFE_DIAG").is_some();
     unsafe {
         // INET_FIREWALL_APP_CONTAINER: app_container_sid + capabilities.
         // We pass an empty capabilities array (no internet caps).
@@ -830,7 +830,7 @@ This is the largest task. The proxy:
 ```rust
 //! Localhost reverse proxy: tokio + hyper + rustls.
 //!
-//! Architecture: the supervisor (`sandbox.exe`) spawns the proxy on a
+//! Architecture: the supervisor (`saife.exe`) spawns the proxy on a
 //! random 127.0.0.1 port before launching the sandboxed process. The
 //! sandboxed process is configured (via env vars) to route HTTP(S)
 //! through this proxy. The proxy enforces the domain allow-list and the
@@ -1141,8 +1141,8 @@ The actual ordering needs care: `create_session` (which mints the AC SID) must h
 ```rust
 if !net_cfg.is_blocked() {
     if let Err(e) = net::loopback::register_loopback(&session.ac_sid) {
-        eprintln!("[sandbox] warning: loopback exemption failed: {e}");
-        eprintln!("[sandbox]          direct connects to the proxy will be denied.");
+        eprintln!("[saife] warning: loopback exemption failed: {e}");
+        eprintln!("[saife]          direct connects to the proxy will be denied.");
     }
 }
 ```
@@ -1258,10 +1258,10 @@ function Invoke-Scenario-S27 {
     $d = New-ScenarioDir 27
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=27; Name='S-27 (AC-3.3)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://api.anthropic.com/v1/messages') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     # Connection succeeded → anthropic returns 401 (no auth) or 4xx. The
     # assertion is that we reached the host (not a proxy error).
@@ -1278,10 +1278,10 @@ function Invoke-Scenario-S28 {
     $d = New-ScenarioDir 28
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=28; Name='S-28 (AC-3.4)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://evil.example.com') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     # curl exits non-zero when the proxy returns 403.
     $passed = ($r.ExitCode -ne 0) -or ($out -eq '403')
@@ -1297,12 +1297,12 @@ function Invoke-Scenario-S29 {
     $d = New-ScenarioDir 29
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=29; Name='S-29 (AC-3.5)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $rA = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://api.anthropic.com/v1/messages') -WorkingDirectory $d
         $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://console.anthropic.com/') -WorkingDirectory $d
         $rC = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','*.anthropic.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://anthropic.com.evil.io/') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $outA = ($rA.Stdout -join '')
     $outB = ($rB.Stdout -join '')
     $outC = ($rC.Stdout -join '')
@@ -1322,10 +1322,10 @@ function Invoke-Scenario-S30 {
     $d = New-ScenarioDir 30
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=30; Name='S-30 (AC-3.6)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','169.254.169.254','--allow-domain','api.anthropic.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','http://169.254.169.254/') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     $passed = ($r.ExitCode -ne 0) -or ($out -eq '403')
     return @{ Num=30; Name='S-30 (AC-3.6)'; Passed=$passed; Skipped=$false
@@ -1340,10 +1340,10 @@ function Invoke-Scenario-S31 {
     $d = New-ScenarioDir 31
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=31; Name='S-31 (AC-3.7)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','metadata.google.internal','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','http://metadata.google.internal/') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     $passed = ($r.ExitCode -ne 0) -or ($out -eq '403')
     return @{ Num=31; Name='S-31 (AC-3.7)'; Passed=$passed; Skipped=$false
@@ -1358,11 +1358,11 @@ function Invoke-Scenario-S32 {
     $d = New-ScenarioDir 32
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=32; Name='S-32 (AC-3.8)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $rAllow = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://api.anthropic.com/v1/messages') -WorkingDirectory $d
         $rDeny  = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','minimal','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://github.com/') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $outA = ($rAllow.Stdout -join '')
     $outD = ($rDeny.Stdout -join '')
     $passed = ($outA -match '^(4[0-9][0-9]|2[0-9][0-9]|3[0-9][0-9])') -and (($rDeny.ExitCode -ne 0) -or ($outD -eq '403'))
@@ -1378,10 +1378,10 @@ function Invoke-Scenario-S33 {
     $d = New-ScenarioDir 33
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--network-profile','developer','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://github.com/') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     $passed = ($out -match '^(4[0-9][0-9]|2[0-9][0-9]|3[0-9][0-9])')
     return @{ Num=33; Name='S-33 (AC-3.9)'; Passed=$passed; Skipped=$false
@@ -1405,11 +1405,11 @@ function Invoke-Scenario-S34 {
     Set-Content -LiteralPath $profilePath -Value $profileJson -Encoding UTF8
     $curl = Get-Command curl -ErrorAction SilentlyContinue
     if (-not $curl) { return @{ Num=34; Name='S-34 (AC-3.10)'; Passed=$true; Skipped=$true; Detail='curl not on PATH' } }
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $rA = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--allow-cwd','--allow-domain','github.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://api.anthropic.com/v1/messages') -WorkingDirectory $d
         $rB = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--allow-cwd','--allow-domain','github.com','--','cmd','/c','curl','-s','-o','NUL','-w','%{http_code}','https://github.com/') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $outA = ($rA.Stdout -join '')
     $outB = ($rB.Stdout -join '')
     $passed = ($outA -match '^(4[0-9][0-9]|2[0-9][0-9]|3[0-9][0-9])') -and ($outB -match '^(4[0-9][0-9]|2[0-9][0-9]|3[0-9][0-9])')
@@ -1455,11 +1455,11 @@ function Invoke-Scenario-S36 {
     $py = Get-Python
     if (-not $py) { return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
     # Start a session and capture the sid + proxy port. The proxy port is
-    # printed on stderr under SANDBOX_DIAG ([proxy] listening on 127.0.0.1:<port>).
-    $env:SANDBOX_DIAG='1'
+    # printed on stderr under SAIFE_DIAG ([proxy] listening on 127.0.0.1:<port>).
+    $env:SAIFE_DIAG='1'
     try {
         $probe = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--print-sid','--','cmd','/c','echo','probe') -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $sid = ($probe.Stdout | Where-Object { $_ -match '^\d{8}-\d{6}-\d{5}$' } | Select-Object -First 1)
     $portLine = ($probe.Stderr | Where-Object { $_ -match '\[proxy\].*127\.0\.0\.1:(\d{2,5})' } | Select-Object -First 1)
     if (-not $sid -or -not $portLine -or $portLine -notmatch '(\d{2,5})') {
@@ -1467,15 +1467,15 @@ function Invoke-Scenario-S36 {
     }
     $port = $matches[1]
     # Reuse the same session. The sandboxed python reads the proxy port from
-    # the diag output (we re-export SANDBOX_DIAG so the second run also logs
+    # the diag output (we re-export SAIFE_DIAG so the second run also logs
     # the port — but we already have it from $port). We hard-code the port
     # into the python snippet. Python opens a raw socket to 127.0.0.1:$port
     # and sends a GET request WITHOUT the X-Sandbox-Token header.
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $pyCmd = "import socket; s=socket.create_connection(('127.0.0.1',$port)); s.sendall(b'GET http://api.anthropic.com/ HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n'); print(s.recv(64).decode(errors='replace'))"
         $r = Invoke-Sandbox -Args @('run','--allow-cwd','--allow-domain','api.anthropic.com','--sid',$sid,'--','python','-c',$pyCmd) -WorkingDirectory $d
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     $out = ($r.Stdout -join '')
     $passed = $out -match '407'
     return @{ Num=36; Name='S-36 (AC-3.12)'; Passed=$passed; Skipped=$false
@@ -1483,7 +1483,7 @@ function Invoke-Scenario-S36 {
 }
 ```
 
-> Requires the proxy to log its listening port under `SANDBOX_DIAG` (added in Task 7's `proxy::spawn`). Also requires `--sid <sid>` reuse to point at the *same* proxy instance whose port we extracted.
+> Requires the proxy to log its listening port under `SAIFE_DIAG` (added in Task 7's `proxy::spawn`). Also requires `--sid <sid>` reuse to point at the *same* proxy instance whose port we extracted.
 
 - [ ] **Step 13: Add S-37 (AC-3.13, raw-socket app fails closed)**
 
@@ -1507,7 +1507,7 @@ function Invoke-Scenario-S37 {
 ```powershell
 function Invoke-Scenario-S38 {
     $d = New-ScenarioDir 38
-    $env:SANDBOX_DIAG='1'
+    $env:SAIFE_DIAG='1'
     try {
         $proc = Start-Process -FilePath $SandboxExe -ArgumentList @('run','--allow-cwd','--network-profile','minimal','--','cmd','/c','ping -t 127.0.0.1') -PassThru -WorkingDirectory $d -RedirectStandardError (Join-Path $d 'diag.log')
         Start-Sleep -Seconds 1
@@ -1526,7 +1526,7 @@ function Invoke-Scenario-S38 {
         }
         $passed = $port -and -not $listenerStillUp
         Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    } finally { Remove-Item env:SANDBOX_DIAG -ErrorAction SilentlyContinue }
+    } finally { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
     return @{ Num=38; Name='S-38 (AC-3.14)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { "proxy port $port released on sandbox exit" } else { "port=$port listenerStillUp=$listenerStillUp" } }
 }

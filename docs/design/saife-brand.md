@@ -30,7 +30,7 @@ saife run -- opencode
 ## 2. `saife --help` (draft)
 
 The version line comes from the crate; the rename has to change it (today it
-prints `sandbox 0.1.0`). Commands, options and exit codes below are the real
+prints `saife 0.1.0`). Commands, options and exit codes below are the real
 ones, verified against the binary.
 
 ```
@@ -81,9 +81,9 @@ Exit codes:
   126  guardrail refusal (for example: the workload never authenticated to the proxy)
 
 Files:
-  profiles   %USERPROFILE%\.sandbox\profiles\<name>.json
-  plugins    %USERPROFILE%\.sandbox\plugins\<name>\plugin.json
-  audit      %LOCALAPPDATA%\sandbox\audit\<sid>.ndjson (+ .root, .sig)
+  profiles   %USERPROFILE%\.saife\profiles\<name>.json
+  plugins    %USERPROFILE%\.saife\plugins\<name>\plugin.json
+  audit      %LOCALAPPDATA%\saife\audit\<sid>.ndjson (+ .root, .sig)
 
 Run 'saife <command> --help' for a command's full options.
 ```
@@ -225,14 +225,14 @@ list — each item is a real string or path in the tree.
 
 | surface | today | target |
 |---|---|---|
-| binary name | `sandbox.exe` | `saife.exe` |
+| binary name | `saife.exe` | `saife.exe` |
 | launcher | `mxc-launch.exe` | `saife-launch.exe` (and the "beside the supervisor" rule follows) |
-| version line | `sandbox 0.1.0` | `SAIFE Sandbox 0.1.0` |
-| stderr prefix | `[sandbox] …` | `[saife] …` |
+| version line | `saife 0.1.0` | `SAIFE Sandbox 0.1.0` |
+| stderr prefix | `[saife] …` | `[saife] …` |
 | profile dir | `%USERPROFILE%\.sandbox\profiles` | `%USERPROFILE%\.saife\profiles` |
 | plugin dir | `%USERPROFILE%\.sandbox\plugins` | `%USERPROFILE%\.saife\plugins` |
 | audit + signing + logs | `%LOCALAPPDATA%\sandbox\…` | `%LOCALAPPDATA%\saife\…` |
-| env markers | `SANDBOX_SESSION_SID`, `SANDBOX_PROXY_PORT`, `SANDBOX_FACADE_MOUNTS` | `SAIFE_*` |
+| env markers | `SAIFE_SESSION_SID`, `SAIFE_PROXY_PORT`, `SAIFE_FACADE_MOUNTS` | `SAIFE_*` |
 | plugin sidecar env | `SIDECAR_*` (keep; it is plural-friendly and not brand-specific) | unchanged |
 | doc set | USER-GUIDE, DEVELOPERS, README, AGENTS, plan/ADR text | rewritten around `saife` |
 | packaging | `build-dist.ps1` paths, `dist/`, zip names | `saife-<version>-x64.zip` |

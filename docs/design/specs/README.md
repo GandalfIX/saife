@@ -1,6 +1,6 @@
 # Sandbox specs
 
-Per-user-story specification documents for the `sandbox` tool. Each
+Per-user-story specification documents for the `saife` tool. Each
 subdirectory corresponds to a user story from the PRD
 (`../prd/prd-sandbox.md`) and is structured in three stages:
 

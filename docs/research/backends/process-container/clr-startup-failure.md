@@ -32,7 +32,7 @@ the registry, the environment, a job object, the working directory, or the SDK?
 Scratch harness `%LOCALAPPDATA%\hermes\cache\scratch\clr\`:
 
 * `probe/` (Rust, `mxc-sdk =1.0.1`) launches one real ProcessContainer per leg through
-  `mxc_sdk::v1::run`, with the P1 production request shape: `mxc-launch` as the
+  `mxc_sdk::v1::run`, with the P1 production request shape: `saife-launch` as the
   container command, workspace readwrite, `C:\Windows` + `C:\Program Files\dotnet`
   readonly, explicit `TEMP`/`TMP`, `inherit_default_environment = true`.
   `CLR_UI=both` runs every leg twice, differing **only** in `request.ui.disable`.
@@ -133,7 +133,7 @@ Numbers are exit codes; `1114` is `ERROR_DLL_INIT_FAILED`, `0xC0000142` is
 
 Two further controls, because "the harness did it" is a real possibility:
 
-* `CLR_NOLAUNCH=1` (no `mxc-launch` wrapper, the binary as the container command):
+* `CLR_NOLAUNCH=1` (no `saife-launch` wrapper, the binary as the container command):
   `-1073741502` with `ui.disable=true`, **`FXOK`** with `ui.disable=false`.
 * `CLR_NET=proxy` (the production network policy: `egress.default=deny`,
   `ingress.hostLoopback=allow`, token-bearing `networkProxy`): `-1073741502` /
@@ -187,7 +187,7 @@ request.ui = Some(UiPolicy {
 
 Proof: `powershell.exe ... "Write-Output FXOK"` → exit `0`, stdout `FXOK`;
 `dotnet hello.dll` → exit `0`, stdout `HELLO-OK`; same result with and without the
-`mxc-launch` wrapper and with the production proxy policy.
+`saife-launch` wrapper and with the production proxy policy.
 
 What is given up, measured rather than assumed:
 
@@ -252,7 +252,7 @@ path *starts* — a green suite that never runs a CLR process would not have cau
 ```
 CLR_UI=both                  # every leg under ui.disable=true and false
 CLR_ONLY=ps51                # or diag-info | diag-load | diag-files | diag-env | ...
-CLR_NOLAUNCH=1 CLR_UI=both   # without the mxc-launch wrapper
+CLR_NOLAUNCH=1 CLR_UI=both   # without the saife-launch wrapper
 CLR_NET=proxy CLR_UI=both    # production-shaped network policy
 CLR_CWD='C:\Windows\System32' CLR_TEMP='C:\Windows\Temp'
 CLR_EXTRA_RO='C:\Program Files;C:\Users\marku\AppData\Local;C:\ProgramData;C:\Windows\Microsoft.NET'

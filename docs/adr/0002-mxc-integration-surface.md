@@ -5,7 +5,7 @@
 > ADR-0003's bounded-adapter posture, on condition of two mandatory guardrails (post-launch proxy proof
 > as a hard gate; per-session tier logging). The attestation gap itself is UNCHANGED — still absent at
 > mxc-sdk 1.0.1 — so a degraded launch is detectable, not preventable.
-> **Scope:** WBD ticket D-03 (`input/WINDOWS_CLI_SANDBOX_WORK_BREAKDOWN.md` line 474, criteria lines 480-492). Consumes D-02 (`docs/research/wbd-d02-capability-matrix.md`). Binds ADR-0003 (D-04) and every product launch-path implementation ticket.
+> **Scope:** WBD ticket D-03 (`input/WINDOWS_CLI_SAIFE_WORK_BREAKDOWN.md` line 474, criteria lines 480-492). Consumes D-02 (`docs/research/wbd-d02-capability-matrix.md`). Binds ADR-0003 (D-04) and every product launch-path implementation ticket.
 > **Origin:** `docs/design/2026-10-14-wbd-d03-d04-stop-work-gates-design.md` §3.2; implementation plan `docs/plans/2026-10-14-wbd-d03-d04-stop-work-gates.md`.
 > **Evidence rule:** every claim below cites a fetched artifact (under `tests/vm/results/<run-id>/`, SHA256-verified against that run's `capture-manifest.json`) or a `file:line` at the pinned tree. Unexposed capabilities are recorded blockers, never inferences.
 

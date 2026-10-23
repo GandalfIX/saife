@@ -14,19 +14,19 @@ backend you will work on by default) and the current plan under
 
 ## 1. Orientation
 
-One Rust binary (`sandbox`) enforces a policy on a child process. Two backends:
+One Rust binary (`saife`) enforces a policy on a child process. Two backends:
 
 | Backend | How containment works | Elevation |
 |---|---|---|
 | `mxc` (default in a `--features mxc-backend` build) | MXC `processcontainer`: additive filesystem policy, egress forced through this process's own loopback proxy | **none** |
 | `appcontainer` (escape hatch) | AppContainer token + per-directory DACL grants + admin loopback exemption | **admin** for networked sessions |
 
-`mxc-launch` is a second binary: a supervisor-owned wrapper that builds the
+`saife-launch` is a second binary: a supervisor-owned wrapper that builds the
 container's environment and proves the child's path to the proxy before the
 payload runs. It is compiled only with the feature.
 
 The tool is bin-only: there is no library target, so every test run is
-`--bin sandbox` / `--bins`. `cargo test --lib` fails by design.
+`--bin saife` / `--bins`. `cargo test --lib` fails by design.
 
 ---
 
@@ -48,7 +48,7 @@ The tool is bin-only: there is no library target, so every test run is
 | `src/sandbox/` | AppContainer specifics: `appcontainer`, `allowlist`, `spawn`, `dacl_journal`, `job` |
 | `src/profile.rs` | profile schema, load, merge, resolve |
 | `src/setup.rs`, `security_groups.rs`, `signing.rs` | setup checks + elevation probe, group expansion, Ed25519 signing |
-| `src/bin/mxc-launch.rs` | wrapper launcher: env, probe, child spawn, exit code |
+| `src/bin/saife-launch.rs` | wrapper launcher: env, probe, child spawn, exit code |
 | `tests/run-tests.ps1` | the integration suite (93 scenarios), `-Backend` switch |
 | `tests/vm/` | disposable-VM lane (stages the repo, runs the suite in a guest) |
 | `tests/Clear-HostTestArtifacts.ps1` | host cleanup gate (`HOST-CLEAN` / `HOST-DIRTY`) |
@@ -149,10 +149,10 @@ to `502` (`docs/adr/0001`, D9).
 
 ### 3.5 Audit model
 
-- One NDJSON file per session under `%LOCALAPPDATA%\sandbox\audit\`, plus
+- One NDJSON file per session under `%LOCALAPPDATA%\saife\audit\`, plus
   `<sid>.root` (sealed root) and `<sid>.sig` (Ed25519).
 - Leaves are hash-chained (`hash` over the canonical body, `parent` = previous
-  hash). `sandbox audit verify` recomputes the chain, checks the signature, and
+  hash). `saife audit verify` recomputes the chain, checks the signature, and
   reports `INCOMPLETE` when a session did not end cleanly.
 - The **root is `SESSION_START`** and is written before any child can run. On a
   refused session it carries `disposition: deny`, followed by `SESSION_REFUSED`.
@@ -163,11 +163,11 @@ to `502` (`docs/adr/0001`, D9).
 ## 4. Build and test
 
 ```bash
-cargo build --release                        # default: mxc + mxc-launch
+cargo build --release                        # default: mxc + saife-launch
 cargo build --release --no-default-features  # AppContainer only (says so at startup)
-cargo test  --bin sandbox                    # 611 + 10 ignored  (default)
-cargo test  --bin sandbox --no-default-features  # 490
-cargo test  --bin mxc-launch                 # 19 (default build only)
+cargo test  --bin saife                    # 611 + 10 ignored  (default)
+cargo test  --bin saife --no-default-features  # 490
+cargo test  --bin saife-launch                 # 19 (default build only)
 cargo clippy --all-targets [--no-default-features] # must be 0 warnings
 ```
 
@@ -181,8 +181,8 @@ Gates for any change: both feature states green (default and `--no-default-featu
 preserved (byte counts, not `grep`: this host's `grep` hides CR).
 
 **Live legs** (`--ignored`) start real containers and **execute
-`target/debug/sandbox.exe`**, not the test binary — run
-`cargo build --features mxc-backend --bin sandbox` first, or the kill-leg's
+`target/debug/saife.exe`**, not the test binary — run
+`cargo build --features mxc-backend --bin saife` first, or the kill-leg's
 freshness guard fails the lane (and you will be debugging a stale binary).
 
 **VM lane** (disposable guest, where the full suite runs):

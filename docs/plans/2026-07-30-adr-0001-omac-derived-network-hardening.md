@@ -13,7 +13,7 @@ Five decisions (D-0 through D-5) layered on top of the existing US-3 proxy infra
 - **D-0** (keystone): replace admin-only `NetworkIsolationSetAppContainerConfig` with `privateNetworkClientServer` capability SID. Unblocks all network features unprivileged.
 - **D-1**: full filter pipeline (hard-deny → learned-deny → deny_domain → allow → prompt/default), DNS pinning + Happy Eyeballs, `Proxy-Authorization: Basic` auth, raw-tunnel (no TLS termination), loopback-CONNECT refusal.
 - **D-2**: upstream corporate proxy chaining (CONNECT-only, `NO_PROXY` direct-dial bypass).
-- **D-3**: interactive `TaskDialogIndirect` prompt with 6 buttons, learned persistence, `--no-prompt`, `sandbox learned` CLI.
+- **D-3**: interactive `TaskDialogIndirect` prompt with 6 buttons, learned persistence, `--no-prompt`, `saife learned` CLI.
 - **D-4**: intent registry (`/sandbox/intent*` endpoints on the proxy listener).
 - **D-5**: audit `source`/`scope`/`persisted` fields on `CONNECT` events, `secret.inject` schema reserved, `--audit-strict` flag.
 
@@ -56,14 +56,14 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 
 - [ ] **Step 1:** In `src/sandbox/appcontainer.rs` `build_env_block` (lines 280–352): change `HTTP_PROXY`/`HTTPS_PROXY` from `http://127.0.0.1:{port}` to `http://sandbox:{token}@127.0.0.1:{port}` (userinfo in URL). Drop the `X-Sandbox-Token` env var. Set `NO_PROXY=localhost,127.0.0.1,::1` (not empty — so the child reaches the intent endpoints directly in D-4).
 - [ ] **Step 2:** Update the `PROXY_VARS` const (line 304) to remove `X-Sandbox-Token`.
-- [ ] **Step 3:** Add `SANDBOX_PROXY_PORT` env var (the port as a string) for D-4 discoverability.
+- [ ] **Step 3:** Add `SAIFE_PROXY_PORT` env var (the port as a string) for D-4 discoverability.
 - [ ] **Step 4:** Update the proxy.rs `handle_conn` token check (lines 197–205) to accept `Proxy-Authorization: Basic` with constant-time compare (`subtle::ConstantTimeCompare` — add `subtle` crate to `Cargo.toml`). Parse `Basic <base64>`, decode, split on `:`, compare the password part to the session token. Missing/invalid → `407 Proxy Authentication Required`.
 - [ ] **Step 5:** Add Rust unit tests for the `Proxy-Authorization` parsing + comparison logic.
 
 ### Task 1.4: Update setup report
 
 - [ ] **Step 1:** In `src/setup.rs` (line 63), update the network row from `"available (US-3)"` to: `Network (privateNetworkClientServer) : available (loopback + intranet; raw-socket LAN leak possible — use --block-net for strong isolation)`.
-- [ ] **Step 2:** Verify `sandbox setup --check-only` prints the new line.
+- [ ] **Step 2:** Verify `saife setup --check-only` prints the new line.
 
 ### Task 1.5: Un-skip network integration tests
 
@@ -73,10 +73,10 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 ### 🛑 CHECKPOINT 1 — User tests unprivileged network
 
 **👤 MANUAL APPROVAL REQUIRED.** The user must manually verify:
-1. `sandbox setup --check-only` shows the updated network row with the intranet-leak warning.
-2. `sandbox run --allow-cwd --block-net -- cmd /c echo hello` still denies all network (regression check).
-3. `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s -o NUL -w "%{http_code}" https://api.anthropic.com/v1/messages` — the connection succeeds (http_code 4xx from Anthropic = connection worked, auth failed = expected).
-4. `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s https://evil.example.com` — denied by the proxy.
+1. `saife setup --check-only` shows the updated network row with the intranet-leak warning.
+2. `saife run --allow-cwd --block-net -- cmd /c echo hello` still denies all network (regression check).
+3. `saife run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s -o NUL -w "%{http_code}" https://api.anthropic.com/v1/messages` — the connection succeeds (http_code 4xx from Anthropic = connection worked, auth failed = expected).
+4. `saife run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl -s https://evil.example.com` — denied by the proxy.
 5. The integration test harness passes: `.\tests\run-tests.ps1 -StopOnFail`.
 
 **Do not proceed to Phase 2 until the user approves.**
@@ -124,8 +124,8 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 **Automated:** `cargo test` passes (all new audit unit tests).
 **👤 MANUAL APPROVAL REQUIRED:**
 1. Run a sandboxed session with `--allow-domain api.anthropic.com -- cmd /c curl https://api.anthropic.com`.
-2. Run `sandbox audit show <sid> --json` and verify the `CONNECT` events now include `source`, `scope`, `persisted` fields.
-3. Run `sandbox audit show <sid> --filter "source=allowlist"` and verify filtering works.
+2. Run `saife audit show <sid> --json` and verify the `CONNECT` events now include `source`, `scope`, `persisted` fields.
+3. Run `saife audit show <sid> --filter "source=allowlist"` and verify filtering works.
 4. Run with `--audit-strict` and verify the session starts normally (log is writable).
 
 ---
@@ -176,7 +176,7 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 ### Task 3.3: Learned-policy store
 
 - [ ] **Step 1:** Create `src/net/learned.rs` with a `LearnedStore` struct:
-  - `load(profile_name: &str) -> LearnedStore` — reads `%USERPROFILE%\.sandbox\learned\<profile_name>.json`. Unnamed → `default.json`. Missing file → empty store.
+  - `load(profile_name: &str) -> LearnedStore` — reads `%USERPROFILE%\.saife\learned\<profile_name>.json`. Unnamed → `default.json`. Missing file → empty store.
   - `lookup(host: &str) -> Option<LearnedDecision>` — returns `Some(LearnedDecision { allow: bool, scope: String })` if found. Suffix entries match the host itself and any subdomain.
   - `record(host: &str, scope: &str, allow: bool) -> Result<()>` — persists immediately. Write-temp + `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` with 3x retry + 50ms backoff, fallback to direct write.
   - File format (our own, camelCase): `{"schema":1,"allow":[{"host":"...","scope":"host"|"suffix"}],"deny":[{"host":"...","scope":"host"|"suffix"}]}`
@@ -231,15 +231,15 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
   - Non-`/sandbox/` non-CONNECT → `400 Bad Request`.
   - All endpoints require `Proxy-Authorization: Basic` (same token as CONNECT).
 - [ ] **Step 5:** In `src/main.rs`, load the `LearnedStore` before starting the proxy. Create the `IntentRegistry`. Pass both + `PromptConfig` into `ProxyConfig`.
-- [ ] **Step 6:** In `src/sandbox/appcontainer.rs`, inject `SANDBOX_PROXY_PORT` env var (from Task 1.3).
+- [ ] **Step 6:** In `src/sandbox/appcontainer.rs`, inject `SAIFE_PROXY_PORT` env var (from Task 1.3).
 - [ ] **Step 7:** Verify `cargo build --release` and `cargo test` pass.
 
-### Task 3.7: `sandbox learned` CLI subcommand
+### Task 3.7: `saife learned` CLI subcommand
 
 - [ ] **Step 1:** In `src/cli.rs`, add `Cmd::Learned { subcommand: LearnedSub, profile: Option<String> }` with `LearnedSub::List`, `LearnedSub::Revoke { host: String }`, `LearnedSub::Clear`.
-- [ ] **Step 2:** Implement `sandbox learned list` — prints a table of host/scope/disposition from the learned file.
-- [ ] **Step 3:** Implement `sandbox learned revoke <host>` — removes the entry, atomically rewrites the file.
-- [ ] **Step 4:** Implement `sandbox learned clear` — empties the file.
+- [ ] **Step 2:** Implement `saife learned list` — prints a table of host/scope/disposition from the learned file.
+- [ ] **Step 3:** Implement `saife learned revoke <host>` — removes the entry, atomically rewrites the file.
+- [ ] **Step 4:** Implement `saife learned clear` — empties the file.
 - [ ] **Step 5:** Add Rust unit tests for the CLI parsing.
 
 ### Task 3.8: Integration tests for prompt + intent + learned
@@ -250,20 +250,20 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
   - **S-74** (D-1 wildcard apex): `--allow-domain *.anthropic.com`, curl `anthropic.com` (apex) → allowed. (Automated.)
   - **S-75** (D-1 loopback CONNECT refused): the agent issues `CONNECT 127.0.0.1:5432` → `403` + `X-Sandbox: denied`. (Automated — use `curl -x` to force a CONNECT to loopback.)
   - **S-76** (D-3 `--no-prompt`): `--allow-domain api.anthropic.com --no-prompt`, curl `evil.example.com` → denied, no dialog spawned, `source: "default"` in audit. (Automated.)
-  - **S-77** (D-4 intent endpoint): inside the sandbox, `curl -H "Proxy-Authorization: Basic ..." http://127.0.0.1:$SANDBOX_PROXY_PORT/sandbox/intent -d '{"target":"api.example.com","reason":"test"}'` → `204`. Then `GET /sandbox/intent?host=api.example.com` → `200` with the reason. (Automated — use a script as the inner command.)
+  - **S-77** (D-4 intent endpoint): inside the sandbox, `curl -H "Proxy-Authorization: Basic ..." http://127.0.0.1:$SAIFE_PROXY_PORT/sandbox/intent -d '{"target":"api.example.com","reason":"test"}'` → `204`. Then `GET /sandbox/intent?host=api.example.com` → `200` with the reason. (Automated — use a script as the inner command.)
   - **S-78** (D-3 learned persistence): run with `--allow-domain api.anthropic.com`, interactively allow `github.com` permanently, restart sandbox, curl `github.com` without `--allow-domain github.com` → allowed (learned). (**👤 MANUAL APPROVAL** — requires interactive dialog click.)
-  - **S-79** (D-3 `sandbox learned list/revoke`): after S-78, run `sandbox learned list` → shows `github.com`, run `sandbox learned revoke github.com`, run `sandbox learned list` → empty. (Automated if S-78 is done first.)
-  - **S-80** (D-5 audit source field): after S-72/S-73/S-76, run `sandbox audit show <sid> --filter "source=hard-deny"` → only hard-deny events. (Automated.)
+  - **S-79** (D-3 `saife learned list/revoke`): after S-78, run `saife learned list` → shows `github.com`, run `saife learned revoke github.com`, run `saife learned list` → empty. (Automated if S-78 is done first.)
+  - **S-80** (D-5 audit source field): after S-72/S-73/S-76, run `saife audit show <sid> --filter "source=hard-deny"` → only hard-deny events. (Automated.)
 
 ### 🛑 CHECKPOINT 3 — User tests interactive prompt
 
 **👤 MANUAL APPROVAL REQUIRED.** The following cannot be automated:
-1. Run `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl https://evil.example.com` — verify the `TaskDialogIndirect` dialog appears with 6 buttons, steals focus, and shows host:port. Click "Deny once" — verify curl gets a 403.
-2. Inside the sandbox (via `cmd /c`), POST an intent: `curl -H "Proxy-Authorization: Basic ..." http://127.0.0.1:%SANDBOX_PROXY_PORT%/sandbox/intent -d "{\"target\":\"api.github.com\",\"reason\":\"fetching releases\"}"`. Then curl `https://api.github.com` — verify the dialog now shows `Agent reason: "fetching releases"`.
+1. Run `saife run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl https://evil.example.com` — verify the `TaskDialogIndirect` dialog appears with 6 buttons, steals focus, and shows host:port. Click "Deny once" — verify curl gets a 403.
+2. Inside the sandbox (via `cmd /c`), POST an intent: `curl -H "Proxy-Authorization: Basic ..." http://127.0.0.1:%SAIFE_PROXY_PORT%/sandbox/intent -d "{\"target\":\"api.github.com\",\"reason\":\"fetching releases\"}"`. Then curl `https://api.github.com` — verify the dialog now shows `Agent reason: "fetching releases"`.
 3. Click "Allow permanently (*.github.com)" — verify the curl succeeds. Restart the sandbox and curl `api.github.com` again — verify it succeeds without a dialog (learned).
-4. Run `sandbox learned list` — verify `api.github.com` appears with scope `suffix`. Run `sandbox learned revoke api.github.com`. Run `sandbox learned list` — verify it's gone.
+4. Run `saife learned list` — verify `api.github.com` appears with scope `suffix`. Run `saife learned revoke api.github.com`. Run `saife learned list` — verify it's gone.
 5. Run with `--no-prompt` — verify no dialog appears and unknown hosts are silently denied.
-6. Verify the audit trail: `sandbox audit show <sid> --json | findstr "source"` — verify `source` values appear (`hard-deny`, `allowlist`, `prompt`, `learned`, `default`).
+6. Verify the audit trail: `saife audit show <sid> --json | findstr "source"` — verify `source` values appear (`hard-deny`, `allowlist`, `prompt`, `learned`, `default`).
 7. Fire 9 concurrent requests to 9 distinct unknown hosts — verify the 9th gets an immediate deny (`source: "prompt_overload"`) and only 8 dialogs appear.
 
 **Do not proceed to Phase 4 until the user approves.**
@@ -297,7 +297,7 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 - [ ] **Step 1:** In `src/net/proxy.rs`, extract the upstream-connect logic (lines 241–269) into a `dial_upstream` function that branches: `if upstream.is_some() && upstream.chains_host(host) { upstream.dial(...) } else { direct.dial(pinned_addrs) }`.
 - [ ] **Step 2:** Under upstream chaining, skip local DNS resolution (run `CheckHost` — hostname-only admission). The upstream proxy does its own DNS.
 - [ ] **Step 3:** Handle upstream errors: `UpstreamError` (proxy unreachable, non-200 response). Return `502 Bad Gateway` with `X-Sandbox: upstream-error` header + body naming the upstream proxy (no credentials). Log to audit with `source: "default"`, `reason: "upstream_error"`.
-- [ ] **Step 4:** In `src/main.rs`, detect upstream proxy: if `network.upstreamProxy` is set in the profile, use it. Else if host env `HTTPS_PROXY`/`HTTP_PROXY` is set, use it (emit `SANDBOX_DIAG` warning if both are set and differ). Else `None` (direct dial only).
+- [ ] **Step 4:** In `src/main.rs`, detect upstream proxy: if `network.upstreamProxy` is set in the profile, use it. Else if host env `HTTPS_PROXY`/`HTTP_PROXY` is set, use it (emit `SAIFE_DIAG` warning if both are set and differ). Else `None` (direct dial only).
 - [ ] **Step 5:** Pass the `UpstreamDialer` (or `None`) into `ProxyConfig`.
 
 ### Task 4.3: Integration tests for upstream chaining
@@ -305,15 +305,15 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 - [ ] **Step 1:** In `tests/run-tests.ps1`, add scenarios:
   - **S-81** (D-2 NO_PROXY bypass): set `HTTPS_PROXY=http://127.0.0.1:9999` (non-existent), `network.noProxy=["api.anthropic.com"]`, curl `api.anthropic.com` → succeeds (NO_PROXY bypass, direct dial). (**👤 MANUAL APPROVAL** — requires a corporate proxy or a local mock proxy to test the chaining path. The NO_PROXY bypass can be automated by pointing at a non-existent upstream and verifying the NO_PROXY host still works.)
   - **S-82** (D-2 upstream unreachable): set `network.upstreamProxy=http://127.0.0.1:9999` (non-existent), curl any host → `502 Bad Gateway` + `X-Sandbox: upstream-error`. (Automated.)
-  - **S-83** (D-2 host env detection): set host env `HTTPS_PROXY`, no profile `upstreamProxy`, verify `SANDBOX_DIAG` does NOT warn. Set both and differ → verify `SANDBOX_DIAG` warns. (Automated — check stderr.)
+  - **S-83** (D-2 host env detection): set host env `HTTPS_PROXY`, no profile `upstreamProxy`, verify `SAIFE_DIAG` does NOT warn. Set both and differ → verify `SAIFE_DIAG` warns. (Automated — check stderr.)
 
 ### 🛑 CHECKPOINT 4 — User tests upstream proxy
 
 **👤 MANUAL APPROVAL REQUIRED.** The full chaining path requires a real or mock corporate proxy:
 1. Start a local mock proxy (e.g. `python -m http.server` won't work for CONNECT; use `mitmproxy` or `squid` or a simple TCP relay). Point `network.upstreamProxy` at it.
-2. Run `sandbox run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl https://api.anthropic.com` — verify the request chains through the mock proxy (check mock proxy logs).
+2. Run `saife run --allow-cwd --allow-domain api.anthropic.com -- cmd /c curl https://api.anthropic.com` — verify the request chains through the mock proxy (check mock proxy logs).
 3. Set `network.noProxy=["api.anthropic.com"]` — verify the request goes direct (not through the mock proxy).
-4. Set `network.upstreamProxy` and host env `HTTPS_PROXY` to different values — verify the `SANDBOX_DIAG` override warning appears.
+4. Set `network.upstreamProxy` and host env `HTTPS_PROXY` to different values — verify the `SAIFE_DIAG` override warning appears.
 5. Point `network.upstreamProxy` at a non-existent proxy — verify `502 Bad Gateway` + `X-Sandbox: upstream-error`.
 
 **Do not proceed to Phase 5 until the user approves.**
@@ -359,13 +359,13 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 ### 🛑 CHECKPOINT 5 — User tests full pipeline
 
 **👤 MANUAL APPROVAL REQUIRED.**
-1. Full end-to-end: `sandbox run --allow-cwd --network-profile developer -- cmd` — inside the sandbox:
+1. Full end-to-end: `saife run --allow-cwd --network-profile developer -- cmd` — inside the sandbox:
    - `curl https://api.anthropic.com` → allowed (in developer profile).
    - `curl https://registry.npmjs.org` → allowed.
    - `curl https://evil.example.com` → dialog appears → click "Deny once" → 403.
    - `curl https://evil.example.com` again → dialog appears again → click "Deny permanently (*.evil.com)" → 403. Restart sandbox, curl again → denied without dialog (learned).
    - `curl https://169.254.169.254` → denied immediately (hard-deny, no dialog).
-2. Verify `sandbox audit show <sid> --json` shows CONNECT events with correct `source` values for each decision type.
+2. Verify `saife audit show <sid> --json` shows CONNECT events with correct `source` values for each decision type.
 3. Run the full test harness: `.\tests\run-tests.ps1 -StopOnFail` — all non-manual scenarios pass.
 
 ---
@@ -386,7 +386,7 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 | Task 3.3 | D-3 | Learned store: load, record, lookup, atomic write | Rust unit |
 | Task 3.4 | D-4 | Intent registry: record, lookup, TTL, explain-more, normalization | Rust unit |
 | Task 3.5 | D-3 | `compute_suffix_hint`, `is_loopback_host` | Rust unit |
-| Task 3.7 | D-3 | `sandbox learned list/revoke/clear` CLI parsing | Rust unit |
+| Task 3.7 | D-3 | `saife learned list/revoke/clear` CLI parsing | Rust unit |
 | Task 4.1 | D-2 | `host_matches_no_proxy`, `chains_host` | Rust unit |
 | Task 5.1 | D-1 | Pipeline ordering (deny_domain over allow, learned over deny_domain) | Rust integration |
 | Task 5.2 | D-1 | Happy Eyeballs first-success-cancels-rest | Rust unit |
@@ -400,7 +400,7 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 | S-75 | D-1 | Loopback CONNECT refused | PowerShell |
 | S-76 | D-3 | `--no-prompt` denies silently | PowerShell |
 | S-77 | D-4 | Intent endpoint POST + GET | PowerShell |
-| S-79 | D-3 | `sandbox learned list/revoke` | PowerShell |
+| S-79 | D-3 | `saife learned list/revoke` | PowerShell |
 | S-80 | D-5 | Audit filter `source=hard-deny` | PowerShell |
 | S-81 | D-2 | `NO_PROXY` bypass (direct dial) | PowerShell |
 | S-82 | D-2 | Upstream unreachable → 502 | PowerShell |
@@ -421,7 +421,7 @@ The plan has **5 user-facing checkpoints** where the user should manually test b
 | Checkpoint 3.1 | D-3 | `TaskDialogIndirect` appears with 6 buttons, steals focus | Requires desktop session |
 | Checkpoint 3.2 | D-3 | Intent reason displayed in dialog | Requires dialog interaction |
 | Checkpoint 3.3 | D-3 | "Allow permanently (*.github.com)" persists across restarts | Requires dialog + restart |
-| Checkpoint 3.4 | D-3 | `sandbox learned list/revoke` after interactive allow | Requires prior dialog |
+| Checkpoint 3.4 | D-3 | `saife learned list/revoke` after interactive allow | Requires prior dialog |
 | Checkpoint 3.5 | D-3 | `--no-prompt` suppresses dialog | Verify no dialog |
 | Checkpoint 3.6 | D-5 | Audit `source` values in `audit show` | Visual inspection |
 | Checkpoint 3.7 | D-3 | 8 concurrent dialogs + 9th prompt_overload deny | Requires counting dialogs |

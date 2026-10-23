@@ -334,12 +334,12 @@ In `README.md` usage section, after `--block-net`:
 ### Strip implicit system-read grants (LPAC)
 
 ```powershell
-sandbox run --allow-cwd --lpac -- cmd /c echo hello
+saife run --allow-cwd --lpac -- cmd /c echo hello
 ```
 
 `--lpac` opts the child out of the implicit `ALL APPLICATION PACKAGES` token
 grants, removing broad read access to system directories (Program Files,
-most of Windows). Stricter profiles may be required; pair with `sandbox audit`
+most of Windows). Stricter profiles may be required; pair with `saife audit`
 (F-24) to discover needed paths. Default OFF; flipping the default is planned
 after profile validation.
 ```
@@ -359,7 +359,7 @@ then flips to assert denial-by-default.
 
 ### Task 3A: DACL journal module (pure-Rust, no branch conflicts)
 
-**Why:** AGENTS.md tracks as an unimplemented follow-up: *"sandbox run should
+**Why:** AGENTS.md tracks as an unimplemented follow-up: *"saife run should
 remove the ACEs it added on exit — not yet implemented"*, with observed failure
 mode ~40 accumulated session ACEs hang `SetNamedSecurityInfoW`. MXC's
 `filesystem_dacl.rs` is the reference design. Restoring also closes finding
@@ -625,9 +625,9 @@ changes). Rebase `feature/dacl-journal` onto the merged trunk first.
 
 - [x] **Step 1: Write the failing integration scenarios**
 
-**S-73 (teardown restore):** in a scenario dir, snapshot `(icacls $d | Select-String 'S-1-15-2-(?!2)').Count` before; run `sandbox run --allow-cwd -- cmd /c echo x`; after exit the count must equal the before-count (session ACEs removed — nothing left to re-derive, F-D). The regex excludes `S-1-15-2-2` (persistent drive-root grant) and inherited ACEs must be filtered (`-not IsInherited` in a Get-Acl variant if `icacls` output proves ambiguous).
+**S-73 (teardown restore):** in a scenario dir, snapshot `(icacls $d | Select-String 'S-1-15-2-(?!2)').Count` before; run `saife run --allow-cwd -- cmd /c echo x`; after exit the count must equal the before-count (session ACEs removed — nothing left to re-derive, F-D). The regex excludes `S-1-15-2-2` (persistent drive-root grant) and inherited ACEs must be filtered (`-not IsInherited` in a Get-Acl variant if `icacls` output proves ambiguous).
 
-**S-74 (crash recovery):** start `sandbox run --allow-cwd -- cmd /c ping -n 30 127.0.0.1` in a scenario dir; `Stop-Process` the supervisor mid-run; assert a `<sid>.jsonl` journal remains in `%USERPROFILE%\.sandbox\dacl-restore\` and the session ACE is still present (crash left both); run a second short `sandbox run` in the same dir (triggers startup `recover_orphans`); assert the stale ACE is gone and the old journal file was deleted. Verify via `tests/cleanup-session-aces.ps1` semantics; on harness failure the pre-written rollback script (Task 3A Step 4) recovers the host — AGENTS.md rule satisfied.
+**S-74 (crash recovery):** start `saife run --allow-cwd -- cmd /c ping -n 30 127.0.0.1` in a scenario dir; `Stop-Process` the supervisor mid-run; assert a `<sid>.jsonl` journal remains in `%USERPROFILE%\.saife\dacl-restore\` and the session ACE is still present (crash left both); run a second short `saife run` in the same dir (triggers startup `recover_orphans`); assert the stale ACE is gone and the old journal file was deleted. Verify via `tests/cleanup-session-aces.ps1` semantics; on harness failure the pre-written rollback script (Task 3A Step 4) recovers the host — AGENTS.md rule satisfied.
 
 Register both in the runner table (non-gate). Verify: `pwsh -ExecutionPolicy Bypass -File tests\run-tests.ps1 -Only 73` / `-Only 74`
 Expected: FAIL (no journaling wired yet).
@@ -728,7 +728,7 @@ if restore_ok {
     journal.remove_file();
 } else {
     eprintln!(
-        "[sandbox] warning: DACL restore failed; journal retained for retry at next start: {}",
+        "[saife] warning: DACL restore failed; journal retained for retry at next start: {}",
         journal.file.display()
     );
 }
@@ -766,7 +766,7 @@ Expected: S-73, S-74 PASS; no regressions in S-1..S-72.
 
 - [x] **Step 6: Update docs**
 
-- `README.md` "How it works": append — *"6. Every ACE grant is journaled before it is applied; on exit the journal is replayed to restore the host. If sandbox.exe is killed, the next run reaps and restores orphaned journals (quarantining unparseable ones as `.corrupt`)."*
+- `README.md` "How it works": append — *"6. Every ACE grant is journaled before it is applied; on exit the journal is replayed to restore the host. If saife.exe is killed, the next run reaps and restores orphaned journals (quarantining unparseable ones as `.corrupt`)."*
 - Worktree `AGENTS.md` ACE-cleanup section: mark the "per-session cleanup (Rust)" follow-up as **implemented** (keep the harness-cleanup rule; `tests/cleanup-session-aces.ps1` is the manual recovery path).
 - `docs/research/mxc-source-analysis.md` F-C/F-D rows: mark landed (this file is on the trunk after Task 0 — edit it in this trunk-based worktree).
 
@@ -778,7 +778,7 @@ git commit -m "feat(us-1): journal-backed DACL restore on teardown + orphan reco
 ```
 
 **Deviations from this spec as implemented on trunk (2026-09-18):**
-- Journal dir is `%LOCALAPPDATA%\sandbox\dacl-restore` (codebase convention), not `%USERPROFILE%\.sandbox\dacl-restore`.
+- Journal dir is `%LOCALAPPDATA%\saife\dacl-restore` (codebase convention), not `%USERPROFILE%\.saife\dacl-restore`.
 - `apply_dacl_kernel` opens the write handle with `WRITE_DAC | READ_CONTROL` — a handle opened with `WRITE_DAC` alone made kernel-handle `SetSecurityInfo` return ACCESS_DENIED on this machine (pre-existing trunk grant bug, found while wiring; root cause of the all-grants-fail warnings in `err-main*.txt`).
 - Ancestor traverse grants are non-inheritable and `collect_ancestors` stops at `USERPROFILE`/`AppData`/`AppData\Local` (ported from ADR commit `5192dfc`): with inheritable ancestor ACEs, even the kernel-handle write performs the recursive subtree DACL walk and hangs on large trees. This must merge cleanly with `5192dfc` during the ADR rebase.
 - `recover_orphans` deletes a journal only when `reap` reports success (MXC hard rule: failed restores keep their entries for retry); `restore_one` skips entries whose object carries none of our ACEs and has no prior state (never-applied grants, e.g. system-owned SystemRoot, would otherwise keep the journal alive forever).

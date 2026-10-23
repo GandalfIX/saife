@@ -2,7 +2,7 @@
 
 > **Status:** Open
 > **Reported:** 2026-08-15
-> **Severity:** Low (test-only) — does not affect `sandbox run` functionality; only affects scenarios that invoke `python` inside the sandbox
+> **Severity:** Low (test-only) — does not affect `saife run` functionality; only affects scenarios that invoke `python` inside the sandbox
 > **Affects:** Integration test harness scenarios S-8, S-9, S-19, S-26, S-37
 
 ---

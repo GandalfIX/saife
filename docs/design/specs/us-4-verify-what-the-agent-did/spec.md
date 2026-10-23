@@ -50,7 +50,7 @@
 ## User Story
 
 As a developer, after a sandboxed session ends I want to run
-`sandbox audit show <session-id>` to see every file the agent touched, every
+`saife audit show <session-id>` to see every file the agent touched, every
 network call it attempted (allowed and denied), and every child process it
 spawned — and I want a Merkle-root proof that the log was not tampered with.
 
@@ -58,10 +58,10 @@ spawned — and I want a Merkle-root proof that the log was not tampered with.
 
 Every sandboxed session gets a unique id of the form
 `YYYYMMDD-HHMMSS-NNNNN` (e.g. `20260723-144521-48291`). While the session is
-running, `sandbox.exe` writes an append-only audit log to:
+running, `saife.exe` writes an append-only audit log to:
 
 ```
-%LOCALAPPDATA%\sandbox\audit\<session-id>.ndjson
+%LOCALAPPDATA%\saife\audit\<session-id>.ndjson
 ```
 
 One JSON object per line. Each line is a Merkle leaf: it contains the event
@@ -71,19 +71,19 @@ the chain's final hash is the **Merkle root** of the session.
 
 At session end, the root is written to `<session-id>.root` and signed with an
 Ed25519 keypair stored in
-`%LOCALAPPDATA%\sandbox\signing\ed25519-key` (generated on first run,
+`%LOCALAPPDATA%\saife\signing\ed25519-key` (generated on first run,
 protected at rest by DPAPI). The signature goes to `<session-id>.sig`.
 
 The user can then:
 
-- `sandbox audit show <id>` — human-readable summary: session header, total
+- `saife audit show <id>` — human-readable summary: session header, total
   event count, deny count, list of files changed, network hosts contacted,
   child processes spawned, plus the root + signature verification status.
-- `sandbox audit show <id> --json` — the raw structured log, suitable for jq
+- `saife audit show <id> --json` — the raw structured log, suitable for jq
   or SIEM ingestion.
-- `sandbox audit show <id> --filter "op=FILE_WRITE&disposition=denied"` —
+- `saife audit show <id> --filter "op=FILE_WRITE&disposition=denied"` —
   filtered subset.
-- `sandbox audit verify <id>` — recompute the Merkle root from the .ndjson
+- `saife audit verify <id>` — recompute the Merkle root from the .ndjson
   file, compare against the committed `.root`, check the Ed25519 signature
   on the `.sig`. Prints `OK` or `TAMPERED` with a description of the first
   mismatch.
@@ -114,7 +114,7 @@ consumer session with `EVENT_ENABLE_PROPERTY_SID` filter requires admin or
 userspace hook (Detours-style `CreateFileW`/`NtCreateFile`/`connect`/`
 CreateProcessW` interception in the spawned process via an injected DLL).
 This is coarser (only the Win32 surface, not the raw NT layer) but
-unprivileged. `sandbox setup --check-only` reports which path is active.
+unprivileged. `saife setup --check-only` reports which path is active.
 
 The hash chain, signing, and verification logic are identical regardless of
 event source — only the event-capture fidelity differs.
@@ -145,8 +145,8 @@ is tracked under "Deferred to US-4b" below.
   - `FILE_*` and `EXEC` are empty in 4a — they arrive in 4b.
 - Ed25519 keypair generation on first run, DPAPI-protected at rest.
 - Root + signature commit on session end (clean exit only).
-- `sandbox audit show` (human + `--json`), `--filter`, `sandbox audit verify`.
-- `sandbox ps --json` shows the current/last session id (best-effort:
+- `saife audit show` (human + `--json`), `--filter`, `saife audit verify`.
+- `saife ps --json` shows the current/last session id (best-effort:
   reads the most recent `.ndjson` in the audit dir).
 
 ### Deferred to US-4b — event capture (out of scope for 4a)
@@ -174,19 +174,19 @@ SKIP in the 4a test harness with `Detail='deferred to US-4b'`.
 ## Acceptance Criteria
 
 ### AC-4.1 — Session id is unique and well-formed
-**Given** two `sandbox run` invocations started in the same second,
+**Given** two `saife run` invocations started in the same second,
 **When** each generates its session id,
 **Then** the ids are distinct (the counter disambiguates) and match
 `^\d{8}-\d{6}-\d{5}$`.
 
 ### AC-4.2 — Log file is created on session start
 **Given** a sandboxed session is running,
-**When** the user lists `%LOCALAPPDATA%\sandbox\audit\`,
+**When** the user lists `%LOCALAPPDATA%\saife\audit\`,
 **Then** a file named `<session-id>.ndjson` exists and is growing as events
 arrive.
 
 ### AC-4.3 — Each log line is a valid hash-chain leaf
-**Given** any `.ndjson` file produced by `sandbox`,
+**Given** any `.ndjson` file produced by `saife`,
 **When** parsed as one JSON object per line,
 **Then** every line has `hash`, `parent`, `seq`, `ts`, `op`, `disposition`
 fields, `seq` is monotonically increasing from 0, `parent` of leaf N equals
@@ -196,97 +196,97 @@ SHA-256 of the line body excluding the `hash` and `parent` fields.
 ### AC-4.4 — File operations are recorded
 **Given** a sandboxed process creates, writes, reads, and deletes a file
 inside the allow-list,
-**When** the session ends and the user runs `sandbox audit show <id>`,
+**When** the session ends and the user runs `saife audit show <id>`,
 **Then** the log contains `FILE_CREATE`, `FILE_WRITE`, `FILE_READ`,
 `FILE_DELETE` events for that path with `disposition: "allowed"`.
 
 ### AC-4.5 — Denied operations are recorded
 **Given** a sandboxed process attempts to read a denied path,
-**When** the user runs `sandbox audit show <id>`,
+**When** the user runs `saife audit show <id>`,
 **Then** the log contains a `FILE_READ` event with
-`disposition: "denied"` for that path, and `sandbox audit show` prints it in
+`disposition: "denied"` for that path, and `saife audit show` prints it in
 the "Denied operations" section.
 
 ### AC-4.6 — Network events come from the proxy
 **Given** a sandboxed process makes allowed and denied network calls,
-**When** the user runs `sandbox audit show <id> --filter "op=CONNECT"`,
+**When** the user runs `saife audit show <id> --filter "op=CONNECT"`,
 **Then** the log contains `CONNECT` events with `disposition: "allowed"` for
 allowed hosts and `disposition: "denied"` with `reason: "domain_not_allowed"`
 or `reason: "denied_cidr"` for denied ones.
 
 ### AC-4.7 — Child-process spawns are recorded
 **Given** the sandboxed process spawns `cmd`, `python`, and a `.bat` wrapper,
-**When** the user runs `sandbox audit show <id> --filter "op=EXEC"`,
+**When** the user runs `saife audit show <id> --filter "op=EXEC"`,
 **Then** the log contains an `EXEC` event for each spawn with the path and a
 truncated args string.
 
 ### AC-4.8 — Verify succeeds on an honest log
 **Given** a session ended normally and produced `.ndjson`, `.root`, `.sig`,
-**When** the user runs `sandbox audit verify <id>`,
+**When** the user runs `saife audit verify <id>`,
 **Then** the command prints `OK` and exits 0.
 
 ### AC-4.9 — Verify fails on a tampered log
 **Given** the same session,
 **When** the user flips one byte in the `.ndjson` file and runs
-`sandbox audit verify <id>`,
+`saife audit verify <id>`,
 **Then** the command prints `TAMPERED` with the leaf index and expected vs
 actual hash, and exits non-zero.
 
 ### AC-4.10 — Verify fails on a truncated log
 **Given** the same session,
 **When** the user deletes the last 3 lines of the `.ndjson` file and runs
-`sandbox audit verify <id>`,
+`saife audit verify <id>`,
 **Then** the command prints `TAMPERED` (root mismatch) and exits non-zero.
 
 ### AC-4.11 — Verify fails on a forged root
 **Given** the user replaces the `.root` file with a different (correctly
 formatted) root,
-**When** the user runs `sandbox audit verify <id>`,
+**When** the user runs `saife audit verify <id>`,
 **Then** signature verification fails (`BAD_SIGNATURE`) because the signature
 was over the original root, and the command prints `TAMPERED` and exits
 non-zero.
 
 ### AC-4.12 — Human-readable summary is useful
 **Given** a session with 200 file events, 50 connects, 10 spawns, 5 denies,
-**When** the user runs `sandbox audit show <id>`,
+**When** the user runs `saife audit show <id>`,
 **Then** the output shows: session header (id, started, command), total
 events by type, denied operations section with one line each, changed-files
 list, hosts contacted, child processes spawned, root + signature status line.
 
 ### AC-4.13 — `--filter` works
 **Given** the same session,
-**When** the user runs `sandbox audit show <id> --filter "op=CONNECT&
+**When** the user runs `saife audit show <id> --filter "op=CONNECT&
 disposition=denied"`,
 **Then** only denied `CONNECT` events are printed, in order.
 
 ### AC-4.14 — First-run key generation
-**Given** `sandbox` has never been run on this user profile,
+**Given** `saife` has never been run on this user profile,
 **When** the user starts their first sandboxed session,
-**Then** `%LOCALAPPDATA%\sandbox\signing\ed25519-key` is created, the session
-is signed with it, and `sandbox audit verify` succeeds.
+**Then** `%LOCALAPPDATA%\saife\signing\ed25519-key` is created, the session
+is signed with it, and `saife audit verify` succeeds.
 
 ### AC-4.15 — Key is DPAPI-protected at rest
 **Given** the ed25519 key file exists,
-**When** the user inspects its raw bytes with `Get-Content` (not via `sandbox`),
+**When** the user inspects its raw bytes with `Get-Content` (not via `saife`),
 **Then** the bytes are not a valid Ed25519 secret — they are DPAPI-encrypted
-ciphertext. `sandbox.exe` is the only thing that can decrypt it via the
+ciphertext. `saife.exe` is the only thing that can decrypt it via the
 user's DPAPI master key.
 
 ### AC-4.16 — `setup --check-only` reports audit fidelity
 **Given** the user is non-admin on Win10 22H2,
-**When** they run `sandbox setup --check-only`,
+**When** they run `saife setup --check-only`,
 **Then** the output includes a line like
 `audit: userspace hook (non-admin) — file/process events captured at Win32 layer`
 and, for an admin user,
 `audit: ETW kernel providers (admin) — full-fidelity file/process/network events`.
 
 ### AC-4.17 — Audit log survives sandbox crash
-**Given** a sandboxed session is running and `sandbox.exe` is killed
+**Given** a sandboxed session is running and `saife.exe` is killed
 forcefully (`Stop-Process -Force`),
-**When** the user runs `sandbox audit verify <id>`,
+**When** the user runs `saife audit verify <id>`,
 **Then** verification reports `INCOMPLETE: no committed root` (no `.root`
 was written) but the `.ndjson` log up to the crash is still readable via
-`sandbox audit show`. (The session is unverifiable but its raw event stream
+`saife audit show`. (The session is unverifiable but its raw event stream
 is preserved.)
 
 ## nono comparison
@@ -307,7 +307,7 @@ is preserved.)
   (future F-4) — when added, they become `POLICY_VIOLATION` or a new
   `SUPERVISOR` event type.
 - **JSON export for SIEM / jq**: nono's `nono audit show --json` emits
-  structured JSON. Our `sandbox audit show <id> --json` does the same —
+  structured JSON. Our `saife audit show <id> --json` does the same —
   `.ndjson` is already line-delimited JSON.
 - **Filtering by date range, operation type, disposition**: nono supports
   filter expressions; we match with `--filter "op=…&disposition=…&ts>=…"`.
@@ -319,7 +319,7 @@ is preserved.)
 | Event capture mechanism | Landlock violations are visible to the calling process (denied syscalls return `EACCES`); nono also hooks via seccomp-notify for allowed operations that match a logged policy. | **Two-tier**: admin users get ETW kernel providers (`Microsoft-Windows-Kernel-File`, `Microsoft-Windows-Kernel-Process`) for full-fidelity file/process events. Non-admin users get a userspace hook (Detours-style DLL injection trapping `CreateFileW`/`NtCreateFile`/`connect`/`CreateProcessW`). Documented in `setup --check-only` (AC-4.16). |
 | Fidelity guarantee | Single mechanism, single fidelity level | Two fidelity levels depending on privilege. This is a forced divergence — Windows ETW kernel providers require admin for real-time consumer sessions with SID filtering. |
 | Network event source | nono's proxy logs connections directly (same as us) | Same — our proxy (US-3) emits `CONNECT` events. No ETW needed for network. |
-| Signing key storage | nono uses an Ed25519 keypair (implied by "cryptographic" commitment; specific storage not documented on the marketing pages) | Ed25519 keypair in `%LOCALAPPDATA%\sandbox\signing\`, DPAPI-protected at rest. Windows-specific storage mechanism. |
+| Signing key storage | nono uses an Ed25519 keypair (implied by "cryptographic" commitment; specific storage not documented on the marketing pages) | Ed25519 keypair in `%LOCALAPPDATA%\saife\signing\`, DPAPI-protected at rest. Windows-specific storage mechanism. |
 | Crash behavior | nono seals the root on clean exit; on crash the session is "incomplete" | Same — AC-4.17: on forced kill, no `.root` is written, `verify` reports `INCOMPLETE`, but the raw `.ndjson` is still readable. |
 
 ### What we add that nono doesn't document
@@ -445,7 +445,7 @@ the plan's task breakdown.
 
 - **Crate:** `ed25519-dalek` (`=2.1`, `rand_core` feature for keypair
   generation; we feed `OsRng` which on Windows uses `BCryptGenRandom`).
-- **Keypair file:** `%LOCALAPPDATA%\sandbox\signing\ed25519-key`.
+- **Keypair file:** `%LOCALAPPDATA%\saife\signing\ed25519-key`.
 - **Format at rest:** DPAPI-encrypted bytes of the 32-byte secret key.
   `CryptProtectData` with `CRYPTPROTECT_LOCAL_MACHINE` **unset** (user
   scope) — only the same user on the same machine can decrypt.
@@ -584,13 +584,13 @@ If the supervisor is killed (Ctrl-C, `Stop-Process -Force`, panic) the
 the last flushed append is preserved on disk; `audit show` can still
 read it; `audit verify` reports `INCOMPLETE: no committed root`.
 
-### `sandbox ps` (minimal)
+### `saife ps` (minimal)
 
 `Cmd::Ps` is currently a stub (`src/main.rs:41`). 4a implements a
-minimal version: scan `%LOCALAPPDATA%\sandbox\audit\*.ndjson`, pick the
+minimal version: scan `%LOCALAPPDATA%\saife\audit\*.ndjson`, pick the
 newest by mtime, print its sid. `--json` emits `{"session_id": "<sid>",
 "running": false}`. `--all` lists all sids found. "Running" detection
-(whether a `sandbox.exe` is alive for that sid) is not implemented in
+(whether a `saife.exe` is alive for that sid) is not implemented in
 4a — `running` is always `false`. (True running detection needs a PID
 file or named-pipe heartbeat; deferred.)
 
@@ -640,12 +640,12 @@ file or named-pipe heartbeat; deferred.)
 
 | AC | Scenario | Command in harness | Assert |
 |---|---|---|---|
-| 4.1 | S-43 | two `sandbox run --print-sid` in the same second | sids are distinct, match `^\d{8}-\d{6}-\d{5}$` |
-| 4.2 | S-44 | `sandbox run --allow-cwd --block-net -- cmd /c echo hi`, then list audit dir | `<sid>.ndjson` exists and is non-empty |
+| 4.1 | S-43 | two `saife run --print-sid` in the same second | sids are distinct, match `^\d{8}-\d{6}-\d{5}$` |
+| 4.2 | S-44 | `saife run --allow-cwd --block-net -- cmd /c echo hi`, then list audit dir | `<sid>.ndjson` exists and is non-empty |
 | 4.3 | S-45 | run any session, parse each `.ndjson` line | every line has `hash`,`parent`,`seq`,`ts`,`op`,`disposition`; `seq` monotonic from 0; `parent[N] == hash[N-1]`; `hash == sha256(canonicalize(leaf minus hash+parent))` |
 | 4.4 | (SKIP) | — | `Detail='deferred to US-4b (FILE_* capture)'` |
 | 4.5 | (SKIP) | — | `Detail='deferred to US-4b (FILE_* capture)'` |
-| 4.6 | S-46 | `sandbox run --allow-cwd --block-net -- cmd /c python -c "...urllib..."` (skip if no python), then `audit show <sid> --filter op=CONNECT` | log has CONNECT events with `disposition=denied` (block-net denies all) |
+| 4.6 | S-46 | `saife run --allow-cwd --block-net -- cmd /c python -c "...urllib..."` (skip if no python), then `audit show <sid> --filter op=CONNECT` | log has CONNECT events with `disposition=denied` (block-net denies all) |
 | 4.7 | (SKIP) | — | `Detail='deferred to US-4b (EXEC capture)'` |
 | 4.8 | S-47 | run a session to clean exit, `audit verify <sid>` | prints `OK`, exit 0 |
 | 4.9 | S-48 | flip one byte in `<sid>.ndjson` line 2, `audit verify <sid>` | prints `TAMPERED` with leaf index, exit 1 |
@@ -653,7 +653,7 @@ file or named-pipe heartbeat; deferred.)
 | 4.11 | S-50 | replace `<sid>.root` with a different valid-format root, `audit verify <sid>` | `BAD_SIGNATURE`, exit 1 |
 | 4.12 | S-51 | run a session with ≥5 CONNECT events, `audit show <sid>` | output has session header, events-by-type, denied section, hosts contacted, root+sig line |
 | 4.13 | S-52 | `audit show <sid> --filter "op=CONNECT&disposition=denied"` | only denied CONNECT events, in order |
-| 4.14 | S-53 | delete `%LOCALAPPDATA%\sandbox\signing\`, run a session, check file exists, `audit verify <sid>` | key file created, verify OK |
+| 4.14 | S-53 | delete `%LOCALAPPDATA%\saife\signing\`, run a session, check file exists, `audit verify <sid>` | key file created, verify OK |
 | 4.15 | S-54 | `Get-Content -Raw ed25519-key`, try to parse as Ed25519 secret | not a valid secret (DPAPI ciphertext) |
 | 4.16 | (SKIP) | — | `Detail='deferred to US-4b (audit fidelity reporting)'` |
 | 4.17 | S-55 | start a session, `Stop-Process -Name sandbox -Force`, `audit verify <sid>` | `INCOMPLETE: no committed root`, exit 1; `audit show <sid>` still readable |
