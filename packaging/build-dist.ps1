@@ -89,14 +89,20 @@ $version = @(
 ) -join "`r`n"
 Set-Content -Path (Join-Path $dist 'VERSION.txt') -Value $version
 
-Get-ChildItem $dist -Recurse -File |
+# LF, not CRLF: `sha256sum -c SHA256SUMS.txt` reads a trailing CR as part of the
+# file name and fails on every line (measured: 11 failed opens). Windows users can
+# still use Get-FileHash; the manifest has to be portable.
+$sums = Get-ChildItem $dist -Recurse -File |
     Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
     Sort-Object FullName |
     ForEach-Object {
         $rel = $_.FullName.Substring($dist.Length + 1).Replace('\', '/')
         '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $rel
-    } |
-    Set-Content -Path (Join-Path $dist 'SHA256SUMS.txt')
+    }
+[IO.File]::WriteAllText(
+    (Join-Path $dist 'SHA256SUMS.txt'),
+    (($sums -join "`n") + "`n"),
+    (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host '== zipping'
 $zip = Join-Path $root "sandbox-$sha.zip"
