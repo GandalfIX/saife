@@ -163,9 +163,9 @@ saife audit verify <sid>
 Three manifests, in `packaging/winget/`:
 
 ```
-TNG.SAIFE-Sandbox.yaml                  version
-TNG.SAIFE-Sandbox.installer.yaml        zip + nested portable installer
-TNG.SAIFE-Sandbox.locale.en-US.yaml     publisher, description, tags, notes
+GandalfIX.Saife-Sandbox.yaml                  version
+GandalfIX.Saife-Sandbox.installer.yaml        zip + nested portable installer
+GandalfIX.Saife-Sandbox.locale.en-US.yaml     publisher, description, tags, notes
 ```
 
 Verified with the real client:
@@ -189,7 +189,12 @@ Design points that are not obvious:
 - **`MinimumOSVersion: 10.0.26100.0`** states the 24H2 floor instead of failing at
   runtime. The AppContainer backend works on older builds, but the package's
   default path does not, so the floor belongs in the manifest.
-- **`PackageIdentifier: TNG.SAIFE-Sandbox`**, `Moniker: saife`. The moniker is
+- **`PackageIdentifier: GandalfIX.Saife-Sandbox`**, `Moniker: saife`. The
+  identifier's segments are PascalCase on purpose: `winget validate` REJECTS
+  `GandalfIX.SAIFE-Sandbox`, and its error blames an unrelated YAML line
+  (`[YAML:Scanner] mapping values are not allowed in this context [line 4; col 21]`)
+  rather than the identifier — measured on 2026-10-23 against winget 1.30, where
+  `GandalfIX.Saife-Sandbox`, `GandalfIX.Saife` and `GandalfIX.SAIFE` all validate. The moniker is
   what makes `winget install saife` work.
 - Two values are placeholders until the repository exists: `PackageUrl` /
   `InstallerUrl` (GitHub) and `License: Proprietary` — both need your decision.
@@ -228,7 +233,7 @@ list — each item is a real string or path in the tree.
 | plugin sidecar env | `SIDECAR_*` (keep; it is plural-friendly and not brand-specific) | unchanged |
 | doc set | USER-GUIDE, DEVELOPERS, README, AGENTS, plan/ADR text | rewritten around `saife` |
 | packaging | `build-dist.ps1` paths, `dist/`, zip names | `saife-<version>-x64.zip` |
-| winget | `RelativeFilePath: saife.exe` (already target-state) | matches once renamed |
+| winget | `RelativeFilePath: saife.exe` (already target-state) | matches once renamed; identifier `GandalfIX.Saife-Sandbox`, URLs under github.com/GandalfIX/saife |
 
 Two decisions:
 
