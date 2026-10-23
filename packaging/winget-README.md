@@ -25,6 +25,11 @@ Three facts that are easy to get wrong here, each of which the manifest encodes:
        # -> release: .../saife-0.1.0-x64.zip (1.889 KB)
        # -> sha256:  477BB4FF...
 
+This file lives OUTSIDE `packaging/winget/` on purpose: `winget validate`
+scans every file in the manifest directory, and a prose file beside the manifests
+is parsed as YAML (a line ending in a colon fails as
+`[YAML:Scanner] ... [line 4; col 21]`, naming nothing useful).
+
 Placeholders that need a decision before submission to microsoft/winget-pkgs:
 `InstallerUrl` and `PackageUrl` (GitHub repository), `PublisherSupportUrl`, and
 `License: Proprietary` (confirm the licence; winget requires the field).
