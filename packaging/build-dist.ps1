@@ -8,7 +8,12 @@
 # the normal debug/release artifacts used by the test lanes.
 
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # When set, ALSO produce the release asset Winget consumes:
+    # saife-<version>-x64.zip, FLAT (no wrapper directory) and with the binary
+    # named saife.exe, because NestedInstallerFiles paths are relative to the
+    # archive root. The human bundle (dist/ + sandbox-<sha>.zip) stays wrapped.
+    [string]$ReleaseVersion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -116,3 +121,27 @@ Remove-Item $stage -Recurse -Force
 $zipInfo = Get-Item $zip
 Write-Host ''
 Write-Host ("bundle: {0}  ({1:N0} files, {2:N0} KB)" -f $zip, (Get-ChildItem $dist -Recurse -File).Count, ($zipInfo.Length / 1KB))
+
+if ($ReleaseVersion) {
+    Write-Host "== release asset for Winget ($ReleaseVersion, flat)"
+    $relStage = Join-Path $env:TEMP "saife-rel"
+    if (Test-Path $relStage) { Remove-Item $relStage -Recurse -Force }
+    New-Item -ItemType Directory -Path $relStage | Out-Null
+
+    # The binary ships under its brand name; the launcher keeps its own name and is
+    # found beside the supervisor.
+    Copy-Item (Join-Path $bin 'sandbox.exe') -Destination (Join-Path $relStage 'saife.exe')
+    Copy-Item (Join-Path $bin 'mxc-launch.exe') -Destination $relStage
+    Copy-Item (Join-Path $dist 'profiles'), (Join-Path $dist 'plugins') -Destination $relStage -Recurse
+    Copy-Item (Join-Path $dist 'README.txt') -Destination $relStage
+
+    $relZip = Join-Path $root "saife-$ReleaseVersion-x64.zip"
+    if (Test-Path $relZip) { Remove-Item $relZip -Force }
+    Compress-Archive -Path (Join-Path $relStage '*') -DestinationPath $relZip
+    Remove-Item $relStage -Recurse -Force
+
+    $hash = (Get-FileHash $relZip -Algorithm SHA256).Hash
+    Write-Host ("release: {0}  ({1:N0} KB)" -f $relZip, ((Get-Item $relZip).Length / 1KB))
+    Write-Host ("sha256:  {0}" -f $hash)
+    Write-Host 'Update InstallerSha256 in packaging/winget/*.installer.yaml with the value above.'
+}

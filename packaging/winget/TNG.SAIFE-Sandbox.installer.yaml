@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: TNG.SAIFE-Sandbox
+PackageVersion: 0.1.0
+# The default backend needs the in-box base-container / PSEC support of Windows 11
+# 24H2. The AppContainer backend also runs on older builds, but this package's
+# default path does not, so the floor is stated instead of discovered at runtime.
+MinimumOSVersion: 10.0.26100.0
+InstallerType: zip
+NestedInstallerType: portable
+Installers:
+  - Architecture: x64
+    # Placeholder: point this at the real release asset when the repository and the
+    # first GitHub release exist. The archive is FLAT (no wrapper directory), which
+    # is what NestedInstallerFiles requires.
+    InstallerUrl: https://github.com/TNG/saife-sandbox/releases/download/v0.1.0/saife-0.1.0-x64.zip
+    InstallerSha256: 477BB4FFC58BD197AC0DBEC55FCBF58B098FFFA02BDD3F4045E354D0AFE956F3
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      # The supervisor must find its launcher beside itself: both files are
+      # extracted, but only the supervisor is aliased onto PATH.
+      - RelativeFilePath: saife.exe
+        PortableCommandAlias: saife
+      - RelativeFilePath: mxc-launch.exe
+    Commands:
+      - saife
+ManifestType: installer
+ManifestVersion: 1.6.0
