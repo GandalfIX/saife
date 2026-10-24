@@ -34,7 +34,7 @@ Requirements on the target machine
 
 Install (2 minutes)
 -------------------
-  1. Copy this whole folder somewhere permanent, e.g. C:\tools\sandbox\bin
+  1. Copy this whole folder somewhere permanent, e.g. C:\tools\saife\bin
      Keep saife.exe and saife-launch.exe in the SAME directory.
   2. Copy the profiles you want:
          profiles\*.json  ->  %USERPROFILE%\.saife\profiles\
