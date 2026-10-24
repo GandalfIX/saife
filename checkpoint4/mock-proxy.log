@@ -1,6 +1,0 @@
-=== mock CONNECT proxy on 127.0.0.1:18080 (15:48:59) ===
-15:49:20.500 CONNECT-REQ: CONNECT anthropic.com:443 HTTP/1.1
-15:49:20.501   HDR: Host: anthropic.com:443
-15:49:20.502   HDR: Proxy-Authorization: Basic dXNlcjpwYXNz
-15:49:20.542 TUNNEL-UP: anthropic.com:443
-15:49:20.646 TUNNEL-DOWN: anthropic.com:443

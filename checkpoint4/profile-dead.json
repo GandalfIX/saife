@@ -1,4 +1,0 @@
-{
-  "meta": { "name": "c4-dead", "schema_version": 1 },
-  "network": { "upstreamProxy": "http://127.0.0.1:1" }
-}

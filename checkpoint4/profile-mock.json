@@ -1,4 +1,0 @@
-{
-  "meta": { "name": "c4-mock", "schema_version": 1 },
-  "network": { "upstreamProxy": "http://user:pass@127.0.0.1:18080" }
-}
