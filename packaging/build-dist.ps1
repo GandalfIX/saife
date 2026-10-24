@@ -12,7 +12,7 @@ param(
     # When set, ALSO produce the release asset Winget consumes:
     # saife-<version>-x64.zip, FLAT (no wrapper directory) and with the binary
     # named saife.exe, because NestedInstallerFiles paths are relative to the
-    # archive root. The human bundle (dist/ + sandbox-<sha>.zip) stays wrapped.
+    # archive root. The human bundle (dist/ + saife-<sha>.zip) stays wrapped.
     [string]$ReleaseVersion
 )
 
@@ -20,7 +20,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot          # sandbox/
 $dist = Join-Path $root 'dist'
 $staticTarget = Join-Path $root 'target-static'
-$repo = Join-Path (Split-Path -Parent $root) '.git'
+$repo = Join-Path $root '.git'
+# SAIFE is its own repository since 2026-10-24 (it used to be <monorepo>/sandbox), so
+# the probed commit is this directory's, not its parent's.
 
 if (-not $SkipBuild) {
     Write-Host '== building static-CRT binaries'
@@ -80,8 +82,8 @@ Copy-Item (Join-Path $PSScriptRoot 'README.txt') -Destination $dist
 Write-Host '== provenance + checksums'
 $sha = 'unknown'; $branch = 'unknown'
 if (Test-Path $repo) {
-    $sha = (& git -C (Split-Path -Parent $root) rev-parse --short HEAD)
-    $branch = (& git -C (Split-Path -Parent $root) rev-parse --abbrev-ref HEAD)
+    $sha = (& git -C $root rev-parse --short HEAD)
+    $branch = (& git -C $root rev-parse --abbrev-ref HEAD)
 }
 $version = @(
     "commit:      $sha"
@@ -110,8 +112,8 @@ $sums = Get-ChildItem $dist -Recurse -File |
     (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host '== zipping'
-$zip = Join-Path $root "sandbox-$sha.zip"
-$stage = Join-Path $env:TEMP "sandbox-$sha"
+$zip = Join-Path $root "saife-$sha.zip"
+$stage = Join-Path $env:TEMP "saife-$sha"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 Copy-Item $dist $stage -Recurse
 if (Test-Path $zip) { Remove-Item $zip -Force }

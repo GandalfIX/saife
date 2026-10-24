@@ -13,7 +13,7 @@ Installers:
     # first GitHub release exist. The archive is FLAT (no wrapper directory), which
     # is what NestedInstallerFiles requires.
     InstallerUrl: https://github.com/GandalfIX/saife/releases/download/v0.2.0/saife-0.2.0-x64.zip
-    InstallerSha256: 2F5D9E6A895F6700C6239CD2162BD78E11E5A3C379BFD6D30221A2195F4943E7
+    InstallerSha256: BA4E847258847BAB2CBF90BBE8F3D5FF70A78F491E50793F1E9887E0040B204D
     NestedInstallerType: portable
     NestedInstallerFiles:
       # The supervisor must find its launcher beside itself: both files are
