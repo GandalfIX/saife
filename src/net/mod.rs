@@ -26,14 +26,20 @@ use crate::profile::NetworkSlice;
 /// not to size a normal run.
 pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = 30 * 60;
 
-/// Ceiling for the `limits` terms (`limits.workloadTimeoutSecs`): 24 hours.
+/// Ceiling for the `limits` terms (`limits.workloadTimeoutSecs`): 7 days.
 ///
-/// Validation, not policy: the container's `timeout_ms` is a `u32` of
-/// milliseconds (49 days), so an absurd value survives the arithmetic and becomes
-/// a session nothing will ever reclaim. A day is already far past any workload this
-/// tool runs; beyond it the honest reading is "a wedged session", and refusing the
-/// value (with a warning and the default) is the fail-closed answer.
-pub const MAX_WORKLOAD_TIMEOUT_SECS: u32 = 24 * 60 * 60;
+/// A guard against an absurd value, not a platform limit: the container's
+/// `timeout_ms` is a `u32` of milliseconds (~49.7 days), so anything up to the cap
+/// survives the arithmetic intact and nothing wraps. Seven days covers the case the
+/// cap has to serve -- an agent left running over a weekend -- while still refusing
+/// a value that can only mean a typo, which falls back to the default with a
+/// warning.
+///
+/// This is a backstop, not the mechanism for multi-day sessions: a wedged session
+/// holding a seven-day deadline is still wrong, which is what an idle watchdog is
+/// for. Raise this constant only together with the container contract, whose
+/// `u32` milliseconds saturate there.
+pub const MAX_WORKLOAD_TIMEOUT_SECS: u32 = 7 * 24 * 60 * 60;
 
 /// The fully-resolved network configuration for a session.
 #[derive(Debug, Clone)]

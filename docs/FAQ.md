@@ -281,7 +281,7 @@ means three authenticated proxy requests, zero completed tunnels; it is not an
 error).
 
 **Raise the workload term in the profile** (top-level `limits` section, cap
-24 h = 86400):
+7 days = 604800):
 
 ```json
 {
@@ -297,8 +297,9 @@ error).
 }
 ```
 
-`workloadTimeoutSecs` and `promptTimeoutSecs` are validated `1..=86400`; an
-out-of-range value falls back to the default (30 min / 60 s) with a warning line,
+`workloadTimeoutSecs` is validated `1..=604800` and `promptTimeoutSecs`
+`0..=604800` (`0` still means "instant deny"); an out-of-range value falls back to
+the default (30 min / 60 s) with a warning line,
 so check the resolved value with `saife profile show <name> --expanded` (it
 prints them under `limits`). Both keys were `network.*` until 2026-10-25 and that
 location is **refused** now, so an installed or copied old profile fails with

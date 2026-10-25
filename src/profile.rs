@@ -198,9 +198,14 @@ pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = crate::net::prompt::DEFAULT_PROMPT_
 /// default.
 pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS;
 
-/// Ceiling for both `limits` terms: 24 hours
+/// Ceiling for both `limits` terms: 7 days
 /// ([`crate::net::MAX_WORKLOAD_TIMEOUT_SECS`]).
 pub const MAX_LIMIT_SECS: u32 = crate::net::MAX_WORKLOAD_TIMEOUT_SECS;
+
+// The cap must stay inside the container contract's `timeout_ms: u32` milliseconds,
+// or the derived budget would saturate instead of expressing what the profile asked
+// for. A compile-time check, so raising the constant past ~49.7 days cannot ship.
+const _: () = assert!((MAX_LIMIT_SECS as u64) * 1000 <= u32::MAX as u64);
 
 /// The session limits ONE run actually uses: defaults applied, both terms
 /// validated into `1..=MAX_LIMIT_SECS`.
@@ -1355,7 +1360,8 @@ mod tests {
 
     #[test]
     fn limits_are_clamped_into_range() {
-        assert_eq!(MAX_LIMIT_SECS, 86_400, "the documented cap is 24 hours");
+        assert_eq!(MAX_LIMIT_SECS, 604_800, "the documented cap is seven days");
+
         // The PROMPT term accepts 0: [G-46] defines it as "instant deny", and the
         // dialog deadline is `Duration::from_secs(0)`, which expires at once.
         for accepted in [0, 1, 600, MAX_LIMIT_SECS] {

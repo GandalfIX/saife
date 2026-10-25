@@ -385,7 +385,12 @@ Session deadline is `limits.promptTimeoutSecs + limits.workloadTimeoutSecs +
 slack` (defaults 60 s + 30 min + 2 min). Both terms live in the top-level
 `limits` section — the deadline bounds the session, not the network policy, so a
 `--block-net` session uses the same terms. If a build or download legitimately
-runs longer, raise `limits.workloadTimeoutSecs` — there is no unlimited mode.
+runs longer, raise `limits.workloadTimeoutSecs` up to the cap of seven days
+(604800 s; `promptTimeoutSecs` accepts `0` = instant deny up to the same cap) —
+there is no unlimited mode. The cap is a guard against a typo, not a platform
+limit: an out-of-range value warns and falls back to the default. A session that
+stops doing anything still holds its deadline, so a seven-day term is a backstop
+for a run you meant to leave going, not a substitute for supervising it.
 
 ### 5.1 Ready-made profiles
 
