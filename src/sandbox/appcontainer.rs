@@ -1069,6 +1069,13 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         }
     }
 
+    // `CreateProcessW` requires the block to be sorted by name (Unicode order), and
+    // callers that binary-search it - cmd.exe, some C runtimes - silently miss
+    // entries when it is not. This block is built by appending PATH/PYTHONPATH/
+    // SAIFE_SESSION_SID/proxy vars to the parent's list, so without this sort the
+    // very variables the sandbox depends on were the ones a child could fail to find.
+    vars.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut block: Vec<u16> = Vec::new();
     for (k, v) in &vars {
         for c in k.encode_utf16() {

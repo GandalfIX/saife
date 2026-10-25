@@ -8,12 +8,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Always-denied IPv4 CIDRs (AC-3.6, AC-3.7). Link-local + AWS/GCP/Azure
 /// metadata.
 pub const ALWAYS_DENIED_V4_CIDRS: &[(Ipv4Addr, u8)] = &[(Ipv4Addr::new(169, 254, 0, 0), 16)];
-/// Canonical always-denied IPv4 host-strings (retained for reference; IP-path
-/// uses `ALWAYS_DENIED_V4_LITERALS`/CIDRs post-split per [G-45]). Not consulted
-/// by `is_hard_denied_host`/`is_hard_denied_ip`; the pre-resolution host-string
-/// deny check that will consume this lands in D-3.6.
-#[allow(dead_code)]
-pub const ALWAYS_DENIED_V4_HOSTS: &[&str] = &["169.254.169.254", "169.254.169.253"];
 /// Always-denied IPv6 CIDRs (link-local).
 pub const ALWAYS_DENIED_V6_CIDRS: &[(Ipv6Addr, u8)] =
     // Link-local fe80::/10 ([G-45]). The network must be `fe80::` —
@@ -167,20 +161,6 @@ fn is_ipv4_mapped(v: &Ipv6Addr) -> bool {
 }
 
 /// Legacy combined check. Prefer [`is_hard_denied_host`] + [`is_hard_denied_ip`]
-/// for precise audit attribution.
-//
-// Kept as the transitional API the spec (D-3.2 Step 2) mandates for call sites
-// that have not yet migrated to the split functions. No production call site
-// consumes it after D-3.2 (the sole caller, `check`, was rewritten to use the
-// split functions); `dead_code` is allowed here so the wrapper remains
-// available for D-3.6 wiring and any external consumers. The `deprecated`
-// attribute surfaces a warning at any future use site.
-#[allow(dead_code)]
-#[deprecated(note = "use is_hard_denied_host + is_hard_denied_ip")]
-pub fn is_always_denied(host: &str, resolved_ips: &[IpAddr]) -> bool {
-    is_hard_denied_host(host) || resolved_ips.iter().any(|ip| is_hard_denied_ip(*ip))
-}
-
 fn in_v4_cidr(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
     let mask: u32 = if prefix == 0 {
         0

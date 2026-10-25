@@ -206,7 +206,6 @@
 //! (`TaskDialogIndirect`) cannot be unit-tested — it requires an
 //! interactive desktop; the checkpoint covers it manually.
 
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -347,10 +346,11 @@ const ID_DENY_ONCE: i32 = 104;
 const ID_DENY_PERM_HOST: i32 = 105;
 const ID_DENY_PERM_SUFFIX: i32 = 106;
 const ID_EXPLAIN_MORE: i32 = 107;
-/// `winuser.h` IDCANCEL (kept as a plain literal: windows-rs types the
-/// constant as `MESSAGEBOX_RESULT`, while `TaskDialogIndirect` reports a
-/// plain button id). With `TDF_ALLOW_DIALOG_CANCELLATION`, the title-bar
-/// X and Esc produce this id ([G-3, G-43]: cancel = Deny once).
+/// `winuser.h` IDCANCEL, kept as a plain literal: windows-rs types the constant as
+/// `MESSAGEBOX_RESULT`, while `TaskDialogIndirect` reports a plain button id. With
+/// `TDF_ALLOW_DIALOG_CANCELLATION`, the title-bar X and Esc produce it
+/// ([G-3, G-43]: cancel = Deny once).
+#[allow(dead_code)] // referenced by the dialog-result tests
 const IDCANCEL: i32 = 2;
 
 /// What to do when the prompt cannot produce a user decision (timeout,
@@ -520,16 +520,6 @@ pub enum UnavailableCause {
     /// demonstrably worked (a dialog was shown and nobody answered it), and the
     /// remedy is "be at the desk", not "run interactively".
     SuppressedAfterBudget,
-}
-
-impl UnavailableCause {
-    /// `true` for the cause a *budget* produced. The proxy turns this into the
-    /// distinct `prompt_budget_exhausted` deny reason (P2.1) — a timed-out
-    /// consultation and a missing dialog backend must not read the same in the
-    /// audit chain.
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::BudgetElapsed)
-    }
 }
 
 /// Injected dialog backend ([test seam]): one blocking call that shows
@@ -915,6 +905,7 @@ struct DialogBackend {
     /// The v6 comctl32 mapped inside the context. Intentionally never
     /// `FreeLibrary`-ed after a successful resolve (see the struct
     /// doc); kept in the struct to document the ownership.
+    #[allow(dead_code)] // ownership documented, never freed on purpose
     module: HMODULE,
     /// Resolved inside the context; stays valid while the module stays
     /// mapped, i.e. for the whole process.
@@ -1187,10 +1178,6 @@ enum StickyPlan {
 }
 
 impl BackendStickiness {
-    fn new(after: usize) -> Self {
-        Self::with_cooldown(after, NO_BACKEND_REPROBE_COOLDOWN)
-    }
-
     fn with_cooldown(after: usize, cooldown: Duration) -> Self {
         Self {
             state: StdMutex::new(StickyState::default()),
@@ -1354,6 +1341,7 @@ impl PromptCoordinator {
     /// Live consultations: slots held by prompts the coordinator is still waiting
     /// on (P2.1). Zero when nothing is being prompted; it must return to zero
     /// after a timeout, because the timed-out consultation is over.
+    #[allow(dead_code)] // read by the live lane and the P2.1 budget tests
     pub fn live_consultations(&self) -> usize {
         MAX_CONCURRENT_PROMPTS - self.permits.available_permits()
     }
@@ -1370,6 +1358,7 @@ impl PromptCoordinator {
     /// accessors describe disjoint sets: `live_consultations()` = dialogs being
     /// awaited, `abandoned_dialogs()` = dialogs that outlived their budget and
     /// whose late answer will be discarded.
+    #[allow(dead_code)] // read by the live lane (P2.1 abandoned-dialog accounting)
     pub fn abandoned_dialogs(&self) -> usize {
         let held = MAX_ABANDONED_PROMPTS - self.abandoned.available_permits();
         // Saturating: a dialog can return while its consultation is still live
@@ -1379,8 +1368,13 @@ impl PromptCoordinator {
         held.saturating_sub(self.live_consultations())
     }
 
-    /// Ask the user about one request and await the outcome. `config`
-    /// supplies the timeout and fallback policy per call ([G-46, G-48]).
+    /// Ask the user about one request and await the outcome. `config` supplies the
+    /// timeout and fallback policy per call ([G-46, G-48]).
+    ///
+    /// Test-only: every production caller wants [`Self::prompt_measured`]'s wall
+    /// clock, and a second entry point that discards it is how the per-request
+    /// accounting drifts. Kept because 37 tests drive the coordinator through it.
+    #[cfg(test)]
     pub async fn prompt(
         &self,
         host: &str,
@@ -1391,7 +1385,7 @@ impl PromptCoordinator {
         self.prompt_measured(host, port, reason, config).await.0
     }
 
-    /// [`PromptCoordinator::prompt`], plus the wall clock **the leader of this
+    /// Ask the user about one request and await the outcome, plus the wall clock **the leader of this
     /// consultation** spent on the dialog it led (P2.1 review round 2, item 1).
     ///
     /// `Some` exactly for the leader of a dialog that actually ran; `None` for a
@@ -1429,7 +1423,7 @@ impl PromptCoordinator {
             let mut map = self.waiters.lock().await;
             if let Some(entry) = map.get(&key) {
                 let (tx, rx) = oneshot::channel();
-                entry.lock().expect("prompt waiter list poisoned").push(tx);
+                entry.lock().unwrap_or_else(|p| p.into_inner()).push(tx);
                 Role::Follower(rx)
             } else {
                 let entry = Arc::new(StdMutex::new(Vec::new()));
@@ -1651,7 +1645,7 @@ impl PromptCoordinator {
     /// dialog's entry is finished.
     async fn finish(waiters: &WaiterMap, key: &str, entry: &Arc<Waiters>, outcome: PromptOutcome) {
         waiters.lock().await.remove(key);
-        let parked = std::mem::take(&mut *entry.lock().expect("prompt waiter list poisoned"));
+        let parked = std::mem::take(&mut *entry.lock().unwrap_or_else(|p| p.into_inner()));
         for tx in parked {
             // A waiter may have hit its own deadline already — send
             // errors are expected and ignored.

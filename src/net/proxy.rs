@@ -3182,6 +3182,10 @@ enum FacadeAction {
     UnknownMount,
     /// The mount exists and the method is not one this transport relays.
     MethodUnsupported,
+    /// The request is well-formed but the manifest does not declare this
+    /// `(method, path)`. The declaration is the operator's reviewed surface, so
+    /// anything outside it is refused rather than relayed.
+    OperationNotDeclared,
     /// Relay this request to the sidecar behind the mount.
     Relay { mount: String, target: FacadeTarget },
 }
@@ -3195,7 +3199,12 @@ enum FacadeAction {
 /// denial — the capability exists, this transport does not carry that operation
 /// yet. The host label is compared case-insensitively but the mount is
 /// canonicalised to the registry's spelling, so audit and `Host` agree.
-fn facade_action(facade: &FacadeRegistry, host: &str, method: &str) -> FacadeAction {
+fn facade_action(
+    facade: &FacadeRegistry,
+    host: &str,
+    method: &str,
+    origin_form: &str,
+) -> FacadeAction {
     let Some(label) = crate::plugin::facade_mount(host) else {
         return FacadeAction::NotFacade;
     };
@@ -3204,6 +3213,16 @@ fn facade_action(facade: &FacadeRegistry, host: &str, method: &str) -> FacadeAct
     };
     if !method.eq_ignore_ascii_case("GET") {
         return FacadeAction::MethodUnsupported;
+    }
+    // The path the sidecar will receive, with the query stripped: a manifest
+    // declares paths, not queries.
+    let path = origin_form.split('?').next().unwrap_or(origin_form);
+    let declared = target
+        .operations
+        .iter()
+        .any(|op| op.method.eq_ignore_ascii_case(method) && op.path == path);
+    if !declared {
+        return FacadeAction::OperationNotDeclared;
     }
     FacadeAction::Relay {
         mount: target.mount.clone(),
@@ -3381,7 +3400,7 @@ async fn handle_forward(
     // before any admission decision — because the name never resolves and must
     // never reach `decide()`, the prompt, or a dial. It is therefore not a
     // consultation either: no origin was contacted on the workload's behalf.
-    match facade_action(&ctx.facade, &fwd.host, method) {
+    match facade_action(&ctx.facade, &fwd.host, method, fwd.origin_form.as_str()) {
         FacadeAction::NotFacade => {}
         FacadeAction::UnknownMount => {
             let label = crate::plugin::facade_mount(&fwd.host).unwrap_or("");
@@ -3415,6 +3434,24 @@ async fn handle_forward(
                 "501 Not Implemented",
                 "Content-Type: text/plain\r\nConnection: close\r\n",
                 "facade_method_unsupported\n",
+            )
+            .await;
+            return Ok(());
+        }
+        FacadeAction::OperationNotDeclared => {
+            let label = crate::plugin::facade_mount(&fwd.host).unwrap_or("");
+            let _ = emit_facade(
+                &ctx.writer,
+                &label.to_ascii_lowercase(),
+                Some(fwd.origin_form.as_str()),
+                "deny",
+                Some("facade_operation_not_declared"),
+            );
+            write_response(
+                &mut sock,
+                "403 Forbidden",
+                "Content-Type: text/plain\r\nConnection: close\r\n",
+                "facade_operation_not_declared\n",
             )
             .await;
             return Ok(());
@@ -9505,7 +9542,60 @@ mod tests {
             mount: mount.to_string(),
             port,
             token: token.to_string(),
+            operations: vec![
+                crate::plugin::Operation { method: "GET".into(), path: "/".into() },
+                crate::plugin::Operation { method: "GET".into(), path: "/page".into() },
+            ],
         }
+    }
+
+    /// The manifest's `operations` are the operator's reviewed surface. They were
+    /// parsed, documented as the plugin's exposed API, and never consulted, so the
+    /// workload could reach any path the sidecar happens to serve.
+    #[test]
+    fn an_undeclared_facade_path_is_refused_before_the_sidecar() {
+        const BODY: &str = "should not be reached";
+        let (sidecar_port, seen) = fake_sidecar(BODY);
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-undeclared", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://fake.sandbox.invalid/admin HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "an undeclared path must be refused: {resp}"
+        );
+        assert!(
+            resp.contains("facade_operation_not_declared"),
+            "the refusal must name the rule: {resp}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the sidecar must never see an undeclared request"
+        );
+        let path = crate::audit::audit_log_path(&t.sid);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut leaf: Option<serde_json::Value> = None;
+        for line in text.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                && v["op"] == "FACADE"
+            {
+                leaf = Some(v);
+            }
+        }
+        let leaf = leaf.expect("the refusal is recorded as a FACADE leaf");
+        assert_eq!(leaf["disposition"], "deny");
+        assert_eq!(leaf["reason"], "facade_operation_not_declared");
     }
 
     /// A one-shot HTTP/1.0 sidecar stand-in: records the request head it received
@@ -9558,39 +9648,39 @@ mod tests {
         reg.insert(facade_target("tngtech", 4321, "tok")).unwrap();
 
         assert!(matches!(
-            facade_action(&reg, "api.example.com", "GET"),
+            facade_action(&reg, "api.example.com", "GET", "/"),
             FacadeAction::NotFacade
         ));
         assert!(
             matches!(
-                facade_action(&reg, "sandbox.invalid", "GET"),
+                facade_action(&reg, "sandbox.invalid", "GET", "/"),
                 FacadeAction::NotFacade
             ),
             "the bare suffix is not a mount"
         );
         assert!(
             matches!(
-                facade_action(&reg, "tngtech.sandbox.invalid.evil.com", "GET"),
+                facade_action(&reg, "tngtech.sandbox.invalid.evil.com", "GET", "/"),
                 FacadeAction::NotFacade
             ),
             "a lookalike suffix must never be a facade host"
         );
         assert!(matches!(
-            facade_action(&reg, "nope.sandbox.invalid", "GET"),
+            facade_action(&reg, "nope.sandbox.invalid", "GET", "/"),
             FacadeAction::UnknownMount
         ));
         assert!(
             matches!(
-                facade_action(&reg, "nope.sandbox.invalid", "POST"),
+                facade_action(&reg, "nope.sandbox.invalid", "POST", "/"),
                 FacadeAction::UnknownMount
             ),
             "an undeclared mount is 404 whatever the method"
         );
         assert!(matches!(
-            facade_action(&reg, "tngtech.sandbox.invalid", "POST"),
+            facade_action(&reg, "tngtech.sandbox.invalid", "POST", "/"),
             FacadeAction::MethodUnsupported
         ));
-        match facade_action(&reg, "TNGTECH.sandbox.invalid", "GET") {
+        match facade_action(&reg, "TNGTECH.sandbox.invalid", "GET", "/") {
             FacadeAction::Relay { mount, target } => {
                 assert_eq!(mount, "tngtech", "the mount is the registry's spelling");
                 assert_eq!(target.port, 4321);

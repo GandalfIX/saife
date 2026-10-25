@@ -61,7 +61,7 @@ impl DaclJournal {
             .append(true)
             .open(&file)?;
         if f.metadata()?.len() == 0 {
-            writeln!(f, "{}", serde_json::to_string(&header).unwrap())?;
+            writeln!(f, "{}", serde_json::to_string(&header).map_err(std::io::Error::other)?)?;
             f.sync_all()?;
         }
         Ok(Self { file })
@@ -76,7 +76,7 @@ impl DaclJournal {
             .create(true)
             .append(true)
             .open(&self.file)?;
-        writeln!(f, "{}", serde_json::to_string(entry).unwrap())?;
+        writeln!(f, "{}", serde_json::to_string(entry).map_err(std::io::Error::other)?)?;
         f.sync_all()?;
         Ok(())
     }
@@ -99,7 +99,7 @@ impl DaclJournal {
             .open(&self.file)?;
         let mut buf = String::new();
         for e in entries {
-            buf.push_str(&serde_json::to_string(e).unwrap());
+            buf.push_str(&serde_json::to_string(e).map_err(std::io::Error::other)?);
             buf.push('\n');
         }
         f.write_all(buf.as_bytes())?;
@@ -109,6 +109,8 @@ impl DaclJournal {
 
     /// Every entry (header line excluded). Unparseable lines are skipped.
     pub fn entries(&self) -> Vec<JournalEntry> {
+        // A journal that cannot be read is NOT an empty journal: `restore_or_warn`
+        // would then report success while leaving every granted ACE on the host.
         fs::read_to_string(&self.file)
             .unwrap_or_default()
             .lines()

@@ -65,6 +65,9 @@ pub struct Sidecar {
     /// would no longer cover a supervisor that dies without running `Drop`.
     job: Option<Job>,
     log_path: PathBuf,
+    /// The manifest's declared `(method, path)` pairs, carried into the facade
+    /// target so the proxy can refuse anything the operator did not review.
+    operations: Vec<crate::plugin::Operation>,
 }
 
 impl Sidecar {
@@ -144,6 +147,7 @@ impl Sidecar {
             child: Some(child),
             job,
             log_path,
+            operations: manifest.operations.clone(),
         };
         // A gate that fails drops `sidecar`, whose `Drop` ends the whole tree: a
         // sidecar never survives a refused session.
@@ -159,6 +163,7 @@ impl Sidecar {
             mount: self.mount.clone(),
             port: self.port,
             token: self.token.clone(),
+            operations: self.operations.clone(),
         }
     }
 

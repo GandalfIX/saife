@@ -69,6 +69,18 @@ pub fn build_allowlist(
     cwd: &std::path::Path,
     fs: &FilesystemSlice,
 ) -> Result<Vec<AllowEntry>> {
+    // The built-in deny set is read from the environment here, once, so the body
+    // below is a pure function of its arguments and can be tested without mutating
+    // process state (the suite has tests that do).
+    build_allowlist_with(sid, cwd, fs, &crate::profile::builtin_deny_dirs())
+}
+
+fn build_allowlist_with(
+    sid: &str,
+    cwd: &std::path::Path,
+    fs: &FilesystemSlice,
+    builtin_denies: &[std::path::PathBuf],
+) -> Result<Vec<AllowEntry>> {
     let mut entries = Vec::new();
     let mut ancestor_set: Vec<std::path::PathBuf> = Vec::new();
 
@@ -102,8 +114,7 @@ pub fn build_allowlist(
     // had them, `--backend appcontainer --allow $USERPROFILE` could read
     // ~/.azure/accessTokens.json and rewrite ~/.saife/plugins, while the docs
     // promised those directories stay denied.
-    let builtin_denies = crate::profile::builtin_deny_dirs();
-    for deny in &builtin_denies {
+    for deny in builtin_denies {
         for grant in fs.allow.iter().chain(fs.read_only.iter()) {
             if crate::profile::path_covers(deny, grant) {
                 // windows::core::Result is this module's error type; the message is
@@ -132,7 +143,7 @@ pub fn build_allowlist(
             false,
         );
     }
-    for deny in &builtin_denies {
+    for deny in builtin_denies {
         push_entry(
             &mut entries,
             deny.clone(),
@@ -872,13 +883,14 @@ mod tests {
     /// swallows a grant is an error, never a silently narrowed DACL.
     #[test]
     fn a_grant_inside_a_builtin_deny_is_refused() {
-        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let denies = vec![home.join(".saife")];
         let fs = FilesystemSlice {
             allow: vec![home.join(".saife").join("plugins")],
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let err = match build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs) {
+        let err = match build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies) {
             Ok(_) => panic!("a grant inside .saife must be refused"),
             Err(e) => e,
         };
@@ -893,13 +905,16 @@ mod tests {
     /// operator can see which rule produced a refusal.
     #[test]
     fn builtin_denies_are_entries_on_the_appcontainer_path() {
-        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let denies = vec![home.join(".saife")];
         let fs = FilesystemSlice {
-            allow: vec![std::path::PathBuf::from("C:\\proj")],
+            allow: vec![std::path::PathBuf::from(r"C:\proj")],
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let entries = build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs).unwrap();
+        let entries =
+            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies)
+                .unwrap();
         let want = home.join(".saife");
         let hit = entries
             .iter()

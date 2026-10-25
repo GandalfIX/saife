@@ -11,7 +11,6 @@
 //! `#![allow(dead_code)]` to keep `cargo build --release` clean.
 //! Tests exercise the full API.
 
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,16 +39,6 @@ struct LearnedFile {
     schema: u32,
     allow: Vec<LearnedEntry>,
     deny: Vec<LearnedEntry>,
-}
-
-impl LearnedFile {
-    fn empty() -> Self {
-        LearnedFile {
-            schema: LEARNED_SCHEMA_VERSION,
-            allow: vec![],
-            deny: vec![],
-        }
-    }
 }
 
 /// A resolved decision from `lookup`.
@@ -304,6 +293,10 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
 /// Does **not** validate `profile_name` — callers passing untrusted input
 /// (e.g. D-3.7 CLI) must call [`validate_profile_name`] first. `load_in`
 /// validates internally.
+/// Test-only: the binary resolves through [`learned_file_path_in`] so the base
+/// directory is explicit. Kept because the learned-policy tests exercise the real
+/// %USERPROFILE% layout.
+#[allow(dead_code)]
 pub fn learned_file_path(profile_name: Option<&str>) -> PathBuf {
     let base = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)

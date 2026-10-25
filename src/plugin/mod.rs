@@ -44,7 +44,6 @@
 // `--no-default-features` lane. The always-compiled half (`FacadeRegistry`,
 // `FacadeTarget`, `facade_mount`) is used by `net::proxy` in every build, and
 // every item below has a caller or a test in the default lane.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -72,6 +71,10 @@ pub const GLOBAL_ROOT_LABEL: &str = r"%USERPROFILE%\.saife\plugins";
 /// `deny_unknown_fields` is deliberate: a typo in a key must be a refusal, not a
 /// silently ignored setting on a process that runs with the supervisor's rights.
 #[derive(Debug, Clone, Deserialize)]
+/// The manifest IS the validated contract: every field is checked on load, and the
+/// ones the POC does not consume yet stay parseable rather than being deleted and
+/// silently accepting the same keys again later.
+#[allow(dead_code)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
     /// Manifest schema. Required: an unversioned manifest is not guessable.
@@ -133,6 +136,8 @@ pub struct Operation {
 /// A secret the plugin wants, by **name**. Unused by the POC (see
 /// [`PluginManifest::secrets`]).
 #[derive(Debug, Clone, Deserialize)]
+/// Declared but not consumed by the POC (see [`PluginManifest::secrets`]).
+#[allow(dead_code)]
 #[serde(deny_unknown_fields)]
 pub struct SecretDecl {
     pub name: String,
@@ -168,6 +173,10 @@ pub struct FacadeTarget {
     pub mount: String,
     pub port: u16,
     pub token: String,
+    /// The `(method, path)` pairs the manifest declares. The proxy refuses anything
+    /// else with 403: the list was parsed, documented as the plugin's exposed
+    /// surface, and never consulted, so the reviewed declaration was not a control.
+    pub operations: Vec<Operation>,
 }
 
 impl std::fmt::Debug for FacadeTarget {
@@ -595,6 +604,7 @@ mod tests {
 
     fn target(mount: &str, port: u16) -> FacadeTarget {
         FacadeTarget {
+            operations: vec![Operation { method: "GET".into(), path: "/".into() }],
             mount: mount.to_string(),
             port,
             token: "0123456789abcdef0123456789abcdef".to_string(),
