@@ -1,6 +1,17 @@
-# sandbox
+# SAIFE Sandbox
 
-A native Windows process-sandboxing tool that runs any program — primarily
+```text
+███████╗ █████╗ ██╗███████╗███████╗
+██╔════╝██╔══██╗██║██╔════╝██╔════╝
+███████╗███████║██║█████╗  █████╗
+╚════██║██╔══██║██║██╔══╝  ██╔══╝
+███████║██║  ██║██║██║     ███████╗
+╚══════╝╚═╝  ╚═╝╚═╝╚═╝     ╚══════╝
+        Secure AI Frontier Environment
+```
+
+**SAIFE** (*Secure AI Frontier Environment*) is a native Windows
+process-sandboxing tool that runs any program — primarily
 AI coding agents (Claude Code, OpenCode, Codex, …) and their build
 toolchains — with only the resources the user has explicitly granted.
 

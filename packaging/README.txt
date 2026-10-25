@@ -1,5 +1,7 @@
-sandbox - distribution bundle
-=============================
++====================================+
+|  S A I F E   S A N D B O X         |
+|  Secure AI Frontier Environment    |
++====================================+
 
 A supervisor that runs a Windows workload inside a container (AppContainer or the
 MXC base-container) with a proxy-only network and an audited session chain.

@@ -1,4 +1,4 @@
-# sandbox
+# SAIFE Sandbox
 
 `saife` is a native Windows process-sandboxing tool that runs any program —
 primarily AI coding agents (Claude Code, OpenCode, Codex, …) and their build

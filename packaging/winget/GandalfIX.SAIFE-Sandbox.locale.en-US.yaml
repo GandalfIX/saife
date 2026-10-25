@@ -35,7 +35,7 @@ InstallationNotes: >-
   and no service are needed for the default backend. Verify the installation with
   `saife setup --check-only`, then run something:
   `saife run --allow-cwd -- cmd /c echo ok`. Profiles live in
-  %USERPROFILE%\.sandbox\profiles and plugin sidecars in
-  %USERPROFILE%\.sandbox\plugins.
+  %USERPROFILE%\.saife\profiles and plugin sidecars in
+  %USERPROFILE%\.saife\plugins.
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0
