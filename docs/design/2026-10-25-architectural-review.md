@@ -220,3 +220,29 @@ implementation shared by both the string and address legs; guardrail 1's
 "attempted and nothing authenticated" rule is the correct shape; `ProxyHandle` and
 `Job` are proper RAII; `saife-launch` handles its Win32 wait/close correctly; and
 `DEVELOPERS.md` is a real module map rather than a directory listing.
+
+---
+
+## 5. Status after the fix pass (2026-10-25, branch `review/arch-20261025`)
+
+| id | severity | state | what changed |
+|---|---|---|---|
+| F-01 | P0 | **fixed** | `ChainState { last, seq }` behind one mutex, held across compute → write → commit; a corrupt existing log is refused instead of restarted; the `"{}"` fallbacks are gone |
+| F-02 | P0 | **fixed** | loopback/unspecified refused on the pinned addresses (`loopback_refused`), as policy — not in `is_hard_denied_ip`, which also feeds the dialer assertion |
+| F-03 | P0 | **fixed** | `builtin_deny_dirs()` (credentials + `.saife` + `%LOCALAPPDATA%\saife`) used by both backends; granting inside one is refused |
+| F-04 | P1 | **partial** | AppContainer now gets the same built-in denies and the deny-covers-grant refusal; guardrail 1 is still MXC-only, because it needs the wrapper/probe mechanism on a path that spawns the workload directly |
+| F-05 | P1 | **partial** | leaves carry `sid`, verify checks `sid` and `seq` (closes substitution, which needs no key); verify still derives the public key from the on-disk secret — closing that needs a recorded public key and a decision on where it lives |
+| F-06 | P1 | **deferred** | the two session scripts are one refactor with F-07 (a `Session` + `Containment` trait); doing it inside a fix pass would mix a rewrite with security fixes |
+| F-07 | P1 | **deferred** | adding `src/lib.rs` moves every module path and makes the live tests integration tests; same pass as F-06 |
+| F-08 | P1 | **fixed** | one permit per in-flight connection (refused, not queued) and a 15 s head deadline answering 408 |
+| F-09 | P1 | **fixed** | `OwnedSid` frees with `FreeSid` in `Drop`; no more `Vec::leak` handed to a Win32 free |
+| F-10 | P1 | **fixed** | a relative profile resolves against the session cwd; three tests now enter through `load_and_resolve` (three-level chain, relative path, missing parent) |
+| F-11 | P1 | **fixed** | `parse_connect_target` returns `Option`; an unparsable port is a 400, not a silent 443; bracketed IPv6 stays legal |
+
+Gates on this branch after the pass: **670 passed / 15 ignored** (default), **542 / 1**
+(`--no-default-features`), clippy **0 warnings** in both states.
+
+The three deferred items share one property: they are restructurings, not corrections.
+F-04's guardrail leg needs a mechanism (the wrapper probe) that does not exist on the
+AppContainer path; F-05's remaining half needs a key-management decision; F-06 and F-07
+are the Phase 2 refactor and should not be done while security fixes are being verified.
