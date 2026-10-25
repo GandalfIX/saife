@@ -79,6 +79,7 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
             name: resolved_name,
             filesystem: fs,
             network: resolve_network_slice(&raw.network),
+            limits: resolve_limits_slice(&raw.limits),
         };
         let groups_expanded = expand_groups_for_show(&groups);
         println!("{}", to_expanded_json(&resolved, &groups_expanded));
@@ -98,7 +99,8 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
 ///   "meta": { "name": "..." },
 ///   "filesystem": { "allow": [...], "read_only": [...], "deny": [...] },
 ///   "security_groups_expanded": { "python_runtime": ["C:\\..."], ... },
-///   "network": { "block": false, "allow_domain": [...], "profile": "..." }
+///   "network": { "block": false, "allow_domain": [...], "profile": "..." },
+///   "limits": { "prompt_timeout_secs": 60, "workload_timeout_secs": 1800 }
 /// }
 /// ```
 pub fn to_expanded_json(
@@ -125,9 +127,13 @@ pub fn to_expanded_json(
             "profile": resolved.network.profile_name,
             "prompt_enabled": resolved.network.prompt_enabled,
             "on_unavailable": resolved.network.on_unavailable,
-            "prompt_timeout_secs": resolved.network.prompt_timeout_secs,
-            "workload_timeout_secs": resolved.network.workload_timeout_secs,
             "upstream_proxy": resolved.network.upstream_proxy,
+        },
+        // Moved out of `network` on 2026-10-25: the session deadline is not a
+        // network policy. `null` means "unset, the resolver's default applies".
+        "limits": {
+            "prompt_timeout_secs": resolved.limits.prompt_timeout_secs,
+            "workload_timeout_secs": resolved.limits.workload_timeout_secs,
         }
     });
     serde_json::to_string_pretty(&expanded).unwrap_or_else(|_| "{}".into())
@@ -164,11 +170,131 @@ pub struct NetworkSlice {
     pub deny_domain: Vec<String>,
     pub prompt_enabled: Option<bool>,
     pub on_unavailable: Option<String>,
-    pub prompt_timeout_secs: Option<u32>,
-    /// Seconds the workload may run (`network.workloadTimeoutSecs`, P2.1 review
-    /// item 6). `None` = the resolver's default (30 min).
-    pub workload_timeout_secs: Option<u32>,
     pub upstream_proxy: Option<String>,
+}
+
+/// The session-deadline slice of a profile, after merging `extends`.
+///
+/// These two terms lived in `network` until 2026-10-25. They are session
+/// concerns, not network policy: a `--block-net` session runs a container and is
+/// bounded by the same terms, and the deadline is supervisor arithmetic over the
+/// prompt and workload terms rather than a host-matching rule. `None` = neither
+/// this profile nor its parents set it, so [`LimitsSlice::resolve`] applies the
+/// documented default.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LimitsSlice {
+    /// Seconds one prompt consultation may take. `None` = 60 s ([G-46]).
+    pub prompt_timeout_secs: Option<u32>,
+    /// Seconds the workload may run before the container kills it. `None` = 30 min.
+    pub workload_timeout_secs: Option<u32>,
+}
+
+/// Default prompt term in seconds: the same constant the prompt layer builds its
+/// dialog timeout from and [`crate::net::mxc::PROMPT_BUDGET`] is defined as, so
+/// the three cannot drift ([G-46]).
+pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = crate::net::prompt::DEFAULT_PROMPT_TIMEOUT_SECS;
+
+/// Default workload term in seconds (30 min) — the `limits.workloadTimeoutSecs`
+/// default.
+pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS;
+
+/// Ceiling for both `limits` terms: 24 hours
+/// ([`crate::net::MAX_WORKLOAD_TIMEOUT_SECS`]).
+pub const MAX_LIMIT_SECS: u32 = crate::net::MAX_WORKLOAD_TIMEOUT_SECS;
+
+/// The session limits ONE run actually uses: defaults applied, both terms
+/// validated into `1..=MAX_LIMIT_SECS`.
+///
+/// Unlike [`LimitsSlice`] these are plain numbers, which is what the session
+/// budget and the dialog timeout are built from — nothing downstream has to
+/// decide what "unset" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// How long one prompt consultation may take.
+    pub prompt_timeout_secs: u32,
+    /// How long the workload itself may run.
+    ///
+    /// Read by the session budget only, which exists in an `mxc-backend` build:
+    /// the AppContainer path carries no container deadline, so a feature-less
+    /// build resolves the term but does not consume it.
+    #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+    pub workload_timeout_secs: u32,
+}
+
+impl Default for Limits {
+    /// The documented defaults — what a run with no profile (or a profile with no
+    /// `limits` section) gets.
+    fn default() -> Self {
+        Self {
+            prompt_timeout_secs: DEFAULT_PROMPT_TIMEOUT_SECS,
+            workload_timeout_secs: DEFAULT_WORKLOAD_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl LimitsSlice {
+    /// Resolve the merged options into the terms a session uses.
+    ///
+    /// Out-of-range values fall back to the default with a warning, in the same
+    /// style as the network slice's other validated knobs - past the cap the only
+    /// honest reading is a wedged session.
+    ///
+    /// The two terms deliberately have different floors. The PROMPT term keeps
+    /// `0` as a legal value: [G-46] defines it as "instant deny", the dialog
+    /// deadline is built with `Duration::from_secs(0)` so it expires at once, and
+    /// moving the field must not change that. The WORKLOAD term needs `>= 1`,
+    /// because `0` there would end every session before its child could run.
+    pub fn resolve(&self) -> Limits {
+        Limits {
+            prompt_timeout_secs: clamp_limit_term(
+                "promptTimeoutSecs",
+                self.prompt_timeout_secs,
+                DEFAULT_PROMPT_TIMEOUT_SECS,
+                0,
+            ),
+            workload_timeout_secs: clamp_limit_term(
+                "workloadTimeoutSecs",
+                self.workload_timeout_secs,
+                DEFAULT_WORKLOAD_TIMEOUT_SECS,
+                1,
+            ),
+        }
+    }
+}
+
+impl Limits {
+    /// The container deadline these terms ask for (P2.1): prompt + workload +
+    /// [`crate::net::mxc::SESSION_SLACK`].
+    ///
+    /// **Invariant: the deadline is strictly greater than the sum of the two
+    /// terms**, so a session that spends both to the last millisecond is not
+    /// killed by arithmetic. The budget must be built from THESE resolved values,
+    /// never from the default constants: the dialog gets the resolved prompt term,
+    /// so a default-sized budget would kill a legitimate dialog in a profile that
+    /// raised it.
+    #[cfg(feature = "mxc-backend")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn session_budget(&self) -> crate::net::mxc::SessionBudget {
+        crate::net::mxc::SessionBudget::from_config(
+            self.prompt_timeout_secs,
+            self.workload_timeout_secs,
+            crate::net::mxc::SESSION_SLACK,
+        )
+    }
+}
+
+fn clamp_limit_term(name: &str, value: Option<u32>, default: u32, min: u32) -> u32 {
+    match value {
+        Some(v) if v >= min && v <= MAX_LIMIT_SECS => v,
+        Some(invalid) => {
+            eprintln!(
+                "[saife] invalid {name} value {invalid} (must be {min}..={MAX_LIMIT_SECS}), \
+                 defaulting to {default}"
+            );
+            default
+        }
+        None => default,
+    }
 }
 
 /// The full resolved profile (filesystem slice only for this MVP slice).
@@ -181,6 +307,7 @@ pub struct ResolvedProfile {
     pub name: String,
     pub filesystem: FilesystemSlice,
     pub network: NetworkSlice,
+    pub limits: LimitsSlice,
 }
 
 /// Raw profile JSON (v1 schema).
@@ -197,6 +324,9 @@ pub struct RawProfile {
     pub filesystem: Option<RawFilesystem>,
     #[serde(default)]
     pub network: Option<RawNetwork>,
+    /// The session-deadline terms (see [`RawLimits`]). Top level, NOT `network.*`.
+    #[serde(default)]
+    pub limits: Option<RawLimits>,
     #[serde(default)]
     pub workdir: Option<Workdir>,
 }
@@ -286,20 +416,36 @@ pub struct RawNetwork {
     /// `"deny"` (default) or `"allow"`. Profile-only ([G-48]).
     #[serde(default, rename = "onUnavailable")]
     pub on_unavailable: Option<String>,
-    /// Seconds before the prompt auto-denies. Default 60; `0` = instant deny
-    /// (handled by the prompt layer in D-3.5). Profile-only ([G-46]).
-    #[serde(default, rename = "promptTimeoutSecs")]
-    pub prompt_timeout_secs: Option<u32>,
-    /// Seconds the workload itself may run before the container kills it.
-    /// Default 1800 (30 min); validated `1..=86400` by the resolver (P2.1 review,
-    /// item 6). The session bound is new, so a workload that legitimately runs
-    /// longer must raise this.
-    #[serde(default, rename = "workloadTimeoutSecs")]
-    pub workload_timeout_secs: Option<u32>,
     /// Upstream proxy URL (e.g. `http://corp:8080`). Parsed now, consumed in
     /// Phase 4.
     #[serde(default, rename = "upstreamProxy")]
     pub upstream_proxy: Option<String>,
+}
+
+/// `limits` block: the two session-deadline terms.
+///
+/// **Both keys were `network.promptTimeoutSecs` / `network.workloadTimeoutSecs`
+/// and are top level since 2026-10-25** — the deadline belongs to the session, not
+/// to the network policy, and a `--block-net` session is bounded by the same
+/// terms. The old location is REFUSED, not aliased: `RawNetwork` denies unknown
+/// fields, so a profile still carrying it fails to parse (with a hint naming
+/// `limits`) instead of silently losing its workload budget.
+///
+/// Canonical spelling is snake_case (`prompt_timeout_secs`,
+/// `workload_timeout_secs`); the camelCase aliases the shipped profiles use are
+/// accepted, matching the `allow_domain` / `allowDomain` convention.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RawLimits {
+    /// Seconds one prompt consultation may take. Default 60; validated
+    /// `1..=86400` by [`LimitsSlice::resolve`] ([G-46]).
+    #[serde(default, alias = "promptTimeoutSecs")]
+    pub prompt_timeout_secs: Option<u32>,
+    /// Seconds the workload itself may run before the container kills it.
+    /// Default 1800 (30 min); validated `1..=86400`. The session bound is new in
+    /// P2.1, so a workload that legitimately runs longer must raise this.
+    #[serde(default, alias = "workloadTimeoutSecs")]
+    pub workload_timeout_secs: Option<u32>,
 }
 
 /// `workdir` block. `access` is the only documented key in v1
@@ -316,8 +462,15 @@ pub struct Workdir {
 
 /// The set of top-level keys a v1 profile accepts. Used by
 /// [`suggest_unknown_key`] to emit "Did you mean X?" hints (AC-5.13).
-pub const KNOWN_TOP_LEVEL_KEYS: &[&str] =
-    &["meta", "extends", "security", "filesystem", "network", "workdir"];
+pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "meta",
+    "extends",
+    "security",
+    "filesystem",
+    "network",
+    "limits",
+    "workdir",
+];
 
 /// Suggest a known key close to `unknown` (case-insensitive). Returns
 /// `Some(known)` when, compared case-insensitively, the lowercased unknown
@@ -367,12 +520,40 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// when a close match exists.
 pub fn with_suggestion(err: serde_json::Error) -> anyhow::Error {
     let msg = format!("{err}");
-    if let Some(unknown) = extract_unknown_field(&msg)
-        && let Some(sugg) = suggest_unknown_key(&unknown)
-    {
-        return anyhow::anyhow!("{err}\n  Did you mean `{sugg}`?");
+    if let Some(unknown) = extract_unknown_field(&msg) {
+        // A key that MOVED between sections gets its new home named: serde's own
+        // message can only list what the section accepts now.
+        if let Some((key, canonical)) = moved_key(&unknown) {
+            return anyhow::anyhow!(
+                "{err}\n  `{key}` moved out of `network` into the top-level \
+                 `limits` section: use \"limits\": {{ \"{canonical}\": <seconds> }}"
+            );
+        }
+        if let Some(sugg) = suggest_unknown_key(&unknown) {
+            return anyhow::anyhow!("{err}\n  Did you mean `{sugg}`?");
+        }
     }
     anyhow::Error::from(err)
+}
+
+/// Keys that moved between profile sections, as `(spelling, canonical)`.
+///
+/// 2026-10-25: the two session-deadline terms left `network` for the top-level
+/// `limits` section, and both spellings of each are listed so the hint fires for a
+/// canonical-snake_case profile as well as for the shipped camelCase ones.
+const MOVED_KEYS: &[(&str, &str)] = &[
+    ("promptTimeoutSecs", "prompt_timeout_secs"),
+    ("prompt_timeout_secs", "prompt_timeout_secs"),
+    ("workloadTimeoutSecs", "workload_timeout_secs"),
+    ("workload_timeout_secs", "workload_timeout_secs"),
+];
+
+/// `Some((spelling, canonical))` when `unknown` is a key that moved sections.
+fn moved_key(unknown: &str) -> Option<(&'static str, &'static str)> {
+    MOVED_KEYS
+        .iter()
+        .copied()
+        .find(|(from, _)| *from == unknown)
 }
 
 /// Extract the field name from a serde `unknown field `X`` message.
@@ -424,6 +605,7 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
         name: resolved_name,
         filesystem: fs,
         network: resolve_network_slice(&raw.network),
+        limits: resolve_limits_slice(&raw.limits),
     })
 }
 
@@ -502,9 +684,17 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
             deny_domain: dedupe_concat(p.deny_domain, c.deny_domain),
             prompt_enabled: c.prompt_enabled.or(p.prompt_enabled),
             on_unavailable: c.on_unavailable.or(p.on_unavailable),
+            upstream_proxy: c.upstream_proxy.or(p.upstream_proxy),
+        }),
+        (Some(p), None) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    // Child overrides a scalar, the parent fills the gaps it left.
+    let limits = match (parent.limits, child.limits) {
+        (Some(p), Some(c)) => Some(RawLimits {
             prompt_timeout_secs: c.prompt_timeout_secs.or(p.prompt_timeout_secs),
             workload_timeout_secs: c.workload_timeout_secs.or(p.workload_timeout_secs),
-            upstream_proxy: c.upstream_proxy.or(p.upstream_proxy),
         }),
         (Some(p), None) => Some(p),
         (None, Some(c)) => Some(c),
@@ -523,6 +713,7 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
         },
         filesystem,
         network,
+        limits,
         workdir: child.workdir.or(parent.workdir),
     }
 }
@@ -566,9 +757,20 @@ fn resolve_network_slice(raw: &Option<RawNetwork>) -> NetworkSlice {
         deny_domain: raw.deny_domain.clone(),
         prompt_enabled: raw.prompt_enabled,
         on_unavailable: raw.on_unavailable.clone(),
-        prompt_timeout_secs: raw.prompt_timeout_secs,
-        workload_timeout_secs: raw.workload_timeout_secs,
         upstream_proxy: raw.upstream_proxy.clone(),
+    }
+}
+
+/// Resolve the limits slice from the raw `limits` block. No validation here: the
+/// merged options are clamped where they are USED ([`LimitsSlice::resolve`]), so
+/// `profile show --expanded` still shows what the file said.
+fn resolve_limits_slice(raw: &Option<RawLimits>) -> LimitsSlice {
+    match raw {
+        Some(l) => LimitsSlice {
+            prompt_timeout_secs: l.prompt_timeout_secs,
+            workload_timeout_secs: l.workload_timeout_secs,
+        },
+        None => LimitsSlice::default(),
     }
 }
 
@@ -954,6 +1156,7 @@ mod tests {
                 profile_name: Some("minimal".into()),
                 ..Default::default()
             },
+            limits: LimitsSlice::default(),
         };
         let groups_expanded: Vec<(String, Vec<PathBuf>)> = vec![
             ("python_runtime".into(), vec![PathBuf::from(r"C:\Py312")]),
@@ -971,13 +1174,13 @@ mod tests {
 
     #[test]
     fn raw_network_parses_camel_case_prompt_fields() {
-        let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allowDomain":["a.com"],"denyDomain":["*.evil.com"],"promptEnabled":false,"onUnavailable":"allow","promptTimeoutSecs":30,"upstreamProxy":"http://corp:8080"}}"#;
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allowDomain":["a.com"],"denyDomain":["*.evil.com"],"promptEnabled":false,"onUnavailable":"allow","upstreamProxy":"http://corp:8080"}}"#;
         let p: RawProfile = serde_json::from_str(raw).expect("parses");
+        assert!(p.limits.is_none(), "this profile declares no `limits`");
         let n = p.network.unwrap();
         assert_eq!(n.deny_domain, vec!["*.evil.com"]);
         assert_eq!(n.prompt_enabled, Some(false));
         assert_eq!(n.on_unavailable.as_deref(), Some("allow"));
-        assert_eq!(n.prompt_timeout_secs, Some(30));
         assert_eq!(n.upstream_proxy.as_deref(), Some("http://corp:8080"));
     }
 
@@ -989,7 +1192,6 @@ mod tests {
         assert!(n.deny_domain.is_empty());
         assert_eq!(n.prompt_enabled, None);
         assert_eq!(n.on_unavailable, None);
-        assert_eq!(n.prompt_timeout_secs, None);
         assert_eq!(n.upstream_proxy, None);
     }
 
@@ -1020,7 +1222,6 @@ mod tests {
             deny_domain: vec!["*.evil.com".into()],
             prompt_enabled: Some(false),
             on_unavailable: Some("allow".into()),
-            prompt_timeout_secs: Some(10),
             upstream_proxy: Some("http://corp:8080".into()),
             ..Default::default()
         };
@@ -1028,8 +1229,20 @@ mod tests {
         assert_eq!(slice.deny_domain, vec!["*.evil.com"]);
         assert_eq!(slice.prompt_enabled, Some(false));
         assert_eq!(slice.on_unavailable.as_deref(), Some("allow"));
-        assert_eq!(slice.prompt_timeout_secs, Some(10));
         assert_eq!(slice.upstream_proxy.as_deref(), Some("http://corp:8080"));
+
+        // The limits slice resolves separately, from the `limits` block.
+        let limits = resolve_limits_slice(&Some(RawLimits {
+            prompt_timeout_secs: Some(10),
+            workload_timeout_secs: Some(600),
+        }));
+        assert_eq!(limits.prompt_timeout_secs, Some(10));
+        assert_eq!(limits.workload_timeout_secs, Some(600));
+        assert_eq!(
+            resolve_limits_slice(&None),
+            LimitsSlice::default(),
+            "a missing `limits` block is the unset slice, not an error"
+        );
     }
 
     #[test]
@@ -1042,9 +1255,12 @@ mod tests {
                 deny_domain: vec!["*.evil.com".into()],
                 prompt_enabled: Some(true),
                 on_unavailable: Some("deny".into()),
-                prompt_timeout_secs: Some(60),
                 upstream_proxy: None,
                 ..Default::default()
+            },
+            limits: LimitsSlice {
+                prompt_timeout_secs: Some(60),
+                workload_timeout_secs: None,
             },
         };
         let json = to_expanded_json(&resolved, &[]);
@@ -1052,6 +1268,293 @@ mod tests {
         assert_eq!(v["network"]["deny_domain"][0], "*.evil.com");
         assert_eq!(v["network"]["prompt_enabled"], true);
         assert_eq!(v["network"]["on_unavailable"], "deny");
-        assert_eq!(v["network"]["prompt_timeout_secs"], 60);
+        assert_eq!(
+            v["limits"]["prompt_timeout_secs"], 60,
+            "the prompt term is a top-level limit now"
+        );
+        assert!(
+            v["limits"]["workload_timeout_secs"].is_null(),
+            "unset stays null (the resolver's default applies), it is not invented here"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `limits`: the session deadline moved out of `network` (2026-10-25)
+    // ---------------------------------------------------------------------
+
+    /// The old location is REFUSED, not aliased (no backward compatibility): a
+    /// profile written before 2026-10-25 still says `network.workloadTimeoutSecs`,
+    /// and losing the workload budget silently is worse than a parse error, so
+    /// `RawNetwork`'s `deny_unknown_fields` rejects it and the message names
+    /// `limits`, the section the key moved to.
+    #[test]
+    fn a_profile_still_carrying_network_workload_timeout_is_refused() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allow_domain":["a.com"],"workloadTimeoutSecs":3600}}"#;
+        let err =
+            serde_json::from_str::<RawProfile>(raw).expect_err("the old location must be refused");
+        let msg = format!("{}", with_suggestion(err));
+        assert!(
+            msg.contains("unknown field `workloadTimeoutSecs`"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("limits"),
+            "the refusal must name the new section, got: {msg}"
+        );
+    }
+
+    /// Same for the prompt term: `network.promptTimeoutSecs` is gone too, so a
+    /// profile that only carries that one is refused as well.
+    #[test]
+    fn a_profile_still_carrying_network_prompt_timeout_is_refused() {
+        let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allow_domain":["a.com"],"promptTimeoutSecs":30}}"#;
+        let err =
+            serde_json::from_str::<RawProfile>(raw).expect_err("the old location must be refused");
+        let msg = format!("{}", with_suggestion(err));
+        assert!(
+            msg.contains("unknown field `promptTimeoutSecs`"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("limits"),
+            "the refusal must name the new section, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn limits_parse_in_snake_case_and_with_the_camel_case_aliases() {
+        let snake = r#"{"meta":{"name":"x","schema_version":1},"limits":{"prompt_timeout_secs":45,"workload_timeout_secs":900}}"#;
+        let p: RawProfile = serde_json::from_str(snake).expect("snake_case parses");
+        let l = p.limits.expect("limits present");
+        assert_eq!(l.prompt_timeout_secs, Some(45));
+        assert_eq!(l.workload_timeout_secs, Some(900));
+
+        let camel = r#"{"meta":{"name":"x","schema_version":1},"limits":{"promptTimeoutSecs":45,"workloadTimeoutSecs":900}}"#;
+        let p: RawProfile = serde_json::from_str(camel).expect("camelCase aliases parse");
+        let l = p.limits.expect("limits present");
+        assert_eq!(l.prompt_timeout_secs, Some(45));
+        assert_eq!(l.workload_timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn limits_default_to_60_seconds_and_30_minutes() {
+        let default = LimitsSlice::default().resolve();
+        assert_eq!(default.prompt_timeout_secs, 60);
+        assert_eq!(default.workload_timeout_secs, 1800);
+        assert_eq!(
+            default,
+            Limits::default(),
+            "a run with no profile gets the defaults"
+        );
+        assert_eq!(
+            resolve_limits_slice(&None).resolve(),
+            default,
+            "a profile without a limits section gets them too"
+        );
+    }
+
+    #[test]
+    fn limits_are_clamped_into_range() {
+        assert_eq!(MAX_LIMIT_SECS, 86_400, "the documented cap is 24 hours");
+        // The PROMPT term accepts 0: [G-46] defines it as "instant deny", and the
+        // dialog deadline is `Duration::from_secs(0)`, which expires at once.
+        for accepted in [0, 1, 600, MAX_LIMIT_SECS] {
+            let l = LimitsSlice {
+                prompt_timeout_secs: Some(accepted),
+                workload_timeout_secs: Some(accepted.max(1)),
+            }
+            .resolve();
+            assert_eq!(l.prompt_timeout_secs, accepted, "prompt {accepted} is legal");
+            assert_eq!(l.workload_timeout_secs, accepted.max(1));
+        }
+        // Past the cap the value can only be a wedged session: both fall back, with
+        // a warning. `0` is rejected for the WORKLOAD term alone - it would end the
+        // session before its child could run.
+        for rejected in [MAX_LIMIT_SECS + 1, u32::MAX] {
+            let l = LimitsSlice {
+                prompt_timeout_secs: Some(rejected),
+                workload_timeout_secs: Some(rejected),
+            }
+            .resolve();
+            assert_eq!(
+                l.prompt_timeout_secs, DEFAULT_PROMPT_TIMEOUT_SECS,
+                "{rejected} must not reach a dialog"
+            );
+            assert_eq!(
+                l.workload_timeout_secs, DEFAULT_WORKLOAD_TIMEOUT_SECS,
+                "{rejected} must not reach the session deadline"
+            );
+        }
+        let zero_workload = LimitsSlice {
+            prompt_timeout_secs: Some(0),
+            workload_timeout_secs: Some(0),
+        }
+        .resolve();
+        assert_eq!(zero_workload.prompt_timeout_secs, 0, "0 stays 'instant deny'");
+        assert_eq!(
+            zero_workload.workload_timeout_secs, DEFAULT_WORKLOAD_TIMEOUT_SECS,
+            "a 0-second workload term is not expressible"
+        );
+        // Each term is validated on its own.
+        let mixed = LimitsSlice {
+            prompt_timeout_secs: Some(300),
+            workload_timeout_secs: Some(0),
+        }
+        .resolve();
+        assert_eq!(mixed.prompt_timeout_secs, 300);
+        assert_eq!(mixed.workload_timeout_secs, DEFAULT_WORKLOAD_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn extends_child_overrides_one_limit_and_inherits_the_other() {
+        let parent = RawProfile {
+            limits: Some(RawLimits {
+                prompt_timeout_secs: Some(120),
+                workload_timeout_secs: Some(7200),
+            }),
+            ..Default::default()
+        };
+        let child = RawProfile {
+            limits: Some(RawLimits {
+                prompt_timeout_secs: None,
+                workload_timeout_secs: Some(900),
+            }),
+            ..Default::default()
+        };
+        let merged = merge_profiles(parent, child).limits.expect("merged limits");
+        assert_eq!(
+            merged.prompt_timeout_secs,
+            Some(120),
+            "the parent fills the gap"
+        );
+        assert_eq!(
+            merged.workload_timeout_secs,
+            Some(900),
+            "the child overrides the scalar"
+        );
+        assert_eq!(
+            resolve_limits_slice(&Some(merged)).resolve(),
+            Limits {
+                prompt_timeout_secs: 120,
+                workload_timeout_secs: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn expanded_json_reports_limits_at_the_top_level_and_not_in_network() {
+        let resolved = ResolvedProfile {
+            name: "x".into(),
+            filesystem: FilesystemSlice::default(),
+            network: NetworkSlice::default(),
+            limits: LimitsSlice {
+                prompt_timeout_secs: Some(30),
+                workload_timeout_secs: Some(3600),
+            },
+        };
+        let v: serde_json::Value = serde_json::from_str(&to_expanded_json(&resolved, &[])).unwrap();
+        assert_eq!(v["limits"]["prompt_timeout_secs"], 30);
+        assert_eq!(v["limits"]["workload_timeout_secs"], 3600);
+        assert!(
+            v["network"].get("prompt_timeout_secs").is_none(),
+            "the network view must not carry the prompt term"
+        );
+        assert!(
+            v["network"].get("workload_timeout_secs").is_none(),
+            "the network view must not carry the workload term"
+        );
+    }
+
+    /// Behaviour is UNCHANGED for a profile relying on the defaults: 60 s +
+    /// 1800 s + 120 s slack, the same numbers the old `network.*` terms (and
+    /// `NetworkConfig::session_budget()`) produced.
+    /// [G-46] survives the move: a 0-second prompt term means "instant deny", and
+    /// the deadline it derives still leaves the workload its own term plus slack.
+    #[test]
+    #[cfg(feature = "mxc-backend")]
+    fn a_zero_prompt_term_still_means_instant_deny_and_keeps_the_workload_term() {
+        let limits = LimitsSlice {
+            prompt_timeout_secs: Some(0),
+            workload_timeout_secs: Some(120),
+        }
+        .resolve();
+        assert_eq!(limits.prompt_timeout_secs, 0);
+        let budget = limits.session_budget();
+        assert_eq!(budget.prompt, std::time::Duration::from_secs(0));
+        assert_eq!(budget.workload, std::time::Duration::from_secs(120));
+        assert_eq!(
+            budget.session(),
+            std::time::Duration::from_secs(120) + crate::net::mxc::SESSION_SLACK,
+            "deadline must be prompt + workload + slack even when prompt is 0"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mxc-backend")]
+    fn the_default_limits_derive_the_same_session_budget_as_before() {
+        use crate::net::mxc::{SESSION_SLACK, SessionBudget};
+
+        let budget = Limits::default().session_budget();
+        assert_eq!(budget.prompt, std::time::Duration::from_secs(60));
+        assert_eq!(budget.workload, std::time::Duration::from_secs(1800));
+        assert_eq!(budget.slack, SESSION_SLACK);
+        assert_eq!(
+            budget.session(),
+            std::time::Duration::from_secs(60 + 1800 + 120)
+        );
+        assert_eq!(budget.timeout_ms(), 1_980_000);
+        assert_eq!(
+            budget,
+            SessionBudget::default(),
+            "the defaults cannot drift"
+        );
+        assert_eq!(
+            resolve_limits_slice(&None).resolve().session_budget(),
+            SessionBudget::default(),
+            "a profile without a limits section asks for the default deadline"
+        );
+    }
+
+    /// A raised `limits` section widens the deadline, and the terms stay separate:
+    /// a dialog that spends its whole raised term still leaves the workload its own
+    /// term, so the kill the audit names is the workload's.
+    #[cfg(feature = "mxc-backend")]
+    #[test]
+    #[cfg(feature = "mxc-backend")]
+    fn a_raised_limits_section_widens_the_session_deadline() {
+        use crate::net::mxc::{SESSION_SLACK, SessionBudget, SessionClock, TimeoutReason};
+
+        let budget = LimitsSlice {
+            prompt_timeout_secs: Some(300),
+            workload_timeout_secs: Some(5400),
+        }
+        .resolve()
+        .session_budget();
+        assert_eq!(
+            budget.prompt,
+            std::time::Duration::from_secs(300),
+            "the prompt term must be the resolved value, not the default"
+        );
+        assert_eq!(budget.workload, std::time::Duration::from_secs(5400));
+        assert_eq!(
+            budget.session(),
+            std::time::Duration::from_secs(300 + 5400 + SESSION_SLACK.as_secs())
+        );
+        assert_eq!(budget.timeout_ms(), 5_820_000);
+        assert!(
+            budget.session() > SessionBudget::default().session(),
+            "a raised profile must widen the deadline, not narrow it"
+        );
+
+        let clock = SessionClock::measured(
+            budget,
+            budget.session(),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_secs(300),
+        );
+        assert_eq!(
+            clock.timeout_reason(),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
     }
 }

@@ -28,5 +28,8 @@
       "services.gradle.org",
       "downloads.gradle.org"
     ]
+  },
+  "limits": {
+    "workloadTimeoutSecs": 7200
   }
 }

@@ -64,7 +64,9 @@ $demo = @'
   },
   "network": {
     "allow_domain": ["api.anthropic.com"],
-    "promptEnabled": false,
+    "promptEnabled": false
+  },
+  "limits": {
     "workloadTimeoutSecs": 3600
   }
 }

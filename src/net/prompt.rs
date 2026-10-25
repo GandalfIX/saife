@@ -229,11 +229,11 @@ use windows::Win32::UI::Controls::{
 use windows::core::{BOOL, HRESULT, HSTRING, PCWSTR, s, w};
 
 /// Default prompt timeout in seconds ([G-46]; ADR field
-/// `network.promptTimeoutSecs`).
+/// `limits.promptTimeoutSecs`).
 ///
 /// The number, in the unit the profile speaks, so the resolver
-/// ([`crate::net::resolve_network`]) can use the same constant as the default it
-/// applies and the session budget can be sized from the resolved value
+/// ([`crate::profile::LimitsSlice::resolve`]) can use the same constant as the
+/// default it applies and the session budget can be sized from the resolved value
 /// ([`crate::net::mxc::SessionBudget::from_config`]) rather than from a second
 /// literal that could drift (P2.1 review, item 6).
 pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = 60;
@@ -364,7 +364,7 @@ pub enum PromptPolicy {
     Allow,
 }
 
-/// Caller-supplied prompt behavior (ADR fields `network.promptTimeoutSecs`
+/// Caller-supplied prompt behavior (ADR fields `limits.promptTimeoutSecs`
 /// + `network.onUnavailable`), passed per call by the proxy ([G-46, G-48]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptConfig {

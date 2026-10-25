@@ -4,6 +4,7 @@
     "version": "1.0.0",
     "schema_version": 1
   },
+  "extends": "jvm",
   "filesystem": {
     "allow": [
       "$CWD",
@@ -29,5 +30,8 @@
     "allow_domain": [
       "*.trustedtokens.eu"
     ]
+  },
+  "limits": {
+    "workloadTimeoutSecs": 14400
   }
 }

@@ -588,6 +588,13 @@ fn run_inner(
     // Merge CLI flags on top of the profile.
     let fs = profile::merge_filesystem(&resolved.filesystem, allow_cwd, allow, read_only, &cwd)?;
 
+    // The session-deadline terms, resolved ONCE: defaults applied and both clamped
+    // into range with a warning. A run with no profile resolves
+    // `ResolvedProfile::default()`'s empty limits slice, i.e. 60 s + 30 min — the
+    // same numbers the CLI-only path has always used. Both consumers (the dialog
+    // timeout and the container deadline) read THIS value, so they cannot disagree.
+    let limits = resolved.limits.resolve();
+
     let sid = match sid {
         Some(s) => s.to_string(),
         None => new_session_id(),
@@ -606,6 +613,7 @@ fn run_inner(
                 &cwd,
                 &net_cfg_resolved,
                 &fs,
+                &limits,
                 audit_strict,
                 print_sid,
                 no_interactive,
@@ -721,6 +729,7 @@ fn run_inner(
     // registry is a fully-closed facade (`404` for any `*.sandbox.invalid`).
     let proxy = start_session_proxy(
         &net_cfg,
+        limits.prompt_timeout_secs,
         &sid,
         audit_writer.clone(),
         std::sync::Arc::new(plugin::FacadeRegistry::new()),
@@ -817,7 +826,7 @@ const EXIT_REFUSED: i32 = 126;
 ///   covers a grant still refuses the session.
 /// * **network** — the same in-process listener with a fresh per-run token, or
 ///   nothing at all under `--block-net`.
-/// * **budget** — the resolved [`net::NetworkConfig::session_budget`], so the
+/// * **budget** — the resolved [`profile::Limits::session_budget`], so the
 ///   container's deadline is *this* profile's prompt + workload + slack.
 /// * **proof** — [`net::mxc::launch_session`] derives the guardrail leg from the
 ///   port (`Required` with a proxy, `MustBeAbsent` without) and carries
@@ -845,6 +854,7 @@ fn run_mxc_session(
     cwd: &std::path::Path,
     net_cfg: &net::NetworkConfig,
     fs: &profile::FilesystemSlice,
+    limits: &profile::Limits,
     audit_strict: bool,
     print_sid: bool,
     no_interactive: bool,
@@ -950,6 +960,7 @@ fn run_mxc_session(
     let facade = std::sync::Arc::new(plugin::FacadeRegistry::new());
     let proxy = start_session_proxy(
         net_cfg,
+        limits.prompt_timeout_secs,
         sid,
         audit_writer.clone(),
         std::sync::Arc::clone(&facade),
@@ -1043,8 +1054,9 @@ fn run_mxc_session(
             net::mxc::StdioSelection::Capture
         },
     };
-    // Decision 3: the deadline is the RESOLVED profile's terms, never the defaults.
-    let budget = net_cfg.session_budget();
+    // Decision 3: the deadline is the RESOLVED profile's `limits`, never the
+    // defaults, and never the network slice's (which no longer carries the terms).
+    let budget = limits.session_budget();
     let request = net::mxc::request_for_session(
         counters.as_ref(),
         proxy_port,
@@ -1314,8 +1326,14 @@ fn emit_child_output(outcome: &net::mxc::SessionOutcome) {
 /// the guardrail leg is [`net::mxc::ProofExpectation::MustBeAbsent`]. Otherwise the
 /// listener plus the child's [`net::ProxyEnv`] — the caller MUST hold the handle
 /// until the child has exited.
+///
+/// `prompt_timeout_secs` is the RESOLVED prompt term
+/// ([`profile::Limits::prompt_timeout_secs`]), passed in rather than read from
+/// `net_cfg`: the session deadline is built from the same value, and the two must
+/// never be able to disagree (2026-10-25 moved the term out of the network slice).
 fn start_session_proxy(
     net_cfg: &net::NetworkConfig,
+    prompt_timeout_secs: u32,
     sid: &str,
     writer: std::sync::Arc<audit::AuditWriter>,
     facade: std::sync::Arc<plugin::FacadeRegistry>,
@@ -1329,7 +1347,6 @@ fn start_session_proxy(
             deny_domain,
             prompt_enabled,
             on_unavailable,
-            prompt_timeout_secs,
             upstream_proxy,
             profile_name,
             ..
@@ -1359,7 +1376,7 @@ fn start_session_proxy(
             let prompt = net::proxy::PromptGate {
                 enabled: *prompt_enabled,
                 config: net::prompt::PromptConfig {
-                    timeout: std::time::Duration::from_secs(u64::from(*prompt_timeout_secs)),
+                    timeout: std::time::Duration::from_secs(u64::from(prompt_timeout_secs)),
                     on_unavailable,
                 },
                 coordinator,

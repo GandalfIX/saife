@@ -1716,13 +1716,13 @@ fn warn_no_dialog_once() {
 /// sized around it), so an elapsed budget on a headless request is a *policy*
 /// answer, not a broken machine: the request was denied on budget. Saying so
 /// once turns "the agent hung for a minute and then failed" into a line an
-/// operator can act on (pre-approve the host, or raise `promptTimeoutSecs`).
+/// operator can act on (pre-approve the host, or raise `limits.promptTimeoutSecs`).
 fn warn_prompt_budget_once(budget: std::time::Duration) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         eprintln!(
             "[saife] prompt budget elapsed ({}s) with no answer — denying on budget; \
-             pre-approve hosts via --allow-domain, or raise promptTimeoutSecs",
+             pre-approve hosts via --allow-domain, or raise limits.promptTimeoutSecs",
             budget.as_secs()
         );
     }

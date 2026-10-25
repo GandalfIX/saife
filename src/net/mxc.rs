@@ -2216,7 +2216,7 @@ pub fn build_request(
 /// The **prompt term**: how long ONE prompt consultation may legitimately take.
 ///
 /// The same value the coordinator uses ([`crate::net::prompt::
-/// DEFAULT_PROMPT_TIMEOUT`], 60 s — the ADR's `network.promptTimeoutSecs`
+/// DEFAULT_PROMPT_TIMEOUT`], 60 s — the ADR's `limits.promptTimeoutSecs`
 /// default), and deliberately the same constant rather than a second number that
 /// can drift: the container's deadline is computed from this, and if a dialog were
 /// allowed to take longer than the term this budget reserves for it, a
@@ -2225,7 +2225,7 @@ pub const PROMPT_BUDGET: Duration = crate::net::prompt::DEFAULT_PROMPT_TIMEOUT;
 
 /// The **workload term**: how long the sandboxed workload itself may run.
 ///
-/// [`crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS`] (30 min) — the `network.
+/// [`crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS`] (30 min) — the `limits.
 /// workloadTimeoutSecs` default: long enough for the workloads this tool actually
 /// runs (a build, a test suite, a model download over the proxy) and short enough
 /// that a wedged child cannot hold a container for a day. It is *not* the
@@ -2235,7 +2235,7 @@ pub const PROMPT_BUDGET: Duration = crate::net::prompt::DEFAULT_PROMPT_TIMEOUT;
 /// **This is a bound the tool never had.** Before P2.1 the session had no bound at
 /// all (`timeout_ms: None`, i.e. `INFINITE`), so a profile that legitimately needs
 /// longer — a cold Rust build with a large dependency graph, a multi-gigabyte model
-/// download — must RAISE it with `network.workloadTimeoutSecs`. The failure mode
+/// download — must RAISE it with `limits.workloadTimeoutSecs`. The failure mode
 /// of leaving it at the default is a killed session whose audit reason says
 /// `workload_budget_exceeded`, which is exactly what that reason is for.
 pub const WORKLOAD_BUDGET: Duration =
@@ -2278,7 +2278,7 @@ pub struct SessionBudget {
 impl Default for SessionBudget {
     /// The configuration defaults, through the same constructor a resolved profile
     /// uses ([`SessionBudget::from_config`]) — not three literals that could drift
-    /// from `network.promptTimeoutSecs` / `network.workloadTimeoutSecs`.
+    /// from the profile's top-level `limits` section.
     fn default() -> Self {
         Self::from_config(
             crate::net::prompt::DEFAULT_PROMPT_TIMEOUT_SECS,
@@ -2300,11 +2300,11 @@ impl SessionBudget {
 
     /// The budget a **resolved profile** asks for (P2.1 review, item 6).
     ///
-    /// Takes the RESOLVED values in seconds — `network.promptTimeoutSecs` and
-    /// `network.workloadTimeoutSecs` after defaults and validation — never the
+    /// Takes the RESOLVED values in seconds — `limits.promptTimeoutSecs` and
+    /// `limits.workloadTimeoutSecs` after defaults and validation — never the
     /// constants, and never a `Duration` built at the call site: the failure this
     /// replaces was a budget sized from [`PROMPT_BUDGET`] (the 60 s DEFAULT) while
-    /// the dialog actually got the profile's `promptTimeoutSecs`. A 300 s profile
+    /// the dialog actually got the profile's `limits.promptTimeoutSecs`. A 300 s profile
     /// then reserved 60 s + slack of prompt time and killed a legitimate dialog
     /// plus a full workload — the exact kill P2.1 exists to prevent — and blamed
     /// the wrong term for it. [`SessionBudget::default`] is defined as
@@ -2919,8 +2919,8 @@ fn supervisor_backend<'a>(
         backend = backend.with_proxy_token(token);
     }
     // P3.0 decision 3: the deadline comes from the **resolved** configuration
-    // (`NetworkConfig::session_budget`, which resolves `promptTimeoutSecs` and
-    // `workloadTimeoutSecs` from the profile). Leaving it at
+    // (`crate::profile::Limits::session_budget`, which resolves the top-level
+    // `limits` terms). Leaving it at
     // `SessionBudget::default()` here would size the container's deadline from the
     // config DEFAULTS while the dialog gate gets the profile's value — the
     // under-reservation that killed a legitimate dialog plus a full workload, and
@@ -4751,9 +4751,8 @@ mod tests {
     /// budget, not [`SessionBudget::default`].
     ///
     /// Red before the fix: a `launch_session` that built its backend without a
-    /// budget shipped the config DEFAULTS, so a profile with a longer
-    /// `promptTimeoutSecs`/`workloadTimeoutSecs` got a container deadline that
-    /// under-reserved it — the very kill P2.1 exists to prevent, reported against
+    /// budget shipped the config DEFAULTS, so a profile with longer `limits`
+    /// terms got a container deadline that under-reserved it — the very kill P2.1 exists to prevent, reported against
     /// the wrong term. The assertion is equality against a budget that differs
     /// from the default in every field, so "the default happened to match" cannot
     /// pass it.
