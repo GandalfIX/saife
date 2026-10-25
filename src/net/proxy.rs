@@ -1060,6 +1060,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
             eprintln!("[proxy] listening on 127.0.0.1:{port}");
         }
 
+        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONNECTIONS));
         loop {
             tokio::select! {
                 _ = cancel_for_task.cancelled() => break,
@@ -1068,8 +1069,18 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+                    // Admit or refuse now: `try_acquire` never queues, so a flood
+                    // cannot grow the wait list - the extra connection is closed.
+                    let permit = match Arc::clone(&inflight).try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            drop(sock);
+                            continue;
+                        }
+                    };
                     let ctx = Arc::clone(&ctx);
                     tokio::spawn(async move {
+                        let _permit = permit; // released when the connection ends
                         let _ = handle_conn(sock, ctx).await;
                     });
                 }
@@ -1851,6 +1862,22 @@ pub(crate) fn pinned_addrs_contain_hard_denied(addrs: &[SocketAddr]) -> bool {
     addrs.iter().any(|sa| matcher::is_hard_denied_ip(sa.ip()))
 }
 
+/// How many connections may be in flight at once. The listener is reachable by any
+/// local process, including the sandboxed child, so an unbounded spawn-per-connection
+/// loop is a local denial of service in the containment root: open sockets, send
+/// nothing, and the supervisor allocates a task and a descriptor per connection.
+/// 128 leaves room for a browser's parallel connections across hosts.
+#[cfg(not(test))]
+const MAX_INFLIGHT_CONNECTIONS: usize = 128;
+/// Test builds use a small cap so the refusal can be observed without opening 129
+/// sockets; the accept path is identical, only the constant differs.
+#[cfg(test)]
+const MAX_INFLIGHT_CONNECTIONS: usize = 32;
+
+/// How long a connection may take to deliver a complete request head. Without it a
+/// silent client parks a task forever - the same local DoS by a slower route.
+const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Offset just past the first `\r\n\r\n` in `buf`, if the head is complete.
 fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
@@ -2025,23 +2052,37 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     // Read the request head (up to 8 KiB, terminated by \r\n\r\n). Bytes
     // past the terminator may be a request body — `head_end` keeps them
     // apart so the intent endpoints can read them.
-    let mut buf = vec![0u8; 8192];
-    let mut filled = 0;
-    let mut head_end = None;
-    loop {
-        if filled >= buf.len() {
-            break;
+    let read_head = async {
+        let mut buf = vec![0u8; 8192];
+        let mut filled = 0;
+        let mut head_end = None;
+        loop {
+            if filled >= buf.len() {
+                break;
+            }
+            let n = sock.read(&mut buf[filled..]).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            filled += n;
+            if let Some(pos) = find_head_end(&buf[..filled]) {
+                head_end = Some(pos);
+                break;
+            }
         }
-        let n = sock.read(&mut buf[filled..]).await.unwrap_or(0);
-        if n == 0 {
-            break;
+        (buf, filled, head_end)
+    };
+    let (buf, filled, head_end) = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head).await {
+        Ok(v) => v,
+        Err(_) => {
+            // A client that opens a connection and says nothing used to park a task
+            // and a descriptor indefinitely.
+            let _ = sock
+                .write_all(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return Ok(());
         }
-        filled += n;
-        if let Some(pos) = find_head_end(&buf[..filled]) {
-            head_end = Some(pos);
-            break;
-        }
-    }
+    };
     let head_end = head_end.unwrap_or(filled);
     let head = std::str::from_utf8(&buf[..head_end]).unwrap_or("");
     let leftover: &[u8] = &buf[head_end..filled];
@@ -9739,5 +9780,42 @@ mod tests {
         for bad in ["example.com:", "example.com:notaport", "example.com:70000", "example.com:0"] {
             assert_eq!(super::parse_connect_target(bad), None, "{bad} must be refused");
         }
+    }
+
+    /// The listener is reachable by any local process, including the child. A
+    /// connection that arrives beyond the cap must be closed at once, not queued:
+    /// otherwise "open sockets and say nothing" is a free denial of service inside
+    /// the containment root.
+    #[test]
+    fn connections_beyond_the_cap_are_refused_instead_of_queued() {
+        use std::io::Read;
+
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("admission-cap", &[], &[], dialog);
+
+        let mut socks = Vec::new();
+        for _ in 0..(super::MAX_INFLIGHT_CONNECTIONS + 3) {
+            socks.push(std::net::TcpStream::connect(("127.0.0.1", t.port)).unwrap());
+        }
+        // Immediacy is the property: the head-read deadline also closes a silent
+        // connection, but only after 15 s. A refusal at admission closes at once.
+        let started = std::time::Instant::now();
+        let mut closed = 0;
+        for s in &socks {
+            // Short: an admitted socket must time out here, a refused one returns 0
+            // at once. 35 * 50 ms keeps the whole loop well inside the bound below.
+            s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            let mut b = [0u8; 1];
+            if matches!((&*s).read(&mut b), Ok(0)) {
+                closed += 1;
+            }
+        }
+        assert!(
+            closed >= 3 && started.elapsed() < Duration::from_secs(3),
+            "the overflow connections must be refused at admission (closed={closed} of {}, \
+             elapsed={:?}); the head deadline is not a substitute",
+            socks.len(),
+            started.elapsed()
+        );
     }
 }

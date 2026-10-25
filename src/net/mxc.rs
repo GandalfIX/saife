@@ -5392,7 +5392,7 @@ mod tests {
             "the launcher grant is part of the policy: {:?}",
             fs.readonly_paths
         );
-        let saife = std::path::Path::new(&format!(r"{PROFILE}")).join(".saife");
+        let saife = std::path::Path::new(PROFILE).join(".saife");
         assert!(
             fs.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&saife.display().to_string())),
             "the tool's own plugin/policy root must stay denied even when the launcher sits \
