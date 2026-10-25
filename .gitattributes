@@ -1,0 +1,15 @@
+# Line endings are part of this repo's contract: Rust and PowerShell sources are
+# CRLF in the working tree (the Windows toolchain and the PowerShell harness both
+# assume it), lockfiles stay LF so tooling diffs stay quiet, and binaries are
+# never touched.
+* text=auto
+*.rs       text eol=crlf
+*.ps1      text eol=crlf
+*.json     text eol=crlf
+*.md       text eol=crlf
+*.yml      text eol=crlf
+Cargo.lock text eol=lf
+*.vhdx     binary
+*.zip      binary
+*.exe      binary
+*.dmp      binary

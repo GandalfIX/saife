@@ -1,0 +1,87 @@
+name: Bug report
+description: Something behaved differently from what the docs or the profile said
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **A containment escape is not a bug report** - if a session reached
+        something the profile denied, use Security -> Report a vulnerability
+        (see SECURITY.md) instead of this form.
+
+  - type: input
+    id: version
+    attributes:
+      label: saife version
+      description: Output of `saife --version` (the tag, e.g. 0.3.0)
+      placeholder: SAIFE Sandbox 0.3.0
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows build
+      description: Output of `cmd /c ver`, or the build number from `winver`
+      placeholder: 10.0.26100.9278
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: Which backend the session used (`saife run` prints it on stderr)
+      options:
+        - mxc (default in a feature build)
+        - appcontainer
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command
+      description: Including the profile name and any --allow/--backend flags
+      render: powershell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Exit code, stderr (the `[saife] ...` lines), and any Windows error text
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Diagnostics
+      description: |
+        Output of `saife doctor` (or `saife setup --check-only`), and the audit
+        session id if one was written (under %LOCALAPPDATA%/saife/audit).
+        Remove anything you consider private; there should be no credentials in it.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: This reproduces outside the sandbox too (or I have noted that it does not)
+        - label: I have removed credentials, tokens and private paths from the output
+          required: true

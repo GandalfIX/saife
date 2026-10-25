@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue (containment escape, audit tampering, credential exposure)
+    url: https://github.com/GandalfIX/saife/security/advisories/new
+    about: Report privately. Do not open a public issue for a containment escape.
+  - name: Question or usage help
+    url: https://github.com/GandalfIX/saife/discussions
+    about: Ask here rather than in the issue tracker, once Discussions is enabled.

@@ -1,0 +1,34 @@
+name: Feature request
+description: A capability, a profile, or a policy that is missing
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the sandbox makes impossible or awkward?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you think should happen
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today instead
+      description: A workaround tells us how much the gap costs; "nothing, I stopped" is a valid answer.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: containment
+    attributes:
+      label: Containment impact
+      options:
+        - label: This would let a session do something it currently cannot (say what and why it is safe)
