@@ -4,7 +4,10 @@
     "version": "1.0.0",
     "schema_version": 1
   },
-  "extends": "jvm",
+  "extends": [
+    "node",
+    "jvm"
+  ],
   "filesystem": {
     "allow": [
       "$CWD",
