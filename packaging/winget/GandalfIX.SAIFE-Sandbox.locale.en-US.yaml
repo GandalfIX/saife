@@ -8,7 +8,8 @@ PublisherSupportUrl: https://github.com/GandalfIX/saife/issues
 Author: GandalfIX
 PackageName: SAIFE Sandbox
 PackageUrl: https://github.com/GandalfIX/saife
-License: Proprietary
+License: MIT
+LicenseUrl: https://github.com/GandalfIX/saife/blob/main/LICENSE
 Copyright: Copyright (c) 2026 GandalfIX
 Moniker: saife
 ShortDescription: Isolate and audit AI agents with production-grade Windows containment policies.

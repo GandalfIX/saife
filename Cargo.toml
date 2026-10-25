@@ -1,8 +1,14 @@
 [package]
 name = "sandbox"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Native Windows process sandbox for AI agents"
+# The crate name stays `sandbox` (the binary is `saife`); these are the release
+# metadata: MIT since 2026-10-25 (decision D1), the repo winget points at.
+license = "MIT"
+repository = "https://github.com/GandalfIX/saife"
+homepage = "https://github.com/GandalfIX/saife"
+authors = ["Gandalf IX <gandalfix@gandalfix.de>"]
 
 [[bin]]
 name = "saife"

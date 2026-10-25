@@ -815,9 +815,10 @@ mod tests {
     fn cli_identity_is_saife_sandbox_with_the_release_version() {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
+        // Derived, never typed: the version lives in Cargo.toml alone (R0.1).
         assert_eq!(
             cmd.render_version().to_string().trim_end(),
-            "SAIFE Sandbox 0.2.0"
+            format!("SAIFE Sandbox {}", env!("CARGO_PKG_VERSION"))
         );
         let help = cmd.render_help().to_string();
         assert!(
