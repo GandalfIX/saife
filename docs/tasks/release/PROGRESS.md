@@ -4,6 +4,23 @@ Plan: [2026-10-25-releasing-and-distribution.md](../../plans/2026-10-25-releasin
 Policy: [docs/design/versioning.md](../../design/versioning.md) (SemVer, single source of truth)
 Version at plan time: `0.2.0` in `Cargo.toml`, **no tags**, no CI, no LICENSE, no exe VERSIONINFO.
 
+**Parked 2026-10-25.** Work stopped deliberately after R0.1 and the repo hygiene
+pass; nothing was published, so there is no half-released version to clean up.
+
+What is done: `Cargo.toml` at 0.3.0 with MIT metadata and a `LICENSE`; the CLI test
+derives its version; `install-local.ps1` refuses a version-mismatched archive and a
+mislabelled binary; `.gitattributes`, `SECURITY.md`, `CONTRIBUTING.md`, issue and PR
+templates committed; GitHub metadata and settings applied (topics, homepage,
+delete-branch-on-merge, immutable releases, actions SHA-pinning).
+
+What blocks the rest: the repository is **private on a free plan**, so winget cannot
+download the asset, and rulesets / secret scanning / private vulnerability reporting
+return 403/404. The first real step on resume is the visibility decision, then
+`gh repo edit ... --visibility public`, then the rulesets and scanning features.
+
+Resume order: R0.2 (build-dist must-match) -> R0.3 (VERSIONINFO) -> R0.4/R0.5
+(release script) -> R1 (tag, changelog, rehearsal on -rc) -> R2 (CI) -> R3 (winget).
+
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated · `[!]` blocked
 
 ## Rows

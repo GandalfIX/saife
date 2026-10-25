@@ -3,6 +3,10 @@
 > **For Hermes:** use subagent-driven-development to implement this task-by-task.
 > A phase is not "done" until its exit criteria have been *observed*, not assumed.
 
+> **Status: PARKED 2026-10-25** at R0.1 + repo hygiene. Nothing published.
+> Resume with the visibility decision (private repo on a free plan blocks winget
+> and the security features), then R0.2. See `docs/tasks/release/PROGRESS.md`.
+
 **Goal:** turn "a zip I can build and install locally" into a versioned, signed,
 auto-published release that `winget install GandalfIX.SAIFE-Sandbox` can serve,
 with every number derived from one source.
