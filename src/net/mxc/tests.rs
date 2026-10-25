@@ -2407,7 +2407,13 @@
             "the launcher grant is part of the policy: {:?}",
             fs.readonly_paths
         );
-        let saife = std::path::Path::new(PROFILE).join(".saife");
+        // `builtin_deny_dirs()` reads %USERPROFILE%, while PROFILE is this suite's
+        // fixture constant: on a CI runner those differ (runneradmin vs marku), and
+        // asserting the fixture path would fail there while proving nothing here.
+        // The invariant is "the real control plane is denied", so ask the same source
+        // the production code asks.
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE must be set");
+        let saife = std::path::Path::new(&home).join(".saife");
         assert!(
             fs.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&saife.display().to_string())),
             "the tool's own plugin/policy root must stay denied even when the launcher sits \

@@ -824,9 +824,17 @@ mod tests {
             std::env::var_os("USERPROFILE").expect("USERPROFILE must be set on this host"),
         );
         let pid = std::process::id();
-        // A scenario dir where the harness puts it: under %LOCALAPPDATA%\Temp.
-        let cwd = std::env::temp_dir().join(format!("sbx-ancestor-test-{pid}"));
-        let fake_home = std::env::temp_dir().join(format!("sbx-fake-home-{pid}"));
+        // The walk only meets the profile stop dirs if the scenario dir sits inside
+        // the real profile tree, so build it THERE. `env::temp_dir()` was used for
+        // this and is not portable: GitHub's Windows runner puts TEMP on another
+        // drive (D:\a\_temp), which made the non-vacuity assertion below fail
+        // before the guard was ever exercised.
+        // `AppData\Local\Temp` exists in every Windows profile, including CI's, and
+        // it is a NORMAL ancestor (unlike the profile stop dirs), so the test can
+        // still prove both halves: hazardous dirs are skipped, ordinary ones are not.
+        let temp_root = real_home.join("AppData").join("Local").join("Temp");
+        let cwd = temp_root.join(format!("sbx-ancestor-test-{pid}"));
+        let fake_home = temp_root.join(format!("sbx-fake-home-{pid}"));
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&fake_home).unwrap();
         // Non-vacuity: the walk only meets the profile stop dirs if the session
@@ -863,18 +871,13 @@ mod tests {
                 entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
             );
         }
-        // The guard must not weaken into "no ancestors at all": %TEMP% is a
-        // normal ancestor of the session dir and still needs its grant.
-        // (`env::temp_dir()` may carry a trailing separator on Windows.)
-        let temp = std::path::PathBuf::from(
-            std::env::temp_dir()
-                .to_string_lossy()
-                .trim_end_matches('\\')
-                .to_string(),
-        );
+        // The guard must not weaken into "no ancestors at all": the temp root the
+        // session dir lives under is an ordinary ancestor and still needs its grant.
+        // Asking for `env::temp_dir()` here would pass locally and fail wherever the
+        // host puts TEMP elsewhere (GitHub's runner uses another drive).
         assert!(
-            entries.iter().any(|e| paths_eq_ci(&e.win32_path, &temp)),
-            "%TEMP% ({temp:?}) must still get its traverse grant; entries: {:?}",
+            entries.iter().any(|e| paths_eq_ci(&e.win32_path, &temp_root)),
+            "the temp root ({temp_root:?}) must still get its traverse grant; entries: {:?}",
             entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
         );
     }
