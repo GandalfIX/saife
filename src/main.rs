@@ -1486,14 +1486,16 @@ fn seal_audit(
     // We then drop the proxy handle + our Arc<AuditWriter> (releasing the file
     // handle) and write the root+sig using the captured root string. No reopen
     // needed.
-    let captured_root = writer.current_root();
+    // Seal FIRST: from here no leaf can be appended, so the root below is the last
+    // line of the file by construction. The previous shape captured the root, dropped
+    // the proxy and slept 50 ms - and a late refusal-aggregate flush in that window
+    // produced a log that grew past its own committed root, which `verify` reports as
+    // TAMPERED. A sleep is not a happens-before edge.
+    let captured_root = writer.seal();
 
-    // Drop the proxy handle (cancels token, detaches the task — non-blocking).
-    // The proxy thread may still be mid-`append` to the file, but the in-memory
-    // `last_hash` is already captured above. We sleep briefly to let the proxy
-    // thread finish its in-flight file writes after cancellation.
+    // The proxy can still be winding down; its late appends are now dropped by the
+    // sealed writer instead of racing the file.
     drop(proxy);
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Drop our Arc<AuditWriter>. The proxy thread's Arc may still be alive (it
     // was detached), but `AuditWriter::append` holds the file open with

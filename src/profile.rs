@@ -694,12 +694,23 @@ fn resolve_profile_path(name: &str, cwd: &Path) -> Result<PathBuf> {
     if p.is_absolute() {
         return Ok(p.to_path_buf());
     }
-    // A relative FILE is resolved against the session's cwd, as the doc above
-    // promises. It used to be returned as-is and therefore resolved against the
-    // PROCESS cwd, which differs exactly when it matters: the supervisor's cwd is
-    // the user's shell, the session's is the workload's.
+    // A relative file path is REFUSED, and this is CR-10 rather than a style rule.
+    // `./x.json` is a path inside the workspace by construction, which means the
+    // agent under test can write it - and then the next session starts with a policy
+    // of the agent's choosing. Resolving it against the session cwd (an earlier fix
+    // here) made that explicit instead of accidental, which is worse, not better.
+    // Profiles live in %USERPROFILE%\.saife\profiles\ (by name) or at an absolute
+    // path the operator typed.
     if name.ends_with(".json") {
-        return Ok(cwd.join(p));
+        let _ = cwd;
+        if p.is_relative() {
+            anyhow::bail!(
+                "profile path must be absolute: {name:?} would be resolved inside the workspace, \
+                 which the sandboxed process can write (CR-10). Put the file in \
+                 %USERPROFILE%\\.saife\\profiles\\ and use its name, or pass an absolute path."
+            );
+        }
+        return Ok(p.to_path_buf());
     }
     // Bare name: look in %USERPROFILE%\.saife\profiles\<name>.json
     let userprofile = std::env::var_os("USERPROFILE")
@@ -1621,19 +1632,19 @@ mod tests {
             "limits": {"workloadTimeoutSecs": 100},
             "network": {"profile": "minimal", "allow_domain": ["base.example"]}
         }"#);
-        write_profile(&dir, "mid", r#"{
-            "meta": {"name": "mid", "version": "1.0.0", "schema_version": 1},
-            "extends": "./base.json",
-            "filesystem": {"read_only": ["C:/ro"]},
-            "limits": {"promptTimeoutSecs": 5}
-        }"#);
-        write_profile(&dir, "leaf", r#"{
-            "meta": {"name": "leaf", "version": "1.0.0", "schema_version": 1},
-            "extends": "./mid.json",
-            "filesystem": {"allow": ["C:/b"]},
-            "limits": {"workloadTimeoutSecs": 200},
-            "network": {"allow_domain": ["leaf.example"]}
-        }"#);
+        write_profile(&dir, "mid", &format!(r#"{{
+            "meta": {{"name": "mid", "version": "1.0.0", "schema_version": 1}},
+            "extends": "{}",
+            "filesystem": {{"read_only": ["C:/ro"]}},
+            "limits": {{"promptTimeoutSecs": 5}}
+        }}"#, json_escaped(&dir.join("base.json"))));
+        write_profile(&dir, "leaf", &format!(r#"{{
+            "meta": {{"name": "leaf", "version": "1.0.0", "schema_version": 1}},
+            "extends": "{}",
+            "filesystem": {{"allow": ["C:/b"]}},
+            "limits": {{"workloadTimeoutSecs": 200}},
+            "network": {{"allow_domain": ["leaf.example"]}}
+        }}"#, json_escaped(&dir.join("mid.json"))));
 
         let resolved = load_and_resolve(dir.join("leaf.json").to_str().unwrap(), &dir).unwrap();
         let allow: Vec<String> = resolved.filesystem.allow.iter().map(|p| p.display().to_string()).collect();
@@ -1659,19 +1670,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A relative profile path is resolved against the SESSION's cwd, which is the
-    /// argument the function used to discard.
+    /// CR-10: a relative profile path is a path inside the workspace, which the
+    /// workload can write - so it is refused, naming the alternative. An absolute
+    /// path (the operator's explicit choice) still loads.
     #[test]
-    fn a_relative_profile_path_is_resolved_against_the_given_cwd() {
+    fn a_relative_profile_path_is_refused_and_an_absolute_one_loads() {
         let dir = temp_dir("cwd");
         std::fs::create_dir_all(&dir).unwrap();
         write_profile(&dir, "solo", r#"{
             "meta": {"name": "solo", "version": "1.0.0", "schema_version": 1}
         }"#);
-        // The process cwd is the repository root, so a path resolved as-is would
-        // fail to open; resolved against `dir` it succeeds.
-        let resolved = load_and_resolve("./solo.json", &dir)
-            .expect("a relative path must resolve against the session cwd");
+
+        let err = match load_and_resolve("./solo.json", &dir) {
+            Ok(_) => panic!("a workspace-relative profile must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("CR-10"), "the refusal must cite the decision: {err}");
+
+        let abs = dir.join("solo.json");
+        let resolved = load_and_resolve(abs.to_str().unwrap(), &dir)
+            .expect("an absolute path is the operator's explicit choice");
         assert_eq!(resolved.name, "solo");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1704,6 +1722,12 @@ mod tests {
                 .as_nanos()
         ));
         d
+    }
+
+/// A Windows path as a JSON string value: separators doubled, so a profile file
+    /// written from a test is valid JSON on this platform.
+    fn json_escaped(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "\\\\")
     }
 
     fn write_profile(dir: &std::path::Path, name: &str, body: &str) {

@@ -120,6 +120,10 @@ pub struct AuditWriter {
 struct ChainState {
     last: Option<String>,
     seq: u64,
+    /// Set by [`AuditWriter::seal`]. A sealed chain accepts no further leaves, so the
+    /// root and the file cannot disagree - the proxy's shutdown flush used to append
+    /// AFTER the root was captured, and `verify` then reported the session TAMPERED.
+    sealed: bool,
 }
 
 impl AuditWriter {
@@ -176,7 +180,7 @@ impl AuditWriter {
                     path.display()
                 )
             })?;
-            ChainState { last, seq }
+            ChainState { last, seq, sealed: false }
         } else {
             ChainState::default()
         };
@@ -200,6 +204,12 @@ impl AuditWriter {
     /// swallows errors (best-effort) and always returns `Ok(())`.
     pub fn append(&self, mut event: Map<String, Value>) -> Result<()> {
         let mut chain = self.chain.lock().unwrap_or_else(|p| p.into_inner());
+        if chain.sealed {
+            // Late append after the root was committed. Dropping the leaf keeps the
+            // chain verifiable; the alternative was a file that grows past its own
+            // root, which reads as tampering.
+            return Ok(());
+        }
         let seq = chain.seq;
         let ts = iso8601_utc();
         event.insert("seq".into(), serde_json::json!(seq));
@@ -239,7 +249,20 @@ impl AuditWriter {
         Ok(())
     }
 
+    /// Seal the chain and return its root. After this no leaf can be added, so the
+    /// caller can commit the root knowing the file will not grow past it. This
+    /// replaces "capture the root, then sleep 50 ms and hope".
+    pub fn seal(&self) -> Option<String> {
+        let mut chain = self.chain.lock().unwrap_or_else(|p| p.into_inner());
+        chain.sealed = true;
+        chain.last.clone()
+    }
+
     /// The current chain root (last leaf's hash). None if no leaves yet.
+    ///
+    /// Test-only since [`AuditWriter::seal`] took over the production path: reading the
+    /// root without freezing the chain is exactly the race that produced TAMPERED.
+    #[cfg(test)]
     pub fn current_root(&self) -> Option<String> {
         self.chain
             .lock()
@@ -719,5 +742,50 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         assert!(err.contains("session id"), "the refusal must say why: {err}");
+    }
+
+    /// Sealing is a state, not a sleep. Once sealed, a late append must not reach the
+    /// file, or the log grows past the root that was committed for it and `verify`
+    /// calls an honest session tampered.
+    #[test]
+    fn a_sealed_chain_refuses_later_leaves() {
+        let sid = format!(
+            "test-sealed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let writer = AuditWriter::open(&sid, false).unwrap();
+        let mut e = Map::new();
+        e.insert("op".into(), serde_json::json!("CONNECT"));
+        e.insert("host".into(), serde_json::json!("a.example"));
+        writer.append(e.clone()).unwrap();
+
+        let root = writer.seal().expect("a chain with one leaf has a root");
+        let path = audit_log_path(&sid);
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        // A late refusal-aggregate flush, exactly as the proxy's Drop does it.
+        let mut late = Map::new();
+        late.insert("op".into(), serde_json::json!("CONNECT"));
+        late.insert("host".into(), serde_json::json!("late.example"));
+        writer.append(late).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes_before,
+            "a sealed chain must not grow"
+        );
+        assert_eq!(writer.seal().as_deref(), Some(root.as_str()), "the root is stable");
+        assert!(
+            !matches!(
+                crate::audit::verify::verify_inner(&sid).unwrap(),
+                crate::audit::verify::VerifyOutcome::Tampered(_)
+            ),
+            "the sealed chain must not verify as tampered"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

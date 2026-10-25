@@ -9844,7 +9844,17 @@ mod tests {
     #[test]
     fn pinned_loopback_addresses_are_hard_denied() {
         use std::net::SocketAddr;
-        for s in ["127.0.0.1:443", "127.1.2.3:443", "[::1]:443", "0.0.0.0:443", "[::]:443"] {
+        // `::ffff:127.0.0.1` is the form a resolver or a literal can produce for the
+        // same destination; the check unmaps before deciding, so it is refused too.
+        for s in [
+            "127.0.0.1:443",
+            "127.1.2.3:443",
+            "[::1]:443",
+            "0.0.0.0:443",
+            "[::]:443",
+            "[::ffff:127.0.0.1]:443",
+            "[::ffff:7f00:1]:443",
+        ] {
             let sa: SocketAddr = s.parse().unwrap();
             assert!(
                 super::pinned_addrs_hard_denied(&[sa], false).is_some(),

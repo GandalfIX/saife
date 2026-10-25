@@ -790,6 +790,20 @@ pub fn filesystem_policy(
     // request whose deny list was filtered against a grant set missing it.
     ensure_launcher_grant(&mut filesystem, &launcher);
 
+    // F-11: the launcher is executed by the NEXT session, on the host. A writable
+    // grant that contains it therefore hands the workload a way to run code with the
+    // supervisor's rights - the escalation the wrapper exists to avoid.
+    for grant in &filesystem.readwrite_paths {
+        let g = path_key(grant);
+        let l = path_key(&launcher.display().to_string());
+        if l == g || l.starts_with(&format!("{g}\\")) {
+            return Err(RequestError::GrantCoversLauncher {
+                grant: grant.clone(),
+                launcher: launcher.display().to_string(),
+            });
+        }
+    }
+
     let grants = granted_paths(&filesystem);
     if let Some(profile) = profile_dir {
         for dir in PROFILE_SECRET_DIRS {
@@ -1557,6 +1571,10 @@ pub enum RequestError {
         /// The SDK's message, unedited.
         reason: String,
     },
+    /// A writable grant contains the launcher binary. The launcher runs in the HOST
+    /// session on the NEXT launch (that is the whole wrapper design), so a workload
+    /// that can rewrite it is scheduling code to run with the supervisor's rights.
+    GrantCoversLauncher { grant: String, launcher: String },
 }
 
 impl fmt::Display for RequestError {
@@ -1600,6 +1618,12 @@ impl fmt::Display for RequestError {
             Self::InvalidRequest { reason } => write!(
                 f,
                 "the sandbox SDK rejected this session's request: {reason}"
+            ),
+            RequestError::GrantCoversLauncher { grant, launcher } => write!(
+                f,
+                "writable grant {grant:?} contains the launcher {launcher:?}: the launcher runs \
+                 on the host at the next launch, so a workload that can replace it is scheduling \
+                 code to run with the supervisor's rights. Narrow the grant."
             ),
         }
     }
@@ -10379,5 +10403,29 @@ exit /b 0
             matches!(err, RequestError::DenyCoversGrant { .. }),
             "expected DenyCoversGrant, got {err:?}"
         );
+    }
+
+    /// F-11: the launcher runs on the HOST at the next launch. A writable grant that
+    /// contains it lets this workload replace the binary that the next session
+    /// executes with the supervisor's rights.
+    #[test]
+    fn a_writable_grant_that_contains_the_launcher_is_refused() {
+        let launcher_dir = std::path::PathBuf::from(r"C:\tools\saife");
+        let launcher = launcher_dir.join("saife-launch.exe");
+        let err = filesystem_policy(
+            std::path::Path::new(r"C:\work"),
+            std::slice::from_ref(&launcher_dir),
+            &[],
+            &[],
+            None,
+            &launcher,
+        )
+        .expect_err("a grant containing the launcher must be refused");
+        match err {
+            RequestError::GrantCoversLauncher { grant, .. } => {
+                assert_eq!(grant, launcher_dir.display().to_string());
+            }
+            other => panic!("expected GrantCoversLauncher, got {other:?}"),
+        }
     }
 }
