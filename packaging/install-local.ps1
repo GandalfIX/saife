@@ -1,8 +1,9 @@
 # Install a locally built SAIFE release on this machine.
 #
-#   pwsh -File packaging\install-local.ps1                 # use the newest saife-*-x64.zip
-#   pwsh -File packaging\install-local.ps1 -Zip .\saife-0.2.0-x64.zip
+#   pwsh -File packaging\install-local.ps1                 # the archive matching Cargo.toml
+#   pwsh -File packaging\install-local.ps1 -Zip .\saife-0.3.0-x64.zip
 #   pwsh -File packaging\install-local.ps1 -WhatIf
+#   pwsh -File packaging\install-local.ps1 -AllowVersionMismatch   # deliberate, e.g. testing an old build
 #
 # What it does: verifies the archive, extracts it to
 # %LOCALAPPDATA%\Programs\saife (or -Destination), and puts that directory on the
@@ -12,42 +13,87 @@
 # http(s); Winget downloads the asset from the release URL. For a local build there
 # is nothing to download, so this script is the local equivalent - and it is what
 # the published package does to the same archive.
+#
+# The version rules are the point of the script:
+#   - `Cargo.toml` declares the version; an archive whose NAME disagrees is refused,
+#     so a stale zip cannot be installed by accident (the failure mode that looks
+#     like success: "installed, and `saife --version` shows the old number").
+#   - after extraction the binary is asked for its version and must agree with the
+#     archive name, so a mislabelled build is caught even when the name matches.
+#   - the winget manifest is compared only when it describes the same version: a
+#     0.2.0 manifest cannot speak for a 0.3.0 archive.
 
 param(
     [string]$Zip,
     [string]$Destination = (Join-Path $env:LOCALAPPDATA 'Programs\saife'),
     [switch]$WhatIf,
-    [switch]$NoPathEntry
+    [switch]$NoPathEntry,
+    [switch]$AllowVersionMismatch
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
+$toml = Get-Content (Join-Path $root 'Cargo.toml') -Raw
+if ($toml -notmatch '(?sm)\[package\].*?^\s*version\s*=\s*"([^"]+)"') {
+    throw "cannot read the package version from $root\Cargo.toml"
+}
+$declared = $Matches[1]
+
+function Get-ArchiveVersion([string]$Path) {
+    $name = Split-Path -Leaf $Path
+    if ($name -match '^saife-(?<v>[0-9A-Za-z][0-9A-Za-z.\-]*)-x64\.zip$') { return $Matches['v'] }
+    return $null
+}
+
 if (-not $Zip) {
-    $candidate = Get-ChildItem $root -Filter 'saife-*-x64.zip' -File |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $candidate) { throw "no saife-*-x64.zip in $root - run packaging\build-dist.ps1 -ReleaseVersion <v> first" }
-    $Zip = $candidate.FullName
+    $matching = Join-Path $root "saife-$declared-x64.zip"
+    if (-not (Test-Path $matching)) {
+        $any = Get-ChildItem $root -Filter 'saife-*-x64.zip' -File |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $found = if ($any) { " (found $((Get-ArchiveVersion $any.FullName)) instead)" } else { '' }
+        throw ("no saife-{0}-x64.zip in {1}{2} - run: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {0}" -f $declared, $root, $found)
+    }
+    $Zip = $matching
 }
 if (-not (Test-Path $Zip)) { throw "archive not found: $Zip" }
 
+$archiveVersion = Get-ArchiveVersion $Zip
+if (-not $archiveVersion) {
+    throw "cannot read a version from '$Zip' - expected saife-<version>-x64.zip"
+}
+if ($archiveVersion -ne $declared) {
+    if ($AllowVersionMismatch) {
+        Write-Warning ("archive is {0} but Cargo.toml declares {1} - installing anyway (-AllowVersionMismatch)" -f $archiveVersion, $declared)
+    } else {
+        throw ("archive is {0} but Cargo.toml declares {1}. Rebuild with: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {1}  (or pass -AllowVersionMismatch to install the older build on purpose)" -f $archiveVersion, $declared)
+    }
+}
+
 $hash = (Get-FileHash $Zip -Algorithm SHA256).Hash
+Write-Host ("version: {0}" -f $archiveVersion)
 Write-Host ("archive: {0}" -f $Zip)
 Write-Host ("sha256:  {0}" -f $hash)
 Write-Host ("target:  {0}" -f $Destination)
 
-# The manifest is the record of what SHOULD ship; compare when it is available so a
-# hand-built archive cannot silently differ from the one being distributed.
+# The manifest is the record of what SHOULD ship, but only for ITS version: compare
+# when it describes the archive in hand, and say so plainly when it does not (that
+# is the normal state between a version bump and the release).
 $manifest = Join-Path $PSScriptRoot 'winget\GandalfIX.SAIFE-Sandbox.installer.yaml'
 if (Test-Path $manifest) {
+    $manifestVersion = (Select-String -Path $manifest -Pattern 'PackageVersion:\s*(\S+)' |
+        Select-Object -First 1).Matches[0].Groups[1].Value
     $expected = (Select-String -Path $manifest -Pattern 'InstallerSha256:\s*([0-9A-Fa-f]+)' |
         Select-Object -First 1).Matches[0].Groups[1].Value
-    if ($expected) {
-        if ($expected.ToUpper() -eq $hash) {
-            Write-Host 'manifest: InstallerSha256 matches'
-        } else {
-            Write-Warning ("manifest: InstallerSha256 is {0}, archive is {1} - the manifest is stale (bump it before publishing)" -f $expected, $hash)
-        }
+
+    if ($manifestVersion -ne $archiveVersion) {
+        Write-Host ("manifest: describes {0}, archive is {1} - not comparable (regenerate it at release time)" -f $manifestVersion, $archiveVersion)
+    } elseif (-not $expected) {
+        Write-Warning 'manifest: has no InstallerSha256 to compare'
+    } elseif ($expected.ToUpper() -eq $hash) {
+        Write-Host 'manifest: PackageVersion and InstallerSha256 match'
+    } else {
+        throw ("manifest: InstallerSha256 is {0} but the archive hashes to {1} - the manifest is stale for this version; fix it before publishing" -f $expected, $hash)
     }
 }
 
@@ -56,8 +102,10 @@ if ($WhatIf) { Write-Host 'WhatIf: nothing extracted, PATH untouched.'; return }
 if (Test-Path $Destination) {
     $existing = Join-Path $Destination 'saife.exe'
     if (Test-Path $existing) {
+        # No VERSIONINFO yet (R0.3), so FileVersion may be empty; fall back to asking.
         $old = (Get-Item $existing).VersionInfo.FileVersion
-        Write-Host ("replacing existing install (file version '{0}')" -f $old)
+        if (-not $old) { $old = ((& $existing --version) -join ' ') -replace '.*\s', '' }
+        Write-Host ("replacing existing install (version '{0}')" -f $old)
     }
     Remove-Item $Destination -Recurse -Force
 }
@@ -70,9 +118,15 @@ foreach ($f in @($exe, $launcher)) {
     if (-not (Test-Path $f)) { throw "archive did not contain $(Split-Path -Leaf $f)" }
 }
 
+# The archive name is a claim; the binary is the evidence. A build labelled 0.3.0
+# that reports 0.2.0 is a packaging bug, and finding it here costs one process.
+$reported = ((& $exe --version) -join ' ').Trim()
+if ($reported -notmatch [regex]::Escape($archiveVersion)) {
+    throw ("the extracted binary reports '{0}', which is not {1} - the archive is mislabelled" -f $reported, $archiveVersion)
+}
 Write-Host ''
 Write-Host '== installed, self-check:'
-& $exe --version
+Write-Host ("{0}  (matches the archive name)" -f $reported)
 & $exe setup --check-only | Select-Object -First 4
 
 if (-not $NoPathEntry) {
