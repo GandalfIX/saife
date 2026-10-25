@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -18,14 +18,24 @@ pub struct ProfileEntry {
 pub fn list_profiles() -> Vec<ProfileEntry> {
     let dir = crate::cli::profiles_dir();
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&dir) else { return out; };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
         let name = name_from_profile_file(&path).unwrap_or_else(|| {
-            path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string()
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string()
         });
-        out.push(ProfileEntry { name, source_path: path });
+        out.push(ProfileEntry {
+            name,
+            source_path: path,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -34,7 +44,13 @@ pub fn list_profiles() -> Vec<ProfileEntry> {
 fn name_from_profile_file(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let raw: RawProfile = serde_json::from_str(&text).ok()?;
-    raw.meta.and_then(|m| if m.name.is_empty() { None } else { Some(m.name) })
+    raw.meta.and_then(|m| {
+        if m.name.is_empty() {
+            None
+        } else {
+            Some(m.name)
+        }
+    })
 }
 
 /// `saife profile show <name> [--expanded]`.
@@ -58,9 +74,15 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
         let raw = load_raw_chain(name, &cwd, &mut stack, &mut done)?
             .expect("the requested profile is always merged");
         validate_schema_version(&raw)?;
-        let groups = raw.security.as_ref().map(|s| s.groups.clone()).unwrap_or_default();
+        let groups = raw
+            .security
+            .as_ref()
+            .map(|s| s.groups.clone())
+            .unwrap_or_default();
         let mut fs = resolve_filesystem(&raw.filesystem, &cwd)?;
-        let resolved_name = raw.meta.as_ref()
+        let resolved_name = raw
+            .meta
+            .as_ref()
             .map(|m| m.name.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| name.to_string());
@@ -74,8 +96,12 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
             }
             fs.read_only = dedupe_paths(fs.read_only);
             let allow_keys: std::collections::BTreeSet<String> = fs
-                .allow.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
-            fs.read_only.retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+                .allow
+                .iter()
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .collect();
+            fs.read_only
+                .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
         }
         let resolved = ResolvedProfile {
             name: resolved_name,
@@ -111,7 +137,10 @@ pub fn to_expanded_json(
 ) -> String {
     let mut groups_obj = serde_json::Map::new();
     for (name, paths) in groups_expanded {
-        let arr: Vec<Value> = paths.iter().map(|p| json!(p.to_string_lossy().to_string())).collect();
+        let arr: Vec<Value> = paths
+            .iter()
+            .map(|p| json!(p.to_string_lossy().to_string()))
+            .collect();
         groups_obj.insert(name.clone(), Value::Array(arr));
     }
     let expanded = json!({
@@ -147,13 +176,16 @@ pub fn to_expanded_json(
 fn expand_groups_for_show(sec_groups: &[String]) -> Vec<(String, Vec<std::path::PathBuf>)> {
     let probe = crate::security_groups::HostEnv;
     let grants = crate::security_groups::resolve_groups(&probe, sec_groups);
-    let mut by_group: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = std::collections::BTreeMap::new();
+    let mut by_group: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
     for g in grants {
-        by_group.entry(g.label.to_string()).or_default().push(g.path);
+        by_group
+            .entry(g.label.to_string())
+            .or_default()
+            .push(g.path);
     }
     by_group.into_iter().collect()
 }
-
 
 /// The filesystem slice of a profile, after merging `extends` and CLI flags.
 #[derive(Debug, Default, Clone)]
@@ -562,9 +594,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 pub fn suggest_unknown_key(unknown: &str) -> Option<String> {
     let lower = unknown.to_ascii_lowercase();
     for &known in KNOWN_TOP_LEVEL_KEYS {
-        if levenshtein(&lower, known) <= 2
-            || lower.starts_with(known)
-            || known.starts_with(&lower)
+        if levenshtein(&lower, known) <= 2 || lower.starts_with(known) || known.starts_with(&lower)
         {
             return Some(known.to_string());
         }
@@ -578,8 +608,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let (n, m) = (a.len(), b.len());
-    if n == 0 { return m; }
-    if m == 0 { return n; }
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
     let mut prev: Vec<usize> = (0..=m).collect();
     let mut curr = vec![0usize; m + 1];
     for i in 1..=n {
@@ -679,7 +713,8 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
             .iter()
             .map(|p| p.to_string_lossy().to_lowercase())
             .collect();
-        fs.read_only.retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+        fs.read_only
+            .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
     }
 
     Ok(ResolvedProfile {
@@ -1208,7 +1243,10 @@ mod tests {
     #[test]
     fn expand_basic() {
         let p = PathBuf::from("C:\\projekte\\myapp");
-        assert_eq!(expand_vars("$CWD/.claude", &p).unwrap(), "C:\\projekte\\myapp\\.claude");
+        assert_eq!(
+            expand_vars("$CWD/.claude", &p).unwrap(),
+            "C:\\projekte\\myapp\\.claude"
+        );
     }
 
     #[test]
@@ -1329,7 +1367,10 @@ mod tests {
         let p: RawProfile = serde_json::from_str(raw).expect("parses structurally");
         let err = validate_schema_version(&p).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("Unsupported profile schema version 99"), "got: {msg}");
+        assert!(
+            msg.contains("Unsupported profile schema version 99"),
+            "got: {msg}"
+        );
         assert!(msg.contains("supports schema version 1"), "got: {msg}");
     }
 
@@ -1339,7 +1380,10 @@ mod tests {
         let p: RawProfile = serde_json::from_str(raw).expect("parses structurally");
         let err = validate_schema_version(&p).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("missing required field `meta.schema_version`"), "got: {msg}");
+        assert!(
+            msg.contains("missing required field `meta.schema_version`"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1376,21 +1420,24 @@ mod tests {
         let raw = "{\"meta\":{\"name\":\"x\",\"schema_version\":1},\"filesystem\":{\"allow\":42}}";
         let err = serde_json::from_str::<RawProfile>(raw).unwrap_err();
         let msg = format!("{}", with_suggestion(err));
-        assert!(msg.contains("expected a sequence") || msg.contains("integer"), "got: {msg}");
+        assert!(
+            msg.contains("expected a sequence") || msg.contains("integer"),
+            "got: {msg}"
+        );
         assert!(msg.contains("line") || msg.contains("col"), "got: {msg}");
     }
 
     #[test]
     fn suggest_closest_known_key() {
         assert_eq!(suggest_unknown_key("netwrok"), Some("network".to_string()));
-        assert_eq!(suggest_unknown_key("filesystemm"), Some("filesystem".to_string()));
+        assert_eq!(
+            suggest_unknown_key("filesystemm"),
+            Some("filesystem".to_string())
+        );
         assert_eq!(suggest_unknown_key("metaa"), Some("meta".to_string()));
         assert_eq!(suggest_unknown_key("zzzzz"), None);
         assert_eq!(suggest_unknown_key("sec"), Some("security".to_string()));
     }
-
-
-
 
     #[test]
     fn list_profiles_returns_user_global_json_files() {
@@ -1398,21 +1445,36 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("sb-list-test-{}", std::process::id()));
         let profiles_dir = tmp.join(".saife").join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();
-        std::fs::write(profiles_dir.join("alpha.json"), r#"{"meta":{"name":"alpha","schema_version":1}}"#).unwrap();
-        std::fs::write(profiles_dir.join("beta.json"), r#"{"meta":{"name":"beta","schema_version":1}}"#).unwrap();
+        std::fs::write(
+            profiles_dir.join("alpha.json"),
+            r#"{"meta":{"name":"alpha","schema_version":1}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            profiles_dir.join("beta.json"),
+            r#"{"meta":{"name":"beta","schema_version":1}}"#,
+        )
+        .unwrap();
         std::fs::write(profiles_dir.join("not-json.txt"), "garbage").unwrap();
         let prev = std::env::var_os("USERPROFILE");
-        unsafe { std::env::set_var("USERPROFILE", &tmp); }
+        unsafe {
+            std::env::set_var("USERPROFILE", &tmp);
+        }
         let result = list_profiles();
         if let Some(p) = prev {
-            unsafe { std::env::set_var("USERPROFILE", p); }
+            unsafe {
+                std::env::set_var("USERPROFILE", p);
+            }
         }
         std::fs::remove_dir_all(&tmp).ok();
 
         let names: Vec<String> = result.into_iter().map(|p| p.name).collect();
         assert!(names.contains(&"alpha".to_string()));
         assert!(names.contains(&"beta".to_string()));
-        assert!(!names.iter().any(|n| n == "not-json"), "non-.json files excluded");
+        assert!(
+            !names.iter().any(|n| n == "not-json"),
+            "non-.json files excluded"
+        );
     }
 
     #[test]
@@ -1432,15 +1494,17 @@ mod tests {
             },
             limits: LimitsSlice::default(),
         };
-        let groups_expanded: Vec<(String, Vec<PathBuf>)> = vec![
-            ("python_runtime".into(), vec![PathBuf::from(r"C:\Py312")]),
-        ];
+        let groups_expanded: Vec<(String, Vec<PathBuf>)> =
+            vec![("python_runtime".into(), vec![PathBuf::from(r"C:\Py312")])];
         let json = to_expanded_json(&resolved, &groups_expanded);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["meta"]["name"], "child");
         assert_eq!(v["filesystem"]["allow"][0], r"C:\proj");
         assert_eq!(v["filesystem"]["read_only"][0], r"C:\Users\test\.gitconfig");
-        assert_eq!(v["security_groups_expanded"]["python_runtime"][0], r"C:\Py312");
+        assert_eq!(
+            v["security_groups_expanded"]["python_runtime"][0],
+            r"C:\Py312"
+        );
         assert_eq!(v["network"]["block"], false);
         assert_eq!(v["network"]["allow_domain"][0], "api.anthropic.com");
         assert_eq!(v["network"]["profile"], "minimal");
@@ -1639,7 +1703,10 @@ mod tests {
                 workload_timeout_secs: Some(accepted.max(1)),
             }
             .resolve();
-            assert_eq!(l.prompt_timeout_secs, accepted, "prompt {accepted} is legal");
+            assert_eq!(
+                l.prompt_timeout_secs, accepted,
+                "prompt {accepted} is legal"
+            );
             assert_eq!(l.workload_timeout_secs, accepted.max(1));
         }
         // Past the cap the value can only be a wedged session: both fall back, with
@@ -1665,7 +1732,10 @@ mod tests {
             workload_timeout_secs: Some(0),
         }
         .resolve();
-        assert_eq!(zero_workload.prompt_timeout_secs, 0, "0 stays 'instant deny'");
+        assert_eq!(
+            zero_workload.prompt_timeout_secs, 0,
+            "0 stays 'instant deny'"
+        );
         assert_eq!(
             zero_workload.workload_timeout_secs, DEFAULT_WORKLOAD_TIMEOUT_SECS,
             "a 0-second workload term is not expressible"
@@ -1841,46 +1911,84 @@ mod tests {
     fn a_three_level_extends_chain_is_flattened_and_merges_child_over_parent() {
         let dir = temp_dir("chain");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "base", r#"{
+        write_profile(
+            &dir,
+            "base",
+            r#"{
             "meta": {"name": "base", "version": "1.0.0", "schema_version": 1},
             "filesystem": {"allow": ["C:/a"], "deny": ["C:/secret"]},
             "limits": {"workloadTimeoutSecs": 100},
             "network": {"profile": "minimal", "allow_domain": ["base.example"]}
-        }"#);
-        write_profile(&dir, "mid", &format!(r#"{{
+        }"#,
+        );
+        write_profile(
+            &dir,
+            "mid",
+            &format!(
+                r#"{{
             "meta": {{"name": "mid", "version": "1.0.0", "schema_version": 1}},
             "extends": "{}",
             "filesystem": {{"read_only": ["C:/ro"]}},
             "limits": {{"promptTimeoutSecs": 5}}
-        }}"#, json_escaped(&dir.join("base.json"))));
-        write_profile(&dir, "leaf", &format!(r#"{{
+        }}"#,
+                json_escaped(&dir.join("base.json"))
+            ),
+        );
+        write_profile(
+            &dir,
+            "leaf",
+            &format!(
+                r#"{{
             "meta": {{"name": "leaf", "version": "1.0.0", "schema_version": 1}},
             "extends": "{}",
             "filesystem": {{"allow": ["C:/b"]}},
             "limits": {{"workloadTimeoutSecs": 200}},
             "network": {{"allow_domain": ["leaf.example"]}}
-        }}"#, json_escaped(&dir.join("mid.json"))));
+        }}"#,
+                json_escaped(&dir.join("mid.json"))
+            ),
+        );
 
         let resolved = load_and_resolve(dir.join("leaf.json").to_str().unwrap(), &dir).unwrap();
-        let allow: Vec<String> = resolved.filesystem.allow.iter().map(|p| p.display().to_string()).collect();
-        assert!(allow.iter().any(|p| p.ends_with("a")), "parent grant kept: {allow:?}");
-        assert!(allow.iter().any(|p| p.ends_with("b")), "child grant added: {allow:?}");
+        let allow: Vec<String> = resolved
+            .filesystem
+            .allow
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         assert!(
-            resolved.filesystem.deny.iter().any(|p| p.display().to_string().ends_with("secret")),
+            allow.iter().any(|p| p.ends_with("a")),
+            "parent grant kept: {allow:?}"
+        );
+        assert!(
+            allow.iter().any(|p| p.ends_with("b")),
+            "child grant added: {allow:?}"
+        );
+        assert!(
+            resolved
+                .filesystem
+                .deny
+                .iter()
+                .any(|p| p.display().to_string().ends_with("secret")),
             "the grandparent's deny survives two levels: {:?}",
             resolved.filesystem.deny
         );
         assert_eq!(
-            resolved.limits.workload_timeout_secs, Some(200),
+            resolved.limits.workload_timeout_secs,
+            Some(200),
             "the child overrides an inherited scalar"
         );
         assert_eq!(
-            resolved.limits.prompt_timeout_secs, Some(5),
+            resolved.limits.prompt_timeout_secs,
+            Some(5),
             "an inherited scalar fills the gap"
         );
         let domains: Vec<String> = resolved.network.allow_domain.clone();
         for want in ["base.example", "leaf.example"] {
-            assert!(domains.iter().any(|d| d == want), "{want} missing: {domains:?}");
+            assert!(
+                domains.iter().any(|d| d == want),
+                "{want} missing: {domains:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1892,15 +2000,22 @@ mod tests {
     fn a_relative_profile_path_is_refused_and_an_absolute_one_loads() {
         let dir = temp_dir("cwd");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "solo", r#"{
+        write_profile(
+            &dir,
+            "solo",
+            r#"{
             "meta": {"name": "solo", "version": "1.0.0", "schema_version": 1}
-        }"#);
+        }"#,
+        );
 
         let err = match load_and_resolve("./solo.json", &dir) {
             Ok(_) => panic!("a workspace-relative profile must be refused"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(err.contains("CR-10"), "the refusal must cite the decision: {err}");
+        assert!(
+            err.contains("CR-10"),
+            "the refusal must cite the decision: {err}"
+        );
 
         let abs = dir.join("solo.json");
         let resolved = load_and_resolve(abs.to_str().unwrap(), &dir)
@@ -1914,15 +2029,22 @@ mod tests {
     fn a_missing_parent_in_the_chain_names_the_path() {
         let dir = temp_dir("missing");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "child", r#"{
+        write_profile(
+            &dir,
+            "child",
+            r#"{
             "meta": {"name": "child", "version": "1.0.0", "schema_version": 1},
             "extends": "./nope.json"
-        }"#);
+        }"#,
+        );
         let err = match load_and_resolve(dir.join("child.json").to_str().unwrap(), &dir) {
             Ok(_) => panic!("a missing parent must fail"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(err.contains("nope.json"), "the error must name the missing file: {err}");
+        assert!(
+            err.contains("nope.json"),
+            "the error must name the missing file: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1939,7 +2061,7 @@ mod tests {
         d
     }
 
-/// A Windows path as a JSON string value: separators doubled, so a profile file
+    /// A Windows path as a JSON string value: separators doubled, so a profile file
     /// written from a test is valid JSON on this platform.
     fn json_escaped(p: &std::path::Path) -> String {
         p.display().to_string().replace('\\', "\\\\")
@@ -1960,10 +2082,9 @@ mod tests {
                 .expect("the single-parent spelling keeps parsing");
         assert_eq!(one.extends.unwrap().names(), vec!["a".to_string()]);
 
-        let many: RawProfile = serde_json::from_str(
-            r#"{"meta":{"name":"c","schema_version":1},"extends":["a","b"]}"#,
-        )
-        .expect("an array of parents parses");
+        let many: RawProfile =
+            serde_json::from_str(r#"{"meta":{"name":"c","schema_version":1},"extends":["a","b"]}"#)
+                .expect("an array of parents parses");
         assert_eq!(
             many.extends.unwrap().names(),
             vec!["a".to_string(), "b".to_string()]
@@ -1976,13 +2097,25 @@ mod tests {
     fn two_parents_compose_their_grants_and_scalars() {
         let dir = temp_dir("multi-compose");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"filesystem":{"allow":["C:/x"]},"network":{"block_net":true},"limits":{"workloadTimeoutSecs":600}}"#);
-        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"filesystem":{"allow":["C:/y"]}}"#);
-        write_profile(&dir, "c", &format!(
-            r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"]}}"#,
-            json_escaped(&dir.join("a.json")),
-            json_escaped(&dir.join("b.json"))
-        ));
+        write_profile(
+            &dir,
+            "a",
+            r#"{"meta":{"name":"a","schema_version":1},"filesystem":{"allow":["C:/x"]},"network":{"block_net":true},"limits":{"workloadTimeoutSecs":600}}"#,
+        );
+        write_profile(
+            &dir,
+            "b",
+            r#"{"meta":{"name":"b","schema_version":1},"filesystem":{"allow":["C:/y"]}}"#,
+        );
+        write_profile(
+            &dir,
+            "c",
+            &format!(
+                r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"]}}"#,
+                json_escaped(&dir.join("a.json")),
+                json_escaped(&dir.join("b.json"))
+            ),
+        );
 
         let resolved = load_and_resolve(dir.join("c.json").to_str().unwrap(), &dir).unwrap();
         let allow: Vec<String> = resolved
@@ -1991,8 +2124,14 @@ mod tests {
             .iter()
             .map(|p| p.display().to_string())
             .collect();
-        assert!(allow.iter().any(|p| p.ends_with("x")), "parent a's grant: {allow:?}");
-        assert!(allow.iter().any(|p| p.ends_with("y")), "parent b's grant: {allow:?}");
+        assert!(
+            allow.iter().any(|p| p.ends_with("x")),
+            "parent a's grant: {allow:?}"
+        );
+        assert!(
+            allow.iter().any(|p| p.ends_with("y")),
+            "parent b's grant: {allow:?}"
+        );
         assert!(resolved.network.block_net, "the scalar a set comes through");
         assert_eq!(resolved.limits.workload_timeout_secs, Some(600));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2003,13 +2142,25 @@ mod tests {
     fn a_child_scalar_overrides_disagreeing_parents() {
         let dir = temp_dir("multi-override");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"network":{"block_net":true}}"#);
-        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"network":{"block_net":false}}"#);
-        write_profile(&dir, "c", &format!(
-            r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"],"network":{{"block_net":false}}}}"#,
-            json_escaped(&dir.join("a.json")),
-            json_escaped(&dir.join("b.json"))
-        ));
+        write_profile(
+            &dir,
+            "a",
+            r#"{"meta":{"name":"a","schema_version":1},"network":{"block_net":true}}"#,
+        );
+        write_profile(
+            &dir,
+            "b",
+            r#"{"meta":{"name":"b","schema_version":1},"network":{"block_net":false}}"#,
+        );
+        write_profile(
+            &dir,
+            "c",
+            &format!(
+                r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"],"network":{{"block_net":false}}}}"#,
+                json_escaped(&dir.join("a.json")),
+                json_escaped(&dir.join("b.json"))
+            ),
+        );
 
         let resolved = load_and_resolve(dir.join("c.json").to_str().unwrap(), &dir)
             .expect("the child decides, so the parents' disagreement is moot");
@@ -2023,20 +2174,35 @@ mod tests {
     fn parents_disagreeing_on_a_scalar_are_refused() {
         let dir = temp_dir("multi-conflict");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"network":{"block_net":true}}"#);
-        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"network":{"block_net":false}}"#);
-        write_profile(&dir, "c", &format!(
-            r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"]}}"#,
-            json_escaped(&dir.join("a.json")),
-            json_escaped(&dir.join("b.json"))
-        ));
+        write_profile(
+            &dir,
+            "a",
+            r#"{"meta":{"name":"a","schema_version":1},"network":{"block_net":true}}"#,
+        );
+        write_profile(
+            &dir,
+            "b",
+            r#"{"meta":{"name":"b","schema_version":1},"network":{"block_net":false}}"#,
+        );
+        write_profile(
+            &dir,
+            "c",
+            &format!(
+                r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"]}}"#,
+                json_escaped(&dir.join("a.json")),
+                json_escaped(&dir.join("b.json"))
+            ),
+        );
 
         let err = match load_and_resolve(dir.join("c.json").to_str().unwrap(), &dir) {
             Ok(_) => panic!("disagreeing parents must be refused"),
             Err(e) => format!("{e:#}"),
         };
         for needle in ["network.block_net", "`a`", "`b`", "true", "false"] {
-            assert!(err.contains(needle), "the refusal must name {needle:?}: {err}");
+            assert!(
+                err.contains(needle),
+                "the refusal must name {needle:?}: {err}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2047,18 +2213,30 @@ mod tests {
     fn a_diamond_merges_the_shared_parent_once() {
         let dir = temp_dir("multi-diamond");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "base", r#"{"meta":{"name":"base","schema_version":1},"filesystem":{"allow":["C:/shared"]},"network":{"block_net":true}}"#);
+        write_profile(
+            &dir,
+            "base",
+            r#"{"meta":{"name":"base","schema_version":1},"filesystem":{"allow":["C:/shared"]},"network":{"block_net":true}}"#,
+        );
         for side in ["l", "r"] {
-            write_profile(&dir, side, &format!(
-                r#"{{"meta":{{"name":"{side}","schema_version":1}},"extends":"{}"}}"#,
-                json_escaped(&dir.join("base.json"))
-            ));
+            write_profile(
+                &dir,
+                side,
+                &format!(
+                    r#"{{"meta":{{"name":"{side}","schema_version":1}},"extends":"{}"}}"#,
+                    json_escaped(&dir.join("base.json"))
+                ),
+            );
         }
-        write_profile(&dir, "d", &format!(
-            r#"{{"meta":{{"name":"d","schema_version":1}},"extends":["{}","{}"]}}"#,
-            json_escaped(&dir.join("l.json")),
-            json_escaped(&dir.join("r.json"))
-        ));
+        write_profile(
+            &dir,
+            "d",
+            &format!(
+                r#"{{"meta":{{"name":"d","schema_version":1}},"extends":["{}","{}"]}}"#,
+                json_escaped(&dir.join("l.json")),
+                json_escaped(&dir.join("r.json"))
+            ),
+        );
 
         let resolved = load_and_resolve(dir.join("d.json").to_str().unwrap(), &dir)
             .expect("a shared parent is not a conflict");
@@ -2078,27 +2256,42 @@ mod tests {
     fn extends_order_does_not_change_the_result() {
         let dir = temp_dir("multi-order");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"filesystem":{"allow":["C:/x"]},"network":{"allow_domain":["a.example"]}}"#);
-        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"filesystem":{"allow":["C:/y"]},"network":{"allow_domain":["b.example"]}}"#);
+        write_profile(
+            &dir,
+            "a",
+            r#"{"meta":{"name":"a","schema_version":1},"filesystem":{"allow":["C:/x"]},"network":{"allow_domain":["a.example"]}}"#,
+        );
+        write_profile(
+            &dir,
+            "b",
+            r#"{"meta":{"name":"b","schema_version":1},"filesystem":{"allow":["C:/y"]},"network":{"allow_domain":["b.example"]}}"#,
+        );
         let (pa, pb) = (dir.join("a.json"), dir.join("b.json"));
-        write_profile(&dir, "ab", &format!(
-            r#"{{"meta":{{"name":"ab","schema_version":1}},"extends":["{}","{}"]}}"#,
-            json_escaped(&pa),
-            json_escaped(&pb)
-        ));
-        write_profile(&dir, "ba", &format!(
-            r#"{{"meta":{{"name":"ba","schema_version":1}},"extends":["{}","{}"]}}"#,
-            json_escaped(&pb),
-            json_escaped(&pa)
-        ));
+        write_profile(
+            &dir,
+            "ab",
+            &format!(
+                r#"{{"meta":{{"name":"ab","schema_version":1}},"extends":["{}","{}"]}}"#,
+                json_escaped(&pa),
+                json_escaped(&pb)
+            ),
+        );
+        write_profile(
+            &dir,
+            "ba",
+            &format!(
+                r#"{{"meta":{{"name":"ba","schema_version":1}},"extends":["{}","{}"]}}"#,
+                json_escaped(&pb),
+                json_escaped(&pa)
+            ),
+        );
 
         let ab = load_and_resolve(dir.join("ab.json").to_str().unwrap(), &dir).unwrap();
         let ba = load_and_resolve(dir.join("ba.json").to_str().unwrap(), &dir).unwrap();
         // Behaviour, not bytes: the CHILD's own name differs by construction, and a
         // grant list is a set. Compare every list sorted, with `meta.name` removed.
         let normalised = |r: &ResolvedProfile| {
-            let mut v: serde_json::Value =
-                serde_json::from_str(&to_expanded_json(r, &[])).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&to_expanded_json(r, &[])).unwrap();
             v["meta"].as_object_mut().map(|m| m.remove("name"));
             for key in ["filesystem", "network"] {
                 if let Some(section) = v.get_mut(key).and_then(|s| s.as_object_mut()) {
@@ -2124,20 +2317,31 @@ mod tests {
     fn a_cycle_through_a_diamond_is_refused() {
         let dir = temp_dir("multi-cycle");
         std::fs::create_dir_all(&dir).unwrap();
-        write_profile(&dir, "a", &format!(
-            r#"{{"meta":{{"name":"a","schema_version":1}},"extends":["{}"]}}"#,
-            json_escaped(&dir.join("b.json"))
-        ));
-        write_profile(&dir, "b", &format!(
-            r#"{{"meta":{{"name":"b","schema_version":1}},"extends":["{}"]}}"#,
-            json_escaped(&dir.join("a.json"))
-        ));
+        write_profile(
+            &dir,
+            "a",
+            &format!(
+                r#"{{"meta":{{"name":"a","schema_version":1}},"extends":["{}"]}}"#,
+                json_escaped(&dir.join("b.json"))
+            ),
+        );
+        write_profile(
+            &dir,
+            "b",
+            &format!(
+                r#"{{"meta":{{"name":"b","schema_version":1}},"extends":["{}"]}}"#,
+                json_escaped(&dir.join("a.json"))
+            ),
+        );
 
         let err = match load_and_resolve(dir.join("a.json").to_str().unwrap(), &dir) {
             Ok(_) => panic!("a cycle must be refused"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(err.contains("cycle"), "the message keeps the cycle shape: {err}");
+        assert!(
+            err.contains("cycle"),
+            "the message keeps the cycle shape: {err}"
+        );
         assert!(
             err.contains("a → b → a") || err.contains("b → a → b"),
             "the refusal spells out the chain it walked: {err}"
