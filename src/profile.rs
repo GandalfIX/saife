@@ -2438,6 +2438,22 @@ mod tests {
         ];
         let dir = temp_dir("doc-examples");
         std::fs::create_dir_all(&dir).unwrap();
+        // An example that says `"extends": ["node", "jvm"]` means the profiles that
+        // SHIP, and a bare name resolves in the installed store - empty on a fresh
+        // machine and on CI. Provision it from the repo, which also makes this a
+        // check that the docs only name profiles the repo actually ships.
+        let store = dir.join("store");
+        let shipped = store.join(".saife").join("profiles");
+        std::fs::create_dir_all(&shipped).unwrap();
+        for entry in std::fs::read_dir(root.join("profiles")).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                std::fs::copy(&path, shipped.join(path.file_name().unwrap())).unwrap();
+            }
+        }
+        let _env = crate::env_lock();
+        let saved = std::env::var_os("USERPROFILE");
+        unsafe { std::env::set_var("USERPROFILE", &store) };
         let mut checked = 0;
         for doc in docs {
             let Ok(text) = std::fs::read_to_string(root.join(doc)) else {
@@ -2475,10 +2491,18 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(
-            checked >= 3,
-            "expected to check the documented examples, found {checked}"
-        );
+        // Restore before asserting: a panic would otherwise leak a fake %USERPROFILE%
+        // into every later test in this process.
+        let checked_ok = checked >= 3;
+        let count = checked;
+        match saved {
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            checked_ok,
+            "expected to check the documented examples, found {count}"
+        );
     }
 }
