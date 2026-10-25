@@ -24,7 +24,6 @@ pub mod verify;
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -78,9 +77,21 @@ pub fn emit_connect(
 
 pub struct AuditWriter {
     path: PathBuf,
-    last_hash: Mutex<Option<String>>,
-    seq: AtomicU64,
+    /// Parent hash AND next sequence number behind one lock. They are one
+    /// invariant: seq must increase in file order, and the parent link must name
+    /// the leaf written immediately before. Splitting them (a mutex for the hash,
+    /// an atomic for seq) let two appends observe the same `None` parent and
+    /// produced leaves that `verify` reported as TAMPERED - the tool accusing its
+    /// own untouched log. Hold this guard across compute -> write -> commit.
+    chain: Mutex<ChainState>,
     strict: bool,
+}
+
+/// The chain's commit point. Only `append` mutates this, and only under the lock.
+#[derive(Default)]
+struct ChainState {
+    last: Option<String>,
+    seq: u64,
 }
 
 impl AuditWriter {
@@ -123,15 +134,26 @@ impl AuditWriter {
             }
         }
 
-        let (last_hash, next_seq) = if path.exists() {
-            scan_existing(&path).unwrap_or((None, 0))
+        // An existing log that cannot be scanned must NOT be extended: appending
+        // with a `null` parent to a chain that already has leaves is exactly the
+        // shape `verify` reports as tampering, so it would manufacture the verdict
+        // it is supposed to detect. Refusing keeps the evidence honest and the
+        // operator moves the file aside deliberately.
+        let chain = if path.exists() {
+            let (last, seq) = scan_existing(&path).with_context(|| {
+                format!(
+                    "existing audit chain {:?} is unreadable or corrupt; refusing to extend it \
+                     (move it aside to start a new session)",
+                    path.display()
+                )
+            })?;
+            ChainState { last, seq }
         } else {
-            (None, 0)
+            ChainState::default()
         };
         Ok(Self {
             path,
-            last_hash: Mutex::new(last_hash),
-            seq: AtomicU64::new(next_seq),
+            chain: Mutex::new(chain),
             strict,
         })
     }
@@ -143,16 +165,18 @@ impl AuditWriter {
     /// appending or the write fails. When `strict` is false, silently
     /// swallows errors (best-effort) and always returns `Ok(())`.
     pub fn append(&self, mut event: Map<String, Value>) -> Result<()> {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let mut chain = self.chain.lock().unwrap_or_else(|p| p.into_inner());
+        let seq = chain.seq;
         let ts = iso8601_utc();
         event.insert("seq".into(), serde_json::json!(seq));
         event.insert("ts".into(), serde_json::json!(ts));
         let canonical = canonicalize(&event);
         let hash = sha256_hex(&canonical);
-        let parent = self.last_hash.lock().unwrap().take();
+        let parent = chain.last.clone();
         event.insert("hash".into(), serde_json::json!(hash));
         event.insert("parent".into(), serde_json::json!(parent));
-        let mut line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+        let mut line = serde_json::to_string(&event)
+            .expect("a Map<String, Value> is always serializable; see canonicalize");
         line.push('\n');
 
         if std::env::var_os("SAIFE_DIAG").is_some() {
@@ -168,32 +192,39 @@ impl AuditWriter {
                 .with_context(|| format!("strict audit: open {:?} for append", self.path.display()))?;
             f.write_all(line.as_bytes())
                 .with_context(|| format!("strict audit: write {:?} failed", self.path.display()))?;
-        } else {
-            if let Ok(mut f) = file_result {
-                let _ = f.write_all(line.as_bytes());
-            }
+        } else if let Ok(mut f) = file_result {
+            let _ = f.write_all(line.as_bytes());
         }
-        *self.last_hash.lock().unwrap() = Some(hash);
+        // Commit last: a failed write must not advance the chain, or the next
+        // leaf would name a parent that is not in the file.
+        chain.seq = seq + 1;
+        chain.last = Some(hash);
         Ok(())
     }
 
     /// The current chain root (last leaf's hash). None if no leaves yet.
     pub fn current_root(&self) -> Option<String> {
-        self.last_hash.lock().unwrap().clone()
+        self.chain
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last
+            .clone()
     }
 }
 
 /// Scan an existing .ndjson file to recover the last hash + next seq for
 /// crash recovery / --reuse.
-fn scan_existing(path: &std::path::Path) -> Option<(Option<String>, u64)> {
-    let content = std::fs::read_to_string(path).ok()?;
+fn scan_existing(path: &std::path::Path) -> Result<(Option<String>, u64)> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read existing chain {:?}", path.display()))?;
     let mut last_hash: Option<String> = None;
     let mut max_seq: Option<u64> = None;
-    for line in content.lines() {
+    for (line_no, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = serde_json::from_str(line).ok()?;
+        let v: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse existing chain {:?} (line {line_no})", path.display()))?;
         if let Some(h) = v.get("hash").and_then(|x| x.as_str()) {
             last_hash = Some(h.to_string());
         }
@@ -202,7 +233,7 @@ fn scan_existing(path: &std::path::Path) -> Option<(Option<String>, u64)> {
         }
     }
     let next_seq = max_seq.map_or(0, |m| m + 1);
-    Some((last_hash, next_seq))
+    Ok((last_hash, next_seq))
 }
 
 fn iso8601_utc() -> String {
@@ -243,7 +274,12 @@ pub fn canonicalize(leaf: &Map<String, Value>) -> String {
     // BTreeMap-backed, producing alphabetical keys. But to be explicit and
     // safe across feature flags, route through a BTreeMap:
     let btree: std::collections::BTreeMap<String, Value> = copy.into_iter().collect();
-    serde_json::to_string(&btree).unwrap_or_else(|_| "{}".to_string())
+    // Infallible by construction: the value is a map with string keys of
+    // `serde_json::Value`, which has no failing representation. The previous
+    // `unwrap_or_else(|_| "{}")` was worse than a panic - it committed
+    // sha256("{}") as the leaf hash while `verify` recomputed the same string, so
+    // the chain "verified" while no longer committing to the event body.
+    serde_json::to_string(&btree).expect("Map<String, Value> is always serializable")
 }
 
 /// SHA-256 of the canonical bytes, returned as lowercase hex.
@@ -526,5 +562,104 @@ mod tests {
         assert!(lenient_res.is_ok(), "non-strict append must swallow the write error");
 
         // No cleanup needed: own_dir was already removed.
+    }
+
+    /// The chain is the product's evidence. Two appends that interleave must still
+    /// produce ONE chain: seq in file order, every parent naming the previous leaf.
+    /// This failed before the writer kept `last` and `seq` behind one lock - both
+    /// threads read `None` and `verify` called the result tampered.
+    #[test]
+    fn concurrent_appends_produce_one_verifiable_chain() {
+        use crate::audit::verify::{VerifyOutcome, verify_inner};
+        use std::sync::Arc;
+
+        let sid = format!(
+            "test-concurrent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            let mut threads = Vec::new();
+            for t in 0..4 {
+                let w = Arc::clone(&writer);
+                threads.push(std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let mut e = Map::new();
+                        e.insert("op".into(), serde_json::json!("CONNECT"));
+                        e.insert("host".into(), serde_json::json!(format!("t{t}-{i}.example")));
+                        w.append(e).unwrap();
+                    }
+                }));
+            }
+            for h in threads {
+                h.join().unwrap();
+            }
+        }
+
+        let path = audit_log_path(&sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let (mut expected_seq, mut prev, mut leaves) = (0u64, None::<String>, 0);
+        for line in content.lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                v["seq"].as_u64().unwrap(),
+                expected_seq,
+                "seq must follow file order even under concurrency"
+            );
+            assert_eq!(
+                v["parent"].as_str().map(str::to_string),
+                prev,
+                "every leaf's parent must name the leaf written before it"
+            );
+            prev = v["hash"].as_str().map(str::to_string);
+            expected_seq += 1;
+            leaves += 1;
+        }
+        assert_eq!(leaves, 100, "no leaf may be lost");
+        assert!(
+            !matches!(verify_inner(&sid).unwrap(), VerifyOutcome::Tampered(_)),
+            "an untampered log must never verify as tampered"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A corrupt existing log is evidence, not a starting point. Extending it would
+    /// emit a null parent after real leaves - the exact shape `verify` reports as
+    /// tampering - so the writer refuses and leaves the bytes alone.
+    #[test]
+    fn an_unreadable_existing_chain_is_refused_not_extended() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "sandbox-audit-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.ndjson");
+        let original = "{\"op\":\"CONNECT\"}\nnot json at all\n";
+        std::fs::write(&path, original).unwrap();
+
+        let err = match AuditWriter::open_at(path.clone(), false) {
+            Ok(_) => panic!("a corrupt chain must not be reopened for appending"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("refusing to extend"),
+            "the refusal must say what to do: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "refusing must not touch the evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
