@@ -326,15 +326,21 @@ A profile is a JSON file in `%USERPROFILE%\.saife\profiles\<name>.json`:
   },
   "network": {
     "allow_domain": ["api.anthropic.com"],
-    "promptEnabled": false,
+    "promptEnabled": false
+  },
+  "limits": {
+    "promptTimeoutSecs": 60,
     "workloadTimeoutSecs": 3600
   }
 }
 ```
 
 `meta.schema_version` is **required**. Fields are snake_case, except the network
-options `denyDomain`, `promptEnabled`, `onUnavailable`, `promptTimeoutSecs` and
-`workloadTimeoutSecs`.
+options `denyDomain`, `promptEnabled` and `onUnavailable`, and the two
+session-deadline terms `promptTimeoutSecs` / `workloadTimeoutSecs`, which live in
+their own top-level `limits` section. That section is new: the same two keys
+under `network` are now **refused** (the error names `limits`), so a profile
+written before it has to move them.
 
 Paths may use `$CWD`, `$HOME`, `$USERPROFILE`, `$TEMP`, `$LOCALAPPDATA`,
 `$APPDATA` and `$SID`; anything else (including `%VAR%`) is taken literally, and a
@@ -375,9 +381,11 @@ Verified: a child that extends `node` and adds `$USERPROFILE/.gradle` produced a
 session whose audited `fs_readwrite` contained the workspace, `npm-cache`,
 `AppData\Roaming\npm` **and** `.gradle`.
 
-Session deadline is `promptTimeoutSecs + workloadTimeoutSecs + slack`
-(defaults 60 s + 30 min + 2 min). If a build or download legitimately runs
-longer, raise `workloadTimeoutSecs` — there is no unlimited mode.
+Session deadline is `limits.promptTimeoutSecs + limits.workloadTimeoutSecs +
+slack` (defaults 60 s + 30 min + 2 min). Both terms live in the top-level
+`limits` section — the deadline bounds the session, not the network policy, so a
+`--block-net` session uses the same terms. If a build or download legitimately
+runs longer, raise `limits.workloadTimeoutSecs` — there is no unlimited mode.
 
 ### 5.1 Ready-made profiles
 

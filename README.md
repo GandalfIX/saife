@@ -72,9 +72,11 @@ credential. If nothing in the session ever authenticated while something tried,
 the session is **refused** with `workload_cannot_authenticate` and the remedy is
 `--backend appcontainer`.
 
-Session deadlines are `promptTimeoutSecs + workloadTimeoutSecs + slack`
-(defaults 60 s + 30 min + 2 min). Raise `network.workloadTimeoutSecs` in the
-profile for long builds or downloads; there is no unlimited mode.
+Session deadlines are `limits.promptTimeoutSecs + limits.workloadTimeoutSecs +
+slack` (defaults 60 s + 30 min + 2 min). Both terms live in the profile's
+top-level `limits` section (`network` no longer accepts them). Raise
+`limits.workloadTimeoutSecs` for long builds or downloads; there is no unlimited
+mode.
 
 ## Build
 

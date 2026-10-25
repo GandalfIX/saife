@@ -36,7 +36,7 @@ The tool is bin-only: there is no library target, so every test run is
 |---|---|
 | `src/main.rs` | CLI dispatch, `run_inner`, the two session paths, exit codes |
 | `src/cli.rs` | clap surface, `resolve_backend` / `route_backend` / `default_backend`, refusal constants |
-| `src/net/mod.rs` | network config resolution, `session_budget()`, `ProxyEnv` |
+| `src/net/mod.rs` | network config resolution, `ProxyEnv` (the session budget is derived from the profile's `limits`, see `src/profile.rs`) |
 | `src/net/proxy.rs` | the listener: CONNECT, absolute-form forward, control-plane endpoints, decisions, counters, refusal budgets |
 | `src/net/mxc.rs` | the only module that talks to `mxc-sdk`: request building (the SDK's `1.0.0` one-shot contract), launch (including the stdio mode), tier gate, proof gate, session clock |
 | `src/net/prompt.rs` | interactive dialog, coordinator, slots, headless fast-fail |
@@ -46,7 +46,7 @@ The tool is bin-only: there is no library target, so every test run is
 | `src/net/upstream.rs` | corporate upstream proxy chaining (D-2) |
 | `src/audit/` | chain core (`mod`), session-start leaf (`session_start`), `verify`, `show`, `filter` |
 | `src/sandbox/` | AppContainer specifics: `appcontainer`, `allowlist`, `spawn`, `dacl_journal`, `job` |
-| `src/profile.rs` | profile schema, load, merge, resolve |
+| `src/profile.rs` | profile schema, load, merge, resolve; the `network` / `limits` slices and `Limits::session_budget()` |
 | `src/setup.rs`, `security_groups.rs`, `signing.rs` | setup checks + elevation probe, group expansion, Ed25519 signing |
 | `src/bin/saife-launch.rs` | wrapper launcher: env, probe, child spawn, exit code |
 | `tests/run-tests.ps1` | the integration suite (93 scenarios), `-Backend` switch |

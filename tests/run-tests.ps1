@@ -2932,7 +2932,7 @@ function Invoke-Scenario-S86 {
 # Prompt note for the trio below (S-87/S-88/S-90): the prompt is enabled ON
 # PURPOSE - the claim is "decided before the prompt". The assertions are safe
 # against regressions in the stages under test, but an UNRELATED allow-matcher
-# regression would fall through to the dialog and stall up to promptTimeoutSecs
+# regression would fall through to the dialog and stall up to limits.promptTimeoutSecs
 # (60 s) before failing - bounded by Invoke-Sandbox's 120 s kill, so slow, never
 # a hang.
 

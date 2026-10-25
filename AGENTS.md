@@ -61,9 +61,10 @@ WinINet/system-proxy class, whose remedy is `--backend appcontainer`.
 stderr for every successful session so the evidence is auditable.
 
 Session deadlines are supervisor arithmetic, not a caller value:
-`promptTimeoutSecs + workloadTimeoutSecs + slack` (profile `network.*`; defaults
-60 s + 30 min + 2 min). A workload that legitimately runs longer must raise
-`network.workloadTimeoutSecs` - there is no "no deadline" mode.
+`promptTimeoutSecs + workloadTimeoutSecs + slack` (profile top-level `limits`
+section; defaults 60 s + 30 min + 2 min). Moved 2026-10-25: both keys used to be
+`network.*`, and that location is now REFUSED. A workload that legitimately runs
+longer must raise `limits.workloadTimeoutSecs` - there is no "no deadline" mode.
 
 ## Testing
 
