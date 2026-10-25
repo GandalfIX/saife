@@ -42,12 +42,22 @@ pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
     let mut prev_hash: Option<String> = None;
     let mut computed_root: Option<String> = None;
     let mut leaf_count: usize = 0;
+    let total_lines = content.lines().count();
+    // A crash mid-append leaves a partial last line with no terminator. That is
+    // INCOMPLETE evidence, not tampering: calling it tampered teaches the operator
+    // to ignore the verdict that matters.
+    let torn_tail = !content.ends_with('\n');
 
     for (i, line) in content.lines().enumerate() {
         if line.trim().is_empty() { continue; }
         leaf_count += 1;
         let leaf: Value = match serde_json::from_str(line) {
             Ok(v) => v,
+            Err(e) if torn_tail && i + 1 == total_lines => {
+                return Ok(VerifyOutcome::Incomplete(format!(
+                    "leaf {i}: last line is truncated ({e}) - the session was killed mid-write"
+                )));
+            }
             Err(e) => return Ok(VerifyOutcome::Tampered(
                 format!("leaf {i}: invalid JSON ({e})")
             )),
@@ -58,6 +68,25 @@ pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
                 format!("leaf {i}: not a JSON object")
             )),
         };
+
+        // The log must belong to the session it is filed under, and its sequence
+        // numbers must be the line order. Both were unchecked, so copying a clean
+        // session's .ndjson/.root/.sig over another session's names verified OK -
+        // a substitution that needs no key at all.
+        if let Some(leaf_sid) = obj.get("sid").and_then(|x| x.as_str())
+            && leaf_sid != session_id
+        {
+            return Ok(VerifyOutcome::Tampered(format!(
+                "leaf {i}: belongs to session {leaf_sid}, not {session_id}"
+            )));
+        }
+        if let Some(seq) = obj.get("seq").and_then(|x| x.as_u64())
+            && seq != leaf_count as u64 - 1
+        {
+            return Ok(VerifyOutcome::Tampered(format!(
+                "leaf {i}: seq {seq} does not match its position in the log"
+            )));
+        }
 
         let stored_hash = match obj.get("hash").and_then(|x| x.as_str()) {
             Some(h) => h.to_string(),
@@ -332,5 +361,90 @@ mod tests {
         let outcome = verify_inner(&sid).unwrap();
         cleanup(&sid);
         assert!(matches!(outcome, VerifyOutcome::BadSignature(_)), "got {:?}", outcome);
+    }
+
+    /// Substitution, the attack that needs no key: copy a clean session's log over
+    /// another session's file name. Leaves now carry the session id, so the copy is
+    /// reported as tampered instead of verified.
+    #[test]
+    fn a_log_copied_from_another_session_is_tampered() {
+        let a = fresh_sid("copy-from");
+        let b = fresh_sid("copy-to");
+        {
+            let w = AuditWriter::open(&a, false).unwrap();
+            let mut e = Map::new();
+            e.insert("op".into(), json!("CONNECT"));
+            e.insert("host".into(), json!("example.com"));
+            w.append(e).unwrap();
+        }
+        std::fs::copy(audit_log_path(&a), audit_log_path(&b)).unwrap();
+
+        match verify_inner(&b).unwrap() {
+            VerifyOutcome::Tampered(m) => assert!(
+                m.contains("belongs to session"),
+                "the verdict must name the mismatch: {m}"
+            ),
+            other => panic!("a copied log must not verify: {other:?}"),
+        }
+        cleanup(&a);
+        cleanup(&b);
+    }
+
+    /// Sequence numbers are the line order. Deleting a middle leaf used to be caught
+    /// by the parent link; this pins the other half, so a log that has been rewritten
+    /// with consistent parents but wrong ordering is still refused.
+    #[test]
+    fn a_leaf_with_the_wrong_seq_is_tampered() {
+        let sid = fresh_sid("seq");
+        {
+            let w = AuditWriter::open(&sid, false).unwrap();
+            for host in ["a.example", "b.example", "c.example"] {
+                let mut e = Map::new();
+                e.insert("op".into(), json!("CONNECT"));
+                e.insert("host".into(), json!(host));
+                w.append(e).unwrap();
+            }
+        }
+        let path = audit_log_path(&sid);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.remove(1); // drop the middle leaf, leaving a seq gap
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Tampered(m) => assert!(
+                m.contains("seq") || m.contains("parent"),
+                "a gap must be reported as tampering: {m}"
+            ),
+            other => panic!("a log missing a leaf must not verify: {other:?}"),
+        }
+        cleanup(&sid);
+    }
+
+    /// A kill mid-write leaves a partial last line. That is an incomplete session,
+    /// not an edited one - the distinction the operator acts on.
+    #[test]
+    fn a_torn_last_line_is_incomplete_not_tampered() {
+        let sid = fresh_sid("torn");
+        {
+            let w = AuditWriter::open(&sid, false).unwrap();
+            let mut e = Map::new();
+            e.insert("op".into(), json!("CONNECT"));
+            e.insert("host".into(), json!("example.com"));
+            w.append(e).unwrap();
+        }
+        let path = audit_log_path(&sid);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"op\":\"CONNE"); // no trailing newline
+        std::fs::write(&path, text).unwrap();
+
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Incomplete(m) => assert!(
+                m.contains("truncated"),
+                "the verdict must say what it found: {m}"
+            ),
+            other => panic!("a torn tail is incomplete, not {other:?}"),
+        }
+        cleanup(&sid);
     }
 }

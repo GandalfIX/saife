@@ -1,6 +1,11 @@
 mod audit;
 mod cli;
 mod net;
+// Plugins/sidecars are a capability of the mxc backend; without the feature the
+// module is compiled but unreachable. Scoped to the feature state rather than a
+// blanket `#![allow(dead_code)]`, so genuine rot inside it still shows up in the
+// build that uses it.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 mod plugin;
 mod profile;
 mod sandbox;
@@ -712,7 +717,7 @@ fn run_inner(
     // on 127.0.0.1:<port>. Fails gracefully when unprivileged (degrades to
     // block-net behavior with a warning).
     if !net_cfg.is_blocked()
-        && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
+        && let Err(e) = net::loopback::register_loopback(&session.ac_sid.0)
     {
         eprintln!("[saife] warning: loopback exemption failed: {e}");
         eprintln!("[saife]          Re-run 'saife run' as administrator (loopback is");
@@ -751,7 +756,7 @@ fn run_inner(
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
 
-    if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries, run_journal.as_ref()) {
+    if let Err(e) = sandbox::grant_access(&session.ac_sid.0, &entries, run_journal.as_ref()) {
         eprintln!("[saife] warning: some ACL grants failed: {e}");
     }
 
@@ -1217,7 +1222,11 @@ fn refusal_for(err: &net::mxc::MxcError) -> Option<audit::session_start::TierRef
         // source, `Required` without a proxy) and `Unproven` the post-run one. The
         // tier the session required is the refusal's `expected`; the root already
         // carries the tier that was probed.
-        MxcError::Guard(_) | MxcError::Unproven(_) => Some(TierRefusal::proof_unmet(REQUIRED_TIER)),
+        // Each guard cause gets its own token: an operator error and a client stack
+        // that cannot use a proxy are different diagnoses, and the audit is the only
+        // place that distinction survives.
+        MxcError::Guard(g) => Some(TierRefusal::refused(g.audit_reason(), REQUIRED_TIER)),
+        MxcError::Unproven(_) => Some(TierRefusal::proof_unmet(REQUIRED_TIER)),
         // Guardrail 2, the shape that can only be reached after the root exists:
         // the launch's own probe of the same request disagreed with the pre-launch
         // probe the root was written from. The mismatch carries what was dispatched
@@ -1477,14 +1486,16 @@ fn seal_audit(
     // We then drop the proxy handle + our Arc<AuditWriter> (releasing the file
     // handle) and write the root+sig using the captured root string. No reopen
     // needed.
-    let captured_root = writer.current_root();
+    // Seal FIRST: from here no leaf can be appended, so the root below is the last
+    // line of the file by construction. The previous shape captured the root, dropped
+    // the proxy and slept 50 ms - and a late refusal-aggregate flush in that window
+    // produced a log that grew past its own committed root, which `verify` reports as
+    // TAMPERED. A sleep is not a happens-before edge.
+    let captured_root = writer.seal();
 
-    // Drop the proxy handle (cancels token, detaches the task — non-blocking).
-    // The proxy thread may still be mid-`append` to the file, but the in-memory
-    // `last_hash` is already captured above. We sleep briefly to let the proxy
-    // thread finish its in-flight file writes after cancellation.
+    // The proxy can still be winding down; its late appends are now dropped by the
+    // sealed writer instead of racing the file.
     drop(proxy);
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Drop our Arc<AuditWriter>. The proxy thread's Arc may still be alive (it
     // was detached), but `AuditWriter::append` holds the file open with
@@ -1704,12 +1715,25 @@ mod tests {
         use audit::session_start::{REASON_PROOF_UNMET, REASON_TIER_MISMATCH};
         use net::mxc::{GuardError, MxcError, REQUIRED_TIER, RequestError, TierMismatch};
 
-        // Guardrail 1, pre-run shape.
+        // Guardrail 1, pre-run shape. The reason is the guard's own cause, so the
+        // five diagnoses stay distinguishable in the record.
         let guard = MxcError::Guard(GuardError::ProbeUnmet);
         let refusal = refusal_for(&guard).expect("guardrail 1 is recorded");
         assert_eq!(refusal.expected, REQUIRED_TIER);
-        assert_eq!(refusal.reason, REASON_PROOF_UNMET);
+        assert_eq!(refusal.reason, "proxy_probe_unmet");
         assert_eq!(launch_failure_exit(&guard), EXIT_REFUSED);
+
+        // A different cause is a different token - this is what the collapse lost.
+        let no_client = MxcError::Guard(GuardError::WorkloadCannotAuthenticate);
+        assert_eq!(
+            refusal_for(&no_client).expect("recorded").reason,
+            "workload_cannot_authenticate"
+        );
+        let no_source = MxcError::Guard(GuardError::MissingProofSource);
+        assert_eq!(
+            refusal_for(&no_source).expect("recorded").reason,
+            "proxy_proof_unavailable"
+        );
 
         // Guardrail 1, post-run shape: same reason, and the one that carries the
         // workload's own output into the transcript.

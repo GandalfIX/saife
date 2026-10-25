@@ -790,6 +790,20 @@ pub fn filesystem_policy(
     // request whose deny list was filtered against a grant set missing it.
     ensure_launcher_grant(&mut filesystem, &launcher);
 
+    // F-11: the launcher is executed by the NEXT session, on the host. A writable
+    // grant that contains it therefore hands the workload a way to run code with the
+    // supervisor's rights - the escalation the wrapper exists to avoid.
+    for grant in &filesystem.readwrite_paths {
+        let g = path_key(grant);
+        let l = path_key(&launcher.display().to_string());
+        if l == g || l.starts_with(&format!("{g}\\")) {
+            return Err(RequestError::GrantCoversLauncher {
+                grant: grant.clone(),
+                launcher: launcher.display().to_string(),
+            });
+        }
+    }
+
     let grants = granted_paths(&filesystem);
     if let Some(profile) = profile_dir {
         for dir in PROFILE_SECRET_DIRS {
@@ -799,6 +813,23 @@ pub fn filesystem_policy(
                 &grants,
             )?;
         }
+    }
+
+    // The tool's own control plane, denied for every launch. `.saife` holds the
+    // plugin manifests whose `command` runs host-side and the learned policy; the
+    // sibling `%LOCALAPPDATA%\saife` holds the audit log and the signing key. A
+    // profile that grants `$HOME` would otherwise let the workload rewrite a plugin
+    // that executes outside the sandbox on the next run.
+    for dir in crate::profile::builtin_deny_dirs() {
+        let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        if PROFILE_SECRET_DIRS.contains(&name) {
+            continue; // already denied above
+        }
+        push_deny(
+            &mut filesystem.denied_paths,
+            &dir.display().to_string(),
+            &grants,
+        )?;
     }
     for candidate in configured_denies {
         push_deny(&mut filesystem.denied_paths, candidate, &grants)?;
@@ -976,6 +1007,24 @@ pub enum GuardError {
     /// path is unproven, here the path is proven and the *workload's client stack*
     /// cannot use it.
     WorkloadCannotAuthenticate,
+}
+
+impl GuardError {
+    /// The token written to the audit as `reason`. The five causes exist because
+    /// they mean different things to whoever reads the log afterwards - a missing
+    /// proof source is an operator error, `WorkloadCannotAuthenticate` is a client
+    /// stack that cannot use a proxy at all - and collapsing them into
+    /// `proxy_proof_unmet` threw that away in the one artifact that outlives the
+    /// process.
+    pub fn audit_reason(&self) -> &'static str {
+        match self {
+            GuardError::MissingProofSource => "proxy_proof_unavailable",
+            GuardError::RequiredWithoutProxy => "proxy_required_without_proxy",
+            GuardError::ProxyConsultedUnexpectedly => "proxy_consulted_unexpectedly",
+            GuardError::ProbeUnmet => "proxy_probe_unmet",
+            GuardError::WorkloadCannotAuthenticate => "workload_cannot_authenticate",
+        }
+    }
 }
 
 impl fmt::Display for GuardError {
@@ -1522,6 +1571,10 @@ pub enum RequestError {
         /// The SDK's message, unedited.
         reason: String,
     },
+    /// A writable grant contains the launcher binary. The launcher runs in the HOST
+    /// session on the NEXT launch (that is the whole wrapper design), so a workload
+    /// that can rewrite it is scheduling code to run with the supervisor's rights.
+    GrantCoversLauncher { grant: String, launcher: String },
 }
 
 impl fmt::Display for RequestError {
@@ -1565,6 +1618,12 @@ impl fmt::Display for RequestError {
             Self::InvalidRequest { reason } => write!(
                 f,
                 "the sandbox SDK rejected this session's request: {reason}"
+            ),
+            RequestError::GrantCoversLauncher { grant, launcher } => write!(
+                f,
+                "writable grant {grant:?} contains the launcher {launcher:?}: the launcher runs \
+                 on the host at the next launch, so a workload that can replace it is scheduling \
+                 code to run with the supervisor's rights. Narrow the grant."
             ),
         }
     }
@@ -5200,10 +5259,21 @@ mod tests {
             Path::new(TEST_LAUNCHER),
         )
         .expect("a deny that contains no grant is kept");
+        let secrets: Vec<_> = fs
+            .denied_paths
+            .iter()
+            .filter(|d| d.eq_ignore_ascii_case(r"C:\secrets"))
+            .collect();
         assert_eq!(
-            fs.denied_paths,
-            vec![r"C:\secrets".to_string()],
-            "case, a trailing separator, a verbatim prefix and a trailing dot are one deny"
+            secrets.len(),
+            1,
+            "case, a trailing separator, a verbatim prefix and a trailing dot are one deny: {:?}",
+            fs.denied_paths
+        );
+        assert!(
+            fs.denied_paths.len() > 1,
+            "the tool's own control plane is always denied as well: {:?}",
+            fs.denied_paths
         );
         assert!(
             !fs.denied_paths.iter().any(|d| d.contains(".ssh")),
@@ -5304,12 +5374,15 @@ mod tests {
             Path::new(TEST_LAUNCHER),
         )
         .expect("neither deny contains a grant");
-        assert_eq!(
-            fs.denied_paths,
-            vec![r"D:\secrets".to_string(), r"C:\work2".to_string()],
-            "`C:\\work2` shares a prefix with the grant but is a sibling: the check stays \
-             segment-aware"
-        );
+        for expected in [r"D:\secrets", r"C:\work2"] {
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(expected)),
+                "{expected} must survive: {:?}",
+                fs.denied_paths
+            );
+        }
     }
 
     /// BLOCKING 1, the ordering defect: the launcher lives under the user profile
@@ -5361,10 +5434,16 @@ mod tests {
             "the launcher grant is part of the policy: {:?}",
             fs.readonly_paths
         );
-        assert_eq!(
-            fs.denied_paths.len(),
-            PROFILE_SECRET_DIRS.len(),
-            "all four credential denies must survive: {:?}",
+        let saife = std::path::Path::new(PROFILE).join(".saife");
+        assert!(
+            fs.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&saife.display().to_string())),
+            "the tool's own plugin/policy root must stay denied even when the launcher sits \
+             under the profile: {:?}",
+            fs.denied_paths
+        );
+        assert!(
+            fs.denied_paths.len() >= PROFILE_SECRET_DIRS.len(),
+            "the credential denies must survive: {:?}",
             fs.denied_paths
         );
     }
@@ -10273,5 +10352,80 @@ exit /b 0
             "EVIDENCE done: a launch whose probe never arrived was refused with \
              proxy_probe_unmet, its workload had already exited 0, and nothing claimed a decision"
         );
+    }
+
+    /// The tool's own control plane is a deny for every launch, whether or not the
+    /// profile names one: `.saife` holds plugin manifests whose command runs
+    /// host-side, and `%LOCALAPPDATA%\saife` holds the audit log and signing key.
+    #[test]
+    fn the_tool_control_plane_is_always_denied() {
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE");
+        let policy = filesystem_policy(
+            std::path::Path::new(r"C:\work"),
+            &[],
+            &[],
+            &[],
+            Some(Path::new(&home)),
+            std::path::Path::new(r"C:\launcher.exe"),
+        )
+        .expect("no deny covers a grant");
+        let want = Path::new(&home).join(".saife").display().to_string();
+        assert!(
+            policy.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&want)),
+            ".saife must be denied: {:?}",
+            policy.denied_paths
+        );
+        if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
+            let audit = Path::new(&lad).join("saife").display().to_string();
+            assert!(
+                policy.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&audit)),
+                "%LOCALAPPDATA%\\saife must be denied: {:?}",
+                policy.denied_paths
+            );
+        }
+    }
+
+    /// Granting the control plane is refused, not silently narrowed: a workload
+    /// that can write `.saife/plugins` can have a sidecar executed host-side.
+    #[test]
+    fn granting_the_control_plane_is_refused() {
+        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+        let err = filesystem_policy(
+            std::path::Path::new(r"C:\work"),
+            &[home.join(".saife").join("plugins")],
+            &[],
+            &[],
+            None,
+            std::path::Path::new(r"C:\launcher.exe"),
+        )
+        .expect_err("a grant inside .saife must be refused");
+        assert!(
+            matches!(err, RequestError::DenyCoversGrant { .. }),
+            "expected DenyCoversGrant, got {err:?}"
+        );
+    }
+
+    /// F-11: the launcher runs on the HOST at the next launch. A writable grant that
+    /// contains it lets this workload replace the binary that the next session
+    /// executes with the supervisor's rights.
+    #[test]
+    fn a_writable_grant_that_contains_the_launcher_is_refused() {
+        let launcher_dir = std::path::PathBuf::from(r"C:\tools\saife");
+        let launcher = launcher_dir.join("saife-launch.exe");
+        let err = filesystem_policy(
+            std::path::Path::new(r"C:\work"),
+            std::slice::from_ref(&launcher_dir),
+            &[],
+            &[],
+            None,
+            &launcher,
+        )
+        .expect_err("a grant containing the launcher must be refused");
+        match err {
+            RequestError::GrantCoversLauncher { grant, .. } => {
+                assert_eq!(grant, launcher_dir.display().to_string());
+            }
+            other => panic!("expected GrantCoversLauncher, got {other:?}"),
+        }
     }
 }

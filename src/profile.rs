@@ -198,6 +198,42 @@ pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = crate::net::prompt::DEFAULT_PROMPT_
 /// default.
 pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS;
 
+/// Directories denied for EVERY launch, on both backends, whatever the profile says.
+///
+/// `.ssh`/`.aws`/`.azure`/`.gnupg` are credentials. `.saife` holds the plugin
+/// manifests whose `command` is executed HOST-side on the next `--plugin` run, the
+/// learned allow/deny policy, and sits beside the audit log and the DPAPI-wrapped
+/// signing key in `%LOCALAPPDATA%\saife`. A profile that grants `$HOME` would
+/// otherwise let the workload rewrite a plugin that later runs outside the sandbox -
+/// a full escape, which is why this is a deny and not a documentation note.
+pub fn builtin_deny_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
+        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
+            out.push(home.join(dir));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
+        out.push(local.join("saife"));
+    }
+    out
+}
+
+/// Does `outer` contain `inner` (equal, or an ancestor)? Component-wise and
+/// case-insensitive, because Windows paths are. Used to refuse a session whose
+/// deny would swallow a grant instead of silently locking the workload out.
+pub fn path_covers(outer: &std::path::Path, inner: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        p.display()
+            .to_string()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    }
+    let (o, i) = (norm(outer), norm(inner));
+    i == o || i.starts_with(&format!("{o}\\"))
+}
+
 /// Ceiling for both `limits` terms: 7 days
 /// ([`crate::net::MAX_WORKLOAD_TIMEOUT_SECS`]).
 pub const MAX_LIMIT_SECS: u32 = crate::net::MAX_WORKLOAD_TIMEOUT_SECS;
@@ -653,9 +689,27 @@ fn load_raw_chain(name: &str, cwd: &Path, seen: &mut Vec<String>) -> Result<RawP
 /// - `--profile claude-code` -> %USERPROFILE%\.saife\profiles\claude-code.json
 /// - `--profile ./relative/path.json` -> resolved against cwd
 /// - `--profile C:\abs\path.json` -> as-is
-fn resolve_profile_path(name: &str, _cwd: &Path) -> Result<PathBuf> {
+fn resolve_profile_path(name: &str, cwd: &Path) -> Result<PathBuf> {
     let p = Path::new(name);
-    if p.is_absolute() || name.ends_with(".json") {
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    // A relative file path is REFUSED, and this is CR-10 rather than a style rule.
+    // `./x.json` is a path inside the workspace by construction, which means the
+    // agent under test can write it - and then the next session starts with a policy
+    // of the agent's choosing. Resolving it against the session cwd (an earlier fix
+    // here) made that explicit instead of accidental, which is worse, not better.
+    // Profiles live in %USERPROFILE%\.saife\profiles\ (by name) or at an absolute
+    // path the operator typed.
+    if name.ends_with(".json") {
+        let _ = cwd;
+        if p.is_relative() {
+            anyhow::bail!(
+                "profile path must be absolute: {name:?} would be resolved inside the workspace, \
+                 which the sandboxed process can write (CR-10). Put the file in \
+                 %USERPROFILE%\\.saife\\profiles\\ and use its name, or pass an absolute path."
+            );
+        }
         return Ok(p.to_path_buf());
     }
     // Bare name: look in %USERPROFILE%\.saife\profiles\<name>.json
@@ -1562,5 +1616,121 @@ mod tests {
             clock.timeout_reason(),
             TimeoutReason::WorkloadBudgetExceeded
         );
+    }
+
+    /// The loader's WIRING, not its parts: a three-level `extends` chain read from
+    /// real files, resolved through `load_and_resolve`. Every helper below was
+    /// tested in isolation while this path had no test at all - a regression that
+    /// dropped the cycle check or the merge would have stayed green.
+    #[test]
+    fn a_three_level_extends_chain_is_flattened_and_merges_child_over_parent() {
+        let dir = temp_dir("chain");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "base", r#"{
+            "meta": {"name": "base", "version": "1.0.0", "schema_version": 1},
+            "filesystem": {"allow": ["C:/a"], "deny": ["C:/secret"]},
+            "limits": {"workloadTimeoutSecs": 100},
+            "network": {"profile": "minimal", "allow_domain": ["base.example"]}
+        }"#);
+        write_profile(&dir, "mid", &format!(r#"{{
+            "meta": {{"name": "mid", "version": "1.0.0", "schema_version": 1}},
+            "extends": "{}",
+            "filesystem": {{"read_only": ["C:/ro"]}},
+            "limits": {{"promptTimeoutSecs": 5}}
+        }}"#, json_escaped(&dir.join("base.json"))));
+        write_profile(&dir, "leaf", &format!(r#"{{
+            "meta": {{"name": "leaf", "version": "1.0.0", "schema_version": 1}},
+            "extends": "{}",
+            "filesystem": {{"allow": ["C:/b"]}},
+            "limits": {{"workloadTimeoutSecs": 200}},
+            "network": {{"allow_domain": ["leaf.example"]}}
+        }}"#, json_escaped(&dir.join("mid.json"))));
+
+        let resolved = load_and_resolve(dir.join("leaf.json").to_str().unwrap(), &dir).unwrap();
+        let allow: Vec<String> = resolved.filesystem.allow.iter().map(|p| p.display().to_string()).collect();
+        assert!(allow.iter().any(|p| p.ends_with("a")), "parent grant kept: {allow:?}");
+        assert!(allow.iter().any(|p| p.ends_with("b")), "child grant added: {allow:?}");
+        assert!(
+            resolved.filesystem.deny.iter().any(|p| p.display().to_string().ends_with("secret")),
+            "the grandparent's deny survives two levels: {:?}",
+            resolved.filesystem.deny
+        );
+        assert_eq!(
+            resolved.limits.workload_timeout_secs, Some(200),
+            "the child overrides an inherited scalar"
+        );
+        assert_eq!(
+            resolved.limits.prompt_timeout_secs, Some(5),
+            "an inherited scalar fills the gap"
+        );
+        let domains: Vec<String> = resolved.network.allow_domain.clone();
+        for want in ["base.example", "leaf.example"] {
+            assert!(domains.iter().any(|d| d == want), "{want} missing: {domains:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CR-10: a relative profile path is a path inside the workspace, which the
+    /// workload can write - so it is refused, naming the alternative. An absolute
+    /// path (the operator's explicit choice) still loads.
+    #[test]
+    fn a_relative_profile_path_is_refused_and_an_absolute_one_loads() {
+        let dir = temp_dir("cwd");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "solo", r#"{
+            "meta": {"name": "solo", "version": "1.0.0", "schema_version": 1}
+        }"#);
+
+        let err = match load_and_resolve("./solo.json", &dir) {
+            Ok(_) => panic!("a workspace-relative profile must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("CR-10"), "the refusal must cite the decision: {err}");
+
+        let abs = dir.join("solo.json");
+        let resolved = load_and_resolve(abs.to_str().unwrap(), &dir)
+            .expect("an absolute path is the operator's explicit choice");
+        assert_eq!(resolved.name, "solo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing parent names the file it looked for, not just the name.
+    #[test]
+    fn a_missing_parent_in_the_chain_names_the_path() {
+        let dir = temp_dir("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "child", r#"{
+            "meta": {"name": "child", "version": "1.0.0", "schema_version": 1},
+            "extends": "./nope.json"
+        }"#);
+        let err = match load_and_resolve(dir.join("child.json").to_str().unwrap(), &dir) {
+            Ok(_) => panic!("a missing parent must fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("nope.json"), "the error must name the missing file: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "saife-profile-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        d
+    }
+
+/// A Windows path as a JSON string value: separators doubled, so a profile file
+    /// written from a test is valid JSON on this platform.
+    fn json_escaped(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "\\\\")
+    }
+
+    fn write_profile(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(format!("{name}.json")), body).unwrap();
     }
 }

@@ -30,7 +30,6 @@
 //! condvar; it uses `blocking_lock()` (legal outside a runtime) and
 //! `close()` wakes + joins it promptly.
 
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -286,7 +285,7 @@ impl IntentRegistry {
     pub fn close(&mut self) {
         {
             let (lock, cv) = &*self.shutdown;
-            let mut flag = lock.lock().expect("intent sweeper shutdown lock poisoned");
+            let mut flag = lock.lock().unwrap_or_else(|p| p.into_inner());
             *flag = true;
             cv.notify_all();
         }
@@ -311,7 +310,7 @@ fn sweeper_loop(state: Arc<Mutex<State>>, shutdown: Arc<(StdMutex<bool>, Condvar
         // Sleep for `interval`, waking early on the shutdown signal.
         {
             let (lock, cv) = &*shutdown;
-            let mut flag = lock.lock().expect("intent sweeper shutdown lock poisoned");
+            let mut flag = lock.lock().unwrap_or_else(|p| p.into_inner());
             let deadline = std::time::Instant::now() + interval;
             loop {
                 if *flag {
@@ -323,7 +322,7 @@ fn sweeper_loop(state: Arc<Mutex<State>>, shutdown: Arc<(StdMutex<bool>, Condvar
                 }
                 let (guard, _t) = cv
                     .wait_timeout(flag, deadline - now)
-                    .expect("intent sweeper shutdown lock poisoned");
+                    .unwrap_or_else(|p| p.into_inner());
                 flag = guard;
             }
         }

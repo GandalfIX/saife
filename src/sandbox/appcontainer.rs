@@ -18,8 +18,28 @@ use crate::sandbox::dacl_journal::{DaclJournal, JournalEntry, PriorAce};
 #[allow(dead_code)]
 pub struct AppContainerSession {
     pub sid: String,
-    pub ac_sid: PSID,
+    /// Owned: a SID from `CreateAppContainerProfile`/`DeriveAppContainerSidFromAppContainerName`
+    /// is freed with `FreeSid`. It used to be a bare `PSID`, so every session leaked
+    /// one allocation and nothing said who was responsible for it.
+    pub ac_sid: OwnedSid,
     pub ac_name: String,
+}
+
+/// A SID that must be released with `FreeSid`.
+pub(crate) struct OwnedSid(pub PSID);
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeSid(self.0);
+        }
+    }
+}
+
+impl std::fmt::Debug for OwnedSid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnedSid(..)")
+    }
 }
 
 /// Create (or re-derive) the AppContainer profile for `sid` and return the
@@ -80,7 +100,7 @@ pub fn create_session(sid: &str) -> Result<AppContainerSession> {
 
     Ok(AppContainerSession {
         sid: sid.to_string(),
-        ac_sid,
+        ac_sid: OwnedSid(ac_sid),
         ac_name,
     })
 }
@@ -158,6 +178,20 @@ pub fn grant_access(
     let diag = std::env::var_os("SAIFE_DIAG").is_some();
     for e in entries {
         if let Err(err) = grant_one(ac_sid, e, journal) {
+            // A failed GRANT means less access than the profile asked for: warn and
+            // carry on. A failed DENY means MORE access than the profile allows, so
+            // the session must not start - continuing was fail-open, and only visible
+            // under SAIFE_DIAG.
+            if e.deny {
+                return Err(Error::new(
+                    E_ACCESSDENIED,
+                    format!(
+                        "deny ACE for {:?} could not be applied: {err} - refusing the session \
+                         rather than running it with the deny missing",
+                        e.win32_path
+                    ),
+                ));
+            }
             if diag {
                 eprintln!(
                     "[grant] WARN: {:>16} {:?} failed: {err}",
@@ -952,6 +986,32 @@ pub(crate) fn allocate_private_network_capability_sid() -> Option<PSID> {
     }
 }
 
+/// Credential-shaped environment variable names, dropped before the child sees them.
+/// Deliberately broad and name-based: the point is to break the "export it in your
+/// shell" habit, not to be a secret scanner. A workload that legitimately needs one
+/// gets it from a sidecar.
+fn is_credential_shaped_env(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITLAB_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AZURE_CLIENT_SECRET",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ];
+    if EXACT.iter().any(|e| name.eq_ignore_ascii_case(e)) {
+        return true;
+    }
+    let upper = name.to_ascii_uppercase();
+    ["TOKEN", "API_KEY", "APIKEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+}
+
 /// Build the child environment block: parent env + `PATH` prepended with
 /// `.sandbox\<sid>\bin`, `PYTHONPATH` prepended with `.sandbox\<sid>\pyshim`
 /// (the CPython 0o700-mkdir interposition — see sitecustomize.py), plus the
@@ -1015,7 +1075,12 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
     // Track which of the 4 proxy vars we've already emitted (by index) so we
     // can fill in any that were missing from the parent env afterwards.
     let mut proxy_seen = [false; 4];
-    for (k, v) in std::env::vars() {
+    // US-1 promises the sandbox does not hand a workload the operator's credentials.
+    // Copying the whole parent environment did exactly that: a shell with
+    // GITHUB_TOKEN or OPENAI_API_KEY exported (or ALL_PROXY with userinfo) passed it
+    // straight in. Credential-shaped names are dropped; a workload that needs one
+    // should get it from a plugin/sidecar, which leaves an audit leaf.
+    for (k, v) in std::env::vars().filter(|(k, _)| !is_credential_shaped_env(k)) {
         if k.eq_ignore_ascii_case("PATH") {
             vars.push((k, format!("{};{}", bin_path, v)));
             path_overridden = true;
@@ -1068,6 +1133,13 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
             vars.push((name.to_string(), proxy_values[idx].clone()));
         }
     }
+
+    // `CreateProcessW` requires the block to be sorted by name (Unicode order), and
+    // callers that binary-search it - cmd.exe, some C runtimes - silently miss
+    // entries when it is not. This block is built by appending PATH/PYTHONPATH/
+    // SAIFE_SESSION_SID/proxy vars to the parent's list, so without this sort the
+    // very variables the sandbox depends on were the ones a child could fail to find.
+    vars.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut block: Vec<u16> = Vec::new();
     for (k, v) in &vars {
@@ -1444,6 +1516,42 @@ mod env_block_tests {
         );
         assert_eq!(get("SAIFE_PROXY_PORT"), "49152");
         assert_eq!(get("NO_PROXY"), "localhost,127.0.0.1,::1");
+    }
+}
+
+#[test]
+fn credential_shaped_env_vars_do_not_reach_the_child() {
+    unsafe {
+        std::env::set_var("SAIFE_TEST_API_KEY", "sk-should-not-ship");
+        std::env::set_var("SAIFE_TEST_GITHUB_TOKEN", "ghp_should_not_ship");
+        std::env::set_var("SAIFE_TEST_ORDINARY", "visible");
+    }
+    let block = build_env_block("s", std::path::Path::new(r"C:\proj"), None);
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for u in block {
+        if u == 0 {
+            if cur.is_empty() {
+                break;
+            }
+            if let Some((k, _)) = cur.split_once('=') {
+                names.push(k.to_string());
+            }
+            cur.clear();
+        } else if let Some(c) = char::from_u32(u32::from(u)) {
+            cur.push(c);
+        }
+    }
+    assert!(!names.iter().any(|n| n.contains("API_KEY")), "credential leaked: {names:?}");
+    assert!(!names.iter().any(|n| n.contains("TOKEN")), "credential leaked: {names:?}");
+    assert!(
+        names.iter().any(|n| n == "SAIFE_TEST_ORDINARY"),
+        "ordinary variables must still pass: {names:?}"
+    );
+    unsafe {
+        std::env::remove_var("SAIFE_TEST_API_KEY");
+        std::env::remove_var("SAIFE_TEST_GITHUB_TOKEN");
+        std::env::remove_var("SAIFE_TEST_ORDINARY");
     }
 }
 

@@ -366,6 +366,11 @@ impl<'a> TierRefusal<'a> {
             reason: REASON_PROOF_UNMET,
         }
     }
+
+    /// A refusal whose reason is the guard's own cause, not a generic token.
+    pub fn refused(reason: &'static str, expected: &'a str) -> Self {
+        Self { expected, reason }
+    }
 }
 
 /// What the root's `disposition` says this run was.

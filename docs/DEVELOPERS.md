@@ -165,8 +165,8 @@ to `502` (`docs/adr/0001`, D9).
 ```bash
 cargo build --release                        # default: mxc + saife-launch
 cargo build --release --no-default-features  # AppContainer only (says so at startup)
-cargo test  --bin saife                    # 611 + 10 ignored  (default)
-cargo test  --bin saife --no-default-features  # 490
+cargo test  --bin saife                    # 673 + 15 ignored  (default)
+cargo test  --bin saife --no-default-features  # 542
 cargo test  --bin saife-launch                 # 19 (default build only)
 cargo clippy --all-targets [--no-default-features] # must be 0 warnings
 ```

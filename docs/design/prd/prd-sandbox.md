@@ -73,10 +73,14 @@ and console processes** that real Windows developers actually run.
   rights, no service, no driver for the MVP. (Admin-only paths are documented
   where they would unlock additional capabilities — see Technical
   Considerations.)
-- **G5. Tamper-evident audit trail** — every filesystem operation, network
-  connection attempt and child-process spawn is recorded as a Merkle leaf; the
-  signed root lets the user verify after the fact that the log was not tampered
-  with.
+- **G5. Tamper-evident audit trail** — every network decision and session
+  lifecycle event is recorded as a Merkle leaf; the signed root lets the user
+  verify after the fact that the log was not tampered with.
+  *Corrected 2026-10-25 (independent review F-7):* the original wording promised
+  every filesystem operation and every spawn. What ships records the **resolved
+  filesystem policy** (grants and denies) in `SESSION_START`, not individual
+  accesses — no kernel event source is wired. `FILE_*` and `EXEC` in FR-4.3 are
+  therefore unrealised; either an ETW consumer or a minifilter would be needed.
 - **G6. Domain-level network filtering** — default-deny outbound network with
   an explicit allow-list of domains; optional full block (`--block-net`); the
   sandboxed process is restricted to a localhost proxy port.
@@ -259,8 +263,12 @@ races, no cross-session poisoning.
 - **FR-4.2** The audit log is an append-only file at
   `%LOCALAPPDATA%\saife\audit\<session-id>.ndjson` — one JSON object per
   line, each line a Merkle leaf.
-- **FR-4.3** Recorded event types: `FILE_READ`, `FILE_WRITE`, `FILE_CREATE`,
-  `FILE_DELETE`, `CONNECT`, `EXEC`, `POLICY_VIOLATION`.
+- **FR-4.3** Recorded event types — **as shipped**: `SESSION_START`,
+  `SESSION_REFUSED`, `CONNECT`, `HTTP`, `FACADE`.
+  *Not shipped:* `FILE_READ`, `FILE_WRITE`, `FILE_CREATE`, `FILE_DELETE` and
+  `EXEC`. The ETW provider described below was never built; see the G5 correction
+  above. The policy an access was judged against IS recorded, which is what makes
+  "was this path denied?" answerable after the fact — "was it touched?" is not.
   - File events: captured via an ETW provider (`Microsoft-Windows-Kernel-File`
     + a custom `sandbox-audit` provider) consuming kernel events for processes
     inside the Job Object.
