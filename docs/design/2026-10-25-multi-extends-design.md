@@ -6,6 +6,12 @@
 > **Owner of the next step:** whoever picks up the plan in `docs/plans/`.
 > **Related:** `docs/FAQ.md` (Gradle/JVM entry), `profiles/opencode.json`,
 > `profiles/node-jvm.json`, `src/profile.rs`.
+>
+> **Status 2026-10-25:** implemented on `feature/multi-extends`. §5 decided the open
+> question the hard way: `opencode.json` now extends `["node", "jvm"]`, the expanded
+> output is byte-identical to the `node-jvm` chain it replaced, and
+> `profiles/node-jvm.json` was deleted from the repo and from the installed profile
+> store.
 
 ## 1. Goal
 

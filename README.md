@@ -178,7 +178,7 @@ Example profile (`%USERPROFILE%\.saife\profiles\claude-code.json`):
 
 ```json
 {
-  "meta": { "name": "claude-code", "version": "1.0.0" },
+  "meta": { "name": "claude-code", "version": "1.0.0", "schema_version": 1 },
   "filesystem": {
     "allow": ["$CWD", "$HOME/.claude"],
     "read_only": ["$HOME/.gitconfig"],
@@ -192,8 +192,14 @@ Example profile (`%USERPROFILE%\.saife\profiles\claude-code.json`):
 }
 ```
 
+`meta.schema_version` is required; a profile without it is refused, which is the
+one field the example above used to omit.
+
 Variables expanded in paths: `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`,
-`$SID` (the session id). Forward slashes are normalized to backslashes.
+`$LOCALAPPDATA`, `$APPDATA`, `$SID` (the session id). Forward slashes are
+normalized to backslashes. Working examples you can copy rather than retype are in
+`profiles/` (`node`, `jvm`, `opencode`); `packaging/README.txt` lists what the
+download contains.
 
 `network.block_net: true` is equivalent to `--block-net`.
 `network.allow_domain` concatenates with `--allow-domain` CLI flags.
