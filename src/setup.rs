@@ -154,7 +154,7 @@ fn grant_drive_roots() -> Result<()> {
     let sid = all_restricted_app_packages_sid()?;
 
     for root in fixed_drive_roots()? {
-        match grant_read_attributes(&root, sid) {
+        match grant_read_attributes(&root, sid.0) {
             Ok(()) => {
                 println!("[grant-drive-root] {root} granted S-1-15-2-2 :FILE_READ_ATTRIBUTES (or already present)");
             }
@@ -163,15 +163,32 @@ fn grant_drive_roots() -> Result<()> {
             }
         }
     }
-    // Free the SID we allocated.
-    unsafe {
-        let _ = windows::Win32::Security::FreeSid(sid);
-    }
+    // `sid` is an OwnedSid: FreeSid runs in its Drop, on every path including the
+    // `?` on fixed_drive_roots above. The previous code called FreeSid by hand on
+    // a pointer that had been CopySid'd into a leaked `Vec<u8>` - a Rust allocator
+    // block handed to the Win32 heap free, on the elevated path.
+    drop(sid);
     Ok(())
 }
 
+/// A SID allocated by `AllocateAndInitializeSid`, freed exactly once by `FreeSid`.
+///
+/// The previous shape returned `owned.leak().as_mut_ptr()` - a pointer into a Rust
+/// `Vec<u8>` that the caller then passed to `FreeSid`, mixing two allocators. Tying
+/// the allocation to a type is the only version of this that cannot be got wrong by
+/// adding an early return later.
+struct OwnedSid(PSID);
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Security::FreeSid(self.0);
+        }
+    }
+}
+
 /// Build the S-1-15-2-2 SID (All RESTRICTED APPLICATION PACKAGES).
-fn all_restricted_app_packages_sid() -> Result<PSID> {
+fn all_restricted_app_packages_sid() -> Result<OwnedSid> {
     // authority 15 (security manager / app packages), 2 sub-authorities: [2, 2].
     let authority = windows::Win32::Security::SID_IDENTIFIER_AUTHORITY {
         Value: [0, 0, 0, 0, 0, 15],
@@ -192,15 +209,9 @@ fn all_restricted_app_packages_sid() -> Result<PSID> {
             0,
             &mut sid,
         )?;
-        let len = windows::Win32::Security::GetLengthSid(sid) as usize;
-        let mut owned: Vec<u8> = vec![0u8; len];
-        let _ = windows::Win32::Security::CopySid(
-            len as u32,
-            PSID(owned.as_mut_ptr() as *mut _),
-            sid,
-        );
-        let _ = windows::Win32::Security::FreeSid(sid);
-        Ok(PSID(owned.leak().as_mut_ptr() as *mut _))
+        // No CopySid into a Vec: keep the SID that AllocateAndInitializeSid made and
+        // let OwnedSid free it. Copying was how the mismatched free got in.
+        Ok(OwnedSid(sid))
     }
 }
 

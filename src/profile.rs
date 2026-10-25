@@ -198,6 +198,42 @@ pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = crate::net::prompt::DEFAULT_PROMPT_
 /// default.
 pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS;
 
+/// Directories denied for EVERY launch, on both backends, whatever the profile says.
+///
+/// `.ssh`/`.aws`/`.azure`/`.gnupg` are credentials. `.saife` holds the plugin
+/// manifests whose `command` is executed HOST-side on the next `--plugin` run, the
+/// learned allow/deny policy, and sits beside the audit log and the DPAPI-wrapped
+/// signing key in `%LOCALAPPDATA%\saife`. A profile that grants `$HOME` would
+/// otherwise let the workload rewrite a plugin that later runs outside the sandbox -
+/// a full escape, which is why this is a deny and not a documentation note.
+pub fn builtin_deny_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
+        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
+            out.push(home.join(dir));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
+        out.push(local.join("saife"));
+    }
+    out
+}
+
+/// Does `outer` contain `inner` (equal, or an ancestor)? Component-wise and
+/// case-insensitive, because Windows paths are. Used to refuse a session whose
+/// deny would swallow a grant instead of silently locking the workload out.
+pub fn path_covers(outer: &std::path::Path, inner: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        p.display()
+            .to_string()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    }
+    let (o, i) = (norm(outer), norm(inner));
+    i == o || i.starts_with(&format!("{o}\\"))
+}
+
 /// Ceiling for both `limits` terms: 7 days
 /// ([`crate::net::MAX_WORKLOAD_TIMEOUT_SECS`]).
 pub const MAX_LIMIT_SECS: u32 = crate::net::MAX_WORKLOAD_TIMEOUT_SECS;

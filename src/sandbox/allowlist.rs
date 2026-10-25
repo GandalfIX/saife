@@ -96,6 +96,31 @@ pub fn build_allowlist(
         );
         collect_ancestors(p, &mut ancestor_set);
     }
+    // Built-in denies come first in the evaluation order the OS uses (explicit
+    // denies are evaluated before allows), and they are identical to the mxc
+    // backend's: credentials plus the tool's own control plane. Before AppContainer
+    // had them, `--backend appcontainer --allow $USERPROFILE` could read
+    // ~/.azure/accessTokens.json and rewrite ~/.saife/plugins, while the docs
+    // promised those directories stay denied.
+    let builtin_denies = crate::profile::builtin_deny_dirs();
+    for deny in &builtin_denies {
+        for grant in fs.allow.iter().chain(fs.read_only.iter()) {
+            if crate::profile::path_covers(deny, grant) {
+                // windows::core::Result is this module's error type; the message is
+                // what the operator sees, so it names both paths and the fix.
+                return Err(Error::new(
+                    E_INVALIDARG,
+                    format!(
+                        "deny covers grant: {} is inside the always-denied {} - narrow the \
+                         grant or drop it (a deny that swallows a grant is refused, never \
+                         silently applied)",
+                        grant.display(),
+                        deny.display()
+                    ),
+                ));
+            }
+        }
+    }
     // Profile deny entries (deny ACE).
     for p in &fs.deny {
         push_entry(
@@ -103,6 +128,16 @@ pub fn build_allowlist(
             p.clone(),
             0,
             format!("deny:{}", p.display()),
+            true,
+            false,
+        );
+    }
+    for deny in &builtin_denies {
+        push_entry(
+            &mut entries,
+            deny.clone(),
+            0,
+            format!("builtin-deny:{}", deny.display()),
             true,
             false,
         );
@@ -831,5 +866,48 @@ mod tests {
             "%TEMP% ({temp:?}) must still get its traverse grant; entries: {:?}",
             entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
         );
+    }
+
+    /// AppContainer must refuse the same grant the mxc backend refuses: a deny that
+    /// swallows a grant is an error, never a silently narrowed DACL.
+    #[test]
+    fn a_grant_inside_a_builtin_deny_is_refused() {
+        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+        let fs = FilesystemSlice {
+            allow: vec![home.join(".saife").join("plugins")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let err = match build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs) {
+            Ok(_) => panic!("a grant inside .saife must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message().contains("deny covers grant"),
+            "the refusal must name the rule: {}",
+            err.message()
+        );
+    }
+
+    /// Both backends deny the same directories, and the entries are labelled so an
+    /// operator can see which rule produced a refusal.
+    #[test]
+    fn builtin_denies_are_entries_on_the_appcontainer_path() {
+        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from("C:\\proj")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries = build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs).unwrap();
+        let want = home.join(".saife");
+        let hit = entries
+            .iter()
+            .find(|e| e.deny && e.win32_path == want)
+            .unwrap_or_else(|| {
+                let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+                panic!(".saife must be a deny entry; entries: {labels:?}")
+            });
+        assert!(hit.label.starts_with("builtin-deny:"), "label: {}", hit.label);
     }
 }

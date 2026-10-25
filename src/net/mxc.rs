@@ -800,6 +800,23 @@ pub fn filesystem_policy(
             )?;
         }
     }
+
+    // The tool's own control plane, denied for every launch. `.saife` holds the
+    // plugin manifests whose `command` runs host-side and the learned policy; the
+    // sibling `%LOCALAPPDATA%\saife` holds the audit log and the signing key. A
+    // profile that grants `$HOME` would otherwise let the workload rewrite a plugin
+    // that executes outside the sandbox on the next run.
+    for dir in crate::profile::builtin_deny_dirs() {
+        let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        if PROFILE_SECRET_DIRS.contains(&name) {
+            continue; // already denied above
+        }
+        push_deny(
+            &mut filesystem.denied_paths,
+            &dir.display().to_string(),
+            &grants,
+        )?;
+    }
     for candidate in configured_denies {
         push_deny(&mut filesystem.denied_paths, candidate, &grants)?;
     }
@@ -5200,10 +5217,21 @@ mod tests {
             Path::new(TEST_LAUNCHER),
         )
         .expect("a deny that contains no grant is kept");
+        let secrets: Vec<_> = fs
+            .denied_paths
+            .iter()
+            .filter(|d| d.eq_ignore_ascii_case(r"C:\secrets"))
+            .collect();
         assert_eq!(
-            fs.denied_paths,
-            vec![r"C:\secrets".to_string()],
-            "case, a trailing separator, a verbatim prefix and a trailing dot are one deny"
+            secrets.len(),
+            1,
+            "case, a trailing separator, a verbatim prefix and a trailing dot are one deny: {:?}",
+            fs.denied_paths
+        );
+        assert!(
+            fs.denied_paths.len() > 1,
+            "the tool's own control plane is always denied as well: {:?}",
+            fs.denied_paths
         );
         assert!(
             !fs.denied_paths.iter().any(|d| d.contains(".ssh")),
@@ -5304,12 +5332,15 @@ mod tests {
             Path::new(TEST_LAUNCHER),
         )
         .expect("neither deny contains a grant");
-        assert_eq!(
-            fs.denied_paths,
-            vec![r"D:\secrets".to_string(), r"C:\work2".to_string()],
-            "`C:\\work2` shares a prefix with the grant but is a sibling: the check stays \
-             segment-aware"
-        );
+        for expected in [r"D:\secrets", r"C:\work2"] {
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(expected)),
+                "{expected} must survive: {:?}",
+                fs.denied_paths
+            );
+        }
     }
 
     /// BLOCKING 1, the ordering defect: the launcher lives under the user profile
@@ -5361,10 +5392,16 @@ mod tests {
             "the launcher grant is part of the policy: {:?}",
             fs.readonly_paths
         );
-        assert_eq!(
-            fs.denied_paths.len(),
-            PROFILE_SECRET_DIRS.len(),
-            "all four credential denies must survive: {:?}",
+        let saife = std::path::Path::new(&format!(r"{PROFILE}")).join(".saife");
+        assert!(
+            fs.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&saife.display().to_string())),
+            "the tool's own plugin/policy root must stay denied even when the launcher sits \
+             under the profile: {:?}",
+            fs.denied_paths
+        );
+        assert!(
+            fs.denied_paths.len() >= PROFILE_SECRET_DIRS.len(),
+            "the credential denies must survive: {:?}",
             fs.denied_paths
         );
     }
@@ -10272,6 +10309,57 @@ exit /b 0
         println!(
             "EVIDENCE done: a launch whose probe never arrived was refused with \
              proxy_probe_unmet, its workload had already exited 0, and nothing claimed a decision"
+        );
+    }
+
+    /// The tool's own control plane is a deny for every launch, whether or not the
+    /// profile names one: `.saife` holds plugin manifests whose command runs
+    /// host-side, and `%LOCALAPPDATA%\saife` holds the audit log and signing key.
+    #[test]
+    fn the_tool_control_plane_is_always_denied() {
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE");
+        let policy = filesystem_policy(
+            std::path::Path::new(r"C:\work"),
+            &[],
+            &[],
+            &[],
+            Some(Path::new(&home)),
+            std::path::Path::new(r"C:\launcher.exe"),
+        )
+        .expect("no deny covers a grant");
+        let want = Path::new(&home).join(".saife").display().to_string();
+        assert!(
+            policy.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&want)),
+            ".saife must be denied: {:?}",
+            policy.denied_paths
+        );
+        if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
+            let audit = Path::new(&lad).join("saife").display().to_string();
+            assert!(
+                policy.denied_paths.iter().any(|d| d.eq_ignore_ascii_case(&audit)),
+                "%LOCALAPPDATA%\\saife must be denied: {:?}",
+                policy.denied_paths
+            );
+        }
+    }
+
+    /// Granting the control plane is refused, not silently narrowed: a workload
+    /// that can write `.saife/plugins` can have a sidecar executed host-side.
+    #[test]
+    fn granting_the_control_plane_is_refused() {
+        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+        let err = filesystem_policy(
+            std::path::Path::new(r"C:\work"),
+            &[home.join(".saife").join("plugins")],
+            &[],
+            &[],
+            None,
+            std::path::Path::new(r"C:\launcher.exe"),
+        )
+        .expect_err("a grant inside .saife must be refused");
+        assert!(
+            matches!(err, RequestError::DenyCoversGrant { .. }),
+            "expected DenyCoversGrant, got {err:?}"
         );
     }
 }
