@@ -986,10 +986,41 @@ fn resolve_profile_path(name: &str, cwd: &Path) -> Result<PathBuf> {
     let userprofile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    Ok(userprofile
-        .join(".saife")
-        .join("profiles")
-        .join(format!("{name}.json")))
+    let dir = userprofile.join(".saife").join("profiles");
+    let candidate = dir.join(format!("{name}.json"));
+    // A bare name is a NAME, not a path: resolving it to a file that is not there and
+    // letting the read fail produces the OS's own wording ("Das System kann die
+    // angegebene Datei nicht finden"), which says nothing about which profile was
+    // asked for or which ones exist. This is the message a stale `extends` produces
+    // after a profile is retired.
+    if !candidate.is_file() {
+        let mut available: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                            return None;
+                        }
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        available.sort();
+        let available = if available.is_empty() {
+            "none".to_string()
+        } else {
+            available.join(", ")
+        };
+        bail!(
+            "no profile named `{name}` in {} (available: {available})",
+            dir.display()
+        );
+    }
+    Ok(candidate)
 }
 
 /// Merge a parent profile and a child profile (child overrides scalars,
@@ -2352,5 +2383,42 @@ mod tests {
             "the chain is spelled a → b → a, not a bare 'cycle': {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare name that names nothing must say so, and list what does exist - a raw
+    /// "cannot find the file" in the OS locale is not an operator-facing error, and
+    /// it is what a stale `extends` produces after a profile is retired.
+    #[test]
+    fn a_missing_profile_name_lists_the_ones_that_exist() {
+        let _env = crate::env_lock();
+        let tmp = std::env::temp_dir().join(format!("sb-missing-{}", std::process::id()));
+        let profiles = tmp.join(".saife").join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("present.json"),
+            r#"{"meta":{"name":"present","schema_version":1}}"#,
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("USERPROFILE");
+        unsafe { std::env::set_var("USERPROFILE", &tmp) };
+        let err = match load_and_resolve("absent", &tmp) {
+            Ok(_) => panic!("a name that resolves to nothing must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        match saved {
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            err.contains("no profile named `absent`"),
+            "the message names the profile that is missing: {err}"
+        );
+        assert!(
+            err.contains("present"),
+            "and lists what exists, so the typo is visible: {err}"
+        );
     }
 }
