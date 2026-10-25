@@ -323,6 +323,28 @@ pub fn load_plugin_from(roots: &[PluginRoot], name: &str) -> Result<Plugin> {
         searched.push(root.label.clone());
         let dir = root.path.join(name);
         let manifest_path = dir.join(PLUGIN_ENTRY);
+        // An explicit --plugin-dir shadows the installed plugin of the same name.
+        // That is sometimes intentional and sometimes a checkout quietly replacing
+        // a reviewed plugin with its own copy, so say it out loud: the operator
+        // named a directory, not which manifest they were trusting.
+        if root.label != GLOBAL_ROOT_LABEL
+            && manifest_path.exists()
+            && roots
+                .iter()
+                .find(|r| r.label == GLOBAL_ROOT_LABEL)
+                .is_some_and(|global| global.path.join(name).join(PLUGIN_ENTRY).exists())
+        {
+            eprintln!(
+                "[saife] warning: plugin `{name}` from {} shadows the installed copy in {}; \
+                 the shadowing manifest is the one that will run",
+                root.path.join(name).display(),
+                roots
+                    .iter()
+                    .find(|r| r.label == GLOBAL_ROOT_LABEL)
+                    .map(|r| r.path.join(name).display().to_string())
+                    .unwrap_or_default()
+            );
+        }
         if manifest_path.is_file() {
             let manifest = read_manifest(&manifest_path, name)?;
             return Ok(Plugin { dir, manifest });

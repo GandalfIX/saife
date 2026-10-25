@@ -1,0 +1,23 @@
+﻿name: ci
+
+# What CI can prove, and what it cannot: the unit suites, the feature-less build and
+# clippy. The VM lane (tests/vm/, 93 scenarios) needs Hyper-V and a guest image, so it
+# stays a local gate - see docs/DEVELOPERS.md. A green run here does not replace it.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      # Pinned to a commit SHA: the repository requires SHA-pinned actions.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: cargo test --bin saife
+      - run: cargo test --bin saife --no-default-features
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo build --release --bin saife --bin saife-launch

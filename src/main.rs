@@ -1,6 +1,11 @@
 mod audit;
 mod cli;
 mod net;
+// Plugins/sidecars are a capability of the mxc backend; without the feature the
+// module is compiled but unreachable. Scoped to the feature state rather than a
+// blanket `#![allow(dead_code)]`, so genuine rot inside it still shows up in the
+// build that uses it.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 mod plugin;
 mod profile;
 mod sandbox;
@@ -712,7 +717,7 @@ fn run_inner(
     // on 127.0.0.1:<port>. Fails gracefully when unprivileged (degrades to
     // block-net behavior with a warning).
     if !net_cfg.is_blocked()
-        && let Err(e) = net::loopback::register_loopback(&session.ac_sid)
+        && let Err(e) = net::loopback::register_loopback(&session.ac_sid.0)
     {
         eprintln!("[saife] warning: loopback exemption failed: {e}");
         eprintln!("[saife]          Re-run 'saife run' as administrator (loopback is");
@@ -751,7 +756,7 @@ fn run_inner(
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
 
-    if let Err(e) = sandbox::grant_access(&session.ac_sid, &entries, run_journal.as_ref()) {
+    if let Err(e) = sandbox::grant_access(&session.ac_sid.0, &entries, run_journal.as_ref()) {
         eprintln!("[saife] warning: some ACL grants failed: {e}");
     }
 

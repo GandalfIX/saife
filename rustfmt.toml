@@ -1,0 +1,6 @@
+# The working tree is CRLF for Rust sources (see .gitattributes), so rustfmt output
+# must be too - otherwise `cargo fmt` fights the checkout on every run.
+newline_style = "Windows"
+edition = "2024"
+# Kept at the default width: the tree has not been formatted with a non-default
+# width, and a repo-wide reformat is not part of this pass.

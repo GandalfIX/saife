@@ -2337,11 +2337,11 @@ mod tests {
 
         // Even with on_unavailable=Allow: ZERO timeout means instant
         // deny — the policy is not consulted ([G-46]).
-        let start = Instant::now();
         let out = coord.prompt("api.example.com", 443, None, cfg).await;
         assert_eq!(out, PromptOutcome::Disabled);
         assert!(handle.calls().is_empty(), "no dialog may be attempted");
-        assert!(start.elapsed() < Duration::from_millis(500));
+        // (no wall-clock assertion here: the two assertions above already pin the
+        // behaviour, and a 500 ms bound only measures how busy the machine is.)
     }
 
     // ---- timeout ([G-4, G-46]) ----------------------------------------------

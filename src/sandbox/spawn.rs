@@ -247,7 +247,7 @@ pub fn spawn(
         };
 
         let mut sec_caps = SECURITY_CAPABILITIES {
-            AppContainerSid: session.ac_sid,
+            AppContainerSid: session.ac_sid.0,
             Capabilities: caps_ptr,
             CapabilityCount: caps_count,
             Reserved: 0,

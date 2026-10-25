@@ -18,8 +18,28 @@ use crate::sandbox::dacl_journal::{DaclJournal, JournalEntry, PriorAce};
 #[allow(dead_code)]
 pub struct AppContainerSession {
     pub sid: String,
-    pub ac_sid: PSID,
+    /// Owned: a SID from `CreateAppContainerProfile`/`DeriveAppContainerSidFromAppContainerName`
+    /// is freed with `FreeSid`. It used to be a bare `PSID`, so every session leaked
+    /// one allocation and nothing said who was responsible for it.
+    pub ac_sid: OwnedSid,
     pub ac_name: String,
+}
+
+/// A SID that must be released with `FreeSid`.
+pub(crate) struct OwnedSid(pub PSID);
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeSid(self.0);
+        }
+    }
+}
+
+impl std::fmt::Debug for OwnedSid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnedSid(..)")
+    }
 }
 
 /// Create (or re-derive) the AppContainer profile for `sid` and return the
@@ -80,7 +100,7 @@ pub fn create_session(sid: &str) -> Result<AppContainerSession> {
 
     Ok(AppContainerSession {
         sid: sid.to_string(),
-        ac_sid,
+        ac_sid: OwnedSid(ac_sid),
         ac_name,
     })
 }

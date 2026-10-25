@@ -239,8 +239,37 @@ implementation shared by both the string and address legs; guardrail 1's
 | F-10 | P1 | **fixed** | a relative profile resolves against the session cwd; three tests now enter through `load_and_resolve` (three-level chain, relative path, missing parent) |
 | F-11 | P1 | **fixed** | `parse_connect_target` returns `Option`; an unparsable port is a 400, not a silent 443; bracketed IPv6 stays legal |
 
-Gates on this branch after the pass: **670 passed / 15 ignored** (default), **542 / 1**
-(`--no-default-features`), clippy **0 warnings** in both states.
+### P2 / P3 pass (same branch, after the table above)
+
+Fixed:
+
+| item | what changed |
+|---|---|
+| refusal causes | `GuardError::audit_reason()` — five diagnoses, five tokens, instead of one `proxy_proof_unmet` |
+| exit-code collision | the launcher's usage error moved `126 → 2`; `126` stays "session refused" |
+| `--sid` | validated at `AuditWriter::open` (letters/digits/`._-`, 1..=64, never `.`/`..`) — it is a file name |
+| torn tail | a partial last line is `Incomplete`, not `Tampered`; accusing a killed session teaches the operator to ignore the verdict |
+| plugin `operations` | enforced at the facade: `(method, path)` must be declared, else `403 facade_operation_not_declared` as a FACADE leaf |
+| env block | sorted before `CreateProcessW`, as the contract requires — the appended PATH/PYTHONPATH/proxy vars were the ones a binary-searching child could miss |
+| journal errors | `dacl_journal` no longer `unwrap()`s on serialization; a non-UTF-8 path returns an error instead of panicking after ACEs were applied |
+| lock poison | `prompt.rs` and `intent.rs` recover the guard like the rest of the crate; one panic no longer wedges every later prompt |
+| dead code | the four module-wide `#![allow(dead_code)]` are gone; dead items deleted, the rest item-scoped with a reason, and the plugin module scoped to its feature state |
+| AppContainer SID | `OwnedSid` frees the per-session SID in `Drop` (it leaked one allocation per session) |
+| shadowing | a `--plugin-dir` that shadows an installed plugin of the same name says so on stderr |
+| gates | `rust-version = 1.88`, `rustfmt.toml` with `newline_style = "Windows"`, `.github/workflows/ci.yml` (both feature states, clippy `-D warnings`, release build), stale counts in `DEVELOPERS.md` corrected |
+| wall-clock test | the 500 ms bound on a zero-timeout path is gone: it measured the machine, not the behaviour |
+
+Still open, and honestly so — each is a refactor rather than a defect fix:
+
+- **positional plumbing** (`main.rs` 17-argument functions, 6 same-typed bools): needs `RunOpts` threaded through three functions. The `too_many_arguments` allows are the receipt.
+- **stringly-typed audit vocabulary**: `Disposition` exists but is `#[cfg(test)]`; `source`/`scope`/`reason` are `&str` literals. The fix is an enum per field across ~13 call sites — mechanical, and worth doing when the vocabulary is next touched.
+- **tier vocabulary duplicated** (`TierRecord` vs `TierFacts`, bridged by a hand-written adapter).
+- **`owner_trustees` still leaks** three SIDs per grant: freeing them needs two deallocator flavours (`FreeSid` for `AllocateAndInitializeSid`, `LocalFree` for `ConvertStringSidToSidW`), which is a type, not a patch.
+- **path-based DACL read-modify-write** (`GetNamedSecurityInfoW` then `CreateFileW`/`SetSecurityInfo`): the TOCTOU is real and the fix is to do both halves on one handle — a contained rewrite of `grant_one`/`restore_one`.
+- **`LIVE_TOKENS` process global** and the second session script (F-06/F-07 above).
+
+Gates on this branch after both passes: **673 passed / 15 ignored** (default), **545 / 1**
+(`--no-default-features`), clippy **0 warnings** in both states, and the 15 live legs green.
 
 The three deferred items share one property: they are restructurings, not corrections.
 F-04's guardrail leg needs a mechanism (the wrapper probe) that does not exist on the
