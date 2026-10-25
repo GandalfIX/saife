@@ -39,6 +39,30 @@ use sha2::{Digest, Sha256};
 pub const SECRET_INJECT_SCHEMA: &str =
     r#"{"op": "secret.inject", "name": "<secret-name>", "seq": <u64>, "ts": "<iso8601>", "hash": "<hex>", "parent": "<hex|null>"}"#;
 
+/// Session ids are a path component: `audit_log_path` pastes one into
+/// `%LOCALAPPDATA%\saife\audit\<sid>.ndjson`, and the root/signature files are
+/// named the same way. `--sid` took whatever the caller passed, so a CI wrapper
+/// doing `--sid "$PR_TITLE"` could write (and overwrite) files outside that
+/// directory as the user. Restricted to the alphabet the generator already uses:
+/// letters, digits, dot, underscore, hyphen - and never a bare `.` or `..`.
+pub fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+    if session_id.is_empty() || session_id.len() > 64 {
+        anyhow::bail!("session id must be 1..=64 characters, got {}", session_id.len());
+    }
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!(
+            "session id may only contain letters, digits, '.', '_' and '-': {session_id:?}"
+        );
+    }
+    if session_id == "." || session_id == ".." {
+        anyhow::bail!("session id must name a file, not a directory: {session_id:?}");
+    }
+    Ok(())
+}
+
 pub fn audit_log_path(session_id: &str) -> PathBuf {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -108,6 +132,7 @@ impl AuditWriter {
     /// is false, degrades gracefully (best-effort logging, never returns
     /// `Err`).
     pub fn open(session_id: &str, strict: bool) -> Result<Self> {
+        validate_session_id(session_id)?;
         let path = audit_log_path(session_id);
         Self::open_at(path, strict)
     }
@@ -673,5 +698,26 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The id becomes a file name, so it is validated where it is used rather than
+    /// at one of the two CLI call sites.
+    #[test]
+    fn a_session_id_that_is_a_path_is_refused() {
+        for bad in ["../escape", "a/b", "a\\b", "..", ".", "", &"x".repeat(65), "sp ace"] {
+            assert!(
+                validate_session_id(bad).is_err(),
+                "{bad:?} must not be accepted as a session id"
+            );
+        }
+        for good in ["20261025-133000-12345", "test_sid.1", "A-b_c"] {
+            assert!(validate_session_id(good).is_ok(), "{good:?} is a normal id");
+        }
+        // And the writer refuses at its door, not just the helper.
+        let err = match AuditWriter::open("../escape", false) {
+            Ok(_) => panic!("a traversal id must not reach the filesystem"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("session id"), "the refusal must say why: {err}");
     }
 }

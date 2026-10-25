@@ -995,6 +995,24 @@ pub enum GuardError {
     WorkloadCannotAuthenticate,
 }
 
+impl GuardError {
+    /// The token written to the audit as `reason`. The five causes exist because
+    /// they mean different things to whoever reads the log afterwards - a missing
+    /// proof source is an operator error, `WorkloadCannotAuthenticate` is a client
+    /// stack that cannot use a proxy at all - and collapsing them into
+    /// `proxy_proof_unmet` threw that away in the one artifact that outlives the
+    /// process.
+    pub fn audit_reason(&self) -> &'static str {
+        match self {
+            GuardError::MissingProofSource => "proxy_proof_unavailable",
+            GuardError::RequiredWithoutProxy => "proxy_required_without_proxy",
+            GuardError::ProxyConsultedUnexpectedly => "proxy_consulted_unexpectedly",
+            GuardError::ProbeUnmet => "proxy_probe_unmet",
+            GuardError::WorkloadCannotAuthenticate => "workload_cannot_authenticate",
+        }
+    }
+}
+
 impl fmt::Display for GuardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {

@@ -156,7 +156,10 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 pub const EXIT_CANT_START: i32 = 127;
 
 /// The wrapper's own command line was malformed.
-pub const EXIT_USAGE: i32 = 126;
+/// Usage error. Deliberately NOT 126: that is the supervisor's refusal code, and
+/// sharing it made an unparseable wrapper command line indistinguishable from a
+/// session the sandbox refused to start.
+pub const EXIT_USAGE: i32 = 2;
 
 /// One parsed wrapper invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]

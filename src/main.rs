@@ -1217,7 +1217,11 @@ fn refusal_for(err: &net::mxc::MxcError) -> Option<audit::session_start::TierRef
         // source, `Required` without a proxy) and `Unproven` the post-run one. The
         // tier the session required is the refusal's `expected`; the root already
         // carries the tier that was probed.
-        MxcError::Guard(_) | MxcError::Unproven(_) => Some(TierRefusal::proof_unmet(REQUIRED_TIER)),
+        // Each guard cause gets its own token: an operator error and a client stack
+        // that cannot use a proxy are different diagnoses, and the audit is the only
+        // place that distinction survives.
+        MxcError::Guard(g) => Some(TierRefusal::refused(g.audit_reason(), REQUIRED_TIER)),
+        MxcError::Unproven(_) => Some(TierRefusal::proof_unmet(REQUIRED_TIER)),
         // Guardrail 2, the shape that can only be reached after the root exists:
         // the launch's own probe of the same request disagreed with the pre-launch
         // probe the root was written from. The mismatch carries what was dispatched
@@ -1704,12 +1708,25 @@ mod tests {
         use audit::session_start::{REASON_PROOF_UNMET, REASON_TIER_MISMATCH};
         use net::mxc::{GuardError, MxcError, REQUIRED_TIER, RequestError, TierMismatch};
 
-        // Guardrail 1, pre-run shape.
+        // Guardrail 1, pre-run shape. The reason is the guard's own cause, so the
+        // five diagnoses stay distinguishable in the record.
         let guard = MxcError::Guard(GuardError::ProbeUnmet);
         let refusal = refusal_for(&guard).expect("guardrail 1 is recorded");
         assert_eq!(refusal.expected, REQUIRED_TIER);
-        assert_eq!(refusal.reason, REASON_PROOF_UNMET);
+        assert_eq!(refusal.reason, "proxy_probe_unmet");
         assert_eq!(launch_failure_exit(&guard), EXIT_REFUSED);
+
+        // A different cause is a different token - this is what the collapse lost.
+        let no_client = MxcError::Guard(GuardError::WorkloadCannotAuthenticate);
+        assert_eq!(
+            refusal_for(&no_client).expect("recorded").reason,
+            "workload_cannot_authenticate"
+        );
+        let no_source = MxcError::Guard(GuardError::MissingProofSource);
+        assert_eq!(
+            refusal_for(&no_source).expect("recorded").reason,
+            "proxy_proof_unavailable"
+        );
 
         // Guardrail 1, post-run shape: same reason, and the one that carries the
         // workload's own output into the transcript.
