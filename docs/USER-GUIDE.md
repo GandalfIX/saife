@@ -363,17 +363,29 @@ saife run --profile demo --allow-cwd -- cmd /c C:\Users\you\.cargo\bin\cargo.exe
 ```json
 {
   "meta": { "name": "node-jvm", "version": "1.0.0", "schema_version": 1 },
-  "extends": "node",
+  "extends": ["node", "jvm"],
   "filesystem": { "allow": ["$USERPROFILE/.gradle"] },
   "network": { "allow_domain": ["repo.maven.apache.org"] }
 }
 ```
 
-A child inherits its parent's entries, arrays are concatenated (deduplicated) and
-scalars are overridden by the child; chains are resolved recursively, and a cycle
-is refused. `extends` names a **single** parent, so combining two unrelated
-profiles means either chaining them (`c` extends `b` extends `a`) or adding the
-second one's paths to the child. CLI flags (`--allow`, `--read-only`,
+`extends` takes one parent (`"extends": "node"`) or several
+(`"extends": ["node", "jvm"]`). A child inherits its parents' grants: lists
+(`filesystem.allow`/`read_only`/`deny`, `network.allow_domain`/`deny_domain`) are
+concatenated and deduplicated, and anything the child sets itself wins.
+
+Settings that only make sense once — the timeouts, `block_net`, the network
+profile, the prompt and upstream settings — must **agree** across the parents. If
+two parents set the same one differently and the child does not decide, the
+profile is refused and the message names the key and both parents:
+
+    [saife] profile show: `network.block_net` conflicts between parents `a` and `b`:
+    true vs false — set it in the child to choose, or make the parents agree
+
+That refusal is deliberate: silently letting the last parent win would mean a
+session running on a policy the file does not visibly state. The order of the
+array does not matter, a parent reachable through two paths is merged once, and a
+cycle is still refused. CLI flags (`--allow`, `--read-only`,
 `--allow-domain`, `--deny-domain`) append on top of whatever the profile says, so
 a one-off extra grant does not need a profile at all.
 

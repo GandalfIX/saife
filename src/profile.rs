@@ -53,8 +53,10 @@ pub fn show_profile(name: &str, expanded: bool) -> i32 {
 fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
     if expanded {
-        let mut seen: Vec<String> = Vec::new();
-        let raw = load_raw_chain(name, &cwd, &mut seen)?;
+        let mut stack: Vec<(String, String)> = Vec::new();
+        let mut done: Vec<String> = Vec::new();
+        let raw = load_raw_chain(name, &cwd, &mut stack, &mut done)?
+            .expect("the requested profile is always merged");
         validate_schema_version(&raw)?;
         let groups = raw.security.as_ref().map(|s| s.groups.clone()).unwrap_or_default();
         let mut fs = resolve_filesystem(&raw.filesystem, &cwd)?;
@@ -351,14 +353,50 @@ pub struct ResolvedProfile {
     pub limits: LimitsSlice,
 }
 
+/// `"extends": "parent"` or `"extends": ["a", "b"]`. Untagged, so the single-parent
+/// spelling that every shipped profile uses keeps parsing unchanged.
+#[derive(Debug, Clone)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn names(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s.clone()],
+            OneOrMany::Many(v) => v.clone(),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OneOrMany {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::One(s) => OneOrMany::One(s),
+            Repr::Many(v) => OneOrMany::Many(v),
+        })
+    }
+}
+
 /// Raw profile JSON (v1 schema).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RawProfile {
     #[serde(default)]
     pub meta: Option<Meta>,
+    /// One parent, or several. A workload that needs two unrelated toolchains
+    /// (Node and the JVM, say) had to invent an intermediate profile that restated
+    /// one parent's slice by hand and drifted from it; composition is a schema
+    /// question, not a policy one.
     #[serde(default)]
-    pub extends: Option<String>,
+    pub extends: Option<OneOrMany>,
     #[serde(default)]
     pub security: Option<Security>,
     #[serde(default)]
@@ -372,7 +410,7 @@ pub struct RawProfile {
     pub workdir: Option<Workdir>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Meta {
     #[serde(default)]
@@ -415,14 +453,14 @@ pub fn validate_schema_version(raw: &RawProfile) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Security {
     #[serde(default)]
     pub groups: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RawFilesystem {
     #[serde(default)]
@@ -437,7 +475,7 @@ pub struct RawFilesystem {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RawNetwork {
     #[serde(default)]
-    pub block_net: bool,
+    pub block_net: Option<bool>,
     /// Accept both `allow_domain` (canonical snake_case) and `allowDomain`
     /// (legacy camelCase) for backward compatibility, matching the
     /// `meta.schema_version` alias convention.
@@ -608,8 +646,10 @@ fn extract_unknown_field(msg: &str) -> Option<String> {
 /// Load a profile by name or path, resolve `extends`, expand variables, and
 /// expand `security.groups` into concrete filesystem paths.
 pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
-    let mut seen: Vec<String> = Vec::new();
-    let raw = load_raw_chain(name, cwd, &mut seen)?;
+    let mut stack: Vec<(String, String)> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+    let raw = load_raw_chain(name, cwd, &mut stack, &mut done)?
+        .expect("the root profile is always merged");
     validate_schema_version(&raw)?;
     let mut fs = resolve_filesystem(&raw.filesystem, cwd)?;
     let resolved_name = raw
@@ -650,39 +690,234 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     })
 }
 
-/// Detect a profile `extends` cycle and format the error per AC-5.6:
-/// `Profile cycle detected: a → b → a` (the repeated name closes the loop).
-fn check_cycle(name: &str, seen: &[String]) -> Result<()> {
-    if seen.iter().any(|s| s == name) {
-        let mut chain: Vec<&str> = seen.iter().map(|s| s.as_str()).collect();
-        chain.push(name);
-        bail!("Profile cycle detected: {}", chain.join(" → "));
-    }
-    Ok(())
-}
-
 /// Recursively load a profile and its `extends` chain. The deepest parent is
 /// loaded first; the child is merged on top (child keys override, arrays
 /// concatenate for filesystem.allow / read_only / deny).
-fn load_raw_chain(name: &str, cwd: &Path, seen: &mut Vec<String>) -> Result<RawProfile> {
-    check_cycle(name, seen)?;
-    seen.push(name.to_string());
-
+fn load_raw_chain(
+    name: &str,
+    cwd: &Path,
+    stack: &mut Vec<(String, String)>,
+    done: &mut Vec<String>,
+) -> Result<Option<RawProfile>> {
     let path = resolve_profile_path(name, cwd)?;
+    // Diamond dedupe keys on the RESOLVED path, not the spelling: `a` and `./a.json`
+    // are one profile.
+    let key = path.to_string_lossy().to_lowercase();
+    if let Some(pos) = stack.iter().position(|(k, _)| k == &key) {
+        // Close the chain on the profile the operator can recognise, not on the path
+        // it happened to be spelled with.
+        let mut chain: Vec<&str> = stack[pos..].iter().map(|(_, n)| n.as_str()).collect();
+        chain.push(stack[pos].1.as_str());
+        bail!("Profile cycle detected: {}", chain.join(" → "));
+    }
+    if done.iter().any(|k| k == &key) {
+        // Reachable twice (a diamond): merge it ONCE, which is also what keeps a
+        // shared parent from looking like two disagreeing ones.
+        return Ok(None);
+    }
+
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read profile {}", path.display()))?;
     let raw: RawProfile = serde_json::from_str(&text)
         .map_err(with_suggestion)
         .with_context(|| format!("parse profile {}", path.display()))?;
 
-    let merged = match raw.extends.as_ref() {
-        Some(parent_name) => {
-            let parent = load_raw_chain(parent_name, cwd, seen)?;
-            merge_profiles(parent, raw)
+    let display = raw
+        .meta
+        .as_ref()
+        .map(|m| m.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| name.to_string());
+    stack.push((key.clone(), display));
+    let parents = raw.extends.as_ref().map(|e| e.names()).unwrap_or_default();
+    let mut parts: Vec<(String, RawProfile)> = Vec::new();
+    for parent in &parents {
+        if let Some(p) = load_raw_chain(parent, cwd, stack, done)? {
+            parts.push((parent.clone(), p));
         }
-        None => raw,
+    }
+    stack.pop();
+
+    let merged = if parts.is_empty() {
+        raw
+    } else {
+        let parent_set = merge_parent_set(&parts, &raw)?;
+        merge_profiles(parent_set, raw)
     };
-    Ok(merged)
+    done.push(key);
+    Ok(Some(merged))
+}
+
+/// Merge the PARENTS of one profile. Arrays concatenate and dedupe; scalars must
+/// AGREE - a profile that silently loses a budget or a security flag is worse than a
+/// parse error, which is the same stance as refusing a moved key rather than aliasing
+/// it. The child then overrides whatever it sets itself ([`merge_profiles`]).
+fn merge_parent_set(parts: &[(String, RawProfile)], child: &RawProfile) -> Result<RawProfile> {
+    let mut allow = Vec::new();
+    let mut read_only = Vec::new();
+    let mut deny = Vec::new();
+    let mut groups = Vec::new();
+    let mut allow_domain = Vec::new();
+    let mut deny_domain = Vec::new();
+    let mut block_net: Vec<(String, bool)> = Vec::new();
+    let mut net_profile: Vec<(String, String)> = Vec::new();
+    let mut prompt_enabled: Vec<(String, bool)> = Vec::new();
+    let mut on_unavailable: Vec<(String, String)> = Vec::new();
+    let mut upstream_proxy: Vec<(String, String)> = Vec::new();
+    let mut prompt_secs: Vec<(String, u32)> = Vec::new();
+    let mut workload_secs: Vec<(String, u32)> = Vec::new();
+
+    for (spelled, part) in parts {
+        // The refusal must name the PARENT, not the spelling: a profile reached as
+        // `C:\...\a.json` is still "a" to the operator reading the error.
+        let display = part
+            .meta
+            .as_ref()
+            .map(|m| m.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| spelled.clone());
+        let n = display.as_str();
+        if let Some(f) = &part.filesystem {
+            allow.extend(f.allow.iter().cloned());
+            read_only.extend(f.read_only.iter().cloned());
+            deny.extend(f.deny.iter().cloned());
+        }
+        if let Some(s) = &part.security {
+            groups.extend(s.groups.iter().cloned());
+        }
+        if let Some(net) = &part.network {
+            allow_domain.extend(net.allow_domain.iter().cloned());
+            deny_domain.extend(net.deny_domain.iter().cloned());
+            if let Some(v) = net.block_net {
+                block_net.push((n.to_string(), v));
+            }
+            if let Some(v) = &net.profile {
+                net_profile.push((n.to_string(), v.clone()));
+            }
+            if let Some(v) = net.prompt_enabled {
+                prompt_enabled.push((n.to_string(), v));
+            }
+            if let Some(v) = &net.on_unavailable {
+                on_unavailable.push((n.to_string(), v.clone()));
+            }
+            if let Some(v) = &net.upstream_proxy {
+                upstream_proxy.push((n.to_string(), v.clone()));
+            }
+        }
+        if let Some(l) = &part.limits {
+            if let Some(v) = l.prompt_timeout_secs {
+                prompt_secs.push((n.to_string(), v));
+            }
+            if let Some(v) = l.workload_timeout_secs {
+                workload_secs.push((n.to_string(), v));
+            }
+        }
+    }
+
+    // The child decides first: a profile that sets the value itself never sees its
+    // parents' disagreement, which is the rule the brief states.
+    let child_net = child.network.as_ref();
+    let child_lim = child.limits.as_ref();
+    let scalar = |key: &str, own: Option<bool>, vals: &[(String, bool)]| -> Result<Option<bool>> {
+        match own {
+            Some(v) => Ok(Some(v)),
+            None => agree(key, vals),
+        }
+    };
+
+    let network = if allow_domain.is_empty()
+        && deny_domain.is_empty()
+        && block_net.is_empty()
+        && net_profile.is_empty()
+        && prompt_enabled.is_empty()
+        && on_unavailable.is_empty()
+        && upstream_proxy.is_empty()
+    {
+        None
+    } else {
+        Some(RawNetwork {
+            block_net: scalar(
+                "network.block_net",
+                child_net.and_then(|n| n.block_net),
+                &block_net,
+            )?,
+            allow_domain: dedupe_vec(allow_domain),
+            profile: match child_net.and_then(|n| n.profile.clone()) {
+                Some(v) => Some(v),
+                None => agree("network.profile", &net_profile)?,
+            },
+            deny_domain: dedupe_vec(deny_domain),
+            prompt_enabled: scalar(
+                "network.prompt_enabled",
+                child_net.and_then(|n| n.prompt_enabled),
+                &prompt_enabled,
+            )?,
+            on_unavailable: match child_net.and_then(|n| n.on_unavailable.clone()) {
+                Some(v) => Some(v),
+                None => agree("network.on_unavailable", &on_unavailable)?,
+            },
+            upstream_proxy: match child_net.and_then(|n| n.upstream_proxy.clone()) {
+                Some(v) => Some(v),
+                None => agree("network.upstream_proxy", &upstream_proxy)?,
+            },
+        })
+    };
+
+    Ok(RawProfile {
+        meta: parts.first().and_then(|(_, p)| p.meta.clone()),
+        extends: None,
+        security: if groups.is_empty() {
+            None
+        } else {
+            Some(Security {
+                groups: dedupe_vec(groups),
+            })
+        },
+        filesystem: Some(RawFilesystem {
+            allow: dedupe_vec(allow),
+            read_only: dedupe_vec(read_only),
+            deny: dedupe_vec(deny),
+        }),
+        network,
+        limits: Some(RawLimits {
+            prompt_timeout_secs: match child_lim.and_then(|l| l.prompt_timeout_secs) {
+                Some(v) => Some(v),
+                None => agree("limits.prompt_timeout_secs", &prompt_secs)?,
+            },
+            workload_timeout_secs: match child_lim.and_then(|l| l.workload_timeout_secs) {
+                Some(v) => Some(v),
+                None => agree("limits.workload_timeout_secs", &workload_secs)?,
+            },
+        }),
+        workdir: None,
+    })
+}
+
+/// The parents must agree on a scalar. `None` when nobody set it; the agreed value
+/// when they do; a refusal naming the key, both parents and both values when they
+/// do not - never last-parent-wins.
+fn agree<T: PartialEq + std::fmt::Display + Clone>(
+    key: &str,
+    values: &[(String, T)],
+) -> Result<Option<T>> {
+    let Some((first_name, first)) = values.first() else {
+        return Ok(None);
+    };
+    for (name, value) in &values[1..] {
+        if value != first {
+            bail!(
+                "`{key}` conflicts between parents `{first_name}` and `{name}`: {first} vs {value} \
+                 — set it in the child to choose, or make the parents agree"
+            );
+        }
+    }
+    Ok(Some((*first).clone()))
+}
+
+fn dedupe_vec(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .fold(Vec::new(), |acc, item| dedupe_concat(acc, vec![item]))
 }
 
 /// Resolve a profile name to a file path.
@@ -737,7 +972,7 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
     };
     let network = match (parent.network, child.network) {
         (Some(p), Some(c)) => Some(RawNetwork {
-            block_net: c.block_net || p.block_net,
+            block_net: c.block_net.or(p.block_net),
             allow_domain: dedupe_concat(p.allow_domain, c.allow_domain),
             profile: c.profile.or(p.profile),
             deny_domain: dedupe_concat(p.deny_domain, c.deny_domain),
@@ -810,7 +1045,7 @@ fn resolve_network_slice(raw: &Option<RawNetwork>) -> NetworkSlice {
     let empty = RawNetwork::default();
     let raw = raw.as_ref().unwrap_or(&empty);
     NetworkSlice {
-        block_net: raw.block_net,
+        block_net: raw.block_net.unwrap_or(false),
         allow_domain: raw.allow_domain.clone(),
         profile_name: raw.profile.clone(),
         deny_domain: raw.deny_domain.clone(),
@@ -1154,28 +1389,8 @@ mod tests {
         assert_eq!(suggest_unknown_key("sec"), Some("security".to_string()));
     }
 
-    #[test]
-    fn cycle_message_matches_spec_format() {
-        let seen: Vec<String> = vec!["a".into(), "b".into()];
-        let next = "a";
-        let err = check_cycle(next, &seen).unwrap_err();
-        let msg = format!("{err:#}");
-        assert_eq!(msg, "Profile cycle detected: a → b → a");
-    }
 
-    #[test]
-    fn cycle_message_three_deep() {
-        let seen: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
-        let err = check_cycle("a", &seen).unwrap_err();
-        let msg = format!("{err:#}");
-        assert_eq!(msg, "Profile cycle detected: a → b → c → a");
-    }
 
-    #[test]
-    fn no_cycle_when_name_not_seen() {
-        let seen: Vec<String> = vec!["a".into(), "b".into()];
-        assert!(check_cycle("c", &seen).is_ok());
-    }
 
     #[test]
     fn list_profiles_returns_user_global_json_files() {
@@ -1732,5 +1947,206 @@ mod tests {
 
     fn write_profile(dir: &std::path::Path, name: &str, body: &str) {
         std::fs::write(dir.join(format!("{name}.json")), body).unwrap();
+    }
+    // ------------------------------------------------------------------
+    // Multi-parent `extends` (docs/design/2026-10-25-multi-extends-design.md)
+    // ------------------------------------------------------------------
+
+    /// `"extends": ["a", "b"]` parses, and the single-parent spelling still does.
+    #[test]
+    fn extends_accepts_a_name_or_an_array() {
+        let one: RawProfile =
+            serde_json::from_str(r#"{"meta":{"name":"c","schema_version":1},"extends":"a"}"#)
+                .expect("the single-parent spelling keeps parsing");
+        assert_eq!(one.extends.unwrap().names(), vec!["a".to_string()]);
+
+        let many: RawProfile = serde_json::from_str(
+            r#"{"meta":{"name":"c","schema_version":1},"extends":["a","b"]}"#,
+        )
+        .expect("an array of parents parses");
+        assert_eq!(
+            many.extends.unwrap().names(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// The composition the design exists for: two parents' grants add up, and a
+    /// scalar set by one parent comes through.
+    #[test]
+    fn two_parents_compose_their_grants_and_scalars() {
+        let dir = temp_dir("multi-compose");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"filesystem":{"allow":["C:/x"]},"network":{"block_net":true},"limits":{"workloadTimeoutSecs":600}}"#);
+        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"filesystem":{"allow":["C:/y"]}}"#);
+        write_profile(&dir, "c", &format!(
+            r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"]}}"#,
+            json_escaped(&dir.join("a.json")),
+            json_escaped(&dir.join("b.json"))
+        ));
+
+        let resolved = load_and_resolve(dir.join("c.json").to_str().unwrap(), &dir).unwrap();
+        let allow: Vec<String> = resolved
+            .filesystem
+            .allow
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(allow.iter().any(|p| p.ends_with("x")), "parent a's grant: {allow:?}");
+        assert!(allow.iter().any(|p| p.ends_with("y")), "parent b's grant: {allow:?}");
+        assert!(resolved.network.block_net, "the scalar a set comes through");
+        assert_eq!(resolved.limits.workload_timeout_secs, Some(600));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child that sets the value itself wins; the parents' disagreement is moot.
+    #[test]
+    fn a_child_scalar_overrides_disagreeing_parents() {
+        let dir = temp_dir("multi-override");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"network":{"block_net":true}}"#);
+        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"network":{"block_net":false}}"#);
+        write_profile(&dir, "c", &format!(
+            r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"],"network":{{"block_net":false}}}}"#,
+            json_escaped(&dir.join("a.json")),
+            json_escaped(&dir.join("b.json"))
+        ));
+
+        let resolved = load_and_resolve(dir.join("c.json").to_str().unwrap(), &dir)
+            .expect("the child decides, so the parents' disagreement is moot");
+        assert!(!resolved.network.block_net, "the child's value wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Parents that disagree and a child that stays silent: refused, naming the key,
+    /// both parents and both values - never last-parent-wins.
+    #[test]
+    fn parents_disagreeing_on_a_scalar_are_refused() {
+        let dir = temp_dir("multi-conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"network":{"block_net":true}}"#);
+        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"network":{"block_net":false}}"#);
+        write_profile(&dir, "c", &format!(
+            r#"{{"meta":{{"name":"c","schema_version":1}},"extends":["{}","{}"]}}"#,
+            json_escaped(&dir.join("a.json")),
+            json_escaped(&dir.join("b.json"))
+        ));
+
+        let err = match load_and_resolve(dir.join("c.json").to_str().unwrap(), &dir) {
+            Ok(_) => panic!("disagreeing parents must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        for needle in ["network.block_net", "`a`", "`b`", "true", "false"] {
+            assert!(err.contains(needle), "the refusal must name {needle:?}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A parent reachable through both sides merges once: no duplicate grant, and no
+    /// spurious conflict from seeing it twice.
+    #[test]
+    fn a_diamond_merges_the_shared_parent_once() {
+        let dir = temp_dir("multi-diamond");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "base", r#"{"meta":{"name":"base","schema_version":1},"filesystem":{"allow":["C:/shared"]},"network":{"block_net":true}}"#);
+        for side in ["l", "r"] {
+            write_profile(&dir, side, &format!(
+                r#"{{"meta":{{"name":"{side}","schema_version":1}},"extends":"{}"}}"#,
+                json_escaped(&dir.join("base.json"))
+            ));
+        }
+        write_profile(&dir, "d", &format!(
+            r#"{{"meta":{{"name":"d","schema_version":1}},"extends":["{}","{}"]}}"#,
+            json_escaped(&dir.join("l.json")),
+            json_escaped(&dir.join("r.json"))
+        ));
+
+        let resolved = load_and_resolve(dir.join("d.json").to_str().unwrap(), &dir)
+            .expect("a shared parent is not a conflict");
+        let shared = resolved
+            .filesystem
+            .allow
+            .iter()
+            .filter(|p| p.display().to_string().ends_with("shared"))
+            .count();
+        assert_eq!(shared, 1, "the shared grant appears exactly once");
+        assert!(resolved.network.block_net);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Order must not matter when the parents agree.
+    #[test]
+    fn extends_order_does_not_change_the_result() {
+        let dir = temp_dir("multi-order");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "a", r#"{"meta":{"name":"a","schema_version":1},"filesystem":{"allow":["C:/x"]},"network":{"allow_domain":["a.example"]}}"#);
+        write_profile(&dir, "b", r#"{"meta":{"name":"b","schema_version":1},"filesystem":{"allow":["C:/y"]},"network":{"allow_domain":["b.example"]}}"#);
+        let (pa, pb) = (dir.join("a.json"), dir.join("b.json"));
+        write_profile(&dir, "ab", &format!(
+            r#"{{"meta":{{"name":"ab","schema_version":1}},"extends":["{}","{}"]}}"#,
+            json_escaped(&pa),
+            json_escaped(&pb)
+        ));
+        write_profile(&dir, "ba", &format!(
+            r#"{{"meta":{{"name":"ba","schema_version":1}},"extends":["{}","{}"]}}"#,
+            json_escaped(&pb),
+            json_escaped(&pa)
+        ));
+
+        let ab = load_and_resolve(dir.join("ab.json").to_str().unwrap(), &dir).unwrap();
+        let ba = load_and_resolve(dir.join("ba.json").to_str().unwrap(), &dir).unwrap();
+        // Behaviour, not bytes: the CHILD's own name differs by construction, and a
+        // grant list is a set. Compare every list sorted, with `meta.name` removed.
+        let normalised = |r: &ResolvedProfile| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&to_expanded_json(r, &[])).unwrap();
+            v["meta"].as_object_mut().map(|m| m.remove("name"));
+            for key in ["filesystem", "network"] {
+                if let Some(section) = v.get_mut(key).and_then(|s| s.as_object_mut()) {
+                    for (_, value) in section.iter_mut() {
+                        if let Some(arr) = value.as_array_mut() {
+                            arr.sort_by_key(|x| x.to_string());
+                        }
+                    }
+                }
+            }
+            v
+        };
+        assert_eq!(
+            normalised(&ab),
+            normalised(&ba),
+            "reordering the extends array must not change the resolved policy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cycle that runs through a diamond is still a cycle.
+    #[test]
+    fn a_cycle_through_a_diamond_is_refused() {
+        let dir = temp_dir("multi-cycle");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(&dir, "a", &format!(
+            r#"{{"meta":{{"name":"a","schema_version":1}},"extends":["{}"]}}"#,
+            json_escaped(&dir.join("b.json"))
+        ));
+        write_profile(&dir, "b", &format!(
+            r#"{{"meta":{{"name":"b","schema_version":1}},"extends":["{}"]}}"#,
+            json_escaped(&dir.join("a.json"))
+        ));
+
+        let err = match load_and_resolve(dir.join("a.json").to_str().unwrap(), &dir) {
+            Ok(_) => panic!("a cycle must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("cycle"), "the message keeps the cycle shape: {err}");
+        assert!(
+            err.contains("a → b → a") || err.contains("b → a → b"),
+            "the refusal spells out the chain it walked: {err}"
+        );
+        assert_eq!(
+            err.matches('→').count(),
+            2,
+            "the chain is spelled a → b → a, not a bare 'cycle': {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
