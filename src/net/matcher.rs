@@ -94,8 +94,22 @@ pub fn is_hard_denied_host(host: &str) -> bool {
 /// Is `ip` on the hard-deny IP list (literal match or link-local CIDR)?
 /// Covers `ALWAYS_DENIED_V4_LITERALS` + `ALWAYS_DENIED_V4_CIDRS` +
 /// `ALWAYS_DENIED_V6_CIDRS`. IPv4-mapped IPv6 forms are unmapped first.
+/// Loopback (`127.0.0.0/8`, `::1`) or the unspecified address (`0.0.0.0`, `::`).
+/// IPv4-mapped IPv6 is unmapped first so `::ffff:127.0.0.1` cannot slip through.
+pub fn is_loopback_or_unspecified(ip: IpAddr) -> bool {
+    match unmap_ipv4_mapped(ip) {
+        IpAddr::V4(v) => v.is_loopback() || v.is_unspecified(),
+        IpAddr::V6(v) => v.is_loopback() || v.is_unspecified(),
+    }
+}
+
 pub fn is_hard_denied_ip(ip: IpAddr) -> bool {
     let ip = unmap_ipv4_mapped(ip);
+    // NOTE: loopback is deliberately NOT part of this predicate. It is a POLICY
+    // refusal ([G-44]), applied by the proxy's decision leg, not a property of the
+    // address: this predicate also feeds the direct-dialer's debug assertion and
+    // the tests that use a local server as an upstream. See
+    // `proxy::pinned_addrs_hard_denied`.
     match ip {
         IpAddr::V4(v) => {
             if ALWAYS_DENIED_V4_LITERALS.contains(&v) {

@@ -1816,7 +1816,23 @@ fn parse_host_ip(host: &str) -> Option<IpAddr> {
 ///
 /// Pure over `&[SocketAddr]`, so the leg is testable with any address list
 /// (no resolver seam needed) and the production dial path calls exactly this.
-fn pinned_addrs_hard_denied(addrs: &[SocketAddr]) -> Option<Decision> {
+fn pinned_addrs_hard_denied(addrs: &[SocketAddr], permit_loopback: bool) -> Option<Decision> {
+    // [G-44]: the proxy must not become a tunnel to host services, and a host-STRING
+    // check cannot enforce that - `localtest.me` and `127.0.0.1.nip.io` are public
+    // DNS names that resolve to 127.0.0.1, so the operator is shown a harmless name
+    // and the workload reaches the Docker API, Ollama or a DevTools port. The pinned
+    // set is the first point where the actual destination is known, so the refusal
+    // belongs here. Same reason token as the string leg, so the audit record reads
+    // the same whichever way the loopback was expressed.
+    if !permit_loopback
+        && addrs
+            .iter()
+            .any(|sa| crate::net::matcher::is_loopback_or_unspecified(sa.ip()))
+    {
+        let mut d = denied_by(DenyReason::DeniedCidr);
+        d.reason = Some("loopback_refused".into());
+        return Some(d);
+    }
     if pinned_addrs_contain_hard_denied(addrs) {
         return Some(denied_by(DenyReason::DeniedCidr));
     }
@@ -1840,10 +1856,26 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-/// host:port from a CONNECT target. Port defaults to 443.
-fn parse_connect_target(target: &str) -> (String, u16) {
-    let (h, p) = target.rsplit_once(':').unwrap_or((target, "443"));
-    (h.to_string(), p.parse().unwrap_or(443))
+/// host:port from a CONNECT target. A missing port means 443, as the method
+/// allows; ANYTHING ELSE THAT DOES NOT PARSE IS `None`, and the caller answers
+/// 400. The previous version used `p.parse().unwrap_or(443)`, so `host:notaport`,
+/// `host:` and `host:70000` were silently retried on 443 - a typo turned into a
+/// different request than the one the workload asked for. Unbracketed IPv6 is
+/// refused for the same reason: it cannot be split unambiguously.
+fn parse_connect_target(target: &str) -> Option<(String, u16)> {
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => (target, "443"),
+    };
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    if host.is_empty() || (host.contains(':') && !bracketed) {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((host.to_string(), port))
 }
 
 // =====================================================================
@@ -1892,6 +1924,11 @@ async fn dial_upstream<F, Fut>(
     upstream: Option<&UpstreamDialer>,
     host: &str,
     port: u16,
+    // `false` in every production path: loopback and the unspecified address are
+    // refused so the proxy cannot become a tunnel to host services ([G-44]). The
+    // dial-mechanics tests pass `true` because their only upstream is a local
+    // stand-in server; that is a property of the test fixture, not of the product.
+    permit_loopback: bool,
     lookup: F,
 ) -> Result<TcpStream, DialFailure>
 where
@@ -1935,7 +1972,7 @@ where
     // The pinned IP set gets the hard-deny check too: a hostname that resolves
     // into a hard-denied range is refused before any dial (fail-closed
     // [G-12, G-45]).
-    if let Some(d) = pinned_addrs_hard_denied(&addrs) {
+    if let Some(d) = pinned_addrs_hard_denied(&addrs, permit_loopback) {
         return Err(DialFailure::Denied(d));
     }
 
@@ -2147,7 +2184,12 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     }
 
     // (1) Parse host:port from the CONNECT target.
-    let (host, port) = parse_connect_target(target);
+    let Some((host, port)) = parse_connect_target(target) else {
+        let _ = sock
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return Ok(());
+    };
     if host.is_empty() {
         let _ = sock
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
@@ -2200,7 +2242,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
 
     // Admission done — dial (Step 2): chained through the upstream
     // proxy, or DNS-pinned + Happy Eyeballs on the direct path.
-    let dialed = dial_upstream(ctx.upstream.as_deref(), &host, port, system_lookup).await;
+    let dialed = dial_upstream(ctx.upstream.as_deref(), &host, port, false, system_lookup).await;
     let mut upstream_stream = match dialed {
         Ok(s) => s,
         Err(DialFailure::Denied(d)) => {
@@ -3363,7 +3405,7 @@ async fn handle_forward(
     emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision);
 
     let mut upstream =
-        match dial_upstream(ctx.upstream.as_deref(), &fwd.host, fwd.port, system_lookup).await {
+        match dial_upstream(ctx.upstream.as_deref(), &fwd.host, fwd.port, false, system_lookup).await {
             Ok(stream) => stream,
             Err(DialFailure::Denied(d)) => {
                 emit_decision(&ctx.writer, &fwd.host, fwd.port, &d);
@@ -3973,7 +4015,7 @@ mod tests {
         ];
         for (addr, denied) in cases {
             let addrs = [public, addr.parse::<SocketAddr>().unwrap()];
-            let verdict = super::pinned_addrs_hard_denied(&addrs);
+            let verdict = super::pinned_addrs_hard_denied(&addrs, false);
             assert_eq!(
                 verdict.is_some(),
                 denied,
@@ -4003,7 +4045,7 @@ mod tests {
         ];
         for (addr, denied) in cases {
             let addrs = [public, addr.parse::<SocketAddr>().unwrap()];
-            let verdict = super::pinned_addrs_hard_denied(&addrs);
+            let verdict = super::pinned_addrs_hard_denied(&addrs, false);
             assert_eq!(
                 verdict.is_some(),
                 denied,
@@ -4024,8 +4066,8 @@ mod tests {
             "203.0.113.9:443".parse::<SocketAddr>().unwrap(),
             "[2001:db8::9]:443".parse::<SocketAddr>().unwrap(),
         ];
-        assert!(super::pinned_addrs_hard_denied(&addrs).is_none());
-        assert!(super::pinned_addrs_hard_denied(&[]).is_none());
+        assert!(super::pinned_addrs_hard_denied(&addrs, false).is_none());
+        assert!(super::pinned_addrs_hard_denied(&[], false).is_none());
     }
 
     /// The gap Task 5.1 recorded: the pinned-IP hard-deny leg had no test.
@@ -4043,7 +4085,7 @@ mod tests {
     async fn dial_upstream_denies_a_pinned_link_local_v4_literal() {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            super::dial_upstream(None, "169.254.31.7", 80, super::system_lookup),
+            super::dial_upstream(None, "169.254.31.7", 80, false, super::system_lookup),
         )
         .await
         {
@@ -4061,7 +4103,7 @@ mod tests {
     async fn dial_upstream_denies_a_pinned_link_local_v6_literal() {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            super::dial_upstream(None, "[fe80::1]", 80, super::system_lookup),
+            super::dial_upstream(None, "[fe80::1]", 80, false, super::system_lookup),
         )
         .await
         {
@@ -4083,7 +4125,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            super::dial_upstream(None, "metadata.evil.example", 80, |host, port| {
+            super::dial_upstream(None, "metadata.evil.example", 80, false, |host, port| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!((host.as_str(), port), ("metadata.evil.example", 80));
                 async { Ok(vec!["169.254.31.7:80".parse::<SocketAddr>().unwrap()]) }
@@ -4110,7 +4152,8 @@ mod tests {
     async fn dial_upstream_resolves_once_and_dials_only_that_answer() {
         let (_l, live) = local_listener().await;
         let calls = AtomicUsize::new(0);
-        let s = match super::dial_upstream(None, "pinned.example", live.port(), |host, port| {
+        let s = match super::dial_upstream(None, "pinned.example", live.port(), true, |host, port| {
+            // `true`: dial mechanics, not policy - the stand-in upstream is a local listener
             calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!((host.as_str(), port), ("pinned.example", live.port()));
             async move { Ok(vec![live]) }
@@ -9198,7 +9241,7 @@ mod tests {
     // path with no pinned addresses — reporting a proxy that was never
     // contacted as unreachable (502 + a spurious `upstream_error` leaf).
     #[test]
-    fn bare_ipv6_no_proxy_entry_bypasses_upstream_for_a_bracketed_target() {
+    fn bare_ipv6_no_proxy_entry_never_chains_and_unspecified_is_refused() {
         let fake = FakeUpstream::start(200);
         let t = t42_setup(
             "chain-v6-bare-noproxy",
@@ -9217,17 +9260,21 @@ mod tests {
             "the upstream proxy must never be contacted: {:?}",
             fake.heads()
         );
+        // The target is the unspecified address, which is now refused at the
+        // pinned-address leg ([G-44]); the point this test protects is unchanged -
+        // the NO_PROXY bypass must never chain to the upstream proxy.
         let evs = connect_events(&t.sid);
-        assert_eq!(evs.len(), 1, "only the admission leaf: {evs:?}");
-        assert_eq!(evs[0]["disposition"], "allow");
-        assert_eq!(evs[0]["source"], "allowlist");
+        let last = evs.last().expect("at least the admission leaf");
+        assert_eq!(last["disposition"], "deny", "unspecified target must be refused: {evs:?}");
+        assert_eq!(last["source"], "hard-deny");
+        assert_eq!(last["reason"], "loopback_refused");
     }
 
     // (i') the bracket form of the same entry keeps working: entries are
     // normalized to the bare host when the dialer is built, so both spellings
     // of an IPv6 bypass agree with the single normalized host.
     #[test]
-    fn bracketed_ipv6_no_proxy_entry_still_bypasses_the_upstream() {
+    fn bracketed_ipv6_no_proxy_entry_never_chains_and_unspecified_is_refused() {
         let fake = FakeUpstream::start(200);
         let t = t42_setup(
             "chain-v6-bracketed-noproxy",
@@ -9244,7 +9291,11 @@ mod tests {
             "the upstream proxy must never be contacted: {:?}",
             fake.heads()
         );
-        assert_eq!(connect_events(&t.sid).len(), 1);
+        let evs = connect_events(&t.sid);
+        assert_eq!(
+            evs.last().unwrap()["reason"], "loopback_refused",
+            "a bracketed NO_PROXY entry changes nothing about the refusal: {evs:?}"
+        );
     }
 
     // =================================================================
@@ -9652,5 +9703,41 @@ mod tests {
             connect_events(&t.sid).is_empty(),
             "a refused facade tunnel is not a consultation"
         );
+    }
+
+    /// [G-44] is about not becoming a tunnel to host services. A host STRING check
+    /// cannot enforce that: `localtest.me` and `127.0.0.1.nip.io` are public names
+    /// that resolve to loopback. The pinned address set is the only place the real
+    /// destination is known, so loopback and the unspecified address must be
+    /// refused there.
+    #[test]
+    fn pinned_loopback_addresses_are_hard_denied() {
+        use std::net::SocketAddr;
+        for s in ["127.0.0.1:443", "127.1.2.3:443", "[::1]:443", "0.0.0.0:443", "[::]:443"] {
+            let sa: SocketAddr = s.parse().unwrap();
+            assert!(
+                super::pinned_addrs_hard_denied(&[sa], false).is_some(),
+                "{s} resolves to loopback/unspecified and must be refused before dialling"
+            );
+            // The bare address predicate stays loopback-agnostic on purpose (the
+            // dialer's debug assertion and the dial-mechanics tests rely on that);
+            // the REFUSAL is the policy leg above.
+            assert!(!super::pinned_addrs_contain_hard_denied(&[sa]), "{s}");
+        }
+        // A public address is still allowed: the check must not swallow the world.
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        assert!(super::pinned_addrs_hard_denied(&[public], false).is_none());
+    }
+
+    /// A CONNECT target whose port is not a number used to be silently retried on
+    /// 443 - a typo in the port became a different request. Refuse it instead, the
+    /// way `split_authority` already refuses the same class in an absolute target.
+    #[test]
+    fn connect_target_with_an_invalid_port_is_refused_not_defaulted() {
+        assert_eq!(super::parse_connect_target("example.com:8443"), Some(("example.com".into(), 8443)));
+        assert_eq!(super::parse_connect_target("example.com"), Some(("example.com".into(), 443)));
+        for bad in ["example.com:", "example.com:notaport", "example.com:70000", "example.com:0"] {
+            assert_eq!(super::parse_connect_target(bad), None, "{bad} must be refused");
+        }
     }
 }
