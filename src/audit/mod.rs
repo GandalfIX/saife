@@ -85,6 +85,10 @@ pub struct AuditWriter {
     /// own untouched log. Hold this guard across compute -> write -> commit.
     chain: Mutex<ChainState>,
     strict: bool,
+    /// Stamped into every leaf. It is what makes a log belong to a session: without
+    /// it, a clean session's three files can be copied over another's names and
+    /// `audit verify` reports OK for the substitute.
+    session_id: Option<String>,
 }
 
 /// The chain's commit point. Only `append` mutates this, and only under the lock.
@@ -151,10 +155,15 @@ impl AuditWriter {
         } else {
             ChainState::default()
         };
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string);
         Ok(Self {
             path,
             chain: Mutex::new(chain),
             strict,
+            session_id,
         })
     }
 
@@ -170,6 +179,9 @@ impl AuditWriter {
         let ts = iso8601_utc();
         event.insert("seq".into(), serde_json::json!(seq));
         event.insert("ts".into(), serde_json::json!(ts));
+        if let Some(sid) = &self.session_id {
+            event.insert("sid".into(), serde_json::json!(sid));
+        }
         let canonical = canonicalize(&event);
         let hash = sha256_hex(&canonical);
         let parent = chain.last.clone();
