@@ -2421,4 +2421,64 @@ mod tests {
             "and lists what exists, so the typo is visible: {err}"
         );
     }
+
+    /// Every JSON example in the docs that declares `meta` must still LOAD. The README
+    /// shipped an example missing `meta.schema_version` for weeks: the one snippet a
+    /// new user copies first was refused by the binary it documented. A fenced block
+    /// that is deliberately invalid belongs in a `text` fence, not a `json` one.
+    #[test]
+    fn every_documented_profile_example_still_loads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let docs = [
+            "README.md",
+            "docs/USER-GUIDE.md",
+            "docs/FAQ.md",
+            "docs/DEVELOPERS.md",
+            "profiles/README.md",
+        ];
+        let dir = temp_dir("doc-examples");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut checked = 0;
+        for doc in docs {
+            let Ok(text) = std::fs::read_to_string(root.join(doc)) else {
+                continue; // a doc that moved is a different test's problem
+            };
+            let mut rest = text.as_str();
+            let mut n = 0;
+            while let Some(start) = rest.find("```json") {
+                let body_start = match rest[start..].find('\n') {
+                    Some(i) => start + i + 1,
+                    None => break,
+                };
+                let Some(end) = rest[body_start..].find("```") else {
+                    break;
+                };
+                let body = &rest[body_start..body_start + end];
+                rest = &rest[body_start + end..];
+                n += 1;
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+                    panic!("{doc} example #{n} is not valid JSON");
+                };
+                // Fragments (a `limits` block to paste into an existing profile) are
+                // not complete profiles and are not expected to load on their own.
+                if value.get("meta").is_none() {
+                    continue;
+                }
+                let file = dir.join(format!("{}-{n}.json", doc.replace(['/', '.'], "_")));
+                std::fs::write(&file, body).unwrap();
+                let loaded = load_and_resolve(file.to_str().unwrap(), &dir);
+                assert!(
+                    loaded.is_ok(),
+                    "{doc} example #{n} does not load: {}",
+                    loaded.err().map(|e| format!("{e:#}")).unwrap_or_default()
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected to check the documented examples, found {checked}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
