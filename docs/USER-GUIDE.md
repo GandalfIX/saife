@@ -362,7 +362,7 @@ saife run --profile demo --allow-cwd -- cmd /c C:\Users\you\.cargo\bin\cargo.exe
 
 ```json
 {
-  "meta": { "name": "node-jvm", "version": "1.0.0", "schema_version": 1 },
+  "meta": { "name": "opencode", "version": "1.0.0", "schema_version": 1 },
   "extends": ["node", "jvm"],
   "filesystem": { "allow": ["$USERPROFILE/.gradle"] },
   "network": { "allow_domain": ["repo.maven.apache.org"] }
