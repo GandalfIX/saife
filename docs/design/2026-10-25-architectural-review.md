@@ -275,3 +275,21 @@ The three deferred items share one property: they are restructurings, not correc
 F-04's guardrail leg needs a mechanism (the wrapper probe) that does not exist on the
 AppContainer path; F-05's remaining half needs a key-management decision; F-06 and F-07
 are the Phase 2 refactor and should not be done while security fixes are being verified.
+
+---
+
+## 6. Independent review (2026-10-25) — status
+
+| id | sev | state | note |
+|---|---|---|---|
+| F-2 | HIGH | **fixed** (already) | loopback refused on the pinned addresses, and the check unmaps IPv4-mapped forms; the test now pins `::ffff:127.0.0.1` and `::ffff:7f00:1`. A DNS name resolving to 127.0.0.1 is refused at the same point |
+| F-3 | HIGH | **fixed** | `--profile ./x.json` and `extends: "./y.json"` resolved inside the workspace — a repo could ship the next session's policy, which is CR-10 verbatim. Relative profile/extends paths are refused; names and absolute paths still load |
+| F-4 | HIGH | **fixed** (earlier) | `builtin_deny_dirs()` denies `.saife` and `%LOCALAPPDATA%\saife` on both backends, and a grant inside one is refused |
+| F-6 | MED | **fixed** | the seal captured the root then slept 50 ms, betting the proxy would not append; `seal()` freezes the chain and late leaves are dropped |
+| F-10 | MED | **fixed** | a failed deny ACE warned (only under `SAIFE_DIAG`) and the session continued; it aborts now. A failed grant still warns — it takes access away |
+| F-11 | MED | **fixed** | a writable grant containing `saife-launch.exe` is refused: that binary runs host-side at the next launch |
+| F-14 | LOW | **fixed** | credential-shaped env names (`*TOKEN*`, `*API_KEY*`, `*SECRET*`, …) no longer reach the AppContainer child |
+| F-1 | HIGH | **open** | AppContainer allocates `privateNetworkClientServer` (S-1-15-3-7) whenever network is active: raw LAN TCP both ways, past the proxy and the allow-list. Correct fix is the capability behind an explicit opt-in (default off) and mxc as the network path; `--block-net` is the stop-gap today |
+| F-5 | HIGH | **open** | `verify` still derives the public key from the on-disk secret — self-referential trust. Needs a recorded public key and a decision on where it lives (the substitution attack that needed no key is closed) |
+| F-7 | MED | **open, documented** | `FILE_*`/`EXEC` events do not exist; the PRD promised them. G5 and FR-4.3 now say what ships (network decisions + the resolved filesystem policy) instead of what was intended |
+| F-8/F-9 | MED | **open, by construction** | the AppContainer loopback exemption is per AppContainer-SID — the OS cannot scope it to one port, so a session under that backend can reach sibling sidecars and other local services. It is one reason mxc is the default. The POC sidecar does validate `X-Facade-Token`; a direct loopback call still produces no FACADE leaf |
