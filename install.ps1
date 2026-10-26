@@ -9,12 +9,10 @@
     .\install.ps1 -Version 0.3.0 -Destination C:\tools\saife
 
 .NOTES
-    Why a script and not a package manager: the community winget index requires a
-    Microsoft CLA signature that this project does not sign. This script does what
-    that package would have done, with one property added - it verifies the
-    SHA256 of the archive against the release's own SHA256SUMS.txt before a single
-    byte is extracted, so a corrupted or swapped download is refused rather than
-    installed.
+    Why a script and not a package manager: there is no winget package. This script
+    is the supported install, and it verifies the SHA256 of the archive against the
+    release's own SHA256SUMS.txt before a single byte is extracted, so a corrupted or
+    swapped download is refused rather than installed.
 
     It needs no administrator rights: everything goes into the user's profile and
     onto the USER Path. Nothing is written to the registry and no service is

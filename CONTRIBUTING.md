@@ -37,6 +37,20 @@ Two things the default build order will trip you on:
 - **Plans live in `docs/plans/`, progress in `docs/tasks/<name>/PROGRESS.md`.**
   Decisions that will be argued about later go in `docs/adr/`.
 
+## Branches and pull requests
+
+Nothing lands on `main` directly. Branch, push, open a pull request, and merge it once
+CI is green:
+
+```bash
+git switch -c fix/<slug>
+git push -u origin fix/<slug>
+gh pr create --fill --base main
+```
+
+The gate on the pull request is `.github/workflows/ci.yml` (both feature states, clippy
+in both, a release build). The VM lane stays local - see below.
+
 ## Commits
 
 Conventional-commit subjects (`feat(profile): ...`, `fix(vm-tests): ...`,
