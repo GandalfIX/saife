@@ -4,8 +4,13 @@
 > A task is not "done" until its exit criterion has been *observed* (alert state
 > read back from the API), not assumed.
 
-> **Status: PLAN ONLY, 2026-10-26.** Nothing was executed: no alert dismissed, no
-> code changed, no commit. The findings below were read from the live API
+> **Status: IMPLEMENTED 2026-10-26** (PR #20, merge `8b88596`). Outcome and evidence
+> in `docs/tasks/codeql-triage/PROGRESS.md`: open 0, dismissed 11, fixed 4
+> (#1, #4, #5, #6). One plan correction is recorded there, not here: a null guard
+> is not a barrier for `rust/access-invalid-pointer` - the out-parameter has to
+> start uninitialised (C3, second round).
+>
+The findings below were read from the live API
 > (`code-scanning/alerts?state=open`) at HEAD `83e7a00` (v0.3.1).
 
 **Goal:** take the 15 open CodeQL alerts on `GandalfIX/saife` from "unknown noise"

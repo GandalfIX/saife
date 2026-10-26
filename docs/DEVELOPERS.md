@@ -171,8 +171,8 @@ to `502` (`docs/adr/0001`, D9).
 ```bash
 cargo build --release                        # default: mxc + saife-launch
 cargo build --release --no-default-features  # AppContainer only (says so at startup)
-cargo test  --bin saife                    # 673 + 15 ignored  (default)
-cargo test  --bin saife --no-default-features  # 542
+cargo test  --bin saife                    # 690 + 15 ignored  (default, 2026-10-26)
+cargo test  --bin saife --no-default-features  # 560
 cargo test  --bin saife-launch                 # 19 (default build only)
 cargo clippy --all-targets [--no-default-features] # must be 0 warnings
 ```
@@ -209,6 +209,12 @@ Triage rule, in order:
    excluding a path: a dismissal does not suppress future findings from the same
    query, and that is the property that makes it safe.
 
+One shape worth knowing: `rust/access-invalid-pointer` traces the **null literal**
+(`std::ptr::null_mut()`) into the dereference, so a `is_null()` guard placed after
+the assignment is not a barrier - the fixed call failed that way once. Start the FFI
+out-parameter as `MaybeUninit::uninit()`, `assume_init()` only after the call
+reports success, and keep the null check anyway.
+
 ```bash
 GH="C:/Program Files/GitHub CLI/gh.exe"
 "$GH" api "repos/GandalfIX/saife/code-scanning/alerts?state=open&per_page=100" \
@@ -217,9 +223,10 @@ GH="C:/Program Files/GitHub CLI/gh.exe"
   -f state=dismissed -f dismissed_reason='used in tests' -f dismissed_comment='<why>'
 ```
 
-Dismissing through the API needs a token with the `security_events` scope
-(`gh auth refresh -h github.com -s security_events`); dismissing in the UI needs
-nothing beyond the session you already have.
+Dismissing through the API worked with the `gh` token's `repo` scope on this
+public repository (2026-10-26); a `403 Resource not accessible` means the token
+needs `security_events` (`gh auth refresh -h github.com -s security_events`).
+Dismissing in the UI needs no scope at all.
 
 **Live legs** (`--ignored`) start real containers and **execute
 `target/debug/saife.exe`**, not the test binary — run
