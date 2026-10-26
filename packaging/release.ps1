@@ -210,9 +210,11 @@ try {
     foreach ($file in Get-ChildItem $manifestTarget -Filter '*.yaml') {
         $raw = [IO.File]::ReadAllText($file.FullName)
         $before = $raw
-        $raw = [regex]::Replace($raw, '(?m)^PackageVersion:\s*.*$', "PackageVersion: $version")
-        $raw = [regex]::Replace($raw, '(?m)^(\s*)InstallerUrl:\s*.*$', "`${1}InstallerUrl: $assetUrl")
-        $raw = [regex]::Replace($raw, '(?m)^(\s*)InstallerSha256:\s*.*$', "`${1}InstallerSha256: $hash")
+        # `[^\r\n]*` rather than `.*$`: .NET's `.` matches CR, so `.*$` swallows the
+        # carriage return and leaves the file with one LF line among CRLFs.
+        $raw = [regex]::Replace($raw, '(?m)^PackageVersion:[^\r\n]*', "PackageVersion: $version")
+        $raw = [regex]::Replace($raw, '(?m)^(\s*)InstallerUrl:[^\r\n]*', "`${1}InstallerUrl: $assetUrl")
+        $raw = [regex]::Replace($raw, '(?m)^(\s*)InstallerSha256:[^\r\n]*', "`${1}InstallerSha256: $hash")
         if ($raw -ne $before) {
             Write-Host ("rewrote {0} -> {1}" -f $file.Name, $version)
             if (-not $DryRun) {
