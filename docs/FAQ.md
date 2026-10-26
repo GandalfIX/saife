@@ -405,6 +405,35 @@ Get-ChildItem 'C:\Windows\System32\CodeIntegrity\CiPolicies\Active' -ErrorAction
 2. Sign the release with a code-signing certificate — the durable, product-level fix.
 3. Install on a host without that policy.
 
+### Confirmed case: Smart App Control (measured 2026-10-26)
+
+On the reporting machine the answer was unambiguous:
+
+```
+(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy').VerifiedAndReputablePolicyState   ->  1   # SAC is ON
+Get-AppLockerPolicy -Effective -Xml                                                                    ->  <AppLockerPolicy Version="1" />  # no rules
+CodeIntegrity event 3077: ... powershell.exe attempted to load ...\Programs\saife\saife.exe
+  that did not meet the Enterprise signing level requirements ... (Policy ID:{0283ac0f-...})
+```
+
+`1` means **Smart App Control is on**, and SAC refuses **unsigned** binaries on
+every path — there is no per-file allow list to add, and the `3033/3077` pairing
+(the `3077` carries the policy id) is its standard signature. Note the policy file
+`{0283AC0F-…}.cip` is also present on hosts where SAC is off (there it audits), so
+the **state value**, not the file list, is what decides.
+
+Consequences worth stating plainly:
+
+- SAC cannot be satisfied by a **self-signed** certificate; passing it needs a
+  trusted publisher (and even then, reputation matters).
+- Turning SAC **off** is one-way: re-enabling requires resetting/reinstalling
+  Windows. Treat it as a machine-owner decision, not an installer flag.
+- Until the release is signed, a SAC-on host cannot run saife at all —
+  path tricks, copying elsewhere, or running elevated do not help.
+
+The installer now warns about this **before** downloading (it reads the same
+registry value), and the blocked-execution message repeats the diagnosis.
+
 **The installer's own behaviour** (after the fix this entry documents): a refused
 execution is reported as a host condition with the diagnosis and those options, not
 as a PowerShell stack trace.

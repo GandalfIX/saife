@@ -91,6 +91,23 @@ if ($Version) {
 }
 
 Step "resolving the release ($releaseUrl)"
+
+# Smart App Control (1 = on) refuses UNSIGNED binaries outright, on every path. Say
+# so BEFORE the download: nothing this script does can change that verdict, and a
+# 2 MB download followed by a refusal reads like a broken release.
+$sacState = $null
+try {
+    $sacState = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+} catch { }
+if ($sacState -eq 1) {
+    Write-Host 'warning: Smart App Control is ON on this machine (VerifiedAndReputablePolicyState=1).' -ForegroundColor Yellow
+    Write-Host '         It refuses UNSIGNED binaries on every path, so this release will download,'
+    Write-Host '         verify and then be blocked when it is executed.'
+    Write-Host '         Turn SAC off (Windows Security > App & browser control > Smart App Control;'
+    Write-Host '         the switch is one-way) or install on a host where it is off.'
+    Write-Host "         Diagnosis and options: docs/FAQ.md, 'An Application Control policy has blocked'."
+    Write-Host ''
+}
 try {
     $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{
         'User-Agent' = 'saife-install'
