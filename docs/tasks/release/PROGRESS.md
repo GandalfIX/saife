@@ -48,6 +48,6 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | # | Decision | Status | Notes |
 |---|---|---|---|
 | D1 | Licence: proprietary-with-EULA vs OSI (manifest says `Proprietary`, repo has no `LICENSE`) | **MIT** | `LICENSE` added, `Cargo.toml` `license = "MIT"`, manifest `License: MIT` + `LicenseUrl`; `winget validate` passes. |
-| D2 | Code signing: Azure Trusted Signing / OV cert / none for now | open (shipped unsigned) | analysis: Artifact Signing (ex-Trusted Signing) is org-only in the EU (individuals US/CA only); OV cert needs an HSM/token; self-signed CA is internal-only. Recommendation stands: unsigned at launch, signing as a 1.0 gate. |
+| D2 | Code signing: Azure Trusted Signing / OV cert / none for now | open (shipped unsigned) | analysis: Artifact Signing (ex-Trusted Signing) is org-only in the EU (individuals US/CA only); OV cert needs an HSM/token; self-signed CA is internal-only. Recommendation stands: unsigned at launch, signing as a 1.0 gate. Options, costs and eligibility re-checked 2026-10-26: docs/design/2026-10-26-code-signing.md (SignPath Foundation free for OSS, Certum OSS cloud ~$58/yr, Azure org-only in the EU). |
 | D3 | First public version: `0.3.0` (breaking schema move already on `main`) vs `0.2.1` | **0.3.0** | `Cargo.toml` bumped; the `limits` move is the MINOR that justifies it. |
 | D4 | MSI scope | **deferred** | R4, only on demand (GPO/Intune). |
