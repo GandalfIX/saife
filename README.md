@@ -196,8 +196,11 @@ Example profile (`%USERPROFILE%\.saife\profiles\claude-code.json`):
 one field the example above used to omit.
 
 Variables expanded in paths: `$HOME`, `$CWD`, `$USERPROFILE`, `$TEMP`,
-`$LOCALAPPDATA`, `$APPDATA`, `$SID` (the session id). Forward slashes are
-normalized to backslashes. Working examples you can copy rather than retype are in
+`$LOCALAPPDATA`, `$APPDATA`, `$JAVA_HOME`, `$SID` (the session id). Forward
+slashes are normalized to backslashes. The set is closed: an unknown token is
+refused, and so is a known token whose variable is unset, because an empty
+expansion would grant a different path than the profile names. Working examples
+you can copy rather than retype are in
 `profiles/` (`node`, `jvm`, `opencode`); `packaging/README.txt` lists what the
 download contains.
 

@@ -4,8 +4,11 @@ Copy the one you need to `%USERPROFILE%\.saife\profiles\` and run
 `saife run --profile <name> --allow-cwd -- <command>`.
 
 Paths use the variables the loader expands: `$CWD`, `$HOME`, `$USERPROFILE`,
-`$TEMP`, `$LOCALAPPDATA`, `$APPDATA`, `$SID`. (`$LOCALAPPDATA`/`$APPDATA` were
-added on 2026-10-23; before that the samples spelled `AppData/Local` out.)
+`$TEMP`, `$LOCALAPPDATA`, `$APPDATA`, `$JAVA_HOME`, `$SID`. (`$LOCALAPPDATA`/`$APPDATA` were
+added on 2026-10-23; before that the samples spelled `AppData/Local` out.
+`$JAVA_HOME` was added on 2026-10-25 so `jvm.json` stops naming one JDK version;
+it must be set in the environment the supervisor starts in, and is refused
+otherwise rather than expanding to nothing.)
 
 These profiles were built from the toolchains installed on this machine and each
 one was exercised in a real sandboxed run, not just parsed.
@@ -53,11 +56,14 @@ which is the `grant propagation ... truncated` warning.
 | read-write | `$CWD` | the project, `build/`, `target/` |
 | read-write | `$HOME\.gradle` | Gradle caches, wrapper distributions, daemon logs |
 | read-write | `$HOME\.m2` | Maven local repository |
-| read-only | `C:\Program Files\Microsoft\jdk-25.0.4.101-hotspot` | the JDK (`JAVA_HOME`) |
+| read-only | `$JAVA_HOME` | the JDK, wherever this machine keeps it |
 | network | `repo.maven.apache.org`, `repo1.maven.org`, `plugins.gradle.org`, `services.gradle.org`, `downloads.gradle.org` | dependencies and wrapper downloads |
 
-The JDK path is version-specific on purpose: the parent directory also contains
-`OneDrive`, which must not be readable. Update the path when the JDK moves.
+`$JAVA_HOME` rather than the install path: the grant is the JDK directory itself,
+not its parent (`C:\Program Files\Microsoft` also holds `OneDrive`, which must not
+be readable), and the profile survives a JDK upgrade. If `JAVA_HOME` is unset the
+profile is refused instead of granting an empty path — set it, or write the path
+out.
 
 Verified: `javac Hello.java && java Hello` printed `JVM-OK 25.0.4.1`, and
 `gradle --version` started with launcher JVM 25.0.4.1.

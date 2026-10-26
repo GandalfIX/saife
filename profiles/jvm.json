@@ -11,7 +11,7 @@
       "$USERPROFILE/.m2"
     ],
     "read_only": [
-      "C:/Program Files/Microsoft/jdk-25.0.4.101-hotspot"
+      "$JAVA_HOME"
     ],
     "deny": [
       "$HOME/.ssh",

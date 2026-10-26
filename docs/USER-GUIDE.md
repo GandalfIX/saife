@@ -343,10 +343,16 @@ under `network` are now **refused** (the error names `limits`), so a profile
 written before it has to move them.
 
 Paths may use `$CWD`, `$HOME`, `$USERPROFILE`, `$TEMP`, `$LOCALAPPDATA`,
-`$APPDATA` and `$SID`; anything else (including `%VAR%`) is taken literally, and a
-path that is neither absolute nor expandable is resolved against the working
-directory — which is how a typo turns into a grant nobody intended, so it is
-worth checking with `saife audit show <sid> --filter 'op=SESSION_START'`.
+`$APPDATA`, `$JAVA_HOME` and `$SID` — a closed set, listed by the error if you use
+another one. `%VAR%` is **not** expanded and is refused like any other unknown
+token: a profile that keeps `$NOPE/tools` as a literal directory name grants
+nothing, and one that expands to an empty string grants the working directory. A
+token whose variable is not set in the environment is refused too, naming both,
+because an empty expansion is a different path than the profile says. `$JAVA_HOME`
+is the reason the set exists: shipped profiles name the toolchain, not one
+machine's JDK version (`jvm.json` grants `$JAVA_HOME` read-only, so the same file
+keeps working after a JDK upgrade). Inspect the result with
+`saife profile show <name> --expanded`.
 
 ```powershell
 saife profile list

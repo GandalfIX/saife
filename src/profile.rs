@@ -1147,48 +1147,117 @@ fn expand_paths(paths: &[String], cwd: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Expand the known variable set in a single string.
-pub fn expand_vars(s: &str, cwd: &Path) -> Result<String> {
-    let userprofile = std::env::var_os("USERPROFILE")
-        .map(|o| o.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let temp = std::env::var_os("TEMP")
-        .map(|o| o.to_string_lossy().to_string())
-        .unwrap_or_default();
-    // The two AppData roots. `$LOCALAPPDATA`/`$APPDATA` before 2026-10-23 were not
-    // expandable, so profiles spelled `$USERPROFILE/AppData/Local/...` out — which
-    // works but hides the intent, and made every sample look like it knew the
-    // layout of this machine. Fall back to the conventional locations when the
-    // variables are absent (a service context), so a profile still resolves.
-    let localappdata = std::env::var_os("LOCALAPPDATA")
-        .map(|o| o.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{userprofile}\\AppData\\Local"));
-    let appdata = std::env::var_os("APPDATA")
-        .map(|o| o.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{userprofile}\\AppData\\Roaming"));
-    let cwd_s = cwd.to_string_lossy().to_string();
-    let home = userprofile.clone();
+/// The tokens a profile may use. A CLOSED set on purpose: a profile is the policy,
+/// so a grant has to come from something the operator can point at in the docs, not
+/// from whatever happens to be exported in the shell that started the supervisor.
+const PROFILE_VARS: &[&str] = &[
+    "$CWD",
+    "$HOME",
+    "$USERPROFILE",
+    "$TEMP",
+    "$LOCALAPPDATA",
+    "$APPDATA",
+    "$JAVA_HOME",
+    // Known, but substituted later: the session id does not exist at load time.
+    "$SID",
+];
 
-    let mut result = s.to_string();
-    // Use distinct placeholder to avoid double-replacing $HOME inside $USERPROFILE.
-    result = result.replace("$CWD", &cwd_s);
-    result = result.replace("$HOME", &home);
-    result = result.replace("$USERPROFILE", &userprofile);
-    result = result.replace("$TEMP", &temp);
-    // No prefix collision: the `$` makes `$APPDATA` a distinct token from the tail
-    // of `$LOCALAPPDATA`, so the order of these two does not matter.
-    result = result.replace("$LOCALAPPDATA", &localappdata);
-    result = result.replace("$APPDATA", &appdata);
-    // $SID is expanded at a later stage when the session id is known; leave as-is
-    // here and the caller will substitute. For now, replace with empty if present
-    // in the filesystem slice (per-session dirs are auto-added by the sandbox).
-    // We don't error: $SID is allowed but optional.
-    if result.contains("$SID") {
-        // Leave the literal token; the allowlist builder substitutes it.
+/// `%JAVA_HOME%` and friends are set by installers WITH a trailing separator
+/// (`C:\Program Files\Java\jdk-25\`), which would otherwise become `...\\bin` - a
+/// different string from the same directory spelled without it.
+fn strip_trailing_sep(value: impl AsRef<str>) -> String {
+    let v = value.as_ref();
+    let trimmed = v.trim_end_matches(['\\', '/']);
+    // Keep a bare drive root ("C:\") intact: trimming it yields "C:", which is not
+    // a directory at all.
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        v.to_string()
+    } else {
+        trimmed.to_string()
     }
+}
+
+fn var_from_env(env_name: &str, token: &str, spelled: &str) -> Result<String> {
+    match std::env::var_os(env_name)
+        .map(|v| strip_trailing_sep(v.to_string_lossy()))
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => Ok(v),
+        // Empty used to expand to "", so "$HOME/x" became "\x": a RELATIVE path, and
+        // the allow-list resolves those against the session cwd. That turned a grant
+        // on the profile into a grant on the workspace, silently.
+        None => bail!(
+            "profile path {spelled:?} uses {token}, but {env_name} is not set. Set it, \
+             or write the path out; an empty value would grant a different directory \
+             than the profile says."
+        ),
+    }
+}
+
+pub fn expand_vars(s: &str, cwd: &Path) -> Result<String> {
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut rest = s;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if len == 0 {
+            // A stray '$' that does not start a token (a filename may contain one).
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        let ident = &after[..len];
+        let token = format!("${ident}");
+        match ident {
+            // Resolved once the session id exists; substituting it here would bake
+            // "no session" into a path that is meant to be per-session.
+            "SID" => out.push_str("$SID"),
+            "CWD" => out.push_str(&strip_trailing_sep(cwd.to_string_lossy())),
+            "HOME" | "USERPROFILE" => out.push_str(&var_from_env("USERPROFILE", &token, s)?),
+            "TEMP" => out.push_str(&var_from_env("TEMP", &token, s)?),
+            "JAVA_HOME" => out.push_str(&var_from_env("JAVA_HOME", &token, s)?),
+            // These two have a documented fallback, so a service context (no
+            // per-user environment) still resolves to the conventional location.
+            "LOCALAPPDATA" | "APPDATA" => {
+                let env_name = if ident == "LOCALAPPDATA" {
+                    "LOCALAPPDATA"
+                } else {
+                    "APPDATA"
+                };
+                let conventional = if ident == "LOCALAPPDATA" {
+                    "AppData\\Local"
+                } else {
+                    "AppData\\Roaming"
+                };
+                match std::env::var_os(env_name)
+                    .map(|v| strip_trailing_sep(v.to_string_lossy()))
+                    .filter(|v| !v.is_empty())
+                {
+                    Some(v) => out.push_str(&v),
+                    None => {
+                        let home = var_from_env("USERPROFILE", &token, s)?;
+                        out.push_str(&home);
+                        out.push('\\');
+                        out.push_str(conventional);
+                    }
+                }
+            }
+            _ => bail!(
+                "profile path {:?} uses {token}, which is not a variable this \
+                 build expands. Known: {}. Use one of those, or an absolute path.",
+                s,
+                PROFILE_VARS.join(", ")
+            ),
+        }
+        rest = &after[len..];
+    }
+    out.push_str(rest);
     // Normalize forward slashes to backslashes for Win32 APIs.
-    Ok(result.replace('/', "\\"))
+    Ok(out.replace('/', "\\"))
 }
 
 /// Merge the profile filesystem slice with CLI flags.
@@ -1289,6 +1358,71 @@ mod tests {
         let s = expand_vars("$HOME/.ssh and $CWD/x", &p).unwrap();
         assert!(s.starts_with("C:\\Users\\"));
         assert!(s.contains("\\.ssh and C:\\projekte\\myapp\\x"));
+    }
+
+    /// `$JAVA_HOME` (and the other toolchain roots) come from the environment, so a
+    /// shipped profile stops naming one machine's JDK version. `JAVA_HOME` is set
+    /// WITH a trailing separator on Windows installers, and that must not survive
+    /// into the grant.
+    #[test]
+    fn expand_java_home_trims_the_installers_trailing_separator() {
+        let _env = crate::env_lock();
+        let saved = std::env::var_os("JAVA_HOME");
+        unsafe { std::env::set_var("JAVA_HOME", "C:\\Program Files\\Java\\jdk-25\\") };
+        let p = PathBuf::from("C:\\projekte\\myapp");
+        let s = expand_vars("$JAVA_HOME/bin/java.exe", &p).unwrap();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("JAVA_HOME", v) },
+            None => unsafe { std::env::remove_var("JAVA_HOME") },
+        }
+        assert_eq!(s, "C:\\Program Files\\Java\\jdk-25\\bin\\java.exe");
+        assert!(!s.contains("\\\\bin"), "no doubled separator: {s:?}");
+    }
+
+    /// A variable the profile uses but the environment does not define is an ERROR.
+    /// The old behaviour expanded it to the empty string, so `"$HOME/x"` silently
+    /// became `"\\x"` - a relative path, which the allow-list resolves against the
+    /// session cwd: a grant on the workspace, spelled as a grant on the profile.
+    #[test]
+    fn expand_refuses_a_variable_that_is_not_set() {
+        let _env = crate::env_lock();
+        let saved = std::env::var_os("JAVA_HOME");
+        unsafe { std::env::remove_var("JAVA_HOME") };
+        let p = PathBuf::from("C:\\projekte\\myapp");
+        let err = expand_vars("$JAVA_HOME/lib", &p).unwrap_err();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("JAVA_HOME", v) },
+            None => unsafe { std::env::remove_var("JAVA_HOME") },
+        }
+        let msg = format!("{err:#}");
+        assert!(msg.contains("JAVA_HOME"), "names the variable: {msg}");
+        assert!(
+            msg.contains("$JAVA_HOME"),
+            "names the token as written: {msg}"
+        );
+    }
+
+    /// An unknown token is refused rather than left in the path: `$NOPE/x` used to
+    /// survive to the DACL setup as a directory literally named `$NOPE`.
+    #[test]
+    fn expand_refuses_an_unknown_variable() {
+        let p = PathBuf::from("C:\\projekte\\myapp");
+        let err = expand_vars("$NOPE/tools", &p).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("$NOPE"), "names the token: {msg}");
+        assert!(
+            msg.contains("$JAVA_HOME") && msg.contains("$LOCALAPPDATA"),
+            "lists the ones it knows: {msg}"
+        );
+    }
+
+    /// `$SID` belongs to a later stage (the session id does not exist yet), so it
+    /// stays literal here instead of being treated as unknown.
+    #[test]
+    fn expand_leaves_sid_for_the_later_stage() {
+        let p = PathBuf::from("C:\\projekte\\myapp");
+        let s = expand_vars("$TEMP/$SID/out", &p).unwrap();
+        assert!(s.contains("$SID"), "left for the session: {s:?}");
     }
 
     /// `$LOCALAPPDATA`/`$APPDATA` resolve to this machine's roots rather than to a
@@ -2451,9 +2585,18 @@ mod tests {
                 std::fs::copy(&path, shipped.join(path.file_name().unwrap())).unwrap();
             }
         }
+        // jvm.json grants `$JAVA_HOME`, so a machine without a JDK (CI) must still be
+        // able to load the docs: point it at a directory instead of skipping the
+        // example, which would quietly stop checking it.
+        let jdk = store.join("jdk");
+        std::fs::create_dir_all(&jdk).unwrap();
         let _env = crate::env_lock();
         let saved = std::env::var_os("USERPROFILE");
-        unsafe { std::env::set_var("USERPROFILE", &store) };
+        let saved_jdk = std::env::var_os("JAVA_HOME");
+        unsafe {
+            std::env::set_var("USERPROFILE", &store);
+            std::env::set_var("JAVA_HOME", &jdk);
+        }
         let mut checked = 0;
         for doc in docs {
             let Ok(text) = std::fs::read_to_string(root.join(doc)) else {
@@ -2498,6 +2641,10 @@ mod tests {
         match saved {
             Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
             None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match saved_jdk {
+            Some(v) => unsafe { std::env::set_var("JAVA_HOME", v) },
+            None => unsafe { std::env::remove_var("JAVA_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
