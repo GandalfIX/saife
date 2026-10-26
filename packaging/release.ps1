@@ -136,16 +136,10 @@ try {
     if ($text -notmatch $pattern) { Refuse "CHANGELOG.md has no '## [$version]' section" }
     $section = $Matches[0].TrimEnd() -replace '(?m)^## \[[^\]]+\][^\r\n]*\r?\n?', ''
 
-    if (-not $NotesFile) {
-        if (-not $section.Trim()) { Refuse "the CHANGELOG section for $version is empty" }
-        $NotesFile = Join-Path $releaseDir 'RELEASE_NOTES.md'
-        New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-        [IO.File]::WriteAllText($NotesFile, $section.Trim() + "`n", (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "release notes: $NotesFile"
-    }
-    $notesPreview = Get-Content $NotesFile -Raw
+    if (-not $section.Trim()) { Refuse "the CHANGELOG section for $version is empty" }
+    if ($NotesFile -and -not (Test-Path $NotesFile)) { Refuse "notes file $NotesFile does not exist" }
     Write-Host '--- release notes ---'
-    Write-Host $notesPreview
+    if ($NotesFile) { Write-Host (Get-Content $NotesFile -Raw) } else { Write-Host $section.Trim() }
     Write-Host '---------------------'
 
     if (-not $SkipTests) {
@@ -196,6 +190,14 @@ try {
         (Join-Path $releaseDir 'SHA256SUMS.txt'),
         "$($hash.ToLower())  $assetName`n",
         (New-Object System.Text.UTF8Encoding($false)))
+
+    # The notes file is written here, not before the build: `build-dist.ps1` deletes
+    # and recreates dist/ wholesale, so anything written into it earlier is gone.
+    if (-not $NotesFile) {
+        $NotesFile = Join-Path $releaseDir 'RELEASE_NOTES.md'
+        [IO.File]::WriteAllText($NotesFile, $section.Trim() + "`n", (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "release notes: $NotesFile"
+    }
 
     Step 'winget manifests'
     # In a dry run the rewrite happens on a copy: a dry run that leaves the tracked
