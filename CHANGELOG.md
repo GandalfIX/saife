@@ -8,6 +8,18 @@ minor release may break the profile schema; the error message names the fix.
 
 ## [Unreleased]
 
+### Added
+
+- `install.ps1`: one-command install (download, hash-verify against the release's
+  `SHA256SUMS.txt`, extract, version-check, user-PATH entry, self-check). It is the
+  supported install channel and needs no administrator rights.
+
+### Changed
+
+- No winget index submission: the community repository requires a Microsoft CLA
+  signature, which this project does not sign. `packaging/winget/` remains for local
+  `winget install --manifest` use.
+
 ## [0.3.0] - 2026-10-26
 
 First public release. Early stages: the tool works end to end, but the profile

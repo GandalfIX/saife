@@ -54,34 +54,33 @@ deferred roadmap.
 End users need Windows 11 24H2 (build 26100) or newer, x64 — and nothing else for
 the default backend: no administrator rights, no service, no MSI.
 
-### winget
+### Install with one command
 
 ```powershell
-winget install --id GandalfIX.SAIFE-Sandbox -e
+# download the installer, read it (about 150 lines, no obfuscation), then run it
+iwr https://raw.githubusercontent.com/GandalfIX/saife/main/install.ps1 -OutFile install.ps1
+notepad install.ps1
+.\install.ps1
 ```
 
-The package is under review in the community repository:
-[microsoft/winget-pkgs#462047](https://github.com/microsoft/winget-pkgs/pull/462047).
-That command starts working once the pull request is merged — a merged package is
-the route that also makes `winget upgrade` work later.
+It resolves the latest release, checks the archive's SHA256 against the release's own
+`SHA256SUMS.txt`, asks the unpacked binary what version it is, installs to
+`%LOCALAPPDATA%\Programs\saife`, puts that directory on your **user** PATH and runs
+`saife setup --check-only` as a self-check. No administrator rights, no registry
+writes, no service. Flags: `-Version <x.y.z>`, `-Destination <path>`,
+`-NoPathEntry`, `-WhatIf`.
 
-Until then, either use the direct download below, or install this repository's own
-manifest. The manifest carries the same fields, but winget distrusts manifest files
-on disk by default, so it needs a one-time, **admin-only** setting:
+The same installer in one line, for when you would rather not read it first:
 
 ```powershell
-winget settings --enable LocalManifestFiles          # once, in an elevated shell
-git clone https://github.com/GandalfIX/saife
-winget install --manifest saife\packaging\winget
+iwr https://raw.githubusercontent.com/GandalfIX/saife/main/install.ps1 | iex
 ```
 
-winget installs `saife.exe` and the launcher beside it under
-`%LOCALAPPDATA%\Microsoft\WinGet\Packages\` and puts `saife` on your PATH. It does
-not create profiles and does not remove state on uninstall: `%USERPROFILE%\.saife`
-and `%LOCALAPPDATA%\saife` survive (the audit chain and the signing key live
-there, by design).
+Piping a remote script straight into a shell is the habit this tool exists to make
+unnecessary, so the two-step form above is the recommended one. Either way the
+archive is hash-verified before extraction, and a mismatch stops the install.
 
-### Direct download
+### Manual download
 
 1. Take `saife-<version>-x64.zip` and `SHA256SUMS.txt` from the
    [latest release](https://github.com/GandalfIX/saife/releases/latest).
@@ -98,6 +97,23 @@ there, by design).
    ```
    Keep `saife.exe` and `saife-launch.exe` in the same directory: the supervisor
    finds its launcher beside itself.
+
+### winget
+
+There is no `winget install --id GandalfIX.SAIFE-Sandbox`. The community index
+(`microsoft/winget-pkgs`) requires a Microsoft CLA signature, which this project
+does not sign, so no package was submitted — the installer above is what the package
+would have done.
+
+The manifests in `packaging/winget/` still describe the release and work locally for
+anyone who wants them. winget refuses manifest files on disk until an elevated
+setting has been enabled once:
+
+```powershell
+winget settings --enable LocalManifestFiles          # once, in an elevated shell
+git clone https://github.com/GandalfIX/saife
+winget install --manifest saife\packaging\winget
+```
 
 The binaries are unsigned, so SmartScreen warns about an unknown publisher on the
 first run. The hash check above is what makes that warning answerable; a code

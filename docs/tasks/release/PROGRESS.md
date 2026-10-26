@@ -8,10 +8,11 @@ Version at plan time: `0.2.0` in `Cargo.toml`, **no tags**, no CI, no LICENSE, n
 public, the release is immutable, and the published asset was downloaded again after
 publishing and hash-compared (`9DD85C4E…`).
 
-What is left is not release-blocking: a tag-driven CI pipeline (R2), the winget-pkgs
-review (R3.2, PR open, CLA signature pending), the clean-VM install proof (R3.3,
-which needs an elevated one-time `winget settings --enable LocalManifestFiles` on the
-test machine), and signing as the 1.0 gate (D2).
+What is left is not release-blocking: a tag-driven CI pipeline (R2), the clean-VM
+install proof (R3.3 - now an `install.ps1` test, since there is no winget package), and
+signing as the 1.0 gate (D2). The winget index is out for good: R3.2 was withdrawn
+because the maintainer does not sign the Microsoft CLA, so `install.ps1` plus the
+release page are the delivery channels.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated · `[!]` blocked
 
@@ -32,10 +33,11 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | R2.2 | Workflow gates: version == tag, changelog section exists, uploaded bytes == hashed bytes | [ ] | |
 | R2.3 | `schema: 1` on `SESSION_START`; `audit verify` reports it; old chains unaffected | [ ] | additive, so a MINOR under the policy |
 | R3.1 | Manifest describes a real, published asset; `License` matches the repository decision | [x] | manifests name `v0.3.0` and the published hash `9DD85C4E…`; `winget show --manifest` resolves the package (name, moniker, licence, description). |
-| R3.2 | Submit to `microsoft/winget-pkgs` (wingetcreate or manual PR) | [~] | [microsoft/winget-pkgs#462047](https://github.com/microsoft/winget-pkgs/pull/462047) is open on the 1.12 schema; the Microsoft CLA signature is a one-time browser step by the maintainer. |
-| R3.3 | Clean-VM proof: install → upgrade → uninstall → `Get-Command saife` fails | [~] | not proven on a clean VM: `winget install --manifest` needs an elevated `winget settings --enable LocalManifestFiles`, which is off on this host. What was proven instead: the archive installs and runs by hand, and `winget validate`/`winget show` accept the manifests. |
+| R3.2 | Submit to `microsoft/winget-pkgs` (wingetcreate or manual PR) | [!] | withdrawn 2026-10-26: the PR ([#462047](https://github.com/microsoft/winget-pkgs/pull/462047)) was opened, then closed because the maintainer will not sign the Microsoft CLA. No `winget install --id` therefore exists; `packaging/winget/` stays for local `--manifest` installs. |
+| R3.3 | Clean-VM proof: install → upgrade → uninstall → `Get-Command saife` fails | [~] | not a winget test any more (no package): prove it with `install.ps1` on the 24H2 VM - install, re-run to upgrade, delete the directory and the user-PATH entry, then confirm `Get-Command saife` fails. Not run yet. |
 | R3.4 | Document what winget does not do: no self-update, no post-install script, state dirs survive uninstall | [x] | README states what winget does not do: no profile creation, no post-install step, and `%USERPROFILE%\.saife` + `%LOCALAPPDATA%\saife` survive uninstall. |
-| R4.1 | Direct download section in README + release page as the primary channel | [x] | `README.md` gained `## Install`: winget (index + local manifest) and direct download with hash verification, then a two-command verification. |
+| R4.1 | Direct download section in README + release page as the primary channel | [x] | README `## Install` leads with `install.ps1` (one command, hash-verified, user PATH, self-check) and keeps the manual 3-step download; verified end to end against the published release (`0.3.0`, hash `9DD85C4E…`) with `-Destination` in a temp directory. |
+| R4.5 | One-command installer (`install.ps1`) as the supported channel, no admin rights | [x] | resolves the latest release via the API, refuses a release without `SHA256SUMS.txt`, verifies the archive hash, refuses a binary whose `--version` disagrees with the tag, then extracts to `%LOCALAPPDATA%\Programs\saife`, appends the user PATH and runs the self-check. `-WhatIf` / `-Version` / `-Destination` / `-NoPathEntry`. |
 | R4.2 | Scoop manifest in `GandalfIX/scoop-bucket` | [ ] | optional, cheap |
 | R4.3 | Chocolatey package | [ ] | only if asked |
 | R4.4 | MSI (WiX) for GPO/Intune, with Add/Remove Programs entry | [ ] | only on demand |
