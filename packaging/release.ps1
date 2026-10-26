@@ -52,6 +52,29 @@ function Refuse([string]$message) {
     throw "release refused: $message"
 }
 
+# Everything the release uploads must be on disk BEFORE the tag moves. `gh release
+# create` is the next step after tagging, so a missing side file there leaves a
+# PUSHED TAG WITH NO RELEASE behind it - and a published tag is immutable, so that
+# failure is permanent rather than retryable. (It happened once: publishing from a
+# clean clone that carried the asset and the notes but not SHA256SUMS.txt.)
+function Assert-ReleaseSideFiles([string]$dir, [string]$name, [string]$hash) {
+    $sumsPath = Join-Path $dir 'SHA256SUMS.txt'
+    if (-not (Test-Path $sumsPath)) {
+        Refuse "no SHA256SUMS.txt in $dir - the release uploads it beside the asset, and a tag pushed without it cannot be withdrawn"
+    }
+    $entries = @{}
+    foreach ($line in (Get-Content $sumsPath)) {
+        if ($line -notmatch '^\s*([0-9a-fA-F]{64})\s+\*?(\S.*?)\s*$') { continue }
+        $entries[$Matches[2]] = $Matches[1].ToLowerInvariant()
+    }
+    if (-not $entries.ContainsKey($name)) {
+        Refuse "SHA256SUMS.txt does not list $name (it lists: $(($entries.Keys | Sort-Object) -join ', '))"
+    }
+    if ($entries[$name] -ne $hash.ToLowerInvariant()) {
+        Refuse "SHA256SUMS.txt records $($entries[$name]) for $name, the asset hashes to $hash - repackaging changes the hash, so rewrite the sums rather than the expectation"
+    }
+}
+
 if ($Prepare -and $Publish) { Refuse 'pass -Prepare or -Publish, not both' }
 if ($VerifyOnly -and $Publish) { Refuse 'pass -VerifyOnly or -Publish, not both' }
 $mode = if ($Publish) { 'publish' } elseif ($VerifyOnly) { 'verify' } else { 'prepare' }
@@ -322,6 +345,18 @@ if ($mainInstaller -notmatch "(?m)^\s*InstallerSha256:\s*$([regex]::Escape($hash
 }
 Write-Host "origin/main describes $assetName ($hash)"
 
+# Uploaded after the tag: prove every one of them exists first.
+Assert-ReleaseSideFiles $releaseDir $assetName $hash
+if ($NotesFile) {
+    if (-not (Test-Path $NotesFile)) { Refuse "notes file $NotesFile does not exist" }
+} else {
+    # Written before the tag rather than after it: generating release notes is the
+    # step most likely to fail (a missing CHANGELOG section), and failing here costs
+    # nothing.
+    $NotesFile = Save-ReleaseNotes $section
+}
+Write-Host "release files present: $assetName, SHA256SUMS.txt, $(Split-Path -Leaf $NotesFile)"
+
 Step 'probe the asset before tagging'
 Test-Asset $assetPath
 
@@ -344,7 +379,6 @@ Invoke-Git 'tag' '--annotate' $tag '--message' "SAIFE Sandbox $version" | Out-Nu
 Invoke-Git 'push' '--quiet' 'origin' $tag | Out-Null
 
 Step "publish the GitHub release $tag"
-if (-not $NotesFile) { $NotesFile = Save-ReleaseNotes $section }
 & $gh release create $tag --repo $Repository --title "SAIFE Sandbox $version" --verify-tag --notes-file $NotesFile $assetPath (Join-Path $releaseDir 'SHA256SUMS.txt')
 if ($LASTEXITCODE -ne 0) { Refuse 'gh release create failed' }
 
