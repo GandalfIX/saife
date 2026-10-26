@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 PackageIdentifier: GandalfIX.SAIFE-Sandbox
-PackageVersion: 0.2.0
+PackageVersion: 0.3.0
 # The default backend needs the in-box base-container / PSEC support of Windows 11
 # 24H2. The AppContainer backend also runs on older builds, but this package's
 # default path does not, so the floor is stated instead of discovered at runtime.
@@ -12,8 +12,8 @@ Installers:
     # Rewritten by packaging/release.ps1 from the built asset; the archive is FLAT
     # (no wrapper directory), which is what NestedInstallerFiles requires. Never edit
     # the URL or the hash by hand - a hand-edited hash is the known drift source.
-    InstallerUrl: https://github.com/GandalfIX/saife/releases/download/v0.2.0/saife-0.2.0-x64.zip
-    InstallerSha256: BA4E847258847BAB2CBF90BBE8F3D5FF70A78F491E50793F1E9887E0040B204D
+    InstallerUrl: https://github.com/GandalfIX/saife/releases/download/v0.3.0/saife-0.3.0-x64.zip
+    InstallerSha256: 9DD85C4EA0518F9CAAE597297C3EF978274873380D26A5DE7974C97CBFBF6640
     NestedInstallerType: portable
     NestedInstallerFiles:
       # The supervisor must find its launcher beside itself: both files are
