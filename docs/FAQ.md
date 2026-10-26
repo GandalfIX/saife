@@ -364,5 +364,39 @@ guarantee for a request with unusual policy — the run probes its own exact req
 and that verdict is the one that counts. **On an unsupported host, use
 `--backend appcontainer`** (it needs no MXC tier) or run on a supported build.
 
+## `install.ps1` fails with "An Application Control policy has blocked this file"
+
+**Symptom** (from the installer's self-check or the version probe):
+
+```
+Program 'saife.exe' failed to run: An Application Control policy has blocked this file
+```
+
+**Cause:** the host enforces an application-control policy — **Smart App Control**,
+**AppLocker** or **WDAC** — and saife ships **unsigned**. Those policies commonly
+block unsigned executables from *user-writable* paths (`%TEMP%`, `%LOCALAPPDATA%`),
+which is exactly where a fresh download and a per-user install live. The download
+itself is fine: in the reporter's own transcript the SHA256 matched and the
+archive extracted before the execute failed.
+
+**Diagnose on the machine:**
+```powershell
+Get-CimInstance Win32_DeviceGuard | Select-Object -ExpandProperty SecurityServicesRunning   # WDAC / Smart App Control services
+Get-AppLockerPolicy -Effective -Xml                                                          # AppLocker rules
+Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 20             # what blocked it, by policy
+```
+
+**Options:**
+1. Allow the install directory (or the binary) in the AppLocker/WDAC policy — needs an admin.
+2. Sign the release with a code-signing certificate — the durable, product-level fix.
+3. Install on a host without that policy.
+
+**The installer's own behaviour** (after the fix this entry documents): a refused
+execution is reported as a host condition with the diagnosis and those options, not
+as a PowerShell stack trace.
+Because `%TEMP%` is blocked more often than a real install path, the version probe
+falls back to the **installed** copy; if *that* copy is refused too, the files stay
+copied, nothing is added to the user Path, and the exit code is 1.
+
 <!-- NEXT FAQ ENTRY GOES HERE -->
 

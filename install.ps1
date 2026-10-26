@@ -45,6 +45,34 @@ function Step([string]$message) {
     Write-Host "== $message" -ForegroundColor Cyan
 }
 
+# A host whose application-control policy refuses to execute the download.
+#
+# Smart App Control, AppLocker and WDAC all fail the same way: Windows refuses to
+# create the process and PowerShell surfaces it as an ApplicationFailedException.
+# The wording is LOCALIZED, so detection keys on the shape (an exception from the
+# call) rather than on English text; every caller treats *any* such failure as
+# "this host will not run the binary", and names the policy families to check.
+function Show-ExecutionBlocked([string]$path, [string]$detail) {
+    Write-Host ''
+    Write-Host "install failed: this host's application-control policy refuses to run $path" -ForegroundColor Red
+    Write-Host "   $detail"
+    Write-Host ''
+    Write-Host '   saife ships UNSIGNED, and Smart App Control / AppLocker / WDAC commonly block'
+    Write-Host '   unsigned executables - often specifically from user-writable paths (%TEMP%,'
+    Write-Host '   %LOCALAPPDATA%), which is where a fresh download lives.'
+    Write-Host ''
+    Write-Host '   Diagnose on this machine:'
+    Write-Host '      Get-CimInstance Win32_DeviceGuard | Select-Object -ExpandProperty SecurityServicesRunning'
+    Write-Host '      Get-AppLockerPolicy -Effective -Xml'
+    Write-Host "      Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 20"
+    Write-Host ''
+    Write-Host '   Options:'
+    Write-Host "      1. allow $installDir (or this binary) in the AppLocker/WDAC policy - needs an admin"
+    Write-Host '      2. sign the release with a code-signing certificate - the product-level fix'
+    Write-Host '      3. install on a host without that policy'
+    Write-Host ''
+}
+
 # ------------------------------------------------------------------ what to fetch
 
 if ($Version) {
@@ -85,7 +113,13 @@ $installDir = $Destination
 $existing = Join-Path $installDir 'saife.exe'
 $existingVersion = $null
 if (Test-Path $existing) {
-    $existingVersion = ((& $existing --version) -join ' ') -replace '.*?(\d+\.\d+\.\d+\S*).*', '$1'
+    # A host that blocks execution throws here as well; report "unknown" rather than
+    # aborting before the download even starts.
+    try {
+        $existingVersion = ((& $existing --version) -join ' ') -replace '.*?(\d+\.\d+\.\d+\S*).*', '$1'
+    } catch {
+        $existingVersion = 'an existing build this host will not execute'
+    }
 }
 
 if ($WhatIf) {
@@ -141,12 +175,23 @@ try {
     }
 
     # Ask the binary what it is before installing it: a mislabelled build passes every
-    # check on the file name alone.
-    $reported = ((& (Join-Path $unpacked 'saife.exe') --version) -join ' ')
-    if ($reported -notlike "*SAIFE Sandbox $version*") {
-        Fail "the downloaded saife.exe reports '$($reported.Trim())', the release is $version"
+    # check on the file name alone. A host whose application-control policy refuses to
+    # execute this %TEMP% copy cannot answer here - that is a HOST condition, not a
+    # mislabelled release, so the probe is deferred to the installed copy (checked
+    # below) instead of being reported as a broken download.
+    $stagedProbe = $null
+    try {
+        $stagedProbe = ((& (Join-Path $unpacked 'saife.exe') --version) -join ' ')
+    } catch {
+        Write-Warning "cannot execute the staged copy on this host: $($_.Exception.Message)"
+        Write-Warning 'the version probe moves to the installed copy (user-writable paths such as %TEMP% are commonly blocked by application-control policy)'
     }
-    Write-Host "   ok: $($reported.Trim())" -ForegroundColor Green
+    if ($stagedProbe) {
+        if ($stagedProbe -notlike "*SAIFE Sandbox $version*") {
+            Fail "the downloaded saife.exe reports '$($stagedProbe.Trim())', the release is $version"
+        }
+        Write-Host "   ok: $($stagedProbe.Trim())" -ForegroundColor Green
+    }
 
     # ------------------------------------------------------------------ install
 
@@ -159,6 +204,20 @@ try {
     Copy-Item (Join-Path $unpacked '*') -Destination $installDir -Recurse -Force
 
     $installed = Join-Path $installDir 'saife.exe'
+
+    # The installed copy is the one that has to run: verify the version HERE, before
+    # the user Path is touched, and say plainly when the host refuses to start it.
+    try {
+        $reported = ((& $installed --version) -join ' ')
+    } catch {
+        Show-ExecutionBlocked $installed $_.Exception.Message
+        Fail 'the files were copied, but this host will not execute them; nothing was added to the user Path'
+    }
+    if ($reported -notlike "*SAIFE Sandbox $version*") {
+        Fail "the installed saife.exe reports '$($reported.Trim())', the release is $version"
+    }
+    Write-Host "   ok: $($reported.Trim())" -ForegroundColor Green
+
     if (-not $NoPathEntry) {
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         $entries = @($userPath -split ';' | Where-Object { $_ })
