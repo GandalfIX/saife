@@ -1243,11 +1243,17 @@ mod propagation_tests {
                 .is_ok()
                 {
                     for i in 0..info.AceCount {
-                        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-                        // `GetAce` writes a pointer into the ACL on success, but the
-                        // out-parameter starts null and nothing in its signature stops a
-                        // failure from leaving it that way: guard before dereferencing.
-                        if GetAce(dacl, i, &mut ace).is_err() || ace.is_null() {
+                        // `GetAce` writes the pointer on success and leaves the
+                        // out-parameter untouched on failure, so it starts uninitialised
+                        // rather than null: a null literal here reads to a static
+                        // analyser as "a null pointer reaches the deref below".
+                        let mut ace = std::mem::MaybeUninit::<*mut core::ffi::c_void>::uninit();
+                        if GetAce(dacl, i, ace.as_mut_ptr()).is_err() {
+                            continue;
+                        }
+                        let ace = ace.assume_init();
+                        // Still guard: a future API change must not turn this into UB.
+                        if ace.is_null() {
                             continue;
                         }
                         let a = &*(ace as *const StdAce);
