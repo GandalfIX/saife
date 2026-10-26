@@ -21,8 +21,8 @@ Three facts that are easy to get wrong here, each of which the manifest encodes:
 3. `InstallerSha256` must be the hash of the release asset, not of the human
    bundle (`sandbox-<sha>.zip`). The build script prints it:
 
-       pwsh -File packaging/build-dist.ps1 -ReleaseVersion 0.1.0
-       # -> release: .../saife-0.1.0-x64.zip (1.889 KB)
+       pwsh -File packaging/build-dist.ps1 -Release
+       # -> release: .../saife-<version>-x64.zip (1.889 KB)
        # -> sha256:  477BB4FF...
 
 This file lives OUTSIDE `packaging/winget/` on purpose: `winget validate`
@@ -30,9 +30,21 @@ scans every file in the manifest directory, and a prose file beside the manifest
 is parsed as YAML (a line ending in a colon fails as
 `[YAML:Scanner] ... [line 4; col 21]`, naming nothing useful).
 
-Placeholders that need a decision before submission to microsoft/winget-pkgs:
-`InstallerUrl` and `PackageUrl` (GitHub repository), `PublisherSupportUrl`, and
-`License: Proprietary` (confirm the licence; winget requires the field).
+The manifests are not edited by hand any more: `packaging/release.ps1` rewrites
+`PackageVersion`, `InstallerUrl` and `InstallerSha256` from the asset it just
+built, validates the directory with the real client, and only then tags and
+publishes. A hand-typed hash is the drift source this replaces.
+
+Submitting to `microsoft/winget-pkgs` (once per version):
+
+    wingetcreate submit --token <PAT> packaging/winget
+    # or copy packaging/winget to manifests/g/GandalfIX/SAIFE-Sandbox/<version>/ in
+    # a fork of microsoft/winget-pkgs and open the PR by hand
+
+The first submission also requires signing Microsoft's CLA (a one-time browser
+step). Until the PR is merged, `winget install --id GandalfIX.SAIFE-Sandbox` fails
+with "no package found" while `winget install --manifest packaging/winget` works -
+that is why the README documents both.
 
 Rationale for the other non-obvious fields — `MinimumOSVersion`, the moniker, the
 nested portable installer, and the release ritual — is in

@@ -76,6 +76,13 @@ base64 = "0.22"
 # must re-run tests/vm/spikes/mxc-ga-spike.
 mxc-sdk = { version = "=1.0.1", optional = true }
 
+[build-dependencies]
+# VERSIONINFO for the exes, derived from `[package] version` (R0.3). Build-time
+# only: nothing links it, and a host without the Windows SDK degrades to a
+# warning rather than a failed build.
+winresource = "0.1"
+
+
 [features]
 # ON BY DEFAULT (2026-10-22). The feature SELECTS the default backend: a build with
 # it runs `mxc` unless --backend appcontainer is passed. It shipped opt-in while the

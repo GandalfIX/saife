@@ -9,9 +9,9 @@ InstallerType: zip
 NestedInstallerType: portable
 Installers:
   - Architecture: x64
-    # Placeholder: point this at the real release asset when the repository and the
-    # first GitHub release exist. The archive is FLAT (no wrapper directory), which
-    # is what NestedInstallerFiles requires.
+    # Rewritten by packaging/release.ps1 from the built asset; the archive is FLAT
+    # (no wrapper directory), which is what NestedInstallerFiles requires. Never edit
+    # the URL or the hash by hand - a hand-edited hash is the known drift source.
     InstallerUrl: https://github.com/GandalfIX/saife/releases/download/v0.2.0/saife-0.2.0-x64.zip
     InstallerSha256: BA4E847258847BAB2CBF90BBE8F3D5FF70A78F491E50793F1E9887E0040B204D
     NestedInstallerType: portable
@@ -20,7 +20,7 @@ Installers:
       # extracted, but only the supervisor is aliased onto PATH.
       - RelativeFilePath: saife.exe
         PortableCommandAlias: saife
-      - RelativeFilePath: mxc-launch.exe
+      - RelativeFilePath: saife-launch.exe
     Commands:
       - saife
 ManifestType: installer

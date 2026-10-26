@@ -9,10 +9,13 @@
 
 param(
     [switch]$SkipBuild,
-    # When set, ALSO produce the release asset Winget consumes:
-    # saife-<version>-x64.zip, FLAT (no wrapper directory) and with the binary
-    # named saife.exe, because NestedInstallerFiles paths are relative to the
-    # archive root. The human bundle (dist/ + saife-<sha>.zip) stays wrapped.
+    # Produce the release asset Winget consumes: saife-<version>-x64.zip, FLAT (no
+    # wrapper directory) and with the binary named saife.exe, because
+    # NestedInstallerFiles paths are relative to the archive root. The human bundle
+    # (dist/ + saife-<sha>.zip) stays wrapped and is built either way.
+    [switch]$Release,
+    # Must-match override of the Cargo.toml version - a typo here publishes an asset
+    # whose name disagrees with the binary inside it, so a mismatch is refused.
     [string]$ReleaseVersion
 )
 
@@ -23,6 +26,21 @@ $staticTarget = Join-Path $root 'target-static'
 $repo = Join-Path $root '.git'
 # SAIFE is its own repository since 2026-10-24 (it used to be <monorepo>/sandbox), so
 # the probed commit is this directory's, not its parent's.
+
+# One number, one place: `Cargo.toml` owns the version and everything below derives
+# from it. `-ReleaseVersion` is a must-match override, not a second source - a typo
+# there would publish `saife-0.4.0-x64.zip` containing a 0.3.0 binary.
+$toml = Get-Content (Join-Path $root 'Cargo.toml') -Raw
+if ($toml -notmatch '(?sm)\[package\].*?^\s*version\s*=\s*"([^"]+)"') {
+    throw "cannot read the package version from $root\Cargo.toml"
+}
+$version = $Matches[1]
+if ($ReleaseVersion -and $ReleaseVersion -ne $version) {
+    throw ("-ReleaseVersion {0} does not match Cargo.toml ({1}); bump Cargo.toml or drop the flag" -f $ReleaseVersion, $version)
+}
+# Windows resource version: the numeric core padded to four components (`0.3.0.0`).
+$core = ($version -split '[-+]')[0]
+$resVersion = (@($core -split '\.') + @('0', '0', '0', '0'))[0..3] -join '.'
 
 if (-not $SkipBuild) {
     Write-Host '== building static-CRT binaries'
@@ -43,6 +61,21 @@ $bin = Join-Path $staticTarget 'release'
 foreach ($exe in 'saife.exe', 'saife-launch.exe') {
     if (-not (Test-Path (Join-Path $bin $exe))) {
         throw "$exe not found in $bin - run without -SkipBuild once"
+    }
+}
+
+# Ask the binaries what they are, rather than trusting the manifest: a stale
+# target-static/ build passes every name-based check and ships the old number.
+Write-Host '== verifying the built binaries'
+$probe = (& (Join-Path $bin 'saife.exe') --version) -join ' '
+$expectedProbe = "SAIFE Sandbox $version"
+if ($probe -notlike "*$expectedProbe*") {
+    throw ("{0} reports '{1}', Cargo.toml says {2} - rebuild (drop -SkipBuild)" -f 'saife.exe', $probe.Trim(), $expectedProbe)
+}
+foreach ($exe in 'saife.exe', 'saife-launch.exe') {
+    $actual = (Get-Item (Join-Path $bin $exe)).VersionInfo.FileVersion
+    if ($actual -ne $resVersion) {
+        throw ("{0} carries FileVersion '{1}', expected {2} - the VERSIONINFO step did not run (build.rs needs rc.exe from the Windows SDK)" -f $exe, $actual, $resVersion)
     }
 }
 
@@ -87,7 +120,8 @@ if (Test-Path $repo) {
     $sha = (& git -C $root rev-parse --short HEAD)
     $branch = (& git -C $root rev-parse --abbrev-ref HEAD)
 }
-$version = @(
+$versionTxt = @(
+    "version:     $version"
     "commit:      $sha"
     "branch:      $branch"
     "built:       $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC"
@@ -96,7 +130,7 @@ $version = @(
     "saife.exe:   $((Get-Item (Join-Path $dist 'saife.exe')).Length) bytes"
     "saife-launch: $((Get-Item (Join-Path $dist 'saife-launch.exe')).Length) bytes"
 ) -join "`r`n"
-Set-Content -Path (Join-Path $dist 'VERSION.txt') -Value $version
+Set-Content -Path (Join-Path $dist 'VERSION.txt') -Value $versionTxt
 
 # LF, not CRLF: `sha256sum -c SHA256SUMS.txt` reads a trailing CR as part of the
 # file name and fails on every line (measured: 11 failed opens). Windows users can
@@ -126,8 +160,8 @@ $zipInfo = Get-Item $zip
 Write-Host ''
 Write-Host ("bundle: {0}  ({1:N0} files, {2:N0} KB)" -f $zip, (Get-ChildItem $dist -Recurse -File).Count, ($zipInfo.Length / 1KB))
 
-if ($ReleaseVersion) {
-    Write-Host "== release asset for Winget ($ReleaseVersion, flat)"
+if ($Release -or $ReleaseVersion) {
+    Write-Host "== release asset for Winget ($version, flat)"
     $relStage = Join-Path $env:TEMP "saife-rel"
     if (Test-Path $relStage) { Remove-Item $relStage -Recurse -Force }
     New-Item -ItemType Directory -Path $relStage | Out-Null
@@ -138,7 +172,7 @@ if ($ReleaseVersion) {
     Copy-Item (Join-Path $dist 'profiles'), (Join-Path $dist 'plugins') -Destination $relStage -Recurse
     Copy-Item (Join-Path $dist 'README.txt') -Destination $relStage
 
-    $relZip = Join-Path $root "saife-$ReleaseVersion-x64.zip"
+    $relZip = Join-Path $root "saife-$version-x64.zip"
     if (Test-Path $relZip) { Remove-Item $relZip -Force }
     Compress-Archive -Path (Join-Path $relStage '*') -DestinationPath $relZip
     Remove-Item $relStage -Recurse -Force
@@ -146,5 +180,5 @@ if ($ReleaseVersion) {
     $hash = (Get-FileHash $relZip -Algorithm SHA256).Hash
     Write-Host ("release: {0}  ({1:N0} KB)" -f $relZip, ((Get-Item $relZip).Length / 1KB))
     Write-Host ("sha256:  {0}" -f $hash)
-    Write-Host 'Update InstallerSha256 in packaging/winget/*.installer.yaml with the value above.'
+    Write-Host 'packaging/release.ps1 rewrites the manifests from this hash; do not edit them by hand.'
 }

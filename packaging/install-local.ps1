@@ -1,4 +1,4 @@
-# Install a locally built SAIFE release on this machine.
+﻿# Install a locally built SAIFE release on this machine.
 #
 #   pwsh -File packaging\install-local.ps1                 # the archive matching Cargo.toml
 #   pwsh -File packaging\install-local.ps1 -Zip .\saife-0.3.0-x64.zip
@@ -47,12 +47,18 @@ function Get-ArchiveVersion([string]$Path) {
 }
 
 if (-not $Zip) {
-    $matching = Join-Path $root "saife-$declared-x64.zip"
-    if (-not (Test-Path $matching)) {
-        $any = Get-ChildItem $root -Filter 'saife-*-x64.zip' -File |
+    # Two homes, on purpose: `build-dist.ps1 -Release` leaves the asset at the repo
+    # root, `release.ps1` archives it under dist/release/ before publishing.
+    $candidates = @(
+        (Join-Path $root "saife-$declared-x64.zip"),
+        (Join-Path $root "dist/release/saife-$declared-x64.zip")
+    )
+    $matching = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $matching) {
+        $any = Get-ChildItem $root, (Join-Path $root 'dist/release') -Filter 'saife-*-x64.zip' -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $found = if ($any) { " (found $((Get-ArchiveVersion $any.FullName)) instead)" } else { '' }
-        throw ("no saife-{0}-x64.zip in {1}{2} - run: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {0}" -f $declared, $root, $found)
+        throw ("no saife-{0}-x64.zip in {1}{2} - run: pwsh -File packaging\build-dist.ps1 -Release" -f $declared, $root, $found)
     }
     $Zip = $matching
 }
@@ -66,7 +72,7 @@ if ($archiveVersion -ne $declared) {
     if ($AllowVersionMismatch) {
         Write-Warning ("archive is {0} but Cargo.toml declares {1} - installing anyway (-AllowVersionMismatch)" -f $archiveVersion, $declared)
     } else {
-        throw ("archive is {0} but Cargo.toml declares {1}. Rebuild with: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {1}  (or pass -AllowVersionMismatch to install the older build on purpose)" -f $archiveVersion, $declared)
+        throw ("archive is {0} but Cargo.toml declares {1}. Rebuild with: pwsh -File packaging\build-dist.ps1 -Release  (or pass -AllowVersionMismatch to install the older build on purpose)" -f $archiveVersion, $declared)
     }
 }
 

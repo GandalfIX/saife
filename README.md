@@ -21,7 +21,12 @@ container runtime, no daemon, no VM. Windows-native equivalent of
 
 ## Status
 
-MVP, under active development. Implemented pillars:
+**First public release, early stages.** The tool works end to end (install, run,
+audit, verify) and is usable for real work, but the profile schema and the CLI
+still move: a 0.x minor release can refuse a profile that worked before, and the
+error message names the fix. The version history is in `CHANGELOG.md`.
+
+Implemented pillars:
 
 - **Filesystem isolation** (US-1, US-2) - `mxc`: an additive policy over the
   workspace plus read-only extra grants; `appcontainer`: per-directory DACL
@@ -43,6 +48,64 @@ proxy. Out of scope for the MVP: undo/rollback, credential injection, ghost
 sessions, runtime supervisor, Sigstore provenance, GUI/TUI, multi-user mode.
 See `docs/design/prd/prd-sandbox.md` for the PRD and `docs/notes/future-ideas.md` for the
 deferred roadmap.
+
+## Install
+
+End users need Windows 11 24H2 (build 26100) or newer, x64 — and nothing else for
+the default backend: no administrator rights, no service, no MSI.
+
+### winget
+
+```powershell
+winget install --id GandalfIX.SAIFE-Sandbox -e
+```
+
+The package is submitted to the community repository (`microsoft/winget-pkgs`) and
+becomes available once that pull request is reviewed and merged. Until then, the
+manifest in this repository installs the same published archive and is the
+supported route:
+
+```powershell
+git clone https://github.com/GandalfIX/saife
+winget install --manifest saife\packaging\winget --accept-package-agreements --accept-source-agreements
+```
+
+winget installs `saife.exe` and the launcher beside it under
+`%LOCALAPPDATA%\Microsoft\WinGet\Packages\` and puts `saife` on your PATH. It does
+not create profiles and does not remove state on uninstall: `%USERPROFILE%\.saife`
+and `%LOCALAPPDATA%\saife` survive (the audit chain and the signing key live
+there, by design).
+
+### Direct download
+
+1. Take `saife-<version>-x64.zip` and `SHA256SUMS.txt` from the
+   [latest release](https://github.com/GandalfIX/saife/releases/latest).
+2. Check the download against the published hash:
+   ```powershell
+   Get-FileHash .\saife-*-x64.zip -Algorithm SHA256     # compare with SHA256SUMS.txt
+   ```
+3. Extract it to a permanent directory and put that directory on your **user**
+   PATH:
+   ```powershell
+   Expand-Archive .\saife-*-x64.zip -DestinationPath "$env:LOCALAPPDATA\Programs\saife"
+   [Environment]::SetEnvironmentVariable(
+     'Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$env:LOCALAPPDATA\Programs\saife", 'User')
+   ```
+   Keep `saife.exe` and `saife-launch.exe` in the same directory: the supervisor
+   finds its launcher beside itself.
+
+The binaries are unsigned, so SmartScreen warns about an unknown publisher on the
+first run. The hash check above is what makes that warning answerable; a code
+signing certificate is a 1.0 gate (see `docs/design/versioning.md`).
+
+### Verify the install
+
+```powershell
+saife setup --check-only                                   # host build, backends, audit, proxy
+saife run --allow-cwd -- cmd /c echo ok                    # one sandboxed command
+```
+
+Then read `docs/USER-GUIDE.md` before pointing an agent at a real repository.
 
 ## Requirements
 
