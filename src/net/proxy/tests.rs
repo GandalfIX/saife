@@ -5501,8 +5501,14 @@
             resp.contains(&format!("127.0.0.1:{port}")),
             "body must name the proxy host:port: {resp}"
         );
-        for secret in ["alice", "s3cret", "@"] {
-            assert!(!resp.contains(secret), "body leaked {secret:?}: {resp}");
+        for (i, secret) in ["alice", "s3cret", "@"].into_iter().enumerate() {
+            // The body is the thing under test: a failure that echoes it re-leaks
+            // whatever the assertion just found.
+            assert!(
+                !resp.contains(secret),
+                "body leaked credential #{} (values withheld)",
+                i + 1
+            );
         }
         let ev = last_connect_event(&t.sid);
         assert_eq!(ev["disposition"], "deny");

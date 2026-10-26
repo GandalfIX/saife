@@ -157,6 +157,12 @@ to `502` (`docs/adr/0001`, D9).
 - The **root is `SESSION_START`** and is written before any child can run. On a
   refused session it carries `disposition: deny`, followed by `SESSION_REFUSED`.
 - Leaves are written **before** the response they describe.
+- **The session id is a selector, not a credential.** It is
+  `YYYYMMDD-HHMMSS-NNNNN` from the clock and the pid; it names the log, the root
+  and the `.saife/<sid>` tree, and `--print-sid`, `audit show` and `audit verify`
+  print it on purpose. It authorises nothing: no command may treat "knows the
+  sid" as permission. The network credential is the per-run `RunToken`, which is
+  never printed and never written to a leaf.
 
 ---
 
@@ -179,6 +185,41 @@ silently behaving differently.
 Gates for any change: both feature states green (default and `--no-default-features`), clippy 0 in dev and release,
 `cargo build --release` 0 warnings, touched files `rustfmt`-clean, CRLF
 preserved (byte counts, not `grep`: this host's `grep` hides CR).
+
+### Code scanning (CodeQL)
+
+Alerts live at <https://github.com/GandalfIX/saife/security/code-scanning>. The
+analyser is GitHub's **default setup** - languages `actions`/`python`/`rust`,
+query suite `default`, threat model `remote`, weekly plus push/PR triggers, and
+**no workflow file**, so there is no `paths`/`paths-ignore` and no query filter.
+`gh` is not on PATH here; use `C:/Program Files/GitHub CLI/gh.exe`.
+
+Triage rule, in order:
+
+1. **Fix it** when the code is one line worse than it should be (a leak test that
+   prints the value it proves absent, an unchecked pointer). A fix closes the
+   alert as `fixed` on the next scan, which is evidence; a dismissal is only an
+   assertion.
+2. **Classify** the rest with one question: *is this value needed to obtain access
+   the caller did not already have?* No -> it is a **selector** (a session id, a
+   log path) and printing it is intentional -> dismiss `won't fix`.
+3. **Test-only code** (`#[cfg(test)]`, `src/tests.rs`, `tests/vm/spikes/**`) is not
+   in the shipped binary -> dismiss `used in tests`.
+4. **Dismiss per alert, with a comment.** Never argue for removing a rule or
+   excluding a path: a dismissal does not suppress future findings from the same
+   query, and that is the property that makes it safe.
+
+```bash
+GH="C:/Program Files/GitHub CLI/gh.exe"
+"$GH" api "repos/GandalfIX/saife/code-scanning/alerts?state=open&per_page=100" \
+  --jq '[.[] | {n: .number, rule: .rule.id, path: .most_recent_instance.location.path}]'
+"$GH" api -X PATCH "repos/GandalfIX/saife/code-scanning/alerts/<n>" \
+  -f state=dismissed -f dismissed_reason='used in tests' -f dismissed_comment='<why>'
+```
+
+Dismissing through the API needs a token with the `security_events` scope
+(`gh auth refresh -h github.com -s security_events`); dismissing in the UI needs
+nothing beyond the session you already have.
 
 **Live legs** (`--ignored`) start real containers and **execute
 `target/debug/saife.exe`**, not the test binary — run

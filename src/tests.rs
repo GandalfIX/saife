@@ -885,8 +885,14 @@
         let warn = warn.expect("differing values must warn [G-42]");
         assert!(warn.contains("profile-proxy:8080"), "{warn}");
         assert!(warn.contains("env-proxy:3128"), "{warn}");
-        for secret in ["s3cret", "hunter2", "alice", "bob"] {
-            assert!(!warn.contains(secret), "warning leaked {secret:?}: {warn}");
+        for (i, secret) in ["s3cret", "hunter2", "alice", "bob"].into_iter().enumerate() {
+            // The failure message must not carry the value it asserts is absent:
+            // a redaction test that prints the credential fails the rule it tests.
+            assert!(
+                !warn.contains(secret),
+                "warning leaked credential #{} (values withheld)",
+                i + 1
+            );
         }
     }
 
@@ -913,8 +919,13 @@
         assert!(w.contains("(unparsable)"), "{w}");
         assert!(w.contains("unsupported upstream proxy scheme"), "{w}");
         assert!(w.contains("direct"), "{w}");
-        for secret in ["alice", "s3cret", "profile-proxy:8443"] {
-            assert!(!w.contains(secret), "warning leaked {secret:?}: {w}");
+        for (i, secret) in ["alice", "s3cret", "profile-proxy:8443"].into_iter().enumerate() {
+            // Same rule as above: name the position, withhold the value.
+            assert!(
+                !w.contains(secret),
+                "warning leaked credential #{} (values withheld)",
+                i + 1
+            );
         }
     }
 

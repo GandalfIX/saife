@@ -1177,6 +1177,18 @@ mod propagation_tests {
     const ACE_TYPE_ALLOWED: u8 = 0;
     const ACE_TYPE_DENIED: u8 = 1;
 
+    /// A standard (non-object) ACE: `ACE_HEADER` is 4 bytes, then `Mask` at
+    /// offset 4, then the SID. `ACCESS_ALLOWED_ACE` and `ACCESS_DENIED_ACE`
+    /// share that layout, and the `AceType` filter below is what makes reading
+    /// it as this struct true (an object ACE carries a GUID after the mask and
+    /// is never reached).
+    #[repr(C)]
+    struct StdAce {
+        header: ACE_HEADER,
+        mask: u32,
+        sid_start: [u8; 4],
+    }
+
     const TEST_SID: &str = "S-1-15-2-3149-3149-3149";
     const DIR_INHERIT_FLAGS: u8 = 0x3; // SUB_CONTAINERS_AND_OBJECTS_INHERIT
 
@@ -1231,18 +1243,28 @@ mod propagation_tests {
                 .is_ok()
                 {
                     for i in 0..info.AceCount {
-                        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-                        if GetAce(dacl, i, &mut ace).is_err() {
+                        // `GetAce` writes the pointer on success and leaves the
+                        // out-parameter untouched on failure, so it starts uninitialised
+                        // rather than null: a null literal here reads to a static
+                        // analyser as "a null pointer reaches the deref below".
+                        let mut ace = std::mem::MaybeUninit::<*mut core::ffi::c_void>::uninit();
+                        if GetAce(dacl, i, ace.as_mut_ptr()).is_err() {
                             continue;
                         }
-                        let hdr = &*(ace as *const ACE_HEADER);
-                        if hdr.AceType != ACE_TYPE_ALLOWED && hdr.AceType != ACE_TYPE_DENIED {
+                        let ace = ace.assume_init();
+                        // Still guard: a future API change must not turn this into UB.
+                        if ace.is_null() {
                             continue;
                         }
-                        let mask = *((ace as *const u8).add(4) as *const u32);
-                        let ace_sid = PSID((ace as *const u8).add(8) as *mut _);
+                        let a = &*(ace as *const StdAce);
+                        if a.header.AceType != ACE_TYPE_ALLOWED
+                            && a.header.AceType != ACE_TYPE_DENIED
+                        {
+                            continue;
+                        }
+                        let ace_sid = PSID(a.sid_start.as_ptr() as *mut _);
                         if EqualSid(*sid, ace_sid).is_ok() {
-                            out.push((mask, hdr.AceFlags));
+                            out.push((a.mask, a.header.AceFlags));
                         }
                     }
                 }
