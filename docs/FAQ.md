@@ -309,5 +309,31 @@ There is no CLI flag for it — profile only, and like every grant it belongs in
 BOTH the installed profile (`%USERPROFILE%\.saife\profiles\`) and the repo
 sample (`profiles/`).
 
+## Why is a session in my home directory refused ("writable grant … contains the launcher")?
+
+```
+[saife] mxc: writable grant "C:\\Users\\marku" contains the launcher "C:\\Users\\marku\\AppData\\Local\\Programs\\saife\\saife-launch.exe": the launcher runs on the host at the next launch, so a workload that can replace it is scheduling code to run with the supervisor's rights. Narrow the grant.
+```
+
+**Why (the short reason):** the `mxc` backend starts the container through
+`saife-launch.exe`, which sits beside the supervisor — and that launcher is
+executed **on the host at the NEXT launch** (it is what carries `NO_PROXY` /
+`SAIFE_PROXY_PORT` into the child). A writable grant that contains it therefore
+lets the workload swap the binary and get its own code run with the
+supervisor's rights next time. So a grant covering your home directory (which
+contains `AppData\Local\Programs\saife\`) — or any ancestor of it, e.g.
+`C:\Users` — is refused **before the child starts**: no container is created,
+no audit session is opened for it at all (no new file under
+`%LOCALAPPDATA%\saife\audit`, not even a `SESSION_START` root), and the exit
+code is **2** (a refusal, deliberately distinct from the workload's own exit
+code and from the 124 deadline kill). This is a designed refusal, not a bug.
+Measured on the installed build and on a clean `target/release` build.
+
+**What to do:** run in the project directory (the workspace is granted anyway),
+or grant the specific directories the workload needs (`--allow <path>`) instead
+of `$HOME`. Do not try to work around it by moving the launcher: the refusal
+follows the launcher's location. Note it is an `mxc`-backend rule — the
+`appcontainer` backend has no host-side launcher wrapper.
+
 <!-- NEXT FAQ ENTRY GOES HERE -->
 
