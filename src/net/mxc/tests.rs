@@ -1730,6 +1730,22 @@
         assert!(refusal.to_string().contains("no tier"), "{refusal}");
     }
 
+    /// A refusal an operator can only read as a dead end is half a message: when
+    /// the probe names NO tier (the machine `mxc` cannot dispatch on), the text
+    /// must name the alternative backend and the diagnostic command.
+    #[test]
+    fn the_no_tier_refusal_names_the_way_out() {
+        let record = tier_record(ProbeView {
+            tier: None,
+            needs_dacl_augmentation: None,
+        });
+        let refusal = verify_tier(&record, TierExpectation::Exactly(REQUIRED_TIER))
+            .expect_err("an unnamed tier cannot satisfy a requirement");
+        let text = refusal.to_string();
+        assert!(text.contains("--backend appcontainer"), "{text}");
+        assert!(text.contains("saife setup --check-only"), "{text}");
+    }
+
     /// The backend's requirement is what decides, not a global constant: a backend
     /// constructed with `Exactly(REQUIRED_TIER)` refuses, and `Recorded` is a
     /// **deliberate, named** opt-out for a measurement (P2.3 review, item 1).

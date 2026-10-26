@@ -1478,7 +1478,10 @@ impl fmt::Display for TierMismatch {
             f,
             "guardrail 2: this session requires tier `{}`, but the probe of the exact request \
              reported {observed} (tier_source `{}`) — refused before launch, so the workload \
-             never ran",
+             never ran\n  \
+             What to do: this host's MXC probe named no dispatcheable tier, so the `mxc` \
+             backend cannot run a session here. Use `--backend appcontainer`, or run \
+             `saife setup --check-only` for the host report and the exact probe verdict.",
             self.expected, self.source
         )
     }

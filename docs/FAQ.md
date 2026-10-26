@@ -335,5 +335,34 @@ of `$HOME`. Do not try to work around it by moving the launcher: the refusal
 follows the launcher's location. Note it is an `mxc`-backend rule — the
 `appcontainer` backend has no host-side launcher wrapper.
 
+## Why does `mxc` refuse with "the probe … reported no tier" on my other machine?
+
+```
+[saife] mxc: guardrail 2: this session requires tier `base-container`, but the probe of the exact request
+reported no tier (tier_source `unavailable`) — refused before launch, so the workload never ran
+  What to do: this host's MXC probe named no dispatcheable tier, …
+```
+
+**Why:** guardrail 2 requires the tier the session actually dispatches to, and that
+tier is *probed per request* — never inferred from the OS build number. On a host
+where the probe names no tier (`tier_source unavailable`), no session can dispatch,
+so the launch is refused before the child exists. That is fail-closed by design:
+a tier that cannot be shown is treated as not met.
+
+**Check the host before running:** `saife setup --check-only` now prints the same
+probe on a representative base request:
+
+| line reads | meaning |
+|---|---|
+| `base-container (tier_source \`probe\`, needs_dacl_augmentation=false)` | sessions should dispatch normally |
+| `no tier reported (tier_source \`unavailable\`) — the mxc backend refuses at launch on this host; use --backend appcontainer` | `mxc` cannot run here |
+| `probe failed: …` | the SDK probe itself errored — the message is the diagnosis |
+| `not built in: this binary has no \`mxc\` backend` | built with `--no-default-features`; sessions use appcontainer |
+
+The setup probe uses a representative base request, so a tier named there is not a
+guarantee for a request with unusual policy — the run probes its own exact request
+and that verdict is the one that counts. **On an unsupported host, use
+`--backend appcontainer`** (it needs no MXC tier) or run on a supported build.
+
 <!-- NEXT FAQ ENTRY GOES HERE -->
 

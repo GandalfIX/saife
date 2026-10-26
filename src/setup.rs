@@ -90,6 +90,7 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
     );
     println!("Job Object                 : available (always, Win9x+)");
     for line in network_report_lines(build) { println!("{line}"); }
+    println!("MXC tier (probe)          : {}", mxc_tier_line());
     println!("Drive-root grant (KI-1.1)  : {}", drive_root_status());
     println!(
         "Audit (hash-chain + Ed25519): {}",
@@ -128,6 +129,86 @@ fn network_report_lines(build: u32) -> Vec<String> {
         "  WARNING (inbound surface) : capability is bidirectional - a listening sandboxed process can accept connections from LAN peers.".to_string(),
         "    Strong isolation       : use --block-net (zero network capability SIDs, all connect() denied)".to_string(),
     ]
+}
+
+/// MXC tier probe for the `setup --check-only` report.
+///
+/// Guardrail 2 probes the tier of the EXACT request at launch, so this report
+/// cannot promise what a session will get. What it CAN do is run the same probe
+/// on a representative base request and print the verdict, so a host where `mxc`
+/// cannot dispatch is visible BEFORE a run refuses with "reported no tier".
+fn mxc_tier_line() -> String {
+    #[cfg(feature = "mxc-backend")]
+    {
+        use crate::net::mxc;
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => return format!("probe failed: {e}"),
+        };
+        let supervisor = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => return format!("probe failed: {e}"),
+        };
+        let Some(launcher) = mxc::launcher_beside(&supervisor) else {
+            return "unavailable: saife-launch.exe is not beside this supervisor, so mxc cannot launch here".to_string();
+        };
+        let cwd_text = cwd.display().to_string();
+        let input = mxc::MxcSessionInput {
+            command: "cmd /c echo saife-setup-probe".to_string(),
+            working_directory: Some(cwd_text.clone()),
+            environment: Vec::new(),
+            filesystem: mxc::MxcFilesystemInput {
+                readwrite_paths: vec![cwd_text],
+                readonly_paths: Vec::new(),
+                denied_paths: Vec::new(),
+            },
+            network: mxc::MxcNetworkInput::default(),
+            timeout_ms: None,
+            stdio: mxc::StdioSelection::Capture,
+        };
+        let request = match mxc::build_request(&input, &launcher) {
+            Ok(request) => request,
+            Err(e) => return format!("probe failed (request): {e}"),
+        };
+        match mxc::probe_tier(&request) {
+            Ok(record) => format_mxc_tier_line(
+                record.tier.as_deref(),
+                record.tier_source,
+                record.needs_dacl_augmentation,
+            ),
+            Err(e) => format!("probe failed: {e}"),
+        }
+    }
+    #[cfg(not(feature = "mxc-backend"))]
+    {
+        "not built in: this binary has no `mxc` backend (--no-default-features); sessions use appcontainer".to_string()
+    }
+}
+
+/// One `setup --check-only` verdict line for the MXC tier probe (pure).
+///
+/// Compiled only where it has a caller: the probe path (`mxc-backend`) and the
+/// tests. A binary without the feature never prints this line, and the live
+/// `#[cfg(not(feature))]` arm of [`mxc_tier_line`] says so instead.
+#[cfg(any(feature = "mxc-backend", test))]
+fn format_mxc_tier_line(
+    tier: Option<&str>,
+    source: &str,
+    needs_dacl: Option<bool>,
+) -> String {
+    match tier {
+        Some(tier) => format!(
+            "{tier} (tier_source `{source}`, needs_dacl_augmentation={})",
+            match needs_dacl {
+                Some(v) => v.to_string(),
+                None => "unknown".to_string(),
+            }
+        ),
+        None => format!(
+            "no tier reported (tier_source `{source}`) — the mxc backend refuses at launch on this \
+             host; use --backend appcontainer"
+        ),
+    }
 }
 
 /// One-time admin step: grant S-1-15-2-2 (All RESTRICTED APPLICATION PACKAGES)
@@ -481,5 +562,33 @@ mod tests {
     fn network_report_handles_unsupported_build() {
         let lines = network_report_lines(16298);
         assert!(lines.iter().any(|l| l.contains("MISSING")));
+    }
+
+    /// The MXC verdict line NAMES the tier when the host's probe reports one, so
+    /// a supported machine reads as supported instead of "unknown".
+    #[test]
+    fn mxc_tier_line_reports_a_named_tier() {
+        let line = format_mxc_tier_line(Some("base-container"), "probe", Some(false));
+        assert!(line.contains("base-container"), "{line}");
+        assert!(line.contains("tier_source `probe`"), "{line}");
+        assert!(line.contains("needs_dacl_augmentation=false"), "{line}");
+    }
+
+    /// An UNKNOWN DACL fact must say `unknown`, never invent `false`: the record
+    /// only carries what the probe said.
+    #[test]
+    fn mxc_tier_line_does_not_invent_a_missing_dacl_fact() {
+        let line = format_mxc_tier_line(Some("processcontainer"), "probe", None);
+        assert!(line.contains("needs_dacl_augmentation=unknown"), "{line}");
+    }
+
+    /// No tier is the machine state that refuses every `mxc` launch; the report
+    /// has to say what to DO, not just what is missing.
+    #[test]
+    fn mxc_tier_line_promises_nothing_and_names_the_way_out() {
+        let line = format_mxc_tier_line(None, "unavailable", None);
+        assert!(line.contains("no tier reported"), "{line}");
+        assert!(line.contains("tier_source `unavailable`"), "{line}");
+        assert!(line.contains("--backend appcontainer"), "{line}");
     }
 }
