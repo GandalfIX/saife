@@ -60,14 +60,19 @@ the default backend: no administrator rights, no service, no MSI.
 winget install --id GandalfIX.SAIFE-Sandbox -e
 ```
 
-The package is submitted to the community repository (`microsoft/winget-pkgs`) and
-becomes available once that pull request is reviewed and merged. Until then, the
-manifest in this repository installs the same published archive and is the
-supported route:
+The package is under review in the community repository:
+[microsoft/winget-pkgs#462047](https://github.com/microsoft/winget-pkgs/pull/462047).
+That command starts working once the pull request is merged — a merged package is
+the route that also makes `winget upgrade` work later.
+
+Until then, either use the direct download below, or install this repository's own
+manifest. The manifest carries the same fields, but winget distrusts manifest files
+on disk by default, so it needs a one-time, **admin-only** setting:
 
 ```powershell
+winget settings --enable LocalManifestFiles          # once, in an elevated shell
 git clone https://github.com/GandalfIX/saife
-winget install --manifest saife\packaging\winget --accept-package-agreements --accept-source-agreements
+winget install --manifest saife\packaging\winget
 ```
 
 winget installs `saife.exe` and the launcher beside it under
