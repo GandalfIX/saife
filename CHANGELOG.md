@@ -8,11 +8,19 @@ minor release may break the profile schema; the error message names the fix.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-26
+
+Documentation, distribution and output only: no profile, no default and no exit
+code changes, so a setup that worked under 0.3.0 works unchanged.
+
 ### Added
 
 - `install.ps1`: one-command install (download, hash-verify against the release's
   `SHA256SUMS.txt`, extract, version-check, user-PATH entry, self-check). It is the
   supported install channel and needs no administrator rights.
+- `saife setup --check-only` prints an `MXC tier (probe)` line: it probes a
+  representative base request and reports the verdict, so a machine whose probe
+  names no tier is visible before a run refuses.
 
 ### Changed
 
@@ -22,6 +30,17 @@ minor release may break the profile schema; the error message names the fix.
   - see `AGENTS.md`.
 - No winget package is provided. `packaging/winget/` remains for local
   `winget install --manifest` use; `install.ps1` is the supported install.
+- The guardrail-2 refusal for a host whose MXC tier probe names no tier now ends
+  with the way out - use `--backend appcontainer`, or run `saife setup
+  --check-only` - instead of a dead end.
+- The winget manifests moved to the 1.12 schema, and the manifest rewrite keeps the
+  file's CRLF endings.
+
+### Docs
+
+- FAQ entry for the writable-grant-covers-launcher refusal: why `--allow-cwd` in the
+  home directory is refused for the mxc backend, with the measured contract (message,
+  exit code 2, no audit session) and the workaround.
 
 ## [0.3.0] - 2026-10-26
 
