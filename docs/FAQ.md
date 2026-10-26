@@ -379,11 +379,25 @@ which is exactly where a fresh download and a per-user install live. The downloa
 itself is fine: in the reporter's own transcript the SHA256 matched and the
 archive extracted before the execute failed.
 
-**Diagnose on the machine:**
+**Diagnose on the machine** — start with the Code Integrity events; they name the
+policy that blocked it. `Win32_DeviceGuard` is NOT reliable for this: on some
+builds it answers `Invalid class` (0x80041010) and tells you nothing.
+
 ```powershell
-Get-CimInstance Win32_DeviceGuard | Select-Object -ExpandProperty SecurityServicesRunning   # WDAC / Smart App Control services
-Get-AppLockerPolicy -Effective -Xml                                                          # AppLocker rules
-Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 20             # what blocked it, by policy
+# WHICH policy blocked it — 3033/3077 carry the policy id
+Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 60 |
+  Where-Object { $_.Id -in 3033,3077 } | Select-Object -First 4 |
+  ForEach-Object { "--- $($_.TimeCreated) Id=$($_.Id)"; $_.Message }
+
+# Smart App Control: 0 = off, 1 = on, 2 = evaluation
+(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+
+# AppLocker — "<AppLockerPolicy Version="1" />" means NO rules, so AppLocker is not the cause
+Get-AppLockerPolicy -Effective -Xml
+
+# active Code Integrity policies — presence alone is normal (system policies are often
+# present in audit mode), so read the events above rather than the file list
+Get-ChildItem 'C:\Windows\System32\CodeIntegrity\CiPolicies\Active' -ErrorAction SilentlyContinue
 ```
 
 **Options:**

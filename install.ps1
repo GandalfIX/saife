@@ -62,9 +62,17 @@ function Show-ExecutionBlocked([string]$path, [string]$detail) {
     Write-Host '   %LOCALAPPDATA%), which is where a fresh download lives.'
     Write-Host ''
     Write-Host '   Diagnose on this machine:'
-    Write-Host '      Get-CimInstance Win32_DeviceGuard | Select-Object -ExpandProperty SecurityServicesRunning'
+    Write-Host '      # WHICH policy blocked it - the 3033/3077 events carry the policy id (Win32_DeviceGuard'
+    Write-Host '      # answers "Invalid class" on some builds, so the events are the reliable source):'
+    Write-Host "      Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 60 |"
+    Write-Host '        Where-Object { $_.Id -in 3033,3077 } | Select-Object -First 4 |'
+    Write-Host '        ForEach-Object { "--- $($_.TimeCreated) Id=$($_.Id)"; $_.Message }'
+    Write-Host '      # Smart App Control (0=off 1=on 2=evaluation):'
+    Write-Host '      (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState'
+    Write-Host '      # AppLocker (<AppLockerPolicy Version="1" /> = no rules, so not AppLocker):'
     Write-Host '      Get-AppLockerPolicy -Effective -Xml'
-    Write-Host "      Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 20"
+    Write-Host '      # active Code Integrity policies (presence alone is normal; the events say what blocked):'
+    Write-Host '      Get-ChildItem "C:\Windows\System32\CodeIntegrity\CiPolicies\Active" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name'
     Write-Host ''
     Write-Host '   Options:'
     Write-Host "      1. allow $installDir (or this binary) in the AppLocker/WDAC policy - needs an admin"
