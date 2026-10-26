@@ -21,3 +21,6 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo build --release --bin saife --bin saife-launch
+      # The release script's pre-tag guard: a tag pushed without the files the
+      # release uploads cannot be withdrawn, so it is checked before tagging.
+      - run: pwsh -NoProfile -File packaging/tests/release-side-files.ps1
