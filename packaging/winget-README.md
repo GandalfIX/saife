@@ -41,16 +41,14 @@ Submitting to `microsoft/winget-pkgs` (once per version):
     # or copy packaging/winget to manifests/g/GandalfIX/SAIFE-Sandbox/<version>/ in
     # a fork of microsoft/winget-pkgs and open the PR by hand
 
-**State 2026-10-26: not submitted, and not going to be.** The community index requires
-a Microsoft CLA signature, which the maintainer decided not to sign, so
-`microsoft/winget-pkgs#462047` was withdrawn. There is therefore no
-`winget install --id GandalfIX.SAIFE-Sandbox`.
-
-The manifests stay in the repository because they still describe the published
-release and they are the only winget route left: `winget install --manifest
-packaging/winget` works locally once an elevated
+**State 2026-10-26: no winget index package.** The manifests are kept because they
+still describe the published release and they are the only winget route there is:
+`winget install --manifest packaging/winget` works locally once an elevated
 `winget settings --enable LocalManifestFiles` has been run (winget refuses manifest
 files on disk by default). `README.md` documents `install.ps1` as the supported
+install and this directory as the optional one.
+
+ as the supported
 install and this directory as the optional one.
 
 Rationale for the other non-obvious fields — `MinimumOSVersion`, the moniker, the

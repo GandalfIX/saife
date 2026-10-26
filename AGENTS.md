@@ -66,6 +66,27 @@ section; defaults 60 s + 30 min + 2 min). Moved 2026-10-25: both keys used to be
 `network.*`, and that location is now REFUSED. A workload that legitimately runs
 longer must raise `limits.workloadTimeoutSecs` - there is no "no deadline" mode.
 
+## Branching
+
+**Never commit to `main` directly.** `main` is what `install.ps1` and the release
+assets point users at, and the branch ruleset only stops force-pushes - a direct push
+is unreviewed by construction, even when the author is the only human.
+
+```bash
+git switch -c fix/<slug>        # or feat/, docs/, chore/, test/
+# ... commits ...
+git push -u origin fix/<slug>
+gh pr create --fill --base main
+```
+
+CI (`.github/workflows/ci.yml`) is the gate on the pull request; merge it yourself once
+it is green - there is nobody to approve it. Then delete the branch.
+
+The release flow obeys the same rule: `packaging/release.ps1` commits the rewritten
+winget manifests on `chore/release-v<version>` and opens a pull request, and only
+`-Publish` (run on `main` after that merge) tags, publishes and verifies. It refuses to
+push `main` at any point.
+
 ## Testing
 
 Must follow: If a test needs to change anything on the host system, like setting permissions, ACLs or similar, 

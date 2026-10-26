@@ -16,9 +16,12 @@ minor release may break the profile schema; the error message names the fix.
 
 ### Changed
 
-- No winget index submission: the community repository requires a Microsoft CLA
-  signature, which this project does not sign. `packaging/winget/` remains for local
-  `winget install --manifest` use.
+- `packaging/release.ps1` no longer pushes `main`. Releasing is two steps: prepare
+  (build, probe, rewrite manifests, open a pull request) and `-Publish` (on `main`
+  after the merge: tag, publish, verify). `main` only moves through pull requests now
+  - see `AGENTS.md`.
+- No winget package is provided. `packaging/winget/` remains for local
+  `winget install --manifest` use; `install.ps1` is the supported install.
 
 ## [0.3.0] - 2026-10-26
 

@@ -100,14 +100,9 @@ archive is hash-verified before extraction, and a mismatch stops the install.
 
 ### winget
 
-There is no `winget install --id GandalfIX.SAIFE-Sandbox`. The community index
-(`microsoft/winget-pkgs`) requires a Microsoft CLA signature, which this project
-does not sign, so no package was submitted — the installer above is what the package
-would have done.
-
-The manifests in `packaging/winget/` still describe the release and work locally for
-anyone who wants them. winget refuses manifest files on disk until an elevated
-setting has been enabled once:
+No winget package currently. The manifests in `packaging/winget/` still describe the
+release and can install it locally, which needs an elevated setting once because
+winget distrusts manifest files on disk:
 
 ```powershell
 winget settings --enable LocalManifestFiles          # once, in an elevated shell
