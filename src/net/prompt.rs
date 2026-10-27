@@ -206,7 +206,6 @@
 //! (`TaskDialogIndirect`) cannot be unit-tested — it requires an
 //! interactive desktop; the checkpoint covers it manually.
 
-
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -345,6 +344,8 @@ const ID_ALLOW_PERM_SUFFIX: i32 = 103;
 const ID_DENY_ONCE: i32 = 104;
 const ID_DENY_PERM_HOST: i32 = 105;
 const ID_DENY_PERM_SUFFIX: i32 = 106;
+const ID_ALLOW_SESSION: i32 = 108;
+const ID_DENY_SESSION: i32 = 109;
 const ID_EXPLAIN_MORE: i32 = 107;
 /// `winuser.h` IDCANCEL, kept as a plain literal: windows-rs types the constant as
 /// `MESSAGEBOX_RESULT`, while `TaskDialogIndirect` reports a plain button id. With
@@ -642,6 +643,7 @@ fn button_id_to_result(id: i32, suffix_hint: &str) -> PromptResult {
             scope: "host".into(),
             suffix: None,
         },
+        ID_ALLOW_SESSION => session_result(true),
         ID_ALLOW_PERM_HOST => PromptResult::Allow {
             persist: true,
             scope: "host".into(),
@@ -653,6 +655,7 @@ fn button_id_to_result(id: i32, suffix_hint: &str) -> PromptResult {
             suffix: Some(suffix_hint.to_string()),
         },
         ID_DENY_ONCE => deny_once(),
+        ID_DENY_SESSION => session_result(false),
         ID_DENY_PERM_HOST => PromptResult::Deny {
             persist: true,
             scope: "host".into(),
@@ -713,7 +716,7 @@ pub fn show_dialog(
     result
 }
 
-/// Build and show the seven-button task dialog (inner of
+/// Build and show the nine-button task dialog (inner of
 /// [`show_dialog`]).
 fn run_task_dialog(
     host: &str,
@@ -745,9 +748,14 @@ fn run_task_dialog(
     // A4]: button labels are user-visible).
     let suffix_hint = display_safe(suffix_hint);
     let label_allow_once = HSTRING::from("Allow once");
+    // "For this session" is the middle ground the once/permanent pair was missing:
+    // it stops the prompting for this host without writing a rule that outlives the
+    // session. Host-scoped only - there is no session-wide suffix button.
+    let label_allow_session = HSTRING::from("Allow for this session (this host)");
     let label_allow_host = HSTRING::from("Allow permanently (this host)");
     let label_allow_suffix = HSTRING::from(format!("Allow permanently (*.{suffix_hint})"));
     let label_deny_once = HSTRING::from("Deny once");
+    let label_deny_session = HSTRING::from("Deny for this session (this host)");
     let label_deny_host = HSTRING::from("Deny permanently (this host)");
     let label_deny_suffix = HSTRING::from(format!("Deny permanently (*.{suffix_hint})"));
     let label_explain_more = HSTRING::from("Explain more");
@@ -756,6 +764,10 @@ fn run_task_dialog(
         TASKDIALOG_BUTTON {
             nButtonID: ID_ALLOW_ONCE,
             pszButtonText: PCWSTR(label_allow_once.as_ptr()),
+        },
+        TASKDIALOG_BUTTON {
+            nButtonID: ID_ALLOW_SESSION,
+            pszButtonText: PCWSTR(label_allow_session.as_ptr()),
         },
         TASKDIALOG_BUTTON {
             nButtonID: ID_ALLOW_PERM_HOST,
@@ -768,6 +780,10 @@ fn run_task_dialog(
         TASKDIALOG_BUTTON {
             nButtonID: ID_DENY_ONCE,
             pszButtonText: PCWSTR(label_deny_once.as_ptr()),
+        },
+        TASKDIALOG_BUTTON {
+            nButtonID: ID_DENY_SESSION,
+            pszButtonText: PCWSTR(label_deny_session.as_ptr()),
         },
         TASKDIALOG_BUTTON {
             nButtonID: ID_DENY_PERM_HOST,
@@ -793,9 +809,9 @@ fn run_task_dialog(
         // literal without naming the anonymous union types.
         let mut config: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
         config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
-        // Command links fit the six long labels; no TDF_NO_FOCUS → the
+        // Command links fit the eight long labels; no TDF_NO_FOCUS → the
         // dialog is foreground-activated and grabs input focus ([G-37]);
-        // SIZE_TO_CONTENT fits the seven rows without scrolling;
+        // SIZE_TO_CONTENT fits the nine rows without scrolling;
         // ALLOW_DIALOG_CANCELLATION gives X/Esc → IDCANCEL ([G-3, G-43]).
         config.dwFlags =
             TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
@@ -1099,6 +1115,12 @@ pub struct PromptCoordinator {
     abandoned: Arc<Semaphore>,
     /// The injected dialog backend (real: [`show_dialog`]; tests: fake).
     dialog: DialogFn,
+    /// Standing answers the user gave "for this session" (host → allow), for the
+    /// rest of the current LAUNCH. Never persisted: the learned file is the
+    /// permanent store, and a session answer must not end up in it. Keyed by the
+    /// normalized hostname only — the session buttons are exact-host, so there is
+    /// no suffix arithmetic here on purpose.
+    session: Arc<StdMutex<HashMap<String, bool>>>,
     /// Session-scoped memory of consultations that produced no decision
     /// ([`NO_BACKEND_STICKY_AFTER`]). Shared with the supervisor tasks, which are
     /// the only place one dialog's outcome is known exactly once.
@@ -1307,6 +1329,7 @@ impl PromptCoordinator {
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PROMPTS)),
             abandoned: Arc::new(Semaphore::new(MAX_ABANDONED_PROMPTS)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
+            session: Arc::new(StdMutex::new(HashMap::new())),
             dialog,
             backend: Arc::new(BackendStickiness::with_cooldown(after, cooldown)),
         }
@@ -1327,6 +1350,12 @@ impl PromptCoordinator {
     /// same instant the attribution window opens.
     pub fn begin_launch(&self) {
         self.backend.begin_launch();
+        // A new session starts with no standing answers: the next launch's policy
+        // is the user's to decide, not the previous one's to inherit.
+        self.session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
     /// Coordinator with the fast-fail threshold chosen by the caller. Tests that
@@ -1411,6 +1440,22 @@ impl PromptCoordinator {
         // port and trailing dot normalized the same way as the intent
         // registry).
         let key = crate::net::intent::normalize_host(host);
+        // `key` is moved into the coalescing map below; the session record needs it
+        // after the consultation.
+        let session_key = key.clone();
+
+        // A "for this session" answer covers every later request to this host: no
+        // window, no consultation slot, no coalescing entry. Exact host only — the
+        // session buttons do not generalize by suffix.
+        if let Some(allow) = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .copied()
+        {
+            return (PromptOutcome::Decided(session_result(allow)), None);
+        }
 
         // Election and parking happen atomically under the map lock so a
         // follower can never park on an entry the leader already
@@ -1432,7 +1477,7 @@ impl PromptCoordinator {
             }
         };
 
-        match role {
+        let (outcome, measured) = match role {
             Role::Follower(rx) => {
                 // Park on the leader's outcome under OUR own deadline —
                 // a follower does not inherit the leader's wait ([G-6,
@@ -1630,7 +1675,12 @@ impl PromptCoordinator {
                     ),
                 }
             }
-        }
+        };
+        // The one place that sees the decision and the normalized key together:
+        // the leader records it, and coalesced followers record the same value
+        // (idempotent), so a decision made under one port answers the next one.
+        remember_session(&self.session, &session_key, &outcome);
+        (outcome, measured)
     }
 
     /// Remove this host's entry and fan the leader's outcome out to
@@ -1652,6 +1702,47 @@ impl PromptCoordinator {
             let _ = tx.send(outcome.clone());
         }
     }
+}
+
+/// The [`PromptResult`] a remembered session answer stands for.
+fn session_result(allow: bool) -> PromptResult {
+    if allow {
+        PromptResult::Allow {
+            persist: false,
+            scope: "session".to_string(),
+            suffix: None,
+        }
+    } else {
+        PromptResult::Deny {
+            persist: false,
+            scope: "session".to_string(),
+            suffix: None,
+        }
+    }
+}
+
+/// Remember a "for this session" decision for the rest of the launch. Anything
+/// else - "once", "permanently", "explain more", or no decision at all - leaves
+/// the memory untouched: the permanent decisions belong in the learned file, and
+/// `once` ends with the request.
+fn remember_session(session: &StdMutex<HashMap<String, bool>>, key: &str, outcome: &PromptOutcome) {
+    let PromptOutcome::Decided(result) = outcome else {
+        return;
+    };
+    let (persist, scope) = match result {
+        PromptResult::Allow { persist, scope, .. } | PromptResult::Deny { persist, scope, .. } => {
+            (*persist, scope.as_str())
+        }
+        PromptResult::NeedsIntent => return,
+    };
+    if persist || scope != "session" {
+        return;
+    }
+    let allow = matches!(result, PromptResult::Allow { .. });
+    session
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_string(), allow);
 }
 
 /// Apply the `on_unavailable` policy to a non-decision ([G-19, G-46]).
@@ -1854,6 +1945,24 @@ mod tests {
         (FakeHandle { calls, state }, dialog)
     }
 
+    /// `Allow for this session (this host)`: host-scoped, never persisted.
+    fn session_allow() -> PromptResult {
+        PromptResult::Allow {
+            persist: false,
+            scope: "session".to_string(),
+            suffix: None,
+        }
+    }
+
+    /// `Deny for this session (this host)`.
+    fn session_deny() -> PromptResult {
+        PromptResult::Deny {
+            persist: false,
+            scope: "session".to_string(),
+            suffix: None,
+        }
+    }
+
     fn allow_once() -> PromptResult {
         PromptResult::Allow {
             persist: false,
@@ -1984,6 +2093,10 @@ mod tests {
     #[test]
     fn button_mapping_all_seven_buttons() {
         let s = "example.com".to_string();
+        // The session buttons: host-scoped, not persisted - that pair of facts is
+        // what keeps the learned file quiet and the prompting quiet for this host.
+        assert_eq!(button_id_to_result(ID_ALLOW_SESSION, &s), session_allow());
+        assert_eq!(button_id_to_result(ID_DENY_SESSION, &s), session_deny());
         assert_eq!(
             button_id_to_result(ID_ALLOW_ONCE, &s),
             PromptResult::Allow {
@@ -2146,6 +2259,133 @@ mod tests {
         // Restore the per-pid manifest (D3: in production it is
         // written once per process and never deleted).
         std::fs::write(&path, COMMON_CONTROLS_V6_MANIFEST).expect("manifest rewrite");
+    }
+
+    // ---- session-scoped decisions ----------------------------------------
+
+    /// A decision the user marks "for this session" answers every later request to
+    /// that host without a dialog, and is never written to the learned file.
+    #[tokio::test]
+    async fn a_session_allow_answers_the_next_request_without_a_dialog() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+
+        let first = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move { c.prompt("session.example.com", 443, None, cfg).await })
+        };
+        handle.wait_for_calls(1).await;
+        handle.reply("session.example.com", Ok(session_allow()));
+        assert_eq!(
+            first.await.unwrap(),
+            PromptOutcome::Decided(session_allow())
+        );
+
+        // Same host, different port: answered from the session memory, no window.
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            coord.prompt("session.example.com", 8443, None, cfg),
+        )
+        .await
+        .expect("a session decision must answer without waiting for a dialog");
+        assert_eq!(second, PromptOutcome::Decided(session_allow()));
+        assert_eq!(
+            handle.calls().len(),
+            1,
+            "the second request must not open another dialog"
+        );
+    }
+
+    /// The same for a denial: one "for this session" click stops the prompting for
+    /// that host instead of asking again on every connection.
+    #[tokio::test]
+    async fn a_session_deny_answers_the_next_request_without_a_dialog() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+
+        let first = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move { c.prompt("deny-me.example.com", 443, None, cfg).await })
+        };
+        handle.wait_for_calls(1).await;
+        handle.reply("deny-me.example.com", Ok(session_deny()));
+        assert_eq!(first.await.unwrap(), PromptOutcome::Decided(session_deny()));
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            coord.prompt("deny-me.example.com", 80, None, cfg),
+        )
+        .await
+        .expect("a session denial must answer without a dialog");
+        assert_eq!(second, PromptOutcome::Decided(session_deny()));
+        assert_eq!(handle.calls().len(), 1);
+    }
+
+    /// Session memory is per host: deciding about one host says nothing about
+    /// another, and it does not generalize by suffix ("no need to have the suffix
+    /// match" - the session buttons are exact-host only).
+    #[tokio::test]
+    async fn session_memory_covers_one_host_and_not_its_siblings() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+
+        let first = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move { c.prompt("api.example.com", 443, None, cfg).await })
+        };
+        handle.wait_for_calls(1).await;
+        handle.reply("api.example.com", Ok(session_allow()));
+        first.await.unwrap();
+
+        // A sibling host still asks, and so does a subdomain of the decided one.
+        let sibling = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move { c.prompt("cdn.example.com", 443, None, cfg).await })
+        };
+        handle.wait_for_calls(2).await;
+        handle.reply("cdn.example.com", Ok(allow_once()));
+        assert_eq!(sibling.await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(
+            handle.calls().len(),
+            2,
+            "a session decision for api.example.com must not answer cdn.example.com"
+        );
+    }
+
+    /// The memory lives in the LAUNCH, like the backend latch: a new launch of the
+    /// same listener asks again, because the next session's policy is the user's
+    /// decision to make, not the last session's.
+    #[tokio::test]
+    async fn a_new_launch_forgets_session_decisions() {
+        let (handle, dialog) = fake_dialog();
+        let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
+        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+
+        let first = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move { c.prompt("launch.example.com", 443, None, cfg).await })
+        };
+        handle.wait_for_calls(1).await;
+        handle.reply("launch.example.com", Ok(session_allow()));
+        first.await.unwrap();
+
+        coord.begin_launch();
+
+        let second = {
+            let c = Arc::clone(&coord);
+            tokio::spawn(async move { c.prompt("launch.example.com", 443, None, cfg).await })
+        };
+        handle.wait_for_calls(2).await;
+        handle.reply("launch.example.com", Ok(deny_once()));
+        assert_eq!(second.await.unwrap(), PromptOutcome::Decided(deny_once()));
+        assert_eq!(
+            handle.calls().len(),
+            2,
+            "the new launch must ask again instead of inheriting the old answer"
+        );
     }
 
     // ---- coalescing ([G-6]) ----------------------------------------------
