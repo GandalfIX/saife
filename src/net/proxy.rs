@@ -1361,6 +1361,11 @@ fn outcome_audit(outcome: &PromptOutcome) -> OutcomeAudit {
             source: "prompt",
             scope: Some(if *persist {
                 scope.clone()
+            } else if scope == "session" {
+                // Not persisted, but not a one-off either: the audit has to tell a
+                // standing session answer from a single click, or a reader cannot
+                // explain why a host stopped prompting.
+                "session".to_string()
             } else {
                 "once".to_string()
             }),
@@ -1371,6 +1376,11 @@ fn outcome_audit(outcome: &PromptOutcome) -> OutcomeAudit {
             source: "prompt",
             scope: Some(if *persist {
                 scope.clone()
+            } else if scope == "session" {
+                // Not persisted, but not a one-off either: the audit has to tell a
+                // standing session answer from a single click, or a reader cannot
+                // explain why a host stopped prompting.
+                "session".to_string()
             } else {
                 "once".to_string()
             }),
@@ -1699,9 +1709,7 @@ fn record_learned(
     match store.record(&entry_host, scope, allow) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!(
-                "[saife] warning: failed to persist learned decision for {entry_host}: {e}"
-            );
+            eprintln!("[saife] warning: failed to persist learned decision for {entry_host}: {e}");
             false
         }
     }
@@ -3482,36 +3490,43 @@ async fn handle_forward(
     }
     emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision);
 
-    let mut upstream =
-        match dial_upstream(ctx.upstream.as_deref(), &fwd.host, fwd.port, false, system_lookup).await {
-            Ok(stream) => stream,
-            Err(DialFailure::Denied(d)) => {
-                emit_decision(&ctx.writer, &fwd.host, fwd.port, &d);
-                respond_deny(&mut sock, &fwd.host, fwd.port, &d).await?;
-                return Ok(());
-            }
-            Err(DialFailure::Direct(e)) => {
-                write_response(&mut sock, "502 Bad Gateway", "", "").await;
-                eprintln!(
-                    "[proxy] plain-HTTP forward to {}:{} failed: {e}",
-                    fwd.host, fwd.port
-                );
-                return Ok(());
-            }
-            Err(DialFailure::Upstream {
-                endpoint,
-                body,
-                error,
-            }) => {
-                eprintln!(
-                    "[proxy] upstream chaining to {}:{} via {endpoint} failed: {error}",
-                    fwd.host, fwd.port
-                );
-                emit_decision(&ctx.writer, &fwd.host, fwd.port, &upstream_error_decision());
-                respond_upstream_error(&mut sock, &body).await;
-                return Ok(());
-            }
-        };
+    let mut upstream = match dial_upstream(
+        ctx.upstream.as_deref(),
+        &fwd.host,
+        fwd.port,
+        false,
+        system_lookup,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(DialFailure::Denied(d)) => {
+            emit_decision(&ctx.writer, &fwd.host, fwd.port, &d);
+            respond_deny(&mut sock, &fwd.host, fwd.port, &d).await?;
+            return Ok(());
+        }
+        Err(DialFailure::Direct(e)) => {
+            write_response(&mut sock, "502 Bad Gateway", "", "").await;
+            eprintln!(
+                "[proxy] plain-HTTP forward to {}:{} failed: {e}",
+                fwd.host, fwd.port
+            );
+            return Ok(());
+        }
+        Err(DialFailure::Upstream {
+            endpoint,
+            body,
+            error,
+        }) => {
+            eprintln!(
+                "[proxy] upstream chaining to {}:{} via {endpoint} failed: {error}",
+                fwd.host, fwd.port
+            );
+            emit_decision(&ctx.writer, &fwd.host, fwd.port, &upstream_error_decision());
+            respond_upstream_error(&mut sock, &body).await;
+            return Ok(());
+        }
+    };
     // The origin connection is up. This is the forward leg's "upstream
     // established" — the same fact the CONNECT path records before its 200.
     ctx.counters.note_upstream_established();

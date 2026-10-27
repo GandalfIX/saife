@@ -298,13 +298,23 @@ For a host that is neither allowed nor denied, the interactive prompt asks:
 | Button | Effect |
 |---|---|
 | Allow once | this request only |
-| Allow for host | remembered for the host for this session |
-| Allow for suffix | remembered for the domain suffix |
-| Deny once / Deny for host / Deny for suffix | the mirror image |
+| Allow for this session (this host) | no more prompts for this host until the session ends; nothing is written to disk |
+| Allow permanently (this host) | written to the learned file |
+| Allow permanently (*.suffix) | the whole domain suffix, written to the learned file |
+| Deny once | this request only |
+| Deny for this session (this host) | refused for the rest of the session without asking again |
+| Deny permanently (this host) | written to the learned file |
+| Deny permanently (*.suffix) | written to the learned file |
 | Explain more | the agent's declared intent is shown (D-4), then the prompt returns |
 
-Decisions can be remembered permanently (`learned` store), and shown again with
-`saife learned list`.
+The two **session** answers are the middle ground: a host stops prompting for the
+rest of the run, and nothing is written down — `saife learned list` never shows
+them, and a new launch asks again. They are per host, exact: a session answer for
+`api.example.com` says nothing about `cdn.example.com`, and there is no
+session-wide suffix button.
+
+Only the permanent buttons change the learned store, which can be inspected with
+`saife learned list` and pruned with `saife learned revoke <host>`.
 
 `--no-prompt` disables the dialog entirely: unlisted hosts are denied (or
 allowed, per the profile's `onUnavailable`). In a headless context — CI, a

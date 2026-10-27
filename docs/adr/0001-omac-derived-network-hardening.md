@@ -87,6 +87,15 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 **Six buttons:** `Allow once`, `Allow permanently (this host)`, `Allow permanently (*.{suffix})`, `Deny once`, `Deny permanently (this host)`, `Deny permanently (*.{suffix})`. The suffix hint is in the button label itself (e.g. "Allow permanently (*.npmjs.org)") so the user sees exactly what the permanent decision covers. Default: `Deny once`. Dialog cancel = `Deny once`. **[G-3, G-43]**
 
+> **Amended 2026-10-26 - eight decision buttons.** Two session-scoped buttons were
+> added: `Allow for this session (this host)` and `Deny for this session (this
+> host)`. The original pair forced a choice between "ask again on the next
+> connection" and "write a rule that outlives the run", which is the wrong trade
+> for a host you are evaluating; session answers live in the coordinator's memory,
+> are cleared by `begin_launch`, never reach the learned file, and are exact-host
+> (`*.{suffix}` stays a permanent-only decision). The audit records `scope=session`
+> rather than folding them into `once`.
+
 **Suffix computation:** host with leftmost label removed when ≥3 labels, else the host itself. IP literals are never suffix-generalized. **[G-43]**
 
 **Focus-stealing:** the dialog grabs input focus (no `TDF_NO_FOCUS`), matching UAC behavior. The toast is the non-intrusive secondary alert. **[G-37]**
@@ -158,7 +167,10 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 **Augment existing `CONNECT` event** (do not rename to `net.decision`): **[G-9]**
 - Add `source` enum: `hard-deny` / `learned` / `blocklist` / `allowlist` / `prompt` / `unavailable` / `dns` / `default` / `prompt_overload`.
-- Add `scope` (nullable: `once` / `host` / `suffix`).
+- Add `scope` (nullable: `once` / `session` / `host` / `suffix`). `session` was
+  added 2026-10-26 with the session-scoped prompt buttons: it means "this host,
+  for the rest of this launch, not persisted", which `once` cannot express and
+  `persisted=false` alone does not distinguish.
 - Add `persisted` (bool).
 - Keep existing `disposition` (`allow` / `deny`) and optional `reason` free-text field.
 - `source` subsumes the free-text `reason` for common cases; `reason` remains for detail (e.g. `source: "dns"`, `reason: "SERVFAIL"`).
