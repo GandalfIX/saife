@@ -28,7 +28,13 @@ param(
     [string]$Destination = (Join-Path $env:LOCALAPPDATA 'Programs\saife'),
     [switch]$WhatIf,
     [switch]$NoPathEntry,
-    [switch]$AllowVersionMismatch
+    [switch]$AllowVersionMismatch,
+    # Install an archive that predates the source tree (a rebuild is the fix).
+    [switch]$AllowStaleArchive,
+    # Install a local rebuild of a version that is already published: the winget
+    # manifest still carries the PUBLISHED hash, so a mismatch is expected here and
+    # only meaningful at publish time.
+    [switch]$AllowUnpublishedBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,8 +82,31 @@ if ($archiveVersion -ne $declared) {
     }
 }
 
+# The version check above cannot tell two builds of the SAME version apart, which is
+# the normal state between a merge and the next bump. Installing an archive built
+# before the change then "succeeds" and the new feature is simply absent - measured
+# exactly once, with a freshly merged prompt button missing from a 0.3.1 install.
+$archiveTime = (Get-Item $Zip).LastWriteTime
+$watched = @(
+    (Join-Path $root 'src'),
+    (Join-Path $root 'Cargo.toml'),
+    (Join-Path $root 'Cargo.lock')
+) | Where-Object { Test-Path $_ }
+$newest = Get-ChildItem -Path $watched -Recurse -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+# Two seconds of slack: a zip's timestamp has coarser granularity than a checkout's.
+if ($newest -and $newest.LastWriteTime -gt $archiveTime.AddSeconds(2)) {
+    $detail = "archive is {0:yyyy-MM-dd HH:mm}, {1} is {2:yyyy-MM-dd HH:mm}" -f $archiveTime, $newest.FullName.Substring($root.Length + 1), $newest.LastWriteTime
+    if ($AllowStaleArchive) {
+        Write-Warning ("stale archive: {0} - installing anyway (-AllowStaleArchive)" -f $detail)
+    } else {
+        throw ("stale archive: {0}. Same version, older build: the newest changes are NOT in it. Rebuild with: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {1}  (or pass -AllowStaleArchive to install it anyway)" -f $detail, $archiveVersion)
+    }
+}
+
 $hash = (Get-FileHash $Zip -Algorithm SHA256).Hash
 Write-Host ("version: {0}" -f $archiveVersion)
+Write-Host ("built:   {0:yyyy-MM-dd HH:mm}" -f $archiveTime)
 Write-Host ("archive: {0}" -f $Zip)
 Write-Host ("sha256:  {0}" -f $hash)
 Write-Host ("target:  {0}" -f $Destination)
@@ -98,12 +127,29 @@ if (Test-Path $manifest) {
         Write-Warning 'manifest: has no InstallerSha256 to compare'
     } elseif ($expected.ToUpper() -eq $hash) {
         Write-Host 'manifest: PackageVersion and InstallerSha256 match'
+    } elseif ($AllowUnpublishedBuild) {
+        Write-Host ("manifest: describes the published {0} archive ({1}...), this one is a local rebuild ({2}...) - installing anyway (-AllowUnpublishedBuild)" -f $manifestVersion, $expected.Substring(0, 8), $hash.Substring(0, 8))
     } else {
-        throw ("manifest: InstallerSha256 is {0} but the archive hashes to {1} - the manifest is stale for this version; fix it before publishing" -f $expected, $hash)
+        throw ("manifest: InstallerSha256 is {0} but the archive hashes to {1}. If this is a local rebuild of an already-published version that is expected - pass -AllowUnpublishedBuild. If you are about to publish it, the manifest is stale: re-run packaging\release.ps1." -f $expected, $hash)
     }
 }
 
 if ($WhatIf) { Write-Host 'WhatIf: nothing extracted, PATH untouched.'; return }
+
+# Windows will not replace a running .exe, and the raw error is "Access to the path
+# ... is denied" with no hint about why. Name the processes instead: a session the
+# user forgot about is the normal cause, and it looks like a permissions problem.
+if (Test-Path $Destination) {
+    $running = @(
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -and $_.Path.StartsWith($Destination, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
+        }
+    )
+    if ($running.Count -gt 0) {
+        $names = ($running | ForEach-Object { "{0} ({1})" -f $_.ProcessName, $_.Id }) -join ', '
+        throw ("{0} is in use - still running from it: {1}. Close that session (or end the process) and run this again; Windows cannot replace a running executable." -f $Destination, $names)
+    }
+}
 
 if (Test-Path $Destination) {
     $existing = Join-Path $Destination 'saife.exe'
