@@ -93,20 +93,29 @@ hosts.
 
 ## `opencode-desktop.json` — the opencode desktop app
 
-`opencode` extended for the Electron app: adds `$APPDATA\OpenCode` (Electron
-userData and the staged server CLI) and the install directory read-only, plus the
-model catalogue and shell hosts. Same 4 h session limit as its parent.
+`opencode` extended for the Electron app: adds the Electron userData directory
+(which also holds the staged server CLI) and the install directory read-only, plus
+the model catalogue and shell hosts. Same 4 h session limit as its parent.
+
+Measured on Windows 11 (2026-10-29), and **not** what the plan guessed: the app is
+installed under its **appId**, not its product name — `%LOCALAPPDATA%\Programs\
+ai.opencode.desktop` with `OpenCode.exe` inside, and userData at
+`%APPDATA%\ai.opencode.desktop`. `...\Programs\OpenCode` does not exist on a real
+install, and neither does `%APPDATA%\OpenCode`; a profile written from the product
+name would grant two directories that are never created.
 
 | access | path | why |
 |---|---|---|
-| read-write | `$APPDATA\OpenCode` | Electron userData; on NTFS the same directory as the parent's `AppData\Roaming\opencode` grant, so it dedupes to one |
-| read-only | `$LOCALAPPDATA\Programs\OpenCode` | the app and its bundled `resources\opencode-cli.exe` |
+| read-write | `$APPDATA\ai.opencode.desktop` | Electron userData, caches, and `cli\<version>-<arch>\opencode-cli.exe` (the staged server the desktop runs) |
+| read-only | `$LOCALAPPDATA\Programs\ai.opencode.desktop` | `OpenCode.exe` and the bundled `resources\opencode-cli.exe` (+ `.version`) |
 | network | `models.opencode.ai`, `opencode.ai` | model catalogue; shell config and theme |
 
 Two things this profile does **not** solve, both measured rather than assumed:
 
 - **The desktop talks to its server over loopback** (`127.0.0.1:28894` on
-  Windows — the app's fixed port, remapped from `0xC0DE`). Under the default
+  Windows — the app's fixed port, remapped from `0xC0DE`; measured: the staged
+  server `cli\2.2.2-x64\opencode-cli.exe` listens there and writes
+  `%USERPROFILE%\.local\state\opencode\service.json` with that url and its pid). Under the default
   `mxc` backend that `connect()` is refused with `WSAEACCES 10013`, so the
   all-in-one shape does not work there yet; `--backend appcontainer` (elevated)
   lifts that wall through its per-SID loopback exemption. Scoping loopback egress

@@ -1,7 +1,7 @@
 {
   "meta": {
     "name": "opencode-desktop",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "schema_version": 1
   },
   "extends": [
@@ -9,10 +9,10 @@
   ],
   "filesystem": {
     "allow": [
-      "$APPDATA/OpenCode"
+      "$APPDATA/ai.opencode.desktop"
     ],
     "read_only": [
-      "$LOCALAPPDATA/Programs/OpenCode"
+      "$LOCALAPPDATA/Programs/ai.opencode.desktop"
     ]
   },
   "network": {
