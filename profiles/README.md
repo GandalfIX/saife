@@ -117,9 +117,14 @@ Two things this profile does **not** solve, both measured rather than assumed:
   server `cli\2.2.2-x64\opencode-cli.exe` listens there and writes
   `%USERPROFILE%\.local\state\opencode\service.json` with that url and its pid). Under the default
   `mxc` backend that `connect()` is refused with `WSAEACCES 10013`, so the
-  all-in-one shape does not work there yet; `--backend appcontainer` (elevated)
-  lifts that wall through its per-SID loopback exemption. Scoping loopback egress
-  per port is the sibling plan `docs/plans/2026-10-28-gradle-daemon-loopback.md`.
+  all-in-one shape does not work there yet. Scoping loopback egress per port is the
+  sibling plan `docs/plans/2026-10-28-gradle-daemon-loopback.md`.
+  **Measured 2026-10-30: neither placement works today.** The split (server inside,
+  desktop outside) fails on host→container ingress — the host's `connect()` to the
+  container's port times out under `mxc` — and `--backend appcontainer` cannot carry
+  this app because the DACL propagation cap (20 000 objects) is below opencode's
+  state tree. Details and reproduction:
+  `docs/research/backends/process-container/opencode-desktop-windows.md`.
 - **Containment depends on which server the app adopts.** If the sandboxed server
   is missing, unhealthy or a different version, the desktop starts its own —
   outside the sandbox — and if a host-side server is registered it is adopted
