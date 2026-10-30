@@ -16,6 +16,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | S0.3 | Bind-mount throughput for ~20 k files, vs in-volume copy | [ ] | |
 | S0.4 | Container → saife proxy reachability (offline vs relayed) | [ ] | |
 | S0.5 | `docs/research/build-runner/measurements.md` written | [ ] | |
+| S0.6 | Endpoint discovery: `/_ping` over npipe from Rust; containerd-mode has no Docker API | [ ] | Rancher Desktop 29.5.3 (moby) is the v1 engine; `Test-Path` on the pipe lies, the API does not |
 | T1.1 | `BuildRequest` type + validation; no image/mount/command field | [ ] | |
 | T1.2 | Declared facade operations (`POST/GET/DELETE /build`) + 403 fixture | [ ] | |
 | T1.3 | Streaming response path | [ ] | |
@@ -25,6 +26,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T2.3 | Idle kill, recycle, invalidate on digest/JDK change | [ ] | |
 | T2.4 | Single-session ownership, kill on end, start-up sweep | [ ] | |
 | T2.5 | Caps + slot facts (`slot_id`, digest) | [ ] | |
+| T2.6 | `src/runner/engine.rs`: endpoint + probe + quirks + `RunnerEngine` trait | [ ] | |
 | T3.1 | Project root resolution: reparse/UNC/subst/install-dir refusals | [ ] | |
 | T3.2 | `/src` and `/cache` mounts, HOME inside | [ ] | |
 | T3.3 | Outputs visible on host; nothing writable outside `/src` | [ ] | |

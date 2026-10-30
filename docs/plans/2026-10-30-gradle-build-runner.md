@@ -82,9 +82,19 @@ image digest (a profile is user-editable; the digest must come from the shipped 
 
 ## 3. Latency: the engine is assumed up, the daemon is not
 
-**Assumption (2026-10-30, user):** the container engine's VM is already running — Rancher
-Desktop, Docker Desktop, or whatever the user chose — so no design decision here is about
-booting a VM. Engine-down is an explicit *state*, not a delay we absorb.
+**Assumption (2026-10-30, user), now measured on the development machine:** the container
+engine's VM is already running, so no design decision here is about booting a VM. Engine-down
+is an explicit *state*, not a delay we absorb.
+
+| fact | value |
+|---|---|
+| engine | Rancher Desktop **29.5.3**, `Rancher Desktop WSL Distribution`, linux/x86_64 — dockerd/moby, not containerd |
+| client | `29.6.2-rd`, `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\docker.exe` |
+| endpoint | `npipe:////./pipe/docker_engine` — the only context (`default`) |
+| trap | `Test-Path \\.\pipe\docker_engine` returns **False** while the API answers fine |
+
+That last row is a design constraint: endpoint discovery must be a real API call (`/_ping`,
+then a version negotiation), never a path existence check.
 
 Starting a container is not one cost, and only one of the rows is about containers at all:
 
@@ -117,6 +127,32 @@ do we throw the daemon away":
 The unavoidable first-run cost — pulling the image, prewarming the wrapper distribution and
 the dependency cache — belongs to **install time**, documented as a step, exactly as the
 Gradle plan already recommends for the in-session variant (§T3.3 there).
+
+### The engine abstraction, built in from the first line
+
+The runner talks to the **Docker Engine REST API over a configurable endpoint** and never
+shells out to a CLI. That single decision is what makes Rancher, Docker Desktop and Podman
+the same backend with different endpoints instead of three integrations:
+
+| piece | responsibility |
+|---|---|
+| `EngineEndpoint` | resolve `DOCKER_HOST` (`npipe://`, `unix://`, `http(s)://`), else the docker context, else the platform default; refuse `tcp://` in v1 (a remote engine silently moves where builds run) |
+| `EngineProbe` | `/_ping` + `GET /version`, then a capability set: pull policy, `/containers/{id}/archive`, exec TTY, events, stats, mount path visibility |
+| `EngineQuirks` | the small per-engine table the probe fills: path translation needed?, archive supported?, exec TTY quirks?, `HostConfig` fields silently ignored? |
+| `RunnerEngine` (trait) | create/start/exec/stop/remove/inspect — the only surface the slot lifecycle sees |
+
+Support statement this buys, to be written into the ADR verbatim:
+
+| engine | status |
+|---|---|
+| Rancher Desktop, **moby** (this machine) | **target for v1**, verified end to end |
+| Docker Desktop | expected to pass the same probe; verified when someone runs the legs |
+| Podman machine (`podman system service`) | expected, **unverified** — its compat API ignores fields rather than erroring, so the probe has to catch that |
+| Rancher Desktop, **containerd** mode | **refused by name** — no Docker API at all |
+| remote engine (`tcp://`) | **refused in v1**, deliberately |
+
+Because the engine is reachable only from the runner and never from the workload, none of
+this touches the containment invariants — it changes latency, licensing and API gaps only.
 
 ## 4. Mounts and path safety
 
@@ -211,6 +247,10 @@ no slots) per AGENTS.md.
       Wall clock for `gradlew build` both ways.
 - [ ] **S0.4** Runner → proxy reachability: can a container reach saife's proxy at all
       (`host.docker.internal`, host-gateway)? Decides offline-only (v1) vs relayed (§5).
+- [ ] **S0.6** Endpoint discovery on this machine: confirm `/_ping` over
+      `npipe:////./pipe/docker_engine` from a Rust client (the docker CLI works, `Test-Path`
+      lies), and record what `GET /version` reports for Rancher's moby. Also confirm that
+      containerd-mode Rancher exposes no Docker API, so the refusal message can name it.
 - [ ] **S0.5** Write `docs/research/build-runner/measurements.md` (method, legs, table) and
       update this plan's status block. A negative result — e.g. streaming cannot work — is a
       recorded result and changes the plan, not a failed spike.
@@ -231,7 +271,12 @@ before S-1 starts.
 - [ ] **T1.4** Per-session runner token, distinct from the MXC proxy token; a test asserts the
       two are never the same value and that the runner token does not authorise a proxied host.
 
-### S-2 — Slot lifecycle
+### S-2 — Slot lifecycle (on top of the engine abstraction)
+
+- [ ] **T2.6** `src/runner/engine.rs`: `EngineEndpoint` + `EngineProbe` + `EngineQuirks` +
+      the `RunnerEngine` trait from §3. Tests: `DOCKER_HOST` parsing for all three schemes,
+      `tcp://` refused by name, containerd-mode Rancher refused by name, and a probe fixture
+      that reports a missing capability instead of failing at first build.
 
 - [ ] **T2.1** Slot spawn with a pinned digest and a readiness probe; the digest is a binary
       constant, not a profile field.
@@ -297,9 +342,11 @@ before S-1 starts.
 
 ## 11. Open questions
 
-1. Substrate: Rancher Desktop, Docker Desktop, Podman machine, or a bare WSL2 distro? The
-   engine is assumed running either way; S0.2's numbers plus licensing decide which one we
-   document first (and whether we support all of them through one `docker`-CLI abstraction).
+1. **Resolved 2026-10-30:** Rancher Desktop in **moby** mode is the engine for v1 (it is what
+   the development machine runs), reached through the Engine API abstraction in §3. Remaining:
+   whether Docker Desktop and Podman pass the same probe unchanged (run the legs; do not
+   promise them in the README until someone has), and whether a bare WSL2 distro is worth
+   supporting at all.
 2. Do we ship a pinned image, or require the user to supply a digest? (Shipping means owning
    its CVE stream; requiring means a config step that can be wrong.)
 3. Offline-only in v1 — confirmed by S0.4, or does the relay have to exist on day one?
@@ -310,7 +357,8 @@ before S-1 starts.
 
 ## 12. Files likely to change
 
-- `src/runner/mod.rs` (new), `src/runner/slot.rs` (new), `src/runner/substrate.rs` (new)
+- `src/runner/mod.rs` (new), `src/runner/slot.rs` (new), `src/runner/engine.rs` (new — endpoint,
+  probe, quirks, trait)
 - `src/plugin/mod.rs`, `src/plugin/sidecar.rs` — facade operation declarations, token scope
 - `src/net/proxy.rs` — nothing expected, but S0.1 decides; the declaration check is already
   there
