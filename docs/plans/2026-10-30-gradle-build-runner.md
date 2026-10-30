@@ -1,8 +1,11 @@
 # Gradle build runner — a facade sidecar that builds in a container (Implementation Plan)
 
-> **Status:** proposal, 2026-10-30. **Nothing is implemented and nothing is measured.** The
-> four experiments in §9 S-0 decide whether this plan is built at all, and two of them can
-> kill it.
+> **Status:** proposal, 2026-10-30. **Nothing is implemented.** S-0 is partly measured
+> (`docs/research/build-runner/measurements.md`): endpoint, container lifecycle and mount
+> throughput are answered, and the mount answer **changed §4** - the project is synced into the
+> runner, not bind-mounted. Still open and still gating: facade streaming (S0.1), container ->
+> proxy reachability (S0.4), and the Gradle daemon cost that decides long-lived vs ephemeral
+> containers.
 
 **Goal:** `gradlew build` runs inside a saife session on Windows, unelevated, **without**
 granting the workload loopback, without a new inbound path, and without a new privileged
@@ -98,13 +101,20 @@ then a version negotiation), never a path existence check.
 
 Starting a container is not one cost, and only one of the rows is about containers at all:
 
-| step | typical | when it is paid |
+| step | measured on this host | when it is paid |
 |---|---|---|
-| `docker info` reachability probe | 50–200 ms | every build |
-| container start (image present) | 0.3–1 s native, 0.5–2 s over Docker Desktop/WSL2 | only if the container is ephemeral |
-| JVM + Gradle daemon start | **2–5 s** | the first build inside a fresh container |
-| Gradle configuration phase | 0.5–2 s | every build, warm or not |
-| task execution | the build | — |
+| `docker info` reachability probe | **93 ms** | every build |
+| `docker run --rm` (create+start+remove) | **497 ms** | only if the container is ephemeral |
+| `docker start` of a stopped container | 37 ms | only if the container is ephemeral |
+| `docker exec` into a running container | **73 ms** | the long-lived shape |
+| sync 20 k files in or out (tar pipe) | **2.8 s** each way | every build, unless the volume is persistent and synced as a delta |
+| JVM + Gradle daemon start | **not yet measured** (needs a JDK image + fixture project) | the first build inside a fresh container |
+| Gradle configuration + execution | the build | — |
+
+The engine is cheaper than the estimates assumed: an ephemeral container per build costs ~0.5 s,
+not 3-8 s, **provided the source tree and the dependency cache live in volumes rather than on a
+bind mount** (S0.3, §4). The open number is the daemon; it is what decides ephemeral vs
+long-lived, and it is the next S-0 leg.
 
 So "spin up a container per build" costs **3–8 s of overhead**, and most of it is the cold
 Gradle daemon, not the container. Attaching to a container that has already built once costs
@@ -154,23 +164,36 @@ Support statement this buys, to be written into the ADR verbatim:
 Because the engine is reachable only from the runner and never from the workload, none of
 this touches the containment invariants — it changes latency, licensing and API gaps only.
 
-## 4. Mounts and path safety
+## 4. The project is synced, not mounted
 
-- Mount the **project directory only**, read-write, at `/src`; plus a private cache volume at
-  `/cache`. Nothing else from the host.
-- **Resolve before mounting.** A junction or symlink inside the project pointing at
-  `%USERPROFILE%` smuggles the home directory (and `.ssh`) into the runner. The mount root
-  must resolve to a real directory with no reparse points on the path, and the runner must
-  refuse UNC paths and `subst` drives.
-- Refuse the saife install directory as a project root — the same reasoning as the launcher
-  guard (`mxc: writable grant … contains the launcher`): a workload that can write the
-  supervisor's tree is scheduling code to run with the supervisor's rights.
-- Outputs land back through the same mount, so `build/` is visible to the agent without a
-  copy-back step; that is also what keeps incremental builds meaningful.
-- Windows semantics that must be stated, not discovered: case-insensitive source paths vs a
-  case-sensitive Linux filesystem (two files differing only in case collide), CRLF in
-  checked-in scripts, file locks (a running Windows process holding a file the build wants to
-  rewrite), long paths, and antivirus scanning the mount.
+Measured (S0.3, `docs/research/build-runner/measurements.md` §3): a live Windows bind mount
+costs **2.65 ms per file** on this engine — 53 s to read 20 000 small files — while the same
+tree inside a volume costs 0.76 s, and pulling the whole tree *into* the volume costs 2.8 s.
+Gradle opens tens of thousands of files per build, so a bind mount is not a percentage slower,
+it is a different order of magnitude. The plan therefore syncs:
+
+1. **Copy in** the project into a per-project volume (an archive stream; measured 2.8 s for
+   20 k files), then build inside the volume.
+2. **Copy out** the declared outputs (`build/`, `target/`, test reports) back into the project
+   directory through a filter — never the whole tree, or the copy-out overwrites the agent's
+   edits with stale snapshot content.
+3. **The volume is persistent per project** and the sync is a delta (size + mtime, or the
+   archive's own index). Without persistence every build pays the sync *and* loses Gradle's
+   incremental state.
+
+Sync semantics are a feature surface with tests, not an implementation detail:
+
+- **deletions and renames** — a copy that never deletes leaves stale sources, and the build then
+  compiles files the agent removed;
+- **file modes** — the executable bit on `gradlew` must survive the round trip;
+- **line endings** — CRLF working tree vs a Linux filesystem, and which side normalises;
+- **a snapshot, not a live tree** — the build sees a point in time, which removes the TOCTOU
+  risk §10 listed and adds a new one: an edit made during a build is invisible to it.
+
+Path safety is unchanged and still mandatory, because the *sync root* is what gets copied:
+resolve the project root, refuse reparse points/junctions (a junction to `%USERPROFILE%` would
+copy `.ssh` into the runner), refuse UNC and `subst` drives, and refuse the saife install
+directory for the same reason the launcher guard exists.
 
 ## 5. Network inside the runner
 
@@ -237,22 +260,20 @@ no slots) per AGENTS.md.
       minutes. Does the response stream through the proxy, or is it buffered/cut by
       `HEAD_READ_TIMEOUT`, the 128-connection cap, or a client read timeout? Record what the
       workload sees and what the proxy logs.
-- [ ] **S0.2** Latency decomposition on this host, with the engine already running (Rancher
-      Desktop / Docker Desktop): `docker info`; container start with the image present; **first
-      build in a fresh container** (cold daemon); **second build in the same container** (warm
-      daemon); `docker exec` attach. The first-vs-second gap is the number that decides §3 -
-      not container start in isolation.
-- [ ] **S0.3** Mount throughput: a Gradle-sized tree (~20 k small files) read and rebuilt
-      inside the runner over a Windows bind mount, versus copied into the runner's volume.
-      Wall clock for `gradlew build` both ways.
+- [x] **S0.2** Latency decomposition — **engine side measured**: `docker info` 93 ms, `run --rm`
+      497 ms, `start` 37 ms, `exec` 73 ms. Open: the Gradle daemon cost (JDK image + fixture
+      project), which is what decides ephemeral vs long-lived.
+- [x] **S0.3** Mount throughput — **measured, and it changed §4**: bind mount 53.6 s vs volume
+      0.76 s for 20 k small files (2.65 ms/file vs 0.038 ms); tar-pipe populate 2.8 s. The
+      project is synced, not mounted.
 - [ ] **S0.4** Runner → proxy reachability: can a container reach saife's proxy at all
       (`host.docker.internal`, host-gateway)? Decides offline-only (v1) vs relayed (§5).
-- [ ] **S0.6** Endpoint discovery on this machine: confirm `/_ping` over
-      `npipe:////./pipe/docker_engine` from a Rust client (the docker CLI works, `Test-Path`
-      lies), and record what `GET /version` reports for Rancher's moby. Also confirm that
-      containerd-mode Rancher exposes no Docker API, so the refusal message can name it.
-- [ ] **S0.5** Write `docs/research/build-runner/measurements.md` (method, legs, table) and
-      update this plan's status block. A negative result — e.g. streaming cannot work — is a
+- [x] **S0.6** Endpoint discovery — **measured**: from a plain named-pipe client (no docker
+      CLI), `/_ping` → `200 OK` and `GET /version` → `api=1.54 min=1.41 engine=29.5.3
+      linux/amd64`; `Test-Path` on the pipe returns False while the API answers. Rust-client leg
+      and the containerd-mode refusal still to confirm.
+- [~] **S0.5** `docs/research/build-runner/measurements.md` written for the three measured legs;
+      the remaining legs append to it. A negative result — e.g. streaming cannot work — is a
       recorded result and changes the plan, not a failed spike.
 
 **Exit criterion:** the four answers exist, and this plan is either confirmed or amended
@@ -290,8 +311,12 @@ before S-1 starts.
 
 - [ ] **T3.1** Resolve the project root; refuse reparse points, UNC, `subst`, and the saife
       install directory. Tests for each refusal, with the message naming the reason.
-- [ ] **T3.2** Mount `/src` (project) and `/cache` (private volume); set HOME inside.
-- [ ] **T3.3** Prove outputs land on the host and that nothing outside `/src` is writable.
+- [ ] **T3.2** Sync in: project → `/src` volume as a delta (archive stream), persistent
+      per-project volume, `/cache` for dependencies, HOME set inside.
+- [ ] **T3.3** Sync out: declared outputs only, filtered; prove the agent's edits are never
+      overwritten by stale snapshot content, and nothing outside the outputs changes.
+- [ ] **T3.5** Sync semantics tests: deletion, rename, executable bit, CRLF, and an edit made
+      during a build (snapshot behaviour is the documented answer).
 - [ ] **T3.4** Document the Windows semantics from §4, with the case-collision test case.
 
 ### S-4 — Gradle integration
@@ -378,8 +403,10 @@ before S-1 starts.
 - **Live (`#[ignore]`):** warm attach < 2 s; `gradlew build` exit 0 with the artifact on the
   host; a second build reuses the daemon; session end leaves no container behind
   (`HOST-CLEAN` analogue: `docker ps --filter label=saife.session=…` empty).
-- **Performance budget:** build wall clock within 20 % of a native build on the same machine
-  (S0.3 establishes the baseline; if the bind mount cannot meet it, the plan changes here).
+- **Performance budget:** engine overhead ≤ ~1 s per build (measured: 497 ms container start or
+  73 ms exec) plus sync ≤ 3 s per direction on a 20 k-file tree (measured 2.8 s full, less as a
+  delta). Everything beyond that must be Gradle itself. A live bind mount cannot meet this —
+  measured at 53 s for the same read.
 
 ## 14. Out of scope
 
