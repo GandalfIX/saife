@@ -253,9 +253,12 @@ in those words.
 5. **The image carries the toolchain.** The sample project's conventions require Java 25; a
    project whose toolchain the image lacks is refused by name (`runner_toolchain_missing`),
    never left to Gradle's auto-provisioning (which needs network and a resolver).
-6. **Failure is a refusal, not a fallback.** If no slot can be prepared, the build fails with
+6. **The facade relays only what a manifest declares** — including the method. Widening it
+   (T1.5) must not turn the facade into a general proxy: declared `(method, path)`, a body size
+   cap, no header pass-through beyond what the relay already does.
+7. **Failure is a refusal, not a fallback.** If no slot can be prepared, the build fails with
    the reason; it never silently runs on the host.
-7. **The audit answers "which image, which task, which exit code".**
+8. **The audit answers "which image, which task, which exit code".**
 
 ## 9. Phases and tasks
 
@@ -266,10 +269,10 @@ no slots) per AGENTS.md.
 
 ### S-0 — Measurement (blocking gate; no product code before this is answered)
 
-- [ ] **S0.1** Facade streaming: a declared operation that emits a line per second for 10
-      minutes. Does the response stream through the proxy, or is it buffered/cut by
-      `HEAD_READ_TIMEOUT`, the 128-connection cap, or a client read timeout? Record what the
-      workload sees and what the proxy logs.
+- [x] **S0.1** Facade streaming — **measured and passing**: 20 lines over 20 s arrived with the
+      first byte at 1 ms and the last at 20 010 ms, no buffering, past the 15 s head deadline.
+      The same leg found that the facade is **GET-only** (`501` for anything else, before the
+      declaration is consulted) — recorded as T1.5.
 - [x] **S0.2** Latency decomposition — **measured, including the daemon**: `info` 93 ms,
       `run --rm` 497 ms, `exec` 73 ms; ephemeral per build 4.95-13.6 s, long-lived 1.67 s, first
       build 88.6 s (904 MB of downloads), `--offline` clean build 8.5 s, daemon RSS 479 MB.
@@ -300,6 +303,12 @@ before S-1 starts.
       facade_operation_not_declared` (existing behaviour, new fixtures).
 - [ ] **T1.3** Streaming response path per S0.1's answer (chunked, flushed per line, cancel on
       client disconnect).
+- [ ] **T1.5** Let the facade relay any **declared** method and forward request bodies: replace
+      the hard-coded GET gate in `facade_action` with the declaration check, forward the body to
+      the sidecar with a size cap and a declared content type, and refuse undeclared methods with
+      `403` rather than `501` (the manifest is the control; the GET gate refuses what the operator
+      declared). Tests: declared `POST` reaches the sidecar with its body; undeclared method →
+      `403`; oversized body → `413`.
 - [ ] **T1.4** Per-session runner token, distinct from the MXC proxy token; a test asserts the
       two are never the same value and that the runner token does not authorise a proxied host.
 

@@ -1,8 +1,8 @@
 # Build runner — S-0 measurements
 
-**Status:** partial, 2026-10-30. Five legs measured, including the one that decides the slot
-model (§5). `S0.1` (facade streaming) and `S0.4` (container → proxy) still need product code or
-a live session before they mean anything.
+**Status:** 2026-10-30. Six of seven legs measured, including facade streaming (§6) and the one
+that decides the slot model (§5). Only `S0.4` (container → proxy) is open, and it needs a live
+session with a listener.
 
 **Host:** Windows 11 (build 26300), 24 vCPU, 33.6 GB visible to the engine.
 **Engine:** Rancher Desktop 29.5.3 — dockerd/moby in the `Rancher Desktop WSL Distribution`
@@ -123,15 +123,49 @@ Consequences recorded in the plan:
 - **`--offline` is the default that works** (§5 of the plan): the cache is complete, and an
   offline clean build succeeds in 8.5 s.
 
-## 6. Still open
+## 6. Facade streaming (S0.1) — it streams, and the facade is GET-only
+
+**Instrument:** `tests/fixtures/stream-sidecar` (a Python sidecar) plus the live leg
+`plugin::sidecar::tests::a_build_log_streams_through_the_facade_past_the_head_timeout`. The
+sidecar answers the health gate on `/status`, then writes one line per second for 20 s on
+`/build`; the test drives it through a real session proxy and timestamps every chunk the
+workload receives.
+
+| observation | value |
+|---|---|
+| lines received | 20 of 20 |
+| first body bytes at the workload | **1 ms** |
+| last chunk | **20 010 ms** (test wall time 20.8 s) |
+| buffering | none — the proxy relays each write as it happens |
+
+So a build log can stream through the facade for longer than the 15 s `HEAD_READ_TIMEOUT`
+(which covers the request head, not the response), and the relay does not accumulate the body.
+**S0.1 passes.**
+
+**But the leg also found a product gap.** The first attempt used `POST /build` and got
+`501 Not Implemented`: `facade_action` in `src/net/proxy.rs` returns `MethodUnsupported` for any
+method that is not GET, *before* consulting the manifest's declared `(method, path)` list. A build
+request wants to be a POST with a small body (task, profile), and neither the method gate nor
+request-body forwarding exists today. That is now `T1.5` in the plan:
+
+- relay any method the manifest declares (the declaration is the control; the GET gate is both
+  redundant and wrong — it refuses a method the operator explicitly declared);
+- forward the request body to the sidecar, with a size cap and a declared content type;
+- tests: declared POST reaches the sidecar with its body; undeclared method → 403 (not 501);
+  oversized body → 413.
+
+The timing leg ran with GET so it measured the response direction alone. The response direction
+is method-independent, so the answer above stands regardless of T1.5.
+
+## 7. Still open
 
 | leg | why it is not answered |
 |---|---|
-| **S0.1** facade streaming | needs a declared facade operation that emits for 10 minutes; that is the first slice of product code. Until then the only fact is that `HEAD_READ_TIMEOUT` (15 s) covers the request *head*, not the response body. |
+| ~~S0.1 facade streaming~~ | **measured** (§6): 20 lines, first byte at 1 ms, last at 20 s. Passed. |
 | **S0.4** container → proxy | needs a live saife session with a proxy listener, and a container that tries to reach it. |
 | JVM/Gradle daemon cost | **measured** (§5): 3–12 s per build when the daemon starts, ~1.5 s when it is already alive; 479 MB RSS. |
 
-## 7. Reproduce
+## 8. Reproduce
 
 ```powershell
 # endpoint without the CLI
