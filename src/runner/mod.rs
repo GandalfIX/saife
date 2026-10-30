@@ -13,6 +13,8 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
+
+pub mod server;
 use std::path::{Path, PathBuf};
 
 /// Tasks the runner will execute. An allow-list, not a pattern: a task string reaches
@@ -138,9 +140,8 @@ mod tests {
             ("env", "{}"),
             ("privileged", "true"),
         ] {
-            let body = format!(
-                r#"{{"project":"app","task":"build","profile":"gradle","{key}":{value}}}"#
-            );
+            let body =
+                format!(r#"{{"project":"app","task":"build","profile":"gradle","{key}":{value}}}"#);
             let err = BuildRequest::parse(body.as_bytes(), &ws())
                 .expect_err("an extra field must be refused");
             let msg = format!("{err:#}");
@@ -154,9 +155,7 @@ mod tests {
     #[test]
     fn a_task_outside_the_allow_list_is_refused() {
         for task in ["build; rm -rf /", "--init-script", "build -x test", ""] {
-            let body = format!(
-                r#"{{"project":"app","task":"{task}","profile":"gradle"}}"#
-            );
+            let body = format!(r#"{{"project":"app","task":"{task}","profile":"gradle"}}"#);
             let err = BuildRequest::parse(body.as_bytes(), &ws())
                 .expect_err(&format!("task {task:?} must be refused"));
             assert!(

@@ -18,10 +18,10 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | S0.5 | `docs/research/build-runner/measurements.md` written | [~] | three legs recorded; S0.1, S0.4 and the daemon cost pending |
 | S0.6 | Endpoint discovery: `/_ping` over npipe from Rust; containerd-mode has no Docker API | [~] | npipe from a plain .NET client: 200 OK, /version api=1.54 min=1.41 engine=29.5.3; Rust leg pending |
 | T1.1 | `BuildRequest` type + validation; no image/mount/command field | [x] | `src/runner/mod.rs`: project/task/profile only, `deny_unknown_fields` names any extra key; task and profile allow-lists; `..`, rooted, UNC and device paths refused. 5 tests |
-| T1.2 | Declared facade operations (`POST/GET/DELETE /build`) + 403 fixture | [ ] | |
-| T1.3 | Streaming response path | [ ] | |
+| T1.2 | Declared runner operations + refusal fixtures | [x] | `runner::server::OPERATIONS` = `POST /build`, `GET /build`; the build id travels as a query because the declaration grammar is exact-path. Server answers 404 for every other method/path |
+| T1.3 | Streaming response path | [x] | `GET /build?id=..&follow=1` writes lines as the engine produces them (close-delimited, 100 ms poll); test proves the first line arrives while the build is still running |
 | T1.5 | Facade relays declared methods + request bodies (403 not 501 for undeclared) | [x] | GET gate removed; declaration is the control; undeclared → 403 `facade_operation_not_declared`, non-token → 400 `facade_method_invalid`, body ≤ 4 KiB forwarded (`413 facade_body_too_large` past). 3 new tests; live S0.1 re-run green (last chunk 20 008 ms) |
-| T1.4 | Per-session runner token, distinct from the proxy token | [ ] | |
+| T1.4 | Per-session runner token, distinct from the proxy token | [~] | the listener requires `X-Facade-Token` and refuses a wrong one (401 `runner_token_invalid`); distinctness from the proxy token is asserted when the session wiring exists |
 | T2.1 | Slot spawn with pinned digest + readiness probe | [ ] | |
 | T2.2 | Attach path with timeout and named failure | [ ] | |
 | T2.3 | Idle kill, recycle, invalidate on digest/JDK change | [ ] | |

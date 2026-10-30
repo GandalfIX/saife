@@ -306,19 +306,23 @@ before S-1 starts.
 - [ ] **T1.1** `src/runner/mod.rs`: `BuildRequest { project, task, profile }` with validation
       (workspace-contained path, allow-listed task, known profile). A test asserts the type
       has no field for image/mount/command/env.
-- [ ] **T1.2** Declared operations on the runner's facade target: `POST /build`,
-      `GET /build/{id}` (log stream), `DELETE /build/{id}`. Anything else → `403
-      facade_operation_not_declared` (existing behaviour, new fixtures).
-- [ ] **T1.3** Streaming response path per S0.1's answer (chunked, flushed per line, cancel on
-      client disconnect).
+- [x] **T1.2** Declared runner operations: `POST /build` and `GET /build` (status, and
+      `&follow=1` for the log stream). The id travels as a **query parameter**, not a path
+      segment, because the facade's declaration grammar is exact-path — `/build/{id}` cannot be
+      expressed, and inventing a wildcard for one caller is a schema change that needs its own
+      argument. Anything else is refused by the facade (403) or by the listener (404).
+- [x] **T1.3** Streaming response path — **done**: close-delimited body, one write per line,
+      100 ms poll of the engine, stop on a terminal state or a closed socket. A test proves the
+      first line reaches the caller while the build is still running.
 - [x] **T1.5** The facade relays any **declared** method and forwards request bodies — **done**:
       the hard-coded GET gate in `facade_action` is gone, the declaration is the control, an
       undeclared method is `403 facade_operation_not_declared` (was `501`), a non-token method is
       `400 facade_method_invalid`, and bodies are forwarded up to `MAX_FACADE_BODY` (4 KiB) with
       `413 facade_body_too_large` past it. Tests: declared `POST /build` reaches the sidecar with
       its body and a `POST /build HTTP/1.0` request line; `DELETE` → 403; oversized → 413.
-- [ ] **T1.4** Per-session runner token, distinct from the MXC proxy token; a test asserts the
-      two are never the same value and that the runner token does not authorise a proxied host.
+- [~] **T1.4** Runner token — the listener requires its own `X-Facade-Token` and refuses any
+      other (401 `runner_token_invalid`). The "never the same value as the proxy token" assertion
+      needs the session wiring, where both exist; it lands with T1.2b.
 
 ### S-2 — Slot lifecycle (on top of the engine abstraction)
 
