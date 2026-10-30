@@ -329,6 +329,42 @@ pub fn learned_file_path_in(base: &Path, profile_name: Option<&str>) -> PathBuf 
         .join(format!("{name}.json"))
 }
 
+/// Every learned store on disk under `base`, as `(profile name, path)`, sorted
+/// by name; `default` is reported as `None`, the way the rest of the API spells
+/// it.
+///
+/// `saife learned` used to address `default.json` only, so a deny recorded under
+/// the store a profile actually selects (`network.profile`, e.g. `developer`)
+/// was invisible to `list` and unreachable for `revoke` - while it silently
+/// outranked that profile's allow-list at run time ([G-33]). Enumeration is what
+/// makes the store findable.
+pub fn stores_in(base: &Path) -> Vec<(Option<String>, PathBuf)> {
+    let dir = base.join(".saife").join("learned");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(Option<String>, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?.to_string();
+            let name = if stem == "default" { None } else { Some(stem) };
+            Some((name, path))
+        })
+        .collect();
+    // `default` first: it is the store a flagless command addresses.
+    out.sort_by(|a, b| match (&a.0, &b.0) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(y),
+    });
+    out
+}
+
 fn ensure_parent(path: &Path) -> Result<()> {
     // `create_dir_all` returns Ok for an existing path, so the `.ok()`
     // only swallows genuine permission failures — in which case the

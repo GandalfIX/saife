@@ -202,6 +202,41 @@ fn learned_cmd_in(
 ) -> (i32, String, String) {
     use cli::LearnedSub;
     match action {
+        LearnedSub::List if profile.is_none() => {
+            // No `--profile`: show every store, labelled. Reading `default` alone
+            // hid a deny that was blocking the run (see `stores_in`).
+            let mut rendered: Vec<(String, String)> = Vec::new();
+            for (name, _) in net::learned::stores_in(base) {
+                let label = name.clone().unwrap_or_else(|| "default".to_string());
+                match net::learned::LearnedStore::load_in(base, name.as_deref()) {
+                    Ok(store) => {
+                        if !store.entries().is_empty() {
+                            rendered.push((label, learned_table(&store.entries())));
+                        }
+                    }
+                    // [G-5] a corrupt store is never skipped: hiding it would
+                    // report "no entries" for a file that hard-aborts `saife run`
+                    // and lose the `learned clear` pointer.
+                    Err(e) => return learned_load_failure(e),
+                }
+            }
+            if rendered.is_empty() {
+                return (0, "(no learned entries)\n".to_string(), String::new());
+            }
+            // The historical bare table is kept only for `default`, the store a
+            // flagless command already addresses. Any other store is labelled even
+            // when it is the only one with entries: otherwise the operator sees
+            // rules and cannot tell which `--profile` would revoke them.
+            if rendered.len() == 1 && rendered[0].0 == "default" {
+                return (0, rendered.remove(0).1, String::new());
+            }
+            let mut out = String::new();
+            for (label, table) in rendered {
+                out.push_str(&format!("# {label}\n"));
+                out.push_str(&table);
+            }
+            (0, out, String::new())
+        }
         LearnedSub::List => match net::learned::LearnedStore::load_in(base, profile) {
             Ok(store) => {
                 let entries = store.entries();
@@ -240,14 +275,42 @@ fn learned_cmd_in(
                 Ok(true) => (0, format!("revoked {host}\n"), String::new()),
                 // A missing entry fails loudly rather than silently
                 // succeeding — honest behavior for a scripted CLI.
-                Ok(false) => (
-                    1,
-                    String::new(),
-                    format!(
-                        "[saife] no learned entry for {host} \
-                         (run `saife learned list` to see stored keys)\n"
-                    ),
-                ),
+                Ok(false) => {
+                    // Without `--profile` the addressed store is `default`. If the
+                    // host lives in another store, name it: otherwise the operator
+                    // is told "no entry" about a rule that IS blocking them.
+                    let elsewhere: Option<String> = if profile.is_none() {
+                        net::learned::stores_in(base)
+                            .into_iter()
+                            .filter_map(|(name, _)| name)
+                            .find(|name| {
+                                net::learned::LearnedStore::load_in(base, Some(name))
+                                    .map(|s| s.entries().iter().any(|e| e.0 == host))
+                                    .unwrap_or(false)
+                            })
+                    } else {
+                        None
+                    };
+                    match elsewhere {
+                        Some(name) => (
+                            1,
+                            String::new(),
+                            format!(
+                                "[saife] `{host}` is not in the default store; it is in store \
+                                 `{name}` - re-run with `--profile {name}` (or `saife learned \
+                                 list` to see every store)\n"
+                            ),
+                        ),
+                        None => (
+                            1,
+                            String::new(),
+                            format!(
+                                "[saife] no learned entry for {host} \
+                                 (run `saife learned list` to see stored keys)\n"
+                            ),
+                        ),
+                    }
+                }
                 Err(e) => (
                     1,
                     String::new(),
@@ -280,6 +343,31 @@ fn learned_cmd_in(
 
 /// Load failure for list/revoke: corrupt file, schema mismatch, or a
 /// rejected profile name all point the user at the [G-5] recovery path.
+/// Render the aligned `HOST  SCOPE  DISPOSITION` table for one store.
+fn learned_table(entries: &[(String, String, bool)]) -> String {
+    let host_w = entries
+        .iter()
+        .map(|e| e.0.len())
+        .max()
+        .unwrap_or(0)
+        .max("HOST".len());
+    let scope_w = entries
+        .iter()
+        .map(|e| e.1.len())
+        .max()
+        .unwrap_or(0)
+        .max("SCOPE".len());
+    let mut out = format!("{:<host_w$}  {:<scope_w$}  DISPOSITION\n", "HOST", "SCOPE");
+    for (host, scope, allow) in entries {
+        let disposition = if *allow { "allow" } else { "deny" };
+        out.push_str(&format!(
+            "{:<host_w$}  {:<scope_w$}  {disposition}\n",
+            host, scope
+        ));
+    }
+    out
+}
+
 fn learned_load_failure(e: anyhow::Error) -> (i32, String, String) {
     (
         1,
