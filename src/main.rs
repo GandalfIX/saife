@@ -8,6 +8,7 @@ mod net;
 #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 mod plugin;
 mod profile;
+mod runner;
 mod sandbox;
 mod security_groups;
 mod setup;

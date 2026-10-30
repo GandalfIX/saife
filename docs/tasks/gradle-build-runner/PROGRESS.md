@@ -17,7 +17,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | S0.4 | Container → saife proxy reachability (offline vs relayed) | [x] | reachable via host.docker.internal (407 realm `sandbox`) — and so is every 127.0.0.1 host service; runner container is not a network boundary → v1 uses `--network none` |
 | S0.5 | `docs/research/build-runner/measurements.md` written | [~] | three legs recorded; S0.1, S0.4 and the daemon cost pending |
 | S0.6 | Endpoint discovery: `/_ping` over npipe from Rust; containerd-mode has no Docker API | [~] | npipe from a plain .NET client: 200 OK, /version api=1.54 min=1.41 engine=29.5.3; Rust leg pending |
-| T1.1 | `BuildRequest` type + validation; no image/mount/command field | [ ] | |
+| T1.1 | `BuildRequest` type + validation; no image/mount/command field | [x] | `src/runner/mod.rs`: project/task/profile only, `deny_unknown_fields` names any extra key; task and profile allow-lists; `..`, rooted, UNC and device paths refused. 5 tests |
 | T1.2 | Declared facade operations (`POST/GET/DELETE /build`) + 403 fixture | [ ] | |
 | T1.3 | Streaming response path | [ ] | |
 | T1.5 | Facade relays declared methods + request bodies (403 not 501 for undeclared) | [x] | GET gate removed; declaration is the control; undeclared → 403 `facade_operation_not_declared`, non-token → 400 `facade_method_invalid`, body ≤ 4 KiB forwarded (`413 facade_body_too_large` past). 3 new tests; live S0.1 re-run green (last chunk 20 008 ms) |
