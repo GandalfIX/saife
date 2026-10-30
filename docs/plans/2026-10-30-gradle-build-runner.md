@@ -331,8 +331,11 @@ before S-1 starts.
       `tcp://` refused by name, containerd-mode Rancher refused by name, and a probe fixture
       that reports a missing capability instead of failing at first build.
 
-- [ ] **T2.1** Slot spawn with a pinned digest and a readiness probe; the digest is a binary
-      constant, not a profile field.
+- [x] **T2.1** Slot spawn with a pinned digest and a readiness probe — **done**: the engine is
+      spoken to over the named pipe (Engine API, no `docker` CLI), `net::` style one request per
+      connection, `RUNNER_IMAGE` is digest-pinned (`require_digest` refuses a floating tag),
+      `NetworkMode: none`, and a `saife.session` label the sweep can find. Live leg: create →
+      start → running → listed by label → removed, in 0.27 s.
 - [ ] **T2.2** Attach path with a timeout and a named failure (`runner_slot_unavailable`).
 - [ ] **T2.3** Idle kill (10 min), recycle after N builds, invalidate on digest/JDK change.
 - [ ] **T2.4** Single-session ownership, kill on session end, start-up sweep of orphaned slots.

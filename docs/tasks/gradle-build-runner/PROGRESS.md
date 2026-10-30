@@ -22,7 +22,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T1.3 | Streaming response path | [x] | `GET /build?id=..&follow=1` writes lines as the engine produces them (close-delimited, 100 ms poll); test proves the first line arrives while the build is still running |
 | T1.5 | Facade relays declared methods + request bodies (403 not 501 for undeclared) | [x] | GET gate removed; declaration is the control; undeclared → 403 `facade_operation_not_declared`, non-token → 400 `facade_method_invalid`, body ≤ 4 KiB forwarded (`413 facade_body_too_large` past). 3 new tests; live S0.1 re-run green (last chunk 20 008 ms) |
 | T1.4 | Per-session runner token, distinct from the proxy token | [~] | the listener requires `X-Facade-Token` and refuses a wrong one (401 `runner_token_invalid`); distinctness from the proxy token is asserted when the session wiring exists |
-| T2.1 | Slot spawn with pinned digest + readiness probe | [ ] | |
+| T2.1 | Slot spawn with pinned digest + readiness probe | [x] | Engine API over the npipe (no CLI): ping, version, create (digest-pinned, `NetworkMode: none`, session label), start, inspect, list-by-label, remove. Live leg green in 0.27 s: create → start → running → visible to the sweep → removed |
 | T2.2 | Attach path with timeout and named failure | [ ] | |
 | T2.3 | Idle kill, recycle, invalidate on digest/JDK change | [ ] | |
 | T2.4 | Single-session ownership, kill on end, start-up sweep | [ ] | |
