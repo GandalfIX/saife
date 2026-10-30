@@ -391,6 +391,26 @@ rollback. If any step is run on the physical host, write the rollback script
 first (ACE cleanup: `tests/cleanup-acls.ps1`, and check the ancestor ACE count
 before/after).
 
+> **Measured 2026-10-30** (Windows 11, `mxc` GA, unelevated) - see
+> `docs/research/backends/process-container/opencode-desktop-windows.md`.
+>
+> - **A1-A5 are wrong about the paths**: the install is `…\Programs\ai.opencode.desktop` and
+>   userData is `%APPDATA%\ai.opencode.desktop` (appId, not product name). The profile now carries
+>   the measured paths.
+> - **B3 passed**: the sandboxed server binds 28894 and writes `service.json` with its own pid.
+> - **B4/B5 failed, and the failure is the finding**: the desktop spawns its own unsandboxed server
+>   (which cannot bind and exits), and the host's `connect()` to the container's port **times out** -
+>   inbound is not a supported direction at all: the `ingress.*` fields in the request are the
+>   ADR-0004 requirement for the container -> proxy path, not an inbound grant, and a process inside
+>   cannot reach even its own loopback listener (`10013`).
+> - **C is not viable for this app**: the DACL propagation cap (20 000 objects) is below opencode's
+>   state tree, so `appcontainer` cannot grant what the session needs.
+>
+> **Consequence for §3: the split topology does not work today.** The all-in-one shape becomes the
+> intended answer *once loopback egress exists* (the sibling plan), because both processes then live
+> in one container and use container loopback - no ingress involved. Electron-under-ProcessContainer
+> stays the open risk (§5.7).
+
 **A. Confirm the source-derived facts**
 
 - [ ] **A1** Install opencode desktop on the VM; record the actual install
