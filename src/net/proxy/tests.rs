@@ -5930,6 +5930,51 @@
     /// A one-shot HTTP/1.0 sidecar stand-in: records the request head it received
     /// and answers a fixed body. Blocking, on a std thread — the proxy connects to
     /// it from a tokio task, exactly as it reaches the real sidecar.
+    /// Like [`fake_sidecar`], but reads the declared body too, so a relayed POST can
+    /// be checked for what actually arrived.
+    fn fake_sidecar_with_body(body: &'static str) -> (u16, Arc<StdMutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_thread = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut raw = Vec::new();
+                let mut one = [0u8; 1];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut one) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => raw.push(one[0]),
+                    }
+                }
+                // The supervisor frames the body it forwards, so Content-Length is the
+                // only thing to trust here.
+                let head = String::from_utf8_lossy(&raw).into_owned();
+                let want = content_length(&head).unwrap_or(0);
+                let mut body_bytes = vec![0u8; want];
+                let mut got = 0;
+                while got < want {
+                    match s.read(&mut body_bytes[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                seen_in_thread.lock().unwrap().push(format!(
+                    "{head}{}",
+                    String::from_utf8_lossy(&body_bytes[..got])
+                ));
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
     fn fake_sidecar(body: &'static str) -> (u16, Arc<StdMutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -6005,10 +6050,21 @@
             ),
             "an undeclared mount is 404 whatever the method"
         );
-        assert!(matches!(
-            facade_action(&reg, "tngtech.sandbox.invalid", "POST", "/"),
-            FacadeAction::MethodUnsupported
-        ));
+        assert!(
+            matches!(
+                facade_action(&reg, "tngtech.sandbox.invalid", "POST", "/"),
+                FacadeAction::OperationNotDeclared
+            ),
+            "a method the manifest does not declare is a 403, not a 501: the declaration \
+             is the control, and 'this transport only speaks GET' was never true"
+        );
+        assert!(
+            matches!(
+                facade_action(&reg, "tngtech.sandbox.invalid", "GE T", "/"),
+                FacadeAction::MethodInvalid
+            ),
+            "a method that is not a token cannot be put on a request line"
+        );
         match facade_action(&reg, "TNGTECH.sandbox.invalid", "GET", "/") {
             FacadeAction::Relay { mount, target } => {
                 assert_eq!(mount, "tngtech", "the mount is the registry's spelling");
@@ -6016,6 +6072,98 @@
             }
             other => panic!("expected a relay, got {other:?}"),
         }
+    }
+
+    /// T1.5: a declared POST reaches the sidecar **with its body**, and the request
+    /// line names the method the manifest declared. Before this, the facade answered
+    /// 501 for every method but GET and forwarded no body at all - a build request
+    /// (task + profile) had nowhere to go.
+    #[test]
+    fn a_declared_post_reaches_the_sidecar_with_its_body() {
+        const BODY: &str = "{\"task\":\"build\"}";
+        let (sidecar_port, seen) = fake_sidecar_with_body("accepted");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-post", &[], &[], dialog);
+        let mut target = facade_target("fake", sidecar_port, "facadetoken");
+        target.operations.push(crate::plugin::Operation {
+            method: "POST".into(),
+            path: "/build".into(),
+        });
+        t.handle.ctx.facade.insert(target).unwrap();
+
+        let request = format!(
+            "POST http://fake.sandbox.invalid/build HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n{BODY}",
+            auth_header(),
+            BODY.len()
+        );
+        let resp = exchange(t.port, &request);
+        assert!(
+            resp.starts_with("HTTP/1.0 200 OK"),
+            "the sidecar's answer must be relayed: {resp}"
+        );
+
+        let seen = seen.lock().unwrap();
+        let got = seen.first().expect("the sidecar must have been dialled");
+        assert!(
+            got.starts_with("POST /build HTTP/1.0"),
+            "the declared method and path go on the request line: {got}"
+        );
+        assert!(
+            got.ends_with(BODY),
+            "the body must arrive verbatim, got: {got:?}"
+        );
+        assert!(
+            got.contains("Content-Length: ") && got.contains("X-Facade-Token: facadetoken"),
+            "the supervisor frames and authenticates the deputy: {got}"
+        );
+    }
+
+    /// The declaration is the control: a method the manifest does not list is refused
+    /// even though the transport now relays whatever *is* listed.
+    #[test]
+    fn an_undeclared_method_is_refused_with_403_not_501() {
+        let (sidecar_port, _seen) = fake_sidecar("never");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-post-undeclared", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let request = format!(
+            "DELETE http://fake.sandbox.invalid/page HTTP/1.1\r\n{}\r\n",
+            auth_header()
+        );
+        let resp = exchange(t.port, &request);
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(
+            resp.contains("facade_operation_not_declared"),
+            "the refusal names the reason: {resp}"
+        );
+    }
+
+    /// An oversized body is refused before a byte of it is read into memory.
+    #[test]
+    fn a_body_past_the_cap_is_413() {
+        let (sidecar_port, _seen) = fake_sidecar("never");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-body-cap", &[], &[], dialog);
+        let mut target = facade_target("fake", sidecar_port, "facadetoken");
+        target.operations.push(crate::plugin::Operation {
+            method: "POST".into(),
+            path: "/page".into(),
+        });
+        t.handle.ctx.facade.insert(target).unwrap();
+
+        let request = format!(
+            "POST http://fake.sandbox.invalid/page HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n",
+            auth_header(),
+            MAX_FACADE_BODY + 1
+        );
+        let resp = exchange(t.port, &request);
+        assert!(resp.starts_with("HTTP/1.1 413"), "got: {resp}");
+        assert!(resp.contains("facade_body_too_large"), "got: {resp}");
     }
 
     #[test]
@@ -6097,7 +6245,10 @@
     }
 
     #[test]
-    fn facade_non_get_is_501_and_audited_as_a_deny() {
+    fn facade_undeclared_method_is_403_and_audited_as_a_deny() {
+        // T1.5 replaced the hard-coded GET gate: the transport relays whatever the
+        // manifest declares, so the refusal for an undeclared method is the same 403
+        // as for an undeclared path — one rule, one reason, one audit spelling.
         let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
         let t = t36_setup("facade-post", &[], &[], dialog);
         t.handle
@@ -6112,11 +6263,11 @@
                 auth_header()
             ),
         );
-        assert!(resp.starts_with("HTTP/1.1 501"), "got: {resp}");
-        assert!(resp.contains("facade_method_unsupported"), "got: {resp}");
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("facade_operation_not_declared"), "got: {resp}");
         let leaves = facade_leaves(&t.sid);
         assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0]["reason"], "facade_method_unsupported");
+        assert_eq!(leaves[0]["reason"], "facade_operation_not_declared");
     }
 
     #[test]

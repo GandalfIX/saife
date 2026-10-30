@@ -20,7 +20,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T1.1 | `BuildRequest` type + validation; no image/mount/command field | [ ] | |
 | T1.2 | Declared facade operations (`POST/GET/DELETE /build`) + 403 fixture | [ ] | |
 | T1.3 | Streaming response path | [ ] | |
-| T1.5 | Facade relays declared methods + request bodies (403 not 501 for undeclared) | [ ] | S0.1 measured GET-only, `facade_action` returns MethodUnsupported before consulting the declaration |
+| T1.5 | Facade relays declared methods + request bodies (403 not 501 for undeclared) | [x] | GET gate removed; declaration is the control; undeclared → 403 `facade_operation_not_declared`, non-token → 400 `facade_method_invalid`, body ≤ 4 KiB forwarded (`413 facade_body_too_large` past). 3 new tests; live S0.1 re-run green (last chunk 20 008 ms) |
 | T1.4 | Per-session runner token, distinct from the proxy token | [ ] | |
 | T2.1 | Slot spawn with pinned digest + readiness probe | [ ] | |
 | T2.2 | Attach path with timeout and named failure | [ ] | |

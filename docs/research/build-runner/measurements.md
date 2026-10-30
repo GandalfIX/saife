@@ -154,6 +154,12 @@ request-body forwarding exists today. That is now `T1.5` in the plan:
 - tests: declared POST reaches the sidecar with its body; undeclared method → 403 (not 501);
   oversized body → 413.
 
+**Closed the same day (T1.5):** `facade_action` no longer refuses non-GET, the manifest's
+`(method, path)` declaration is the control, an undeclared method is `403
+facade_operation_not_declared`, a non-token method is `400 facade_method_invalid`, and a declared
+body is forwarded up to 4 KiB (`413 facade_body_too_large` past it). Verified by three tests plus
+the live streaming leg re-run: `S0.1: 20 lines, first body at 1 ms, last chunk at 20 008 ms`.
+
 The timing leg ran with GET so it measured the response direction alone. The response direction
 is method-independent, so the answer above stands regardless of T1.5.
 

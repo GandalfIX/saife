@@ -303,12 +303,12 @@ before S-1 starts.
       facade_operation_not_declared` (existing behaviour, new fixtures).
 - [ ] **T1.3** Streaming response path per S0.1's answer (chunked, flushed per line, cancel on
       client disconnect).
-- [ ] **T1.5** Let the facade relay any **declared** method and forward request bodies: replace
-      the hard-coded GET gate in `facade_action` with the declaration check, forward the body to
-      the sidecar with a size cap and a declared content type, and refuse undeclared methods with
-      `403` rather than `501` (the manifest is the control; the GET gate refuses what the operator
-      declared). Tests: declared `POST` reaches the sidecar with its body; undeclared method →
-      `403`; oversized body → `413`.
+- [x] **T1.5** The facade relays any **declared** method and forwards request bodies — **done**:
+      the hard-coded GET gate in `facade_action` is gone, the declaration is the control, an
+      undeclared method is `403 facade_operation_not_declared` (was `501`), a non-token method is
+      `400 facade_method_invalid`, and bodies are forwarded up to `MAX_FACADE_BODY` (4 KiB) with
+      `413 facade_body_too_large` past it. Tests: declared `POST /build` reaches the sidecar with
+      its body and a `POST /build HTTP/1.0` request line; `DELETE` → 403; oversized → 413.
 - [ ] **T1.4** Per-session runner token, distinct from the MXC proxy token; a test asserts the
       two are never the same value and that the runner token does not authorise a proxied host.
 
