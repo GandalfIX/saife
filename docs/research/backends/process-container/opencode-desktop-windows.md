@@ -60,10 +60,15 @@ serve --service` under `--backend mxc`, unelevated; then `OpenCode.exe` launched
 
 Two facts follow, and they are the important ones:
 
-1. **Host→container ingress is not usable under `mxc`**, even though `src/net/mxc.rs` requests
-   `ingress.default = allow` + `ingress.host_loopback = allow` for proxy sessions. The host's
-   `connect()` to the container's listener is filtered — *timed out*, not refused, so it is a policy
-   refusal rather than a missing listener.
+1. **Inbound is not a supported direction — by design, not by accident.** `src/net/mxc.rs` sets
+   `ingress.default = allow` + `ingress.host_loopback = allow` whenever a proxy exists, but those
+   fields are the ADR-0004 requirement for the *container → supervisor proxy* path, not a grant that
+   outside processes may connect in. Measured with a probe listener inside a session, in **both**
+   postures (`--block-net` and proxy + `allow_domain`): the host's `connect()` **times out** (not
+   refused — the socket is visible in the host's TCP table), and the container cannot connect to
+   **its own** loopback listener either: `10013`. Loopback is closed in both directions; the single
+   cross-boundary channel is the proxy, and it is one-directional. Reading this as broken ingress
+   would send the next reader looking for a bug that does not exist.
 2. **The containment trap is real but self-limiting.** The desktop spawned an unsandboxed server
    exactly as §3.3 predicts. It did not take over the session because the fixed port was already
    bound, and the registration file kept pointing at the sandboxed pid. So the failure mode is "no

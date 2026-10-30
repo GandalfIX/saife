@@ -400,7 +400,9 @@ before/after).
 > - **B3 passed**: the sandboxed server binds 28894 and writes `service.json` with its own pid.
 > - **B4/B5 failed, and the failure is the finding**: the desktop spawns its own unsandboxed server
 >   (which cannot bind and exits), and the host's `connect()` to the container's port **times out** -
->   host -> container ingress is not usable under `mxc`, whatever the request asks for.
+>   inbound is not a supported direction at all: the `ingress.*` fields in the request are the
+>   ADR-0004 requirement for the container -> proxy path, not an inbound grant, and a process inside
+>   cannot reach even its own loopback listener (`10013`).
 > - **C is not viable for this app**: the DACL propagation cap (20 000 objects) is below opencode's
 >   state tree, so `appcontainer` cannot grant what the session needs.
 >
