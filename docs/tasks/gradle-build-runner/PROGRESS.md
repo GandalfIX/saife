@@ -12,7 +12,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | # | Task | Status | Evidence |
 |---|---|---|---|
 | S0.1 | Facade can stream a 10-minute build log | [ ] | |
-| S0.2 | Substrate attach latency measured (docker exec / start / WSL2) | [~] | info 93 ms, run --rm 497 ms, start 37 ms, exec 73 ms (Rancher moby 29.5.3). Open: Gradle daemon cost |
+| S0.2 | Substrate attach latency measured (docker exec / start / WSL2) | [x] | info 93 ms, run --rm 497 ms, exec 73 ms; sample project: cold 88.6 s (904 MB downloads), warm 1.67 s, ephemeral 4.95-13.6 s, `--offline` clean 8.5 s, daemon 479 MB. Decision: long-lived container |
 | S0.3 | Bind-mount throughput for ~20 k files, vs in-volume copy | [x] | bind 53.6 s vs volume 0.76 s (2.65 vs 0.038 ms/file); tar-pipe populate 2.8 s. §4 rewritten: sync, not mount |
 | S0.4 | Container → saife proxy reachability (offline vs relayed) | [ ] | |
 | S0.5 | `docs/research/build-runner/measurements.md` written | [~] | three legs recorded; S0.1, S0.4 and the daemon cost pending |

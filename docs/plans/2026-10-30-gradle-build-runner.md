@@ -108,13 +108,20 @@ Starting a container is not one cost, and only one of the rows is about containe
 | `docker start` of a stopped container | 37 ms | only if the container is ephemeral |
 | `docker exec` into a running container | **73 ms** | the long-lived shape |
 | sync 20 k files in or out (tar pipe) | **2.8 s** each way | every build, unless the volume is persistent and synced as a delta |
-| JVM + Gradle daemon start | **not yet measured** (needs a JDK image + fixture project) | the first build inside a fresh container |
+| JVM + Gradle daemon start (ephemeral container, same volumes) | **4.95 s** warm page cache / 13.6 s first | every build if the container is ephemeral |
+| same build, daemon already alive (long-lived container) | **1.67 s** | the long-lived shape |
+| first build ever (downloads distribution + deps, 904 MB) | **88.6 s** | once per image, moved to image build time |
 | Gradle configuration + execution | the build | — |
 
-The engine is cheaper than the estimates assumed: an ephemeral container per build costs ~0.5 s,
-not 3-8 s, **provided the source tree and the dependency cache live in volumes rather than on a
-bind mount** (S0.3, §4). The open number is the daemon; it is what decides ephemeral vs
-long-lived, and it is the next S-0 leg.
+The engine is cheap; the **daemon** is not. Measured with the sample project
+(`C:\Users\marku\projekte\temp\sample-gradle` — Spring Boot, composite build, dependency
+locking, toolchain Java 25): an ephemeral container pays **4.95-13.6 s per build** for the
+daemon, a long-lived container pays **1.67 s**, and the first build anywhere pays 88.6 s
+because it downloads the distribution and dependencies (904 MB).
+
+**Decision (2026-10-30): one long-lived container per session**, idle-killed at 10 minutes, with
+the distribution and dependency cache baked into the image so a session's first build is an
+`--offline` clean build (~8.5 s measured) rather than an 88 s download.
 
 So "spin up a container per build" costs **3–8 s of overhead**, and most of it is the cold
 Gradle daemon, not the container. Attaching to a container that has already built once costs
@@ -243,9 +250,12 @@ in those words.
 3. **The runner receives no credentials** from the session. A private registry needs its own
    story (out of scope, deny first).
 4. **One session per slot**, and a slot dies with its session.
-5. **Failure is a refusal, not a fallback.** If no slot can be prepared, the build fails with
+5. **The image carries the toolchain.** The sample project's conventions require Java 25; a
+   project whose toolchain the image lacks is refused by name (`runner_toolchain_missing`),
+   never left to Gradle's auto-provisioning (which needs network and a resolver).
+6. **Failure is a refusal, not a fallback.** If no slot can be prepared, the build fails with
    the reason; it never silently runs on the host.
-6. **The audit answers "which image, which task, which exit code".**
+7. **The audit answers "which image, which task, which exit code".**
 
 ## 9. Phases and tasks
 
@@ -260,9 +270,10 @@ no slots) per AGENTS.md.
       minutes. Does the response stream through the proxy, or is it buffered/cut by
       `HEAD_READ_TIMEOUT`, the 128-connection cap, or a client read timeout? Record what the
       workload sees and what the proxy logs.
-- [x] **S0.2** Latency decomposition — **engine side measured**: `docker info` 93 ms, `run --rm`
-      497 ms, `start` 37 ms, `exec` 73 ms. Open: the Gradle daemon cost (JDK image + fixture
-      project), which is what decides ephemeral vs long-lived.
+- [x] **S0.2** Latency decomposition — **measured, including the daemon**: `info` 93 ms,
+      `run --rm` 497 ms, `exec` 73 ms; ephemeral per build 4.95-13.6 s, long-lived 1.67 s, first
+      build 88.6 s (904 MB of downloads), `--offline` clean build 8.5 s, daemon RSS 479 MB.
+      Decides §3: long-lived container.
 - [x] **S0.3** Mount throughput — **measured, and it changed §4**: bind mount 53.6 s vs volume
       0.76 s for 20 k small files (2.65 ms/file vs 0.038 ms); tar-pipe populate 2.8 s. The
       project is synced, not mounted.
@@ -400,8 +411,9 @@ before S-1 starts.
 - **Harness:** a fixture project built through the runner; negative legs — undeclared path
   `403`, project root outside the workspace refused, junction/symlink refused, image override
   impossible.
-- **Live (`#[ignore]`):** warm attach < 2 s; `gradlew build` exit 0 with the artifact on the
-  host; a second build reuses the daemon; session end leaves no container behind
+- **Live (`#[ignore]`):** the fixture `C:\Users\marku\projekte\temp\sample-gradle` (Spring
+  Boot + composite build + dependency locking, Java 25): `gradlew build` exit 0 with
+  `sample-gradle.jar` synced back; warm build < 3 s (measured 1.67 s); a second build reuses the daemon; session end leaves no container behind
   (`HOST-CLEAN` analogue: `docker ps --filter label=saife.session=…` empty).
 - **Performance budget:** engine overhead ≤ ~1 s per build (measured: 497 ms container start or
   73 ms exec) plus sync ≤ 3 s per direction on a 20 k-file tree (measured 2.8 s full, less as a

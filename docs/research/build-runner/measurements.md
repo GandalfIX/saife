@@ -1,7 +1,8 @@
 # Build runner — S-0 measurements
 
-**Status:** partial, 2026-10-30. Three of the six legs are measured; `S0.1` (facade streaming)
-and `S0.4` (container → proxy) need product code or a live session before they mean anything.
+**Status:** partial, 2026-10-30. Five legs measured, including the one that decides the slot
+model (§5). `S0.1` (facade streaming) and `S0.4` (container → proxy) still need product code or
+a live session before they mean anything.
 
 **Host:** Windows 11 (build 26300), 24 vCPU, 33.6 GB visible to the engine.
 **Engine:** Rancher Desktop 29.5.3 — dockerd/moby in the `Rancher Desktop WSL Distribution`
@@ -89,15 +90,48 @@ The tar-pipe populate is the important number: pulling the *entire* tree into th
    the reference workload: the engine overhead is ~3 s of sync per direction plus ~0.5 s of
    container lifecycle; anything beyond that is Gradle itself.
 
-## 5. Still open
+## 5. The sample project: cold, warm, ephemeral (S0.2, the daemon leg)
+
+**Fixture:** `C:\Users\marku\projekte\temp\sample-gradle` — Spring Boot, Kotlin DSL,
+composite build (`build-logic`), dependency locking (`gradle.lockfile`), `integrationTest`
+suite, Gradle **9.8.2** wrapper, toolchain **Java 25**. 26 files / 304 KB of source.
+
+| leg | wall | notes |
+|---|---|---|
+| sync in (tar pipe, 26 files) | **0.58 s** | 304 KB |
+| build 1, fresh container (downloads distribution + dependencies, starts the daemon) | **88.6 s** | 1 m 27 s Gradle time, 24 tasks, 904 MB added to `/cache` |
+| build 2, same container (daemon alive, all up-to-date) | **1.67 s** | Gradle reports 1 s |
+| build 3, same container, `clean build` (build cache hit) | **1.49 s** | 6 executed, 10 from cache |
+| `clean build --offline` (daemon alive) | 8.5 s | the dependency cache is complete; `--offline` is viable |
+| **ephemeral container**, same volumes, up-to-date build | **13.6 s** / **4.95 s** | first / second; daemon has to start every time |
+| Gradle daemon RSS after a build | **479 MB** | one JVM |
+
+**The daemon is the whole cost.** Container start is 0.5 s (§2) and the project sync is 0.6 s;
+everything expensive is the JVM + Gradle daemon (≈3–12 s when started per build) and the
+first-time download (88 s, 904 MB).
+
+Consequences recorded in the plan:
+
+- **One long-lived container per session** (§3): warm builds are ~1.5 s against ~5–14 s
+  ephemeral, and the daemon's 479 MB is bounded by the idle kill.
+- **The first build must be moved to image build time.** Baking the Gradle distribution, the
+  dependency cache and a warm-up build into the runner image turns the session's first build
+  from 88 s into the same ~8 s `--offline` clean build measured above.
+- **The image must carry the toolchain the project asks for.** This fixture requires Java 25;
+  Gradle's auto-provisioning would need network and a resolver. Missing toolchain must be a
+  named refusal (`runner_toolchain_missing`), not a silent download attempt inside a build.
+- **`--offline` is the default that works** (§5 of the plan): the cache is complete, and an
+  offline clean build succeeds in 8.5 s.
+
+## 6. Still open
 
 | leg | why it is not answered |
 |---|---|
 | **S0.1** facade streaming | needs a declared facade operation that emits for 10 minutes; that is the first slice of product code. Until then the only fact is that `HEAD_READ_TIMEOUT` (15 s) covers the request *head*, not the response body. |
 | **S0.4** container → proxy | needs a live saife session with a proxy listener, and a container that tries to reach it. |
-| Gradle daemon cost (part of S0.2) | needs a JDK image plus a fixture project; this is the number that decides long-lived container vs ephemeral per build. |
+| JVM/Gradle daemon cost | **measured** (§5): 3–12 s per build when the daemon starts, ~1.5 s when it is already alive; 479 MB RSS. |
 
-## 6. Reproduce
+## 7. Reproduce
 
 ```powershell
 # endpoint without the CLI
