@@ -81,11 +81,34 @@ impl Endpoint {
 
     fn open(&self) -> Result<std::fs::File> {
         match self {
-            Endpoint::Pipe(path) => std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .with_context(|| format!("runner: open the engine pipe {}", path.display())),
+            Endpoint::Pipe(path) => {
+                // A named pipe has a limited number of instances, and the engine is busy
+                // when they are all taken (`ERROR_PIPE_BUSY`, os error 231). That is a
+                // retry, not a failure - concurrent requests (a build log plus a status
+                // poll) hit it routinely, and reporting it as "engine unreachable" would
+                // turn normal concurrency into a broken session.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                    {
+                        Ok(file) => return Ok(file),
+                        Err(e)
+                            if e.raw_os_error() == Some(231)
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!("runner: open the engine pipe {}", path.display())
+                            });
+                        }
+                    }
+                }
+            }
             Endpoint::Unix(path) => {
                 // A unix socket is not a file on Windows; this arm exists for Linux hosts.
                 #[cfg(windows)]
@@ -415,6 +438,180 @@ impl Engine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Exec: running a command inside a slot, with its log as it is produced
+// ---------------------------------------------------------------------------
+
+impl Engine {
+    /// Create an exec and return its id. `Tty: false` on purpose: the multiplexed stream carries
+    /// stdout and stderr separately, and no terminal escapes end up in the build log.
+    pub fn exec_create(
+        &self,
+        container: &str,
+        cmd: &[String],
+        workdir: &str,
+        env: &[String],
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "Tty": false,
+            "WorkingDir": workdir,
+            "Env": env,
+            "Cmd": cmd,
+        });
+        let r = self.request(
+            "POST",
+            &format!("/{API}/containers/{container}/exec"),
+            body.to_string().as_bytes(),
+        )?;
+        if r.status != 201 {
+            bail!(
+                "runner: engine refused the exec ({}) {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+        let v = r.json()?;
+        let id = v["Id"].as_str().unwrap_or_default().to_string();
+        if id.is_empty() {
+            bail!("runner: the engine created an exec without an id");
+        }
+        Ok(id)
+    }
+
+    /// Start an exec and hand every output chunk to `on_chunk` **as it arrives**.
+    ///
+    /// The engine answers with a multiplexed stream when `Tty` is false: an 8-byte header
+    /// (stream id, three zero bytes, a big-endian length) followed by that many payload bytes,
+    /// repeated until the process ends. Reading it incrementally is the whole point - a build
+    /// log that only appears when the build finishes is useless.
+    pub fn exec_stream(&self, exec_id: &str, mut on_chunk: impl FnMut(&[u8])) -> Result<()> {
+        let mut file = self.endpoint.open()?;
+        let body = serde_json::json!({ "Detach": false, "Tty": false }).to_string();
+        let head = format!(
+            "POST /{API}/exec/{exec_id}/start HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        file.write_all(head.as_bytes())
+            .context("runner: write the exec start head")?;
+        file.write_all(body.as_bytes())
+            .context("runner: write the exec start body")?;
+
+        // Response head, byte by byte: the body follows with no length framing of its own.
+        let mut resp_head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !resp_head.ends_with(b"\r\n\r\n") {
+            match file.read(&mut byte) {
+                Ok(0) | Err(_) => bail!("runner: the engine closed before the exec answered"),
+                Ok(_) => resp_head.push(byte[0]),
+            }
+            if resp_head.len() > 16 * 1024 {
+                bail!("runner: exec response head too large");
+            }
+        }
+        let head_text = String::from_utf8_lossy(&resp_head).into_owned();
+        let status: u16 = head_text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if status != 200 && status != 101 {
+            bail!("runner: exec start answered {status}");
+        }
+        // The engine answers `Transfer-Encoding: chunked`, and inside those HTTP chunks is the
+        // multiplexed frame stream. Both layers have to be unwrapped, and a frame may span
+        // chunks - so bytes are buffered until a whole frame is present.
+        let chunked = head_text
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        let mut reader = std::io::BufReader::new(file);
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            if pending.len() >= 8 {
+                let size =
+                    u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
+                if pending.len() >= 8 + size {
+                    if size > 0 {
+                        on_chunk(&pending[8..8 + size]);
+                    }
+                    pending.drain(..8 + size);
+                    continue;
+                }
+            }
+            let more = if chunked {
+                Self::read_http_chunk(&mut reader)?
+            } else {
+                let mut buf = [0u8; 8192];
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => None,
+                    Ok(n) => Some(buf[..n].to_vec()),
+                }
+            };
+            match more {
+                Some(bytes) if !bytes.is_empty() => pending.extend_from_slice(&bytes),
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Read one HTTP chunk (the engine sends `Transfer-Encoding: chunked` on the exec stream).
+    fn read_http_chunk(reader: &mut impl std::io::BufRead) -> Result<Option<Vec<u8>>> {
+        let mut size_line = String::new();
+        if reader.read_line(&mut size_line)? == 0 {
+            return Ok(None);
+        }
+        let size_hex = size_line.trim_end().split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .with_context(|| format!("runner: bad HTTP chunk size {size_hex:?}"))?;
+        if size == 0 {
+            // Trailer: consume the terminating empty line.
+            let mut trailer = String::new();
+            let _ = reader.read_line(&mut trailer);
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; size];
+        reader
+            .read_exact(&mut buf)
+            .context("runner: truncated HTTP chunk")?;
+        let mut crlf = String::new();
+        let _ = reader.read_line(&mut crlf);
+        Ok(Some(buf))
+    }
+
+    /// The exit code of a finished exec. `Running: true` means the caller polled too early.
+    pub fn exec_exit(&self, exec_id: &str) -> Result<Option<i32>> {
+        let r = self.request("GET", &format!("/{API}/exec/{exec_id}/json"), &[])?;
+        if r.status != 200 {
+            bail!("runner: exec inspect answered {}", r.status);
+        }
+        let v = r.json()?;
+        if v["Running"].as_bool().unwrap_or(true) {
+            return Ok(None);
+        }
+        Ok(v["ExitCode"].as_i64().map(|c| c as i32))
+    }
+}
+
+/// `Ok(true)` when the buffer was filled; `Ok(false)` on a clean EOF at the first byte.
+fn read_exact_or_eof(file: &mut std::fs::File, buf: &mut [u8]) -> Result<bool> {
+    let mut got = 0;
+    while got < buf.len() {
+        match file.read(&mut buf[got..]) {
+            Ok(0) => {
+                if got == 0 {
+                    return Ok(false);
+                }
+                bail!("runner: truncated stream");
+            }
+            Ok(n) => got += n,
+            Err(e) => return Err(e).context("runner: read the exec stream"),
+        }
+    }
+    Ok(true)
+}
+
 /// Percent-encode a query value. The runner only ever passes container names, labels and
 /// filters, but a name is caller-adjacent enough to encode rather than trust.
 fn urlencode(s: &str) -> String {
@@ -472,40 +669,46 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&r.body), "hello world");
     }
 
-    /// LIVE (`-- --ignored`): a real slot container comes up with no network, is visible to
-    /// the sweep, and is removed cleanly. This is T2.1 - the lifecycle the rest of S-2
-    /// builds on.
+    /// LIVE (`-- --ignored`): a command runs inside the slot, its output arrives as it is
+    /// produced, and the exit code comes back. This is the mechanism every build uses.
     #[test]
     #[ignore = "needs a running container engine and the pinned runner image"]
-    fn live_a_slot_starts_with_no_network_and_can_be_removed() {
-        let engine = Engine::connect(Endpoint::resolve().expect("endpoint"));
-        let session = format!("probe{}", std::process::id());
-        let spec = SlotSpec::new(&session);
+    fn live_a_command_runs_in_the_slot_and_streams_its_output() {
+        let g = SlotGuard::start(&format!("exec{}", std::process::id()));
+        // stdout, stderr, a delayed line and a non-zero exit.
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo first; echo oops >&2; sleep 1; echo second; exit 3".to_string(),
+        ];
+        let exec_id = g
+            .engine
+            .exec_create(&g.slot.id, &cmd, "/", &[])
+            .expect("create exec");
 
-        // A previous crashed run must not confuse this one.
-        for old in engine.list_slots().unwrap_or_default() {
-            if old.name == spec.name {
-                let _ = engine.remove_slot(&old);
-            }
-        }
+        let mut chunks: Vec<(u128, String)> = Vec::new();
+        let started = std::time::Instant::now();
+        g.engine
+            .exec_stream(&exec_id, |chunk| {
+                chunks.push((
+                    started.elapsed().as_millis(),
+                    String::from_utf8_lossy(chunk).into_owned(),
+                ));
+            })
+            .expect("stream the exec");
+        let all: String = chunks.iter().map(|(_, c)| c.as_str()).collect();
 
-        let slot = engine.create_slot(&spec).expect("create the slot");
-        engine.start_slot(&slot).expect("start the slot");
+        assert!(all.contains("first"), "stdout arrives: {all:?}");
+        assert!(all.contains("oops"), "stderr arrives: {all:?}");
+        assert!(all.contains("second"), "the delayed line arrives: {all:?}");
         assert!(
-            engine.slot_running(&slot).expect("inspect"),
-            "slot must be running"
+            chunks.first().map(|(ms, _)| *ms < 800).unwrap_or(false),
+            "the first chunk must arrive before the sleeps finish, not at the end: {chunks:?}"
         );
-
-        let listed = engine.list_slots().expect("list slots");
-        assert!(
-            listed.iter().any(|s| s.id == slot.id),
-            "the sweep must see the slot by label: {listed:?}"
-        );
-
-        engine.remove_slot(&slot).expect("remove the slot");
-        assert!(
-            !engine.slot_running(&slot).expect("inspect after remove"),
-            "a removed slot is not running"
+        assert_eq!(
+            g.engine.exec_exit(&exec_id).expect("exit code"),
+            Some(3),
+            "the exit code is reported, not inferred"
         );
     }
 
@@ -537,5 +740,63 @@ mod tests {
     fn a_close_delimited_response_is_the_rest_of_the_stream() {
         let raw = b"HTTP/1.1 200 OK\r\n\r\nOK";
         assert_eq!(parse_response(raw).unwrap().body, b"OK");
+    }
+    /// A slot that removes itself even when the test panics: the first failing runs of these
+    /// legs left containers behind, which is exactly the leak the start-up sweep exists to
+    /// clean up - the tests should not be the thing that creates the mess.
+    struct SlotGuard {
+        engine: Engine,
+        slot: Slot,
+    }
+
+    impl SlotGuard {
+        fn start(session: &str) -> Self {
+            let engine = Engine::connect(Endpoint::resolve().expect("endpoint"));
+            let spec = SlotSpec::new(session);
+            for old in engine.list_slots().unwrap_or_default() {
+                if old.name == spec.name {
+                    let _ = engine.remove_slot(&old);
+                }
+            }
+            let slot = engine.create_slot(&spec).expect("create the slot");
+            engine.start_slot(&slot).expect("start the slot");
+            SlotGuard { engine, slot }
+        }
+    }
+
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            let _ = self.engine.remove_slot(&self.slot);
+        }
+    }
+
+    /// LIVE (`-- --ignored`): a real slot container comes up with no network and is visible
+    /// to the sweep. T2.1's lifecycle, on the real engine.
+    #[test]
+    #[ignore = "needs a running container engine and the pinned runner image"]
+    fn live_a_slot_starts_with_no_network_and_can_be_removed() {
+        let g = SlotGuard::start(&format!("slot{}", std::process::id()));
+        assert!(
+            g.engine.slot_running(&g.slot).expect("inspect"),
+            "slot must be running"
+        );
+        let listed = g.engine.list_slots().expect("list slots");
+        assert!(
+            listed.iter().any(|s| s.id == g.slot.id),
+            "the sweep must see the slot by label: {listed:?}"
+        );
+        // A container reaches the whole host loopback otherwise, so `none` is asserted rather
+        // than trusted.
+        let inspect = g
+            .engine
+            .request("GET", &format!("/{API}/containers/{}/json", g.slot.id), &[])
+            .expect("inspect json")
+            .json()
+            .expect("json body");
+        assert_eq!(
+            inspect["HostConfig"]["NetworkMode"].as_str(),
+            Some("none"),
+            "a slot is created with no network: {inspect}"
+        );
     }
 }
