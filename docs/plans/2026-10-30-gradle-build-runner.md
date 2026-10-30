@@ -80,29 +80,39 @@ Rejected shapes, recorded so they are not re-proposed: a generic `POST /exec` (e
 mounted docker socket (root-equivalent by definition), and letting the profile JSON carry the
 image digest (a profile is user-editable; the digest must come from the shipped binary).
 
-## 3. Warm slots: what "starts fast" costs
+## 3. Latency: the engine is assumed up, the daemon is not
 
-Cold paths are disqualifying and should be said plainly:
+**Assumption (2026-10-30, user):** the container engine's VM is already running — Rancher
+Desktop, Docker Desktop, or whatever the user chose — so no design decision here is about
+booting a VM. Engine-down is an explicit *state*, not a delay we absorb.
 
-| substrate | cold | warm |
+Starting a container is not one cost, and only one of the rows is about containers at all:
+
+| step | typical | when it is paid |
 |---|---|---|
-| Docker Desktop, daemon down | tens of seconds to minutes | — |
-| Docker container, daemon up, image present | ~0.3–1 s | `exec` into a running container: tens of ms |
-| Linux VM boot | 5–20 s | snapshot resume: ~0.1–0.3 s |
-| bare WSL2 distro | seconds | fast, no snapshot |
+| `docker info` reachability probe | 50–200 ms | every build |
+| container start (image present) | 0.3–1 s native, 0.5–2 s over Docker Desktop/WSL2 | only if the container is ephemeral |
+| JVM + Gradle daemon start | **2–5 s** | the first build inside a fresh container |
+| Gradle configuration phase | 0.5–2 s | every build, warm or not |
+| task execution | the build | — |
 
-So a build must never boot anything. The unit of reuse is a **slot**:
+So "spin up a container per build" costs **3–8 s of overhead**, and most of it is the cold
+Gradle daemon, not the container. Attaching to a container that has already built once costs
+**30–80 ms**. The decision therefore is not "how fast can we start a container" but "how often
+do we throw the daemon away":
 
-- spawned once per session (or per project, at most one warm slot per project), with the image
-  digest pinned and a readiness probe before it is advertised;
-- holds a live Gradle daemon and a populated `~/.gradle`; the daemon's idle timeout is set
-  long enough that consecutive builds reuse it;
-- attached per build (`exec`, not `run`), with the project mounted at `/src`;
-- idle-killed after N minutes (default 10), recycled after N builds (default 20), invalidated
-  when the image digest or the JDK version changes;
-- owned by exactly one session, killed when that session ends (a container label plus the
-  session id, swept on start-up so a crashed supervisor cannot leak slots);
-- memory budget is real and must be documented: a warm daemon is ~0.5–1.5 GB, a warm VM 1–2 GB.
+- **v1: one long-lived container per session.** Started on the first build, `exec`ed into
+  afterwards, idle-killed after 10 minutes. The Gradle daemon warms itself on the first build
+  and is reused; the idle cost of an empty container is a few MB, and the 0.5–1.5 GB of a live
+  daemon only exists between the first build and the idle kill.
+- **Persistent cache volume** in both variants (`/cache`), because a container without it
+  re-downloads dependencies on every start — a cost far larger than any of the rows above.
+- **Ephemeral container per build** is the fallback if S0.2 shows container start is cheap
+  enough on the chosen substrate *and* statelessness is worth 3–8 s per build. That is a
+  decision for numbers, not for taste.
+- **Engine down** → fail immediately with `runner_engine_unavailable` and a message naming
+  the engine; never sit in a 40 s retry inside a tool call. Optional `--start-engine` may
+  later start it explicitly and say so.
 
 The unavoidable first-run cost — pulling the image, prewarming the wrapper distribution and
 the dependency cache — belongs to **install time**, documented as a step, exactly as the
@@ -191,9 +201,11 @@ no slots) per AGENTS.md.
       minutes. Does the response stream through the proxy, or is it buffered/cut by
       `HEAD_READ_TIMEOUT`, the 128-connection cap, or a client read timeout? Record what the
       workload sees and what the proxy logs.
-- [ ] **S0.2** Substrate latency on this host: `docker exec` into a warm container, `docker
-      start` of a stopped one, a Podman machine, a bare WSL2 distro. Numbers for attach, not
-      for boot.
+- [ ] **S0.2** Latency decomposition on this host, with the engine already running (Rancher
+      Desktop / Docker Desktop): `docker info`; container start with the image present; **first
+      build in a fresh container** (cold daemon); **second build in the same container** (warm
+      daemon); `docker exec` attach. The first-vs-second gap is the number that decides §3 -
+      not container start in isolation.
 - [ ] **S0.3** Mount throughput: a Gradle-sized tree (~20 k small files) read and rebuilt
       inside the runner over a Windows bind mount, versus copied into the runner's volume.
       Wall clock for `gradlew build` both ways.
@@ -271,7 +283,10 @@ before S-1 starts.
 2. **The project tree crosses the boundary twice** (sandbox writes, runner builds), so a
    build's inputs can change mid-build, and Windows file locks can fail a build in ways a
    native build would not.
-3. **The substrate is a dependency we do not control.** Docker Desktop requires a paid
+3. **The engine is assumed running, and that assumption can be false.** Rancher/Docker
+   Desktop may be closed, updating, or in a broken state; the runner must detect it in
+   milliseconds and refuse by name rather than wait.
+4. **The substrate is a dependency we do not control.** Docker Desktop requires a paid
    subscription for larger organisations, updates itself, and is itself a VM; Podman machine
    and a bare WSL2 distro are alternatives with different gaps. S-0 picks one on numbers.
 4. **Audit stops at the facade.** Container-internal actions are invisible to saife.
@@ -282,8 +297,9 @@ before S-1 starts.
 
 ## 11. Open questions
 
-1. Substrate: Docker Desktop, Podman machine, or a bare WSL2 distro? (S0.2, licensing, and
-   whether we want to own a distro.)
+1. Substrate: Rancher Desktop, Docker Desktop, Podman machine, or a bare WSL2 distro? The
+   engine is assumed running either way; S0.2's numbers plus licensing decide which one we
+   document first (and whether we support all of them through one `docker`-CLI abstraction).
 2. Do we ship a pinned image, or require the user to supply a digest? (Shipping means owning
    its CVE stream; requiring means a config step that can be wrong.)
 3. Offline-only in v1 — confirmed by S0.4, or does the relay have to exist on day one?
