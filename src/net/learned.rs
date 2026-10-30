@@ -11,7 +11,6 @@
 //! `#![allow(dead_code)]` to keep `cargo build --release` clean.
 //! Tests exercise the full API.
 
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -112,7 +111,11 @@ impl LearnedStore {
         for e in parsed.deny {
             deny.insert(e.host.to_ascii_lowercase(), e.scope);
         }
-        Ok(Self { file_path: path, allow, deny })
+        Ok(Self {
+            file_path: path,
+            allow,
+            deny,
+        })
     }
 
     /// Look up a host. Suffix entries match the host itself and any
@@ -123,7 +126,10 @@ impl LearnedStore {
         let h = host.trim_end_matches('.').to_ascii_lowercase();
         // Deny first (matches the pipeline: learned-deny precedes allow).
         if let Some(scope) = self.match_entry(&h, &self.deny) {
-            return Some(LearnedDecision { allow: false, scope });
+            return Some(LearnedDecision {
+                allow: false,
+                scope,
+            });
         }
         if let Some(scope) = self.match_entry(&h, &self.allow) {
             return Some(LearnedDecision { allow: true, scope });
@@ -318,7 +324,45 @@ pub fn learned_file_path_in(base: &Path, profile_name: Option<&str>) -> PathBuf 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("default");
-    base.join(".saife").join("learned").join(format!("{name}.json"))
+    base.join(".saife")
+        .join("learned")
+        .join(format!("{name}.json"))
+}
+
+/// Every learned store on disk under `base`, as `(profile name, path)`, sorted
+/// by name; `default` is reported as `None`, the way the rest of the API spells
+/// it.
+///
+/// `saife learned` used to address `default.json` only, so a deny recorded under
+/// the store a profile actually selects (`network.profile`, e.g. `developer`)
+/// was invisible to `list` and unreachable for `revoke` - while it silently
+/// outranked that profile's allow-list at run time ([G-33]). Enumeration is what
+/// makes the store findable.
+pub fn stores_in(base: &Path) -> Vec<(Option<String>, PathBuf)> {
+    let dir = base.join(".saife").join("learned");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(Option<String>, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?.to_string();
+            let name = if stem == "default" { None } else { Some(stem) };
+            Some((name, path))
+        })
+        .collect();
+    // `default` first: it is the store a flagless command addresses.
+    out.sort_by(|a, b| match (&a.0, &b.0) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(y),
+    });
+    out
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
@@ -336,15 +380,22 @@ fn ensure_parent(path: &Path) -> Result<()> {
 /// existing is not atomic). [G-56]
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
     use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
 
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, data)
-        .with_context(|| format!("write temp file {}", tmp.display()))?;
+    std::fs::write(&tmp, data).with_context(|| format!("write temp file {}", tmp.display()))?;
 
-    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let tmp_w: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let path_w: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let tmp_w: Vec<u16> = tmp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     let backoff = Duration::from_millis(50);
     for attempt in 0..3u32 {
@@ -424,7 +475,11 @@ mod tests {
         // [G-55] suffix matches apex + subdomain.
         assert!(store.lookup("npmjs.org").is_some_and(|d| d.allow));
         assert!(store.lookup("registry.npmjs.org").is_some_and(|d| d.allow));
-        assert!(store.lookup("sub.registry.npmjs.org").is_some_and(|d| d.allow));
+        assert!(
+            store
+                .lookup("sub.registry.npmjs.org")
+                .is_some_and(|d| d.allow)
+        );
         // Does not cross dots.
         assert!(store.lookup("npmjs.org.evil.io").is_none());
 
@@ -558,7 +613,10 @@ mod tests {
 
     #[test]
     fn validate_profile_name_rejects_path_traversal() {
-        assert!(validate_profile_name("../escape").is_err(), "parent traversal");
+        assert!(
+            validate_profile_name("../escape").is_err(),
+            "parent traversal"
+        );
         assert!(validate_profile_name("a/b").is_err(), "forward slash");
         assert!(validate_profile_name("a\\b").is_err(), "backslash");
         assert!(validate_profile_name("..").is_err(), "bare ..");

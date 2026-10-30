@@ -623,6 +623,75 @@
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// With no `--profile`, `list` must show EVERY store: a deny in
+    /// `developer.json` blocked a profile whose allow-list named the host, and
+    /// `list` printed "(no learned entries)" because it only read `default.json`.
+    /// Invisible was the harm; the entry itself was correct.
+    #[test]
+    fn learned_list_without_a_profile_shows_every_store() {
+        let tmp = learned_temp_dir("list-all-stores");
+        {
+            let mut dflt = net::learned::LearnedStore::load_in(&tmp, None).unwrap();
+            dflt.record("api.example.com", "host", true).unwrap();
+            let mut dev = net::learned::LearnedStore::load_in(&tmp, Some("developer")).unwrap();
+            dev.record("models.opencode.ai", "host", false).unwrap();
+        }
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.contains("default"), "store name missing: {out}");
+        assert!(out.contains("developer"), "store name missing: {out}");
+        assert!(out.contains("api.example.com"), "default entry: {out}");
+        assert!(out.contains("models.opencode.ai"), "hidden entry: {out}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A lone non-default store still gets its name: "which store is this?" is
+    /// the question the old output could not answer.
+    #[test]
+    fn learned_list_labels_a_lone_non_default_store() {
+        let tmp = learned_temp_dir("list-lone-developer");
+        {
+            let mut dev = net::learned::LearnedStore::load_in(&tmp, Some("developer")).unwrap();
+            dev.record("api.github.com", "host", true).unwrap();
+        }
+        let (rc, out, err) = learned_cmd_in(cli::LearnedSub::List, None, &tmp);
+        assert_eq!(rc, 0, "stderr: {err}");
+        assert!(out.contains("# developer"), "store label missing: {out}");
+        assert!(out.contains("api.github.com"), "entry missing: {out}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Revoking with no `--profile` must not claim "no entry" while another
+    /// store holds one: it names the store and the flag instead.
+    #[test]
+    fn learned_revoke_names_the_store_that_holds_the_entry() {
+        let tmp = learned_temp_dir("revoke-other-store");
+        {
+            let mut dev = net::learned::LearnedStore::load_in(&tmp, Some("developer")).unwrap();
+            dev.record("models.opencode.ai", "host", false).unwrap();
+        }
+        let (rc, _out, err) = learned_cmd_in(
+            cli::LearnedSub::Revoke {
+                host: "models.opencode.ai".to_string(),
+            },
+            None,
+            &tmp,
+        );
+        assert_eq!(rc, 1, "a miss must not look like success");
+        assert!(err.contains("developer"), "must name the store: {err}");
+        assert!(err.contains("--profile"), "must name the remedy: {err}");
+        // ... and it must not have touched the store it was not asked about.
+        let dev = net::learned::LearnedStore::load_in(&tmp, Some("developer")).unwrap();
+        assert!(
+            dev.entries().iter().any(|e| e.0 == "models.opencode.ai"),
+            "a refused revoke must not write"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn learned_list_shows_host_scope_disposition_table() {
         let tmp = learned_temp_dir("list-table");
