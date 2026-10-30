@@ -14,7 +14,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | S0.1 | Facade can stream a 10-minute build log | [x] | live leg with the stream-sidecar fixture: 20 lines over 20 s, first byte 1 ms, last 20 010 ms, no buffering. Also found the facade is GET-only (501) → T1.5 |
 | S0.2 | Substrate attach latency measured (docker exec / start / WSL2) | [x] | info 93 ms, run --rm 497 ms, exec 73 ms; sample project: cold 88.6 s (904 MB downloads), warm 1.67 s, ephemeral 4.95-13.6 s, `--offline` clean 8.5 s, daemon 479 MB. Decision: long-lived container |
 | S0.3 | Bind-mount throughput for ~20 k files, vs in-volume copy | [x] | bind 53.6 s vs volume 0.76 s (2.65 vs 0.038 ms/file); tar-pipe populate 2.8 s. §4 rewritten: sync, not mount |
-| S0.4 | Container → saife proxy reachability (offline vs relayed) | [ ] | |
+| S0.4 | Container → saife proxy reachability (offline vs relayed) | [x] | reachable via host.docker.internal (407 realm `sandbox`) — and so is every 127.0.0.1 host service; runner container is not a network boundary → v1 uses `--network none` |
 | S0.5 | `docs/research/build-runner/measurements.md` written | [~] | three legs recorded; S0.1, S0.4 and the daemon cost pending |
 | S0.6 | Endpoint discovery: `/_ping` over npipe from Rust; containerd-mode has no Docker API | [~] | npipe from a plain .NET client: 200 OK, /version api=1.54 min=1.41 engine=29.5.3; Rust leg pending |
 | T1.1 | `BuildRequest` type + validation; no image/mount/command field | [ ] | |

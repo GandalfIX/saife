@@ -1,8 +1,8 @@
 # Build runner — S-0 measurements
 
-**Status:** 2026-10-30. Six of seven legs measured, including facade streaming (§6) and the one
-that decides the slot model (§5). Only `S0.4` (container → proxy) is open, and it needs a live
-session with a listener.
+**Status:** 2026-10-30. **S-0 is complete.** All seven legs are measured, including facade
+streaming (§6), the daemon question (§5) and container → proxy reachability (§7) — the last one
+answered differently than expected, in both directions.
 
 **Host:** Windows 11 (build 26300), 24 vCPU, 33.6 GB visible to the engine.
 **Engine:** Rancher Desktop 29.5.3 — dockerd/moby in the `Rancher Desktop WSL Distribution`
@@ -163,15 +163,48 @@ the live streaming leg re-run: `S0.1: 20 lines, first body at 1 ms, last chunk a
 The timing leg ran with GET so it measured the response direction alone. The response direction
 is method-independent, so the answer above stands regardless of T1.5.
 
-## 7. Still open
+## 7. Container → proxy reachability (S0.4) — reachable, and so is everything else
+
+Live session: `saife run --profile opencode-desktop`, unelevated, `tier=base-container`, proxy
+bound to `127.0.0.1:59366` (from the session's audit leaf). Probes from a container on the same
+engine:
+
+| probe | result |
+|---|---|
+| host listener on `0.0.0.0:47123` via `host.docker.internal` | reachable (control) |
+| **saife proxy** `127.0.0.1:59366` via `host.docker.internal` | **reachable** — answers `HTTP/1.1 407 Proxy Authentication Required`, realm `sandbox` |
+| host listener **bound to `127.0.0.1` only** (`:47124`) via `host.docker.internal` | **reachable** |
+| anything via the bridge gateway `172.17.0.1` | refused (even a `0.0.0.0` listener) |
+| `host.docker.internal` resolves to | `192.168.127.254` (Rancher's host gateway) |
+
+Two conclusions, and the second is the important one for containment:
+
+1. **A container can reach the session proxy.** The relayed-network variant (§5 of the plan) is
+   technically possible: a build running in the runner could send its traffic through saife's
+   audited proxy, auth token and all.
+2. **A container can reach *any* host service bound to `127.0.0.1`.** Rancher's host gateway
+   forwards to host loopback, so the runner container is **not** a network boundary with respect
+   to the host. A build with network would be able to talk to every local service the user runs —
+   dev servers, MCP servers, other sessions' proxies, anything unauthenticated on loopback.
+
+That second fact inverts the "offline is simpler" argument into a containment requirement:
+
+- **v1 must run the runner container with `--network none`.** Offline builds were already measured
+  to work (§5: `clean build --offline` in 8.5 s), and `--network none` removes the host-loopback
+  exposure entirely rather than relying on the build not looking for it.
+- The relayed variant is only acceptable if it is explicit, audited, and paired with the fact that
+  the container shares the host's loopback: an authenticated proxy is a weak boundary when the
+  same container can dial anything else on `127.0.0.1` directly.
+
+## 8. Still open
 
 | leg | why it is not answered |
 |---|---|
 | ~~S0.1 facade streaming~~ | **measured** (§6): 20 lines, first byte at 1 ms, last at 20 s. Passed. |
-| **S0.4** container → proxy | needs a live saife session with a proxy listener, and a container that tries to reach it. |
+| ~~S0.4 container → proxy~~ | **measured** (§7): reachable via `host.docker.internal`, as is every host loopback service. |
 | JVM/Gradle daemon cost | **measured** (§5): 3–12 s per build when the daemon starts, ~1.5 s when it is already alive; 479 MB RSS. |
 
-## 8. Reproduce
+## 9. Reproduce
 
 ```powershell
 # endpoint without the CLI

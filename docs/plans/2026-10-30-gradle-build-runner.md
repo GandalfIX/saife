@@ -204,11 +204,17 @@ directory for the same reason the launcher guard exists.
 
 ## 5. Network inside the runner
 
+Measured (S0.4, §7 of the measurements): a container on this engine reaches the session proxy
+through `host.docker.internal` — and reaches **every** host service bound to `127.0.0.1` the same
+way, because Rancher's host gateway forwards to host loopback. The container is therefore not a
+network boundary against the host, and "give the runner no network" is a containment requirement
+rather than a simplification.
+
 Two shapes; only one is honest in v1:
 
-- **Offline (default, v1).** `--offline` builds against a prewarmed cache; the runner has no
-  network at all. Missing dependencies fail with a message that names the dependency and the
-  documented refresh step.
+- **Offline (default, v1).** `--network none` plus `--offline`, against a prewarmed cache.
+  Missing dependencies fail with a message naming the dependency and the documented refresh step.
+  `--network none` is what removes the host-loopback exposure measured above.
 - **Relayed (later, if asked).** The container cannot reach saife's proxy on the host's
   `127.0.0.1`, so the runner would relay CONNECTs into the proxy — which makes the runner a
   network chokepoint holding a proxy token, i.e. the one place an unaudited path can appear.
@@ -280,8 +286,10 @@ no slots) per AGENTS.md.
 - [x] **S0.3** Mount throughput — **measured, and it changed §4**: bind mount 53.6 s vs volume
       0.76 s for 20 k small files (2.65 ms/file vs 0.038 ms); tar-pipe populate 2.8 s. The
       project is synced, not mounted.
-- [ ] **S0.4** Runner → proxy reachability: can a container reach saife's proxy at all
-      (`host.docker.internal`, host-gateway)? Decides offline-only (v1) vs relayed (§5).
+- [x] **S0.4** Runner → proxy reachability — **measured**: yes, a container reaches the session
+      proxy via `host.docker.internal` (`407 Proxy Authentication Required`, realm `sandbox`) —
+      **and it also reaches any host service bound to `127.0.0.1`**. The runner container is not
+      a network boundary against the host, so v1 uses `--network none` (see §5).
 - [x] **S0.6** Endpoint discovery — **measured**: from a plain named-pipe client (no docker
       CLI), `/_ping` → `200 OK` and `GET /version` → `api=1.54 min=1.41 engine=29.5.3
       linux/amd64`; `Test-Path` on the pipe returns False while the API answers. Rust-client leg
