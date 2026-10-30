@@ -495,12 +495,12 @@ fn run_cmd(
         cli::default_backend(feature_enabled)
     });
     let backend = match cli::route_backend(backend, feature_enabled, MXC_SESSION_WIRED) {
-            Ok(backend) => backend,
-            Err(refusal) => {
-                eprintln!("[saife] {}", refusal.message());
-                return 2;
-            }
-        };
+        Ok(backend) => backend,
+        Err(refusal) => {
+            eprintln!("[saife] {}", refusal.message());
+            return 2;
+        }
+    };
     // No blanket `--backend mxc` refusal here any more (P3.0): the routed backend
     // is carried into `run_inner`, which has a session path for both. A binary
     // without the feature never reaches this point (`route_backend` refuses), and
@@ -721,9 +721,7 @@ fn run_inner(
     {
         eprintln!("[saife] warning: loopback exemption failed: {e}");
         eprintln!("[saife]          Re-run 'saife run' as administrator (loopback is");
-        eprintln!(
-            "[saife]          registered automatically when elevated), or use --block-net."
-        );
+        eprintln!("[saife]          registered automatically when elevated), or use --block-net.");
     }
 
     // Start the proxy (if not blocked) and hold the handle until the child exits:
@@ -911,12 +909,12 @@ fn run_mxc_session(
         home.as_deref(),
         &launcher,
     ) {
-            Ok(policy) => policy,
-            Err(e) => {
-                eprintln!("[saife] mxc: {e}");
-                return Ok(2);
-            }
-        };
+        Ok(policy) => policy,
+        Err(e) => {
+            eprintln!("[saife] mxc: {e}");
+            return Ok(2);
+        }
+    };
 
     // (4) The audit writer and the ARMED root. The writer must exist before the
     //     listener, because the listener audits through it — and the tier is not
@@ -1367,9 +1365,8 @@ fn start_session_proxy(
             // Task 3.6 Step 5: load the learned policy BEFORE starting the
             // proxy. A corrupt learned file is a hard error by design — the
             // user notices immediately and can fix or revoke it ([G-5]).
-            let learned = net::learned::LearnedStore::load(profile_name.as_deref()).context(
-                "load learned policy file ('saife learned clear' resets a corrupt one)",
-            )?;
+            let learned = net::learned::LearnedStore::load(profile_name.as_deref())
+                .context("load learned policy file ('saife learned clear' resets a corrupt one)")?;
             // D-4 registry + D-3.5 coordinator: created in the supervisor
             // (all sync) before the proxy runtime exists and Arc-shared
             // into every handler. The registry's `Drop` joins its sweeper
