@@ -27,7 +27,9 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T2.3 | Idle kill, recycle, invalidate on digest/JDK change | [ ] | |
 | T2.4 | Single-session ownership, kill on end, start-up sweep | [ ] | |
 | T2.5 | Caps + slot facts (`slot_id`, digest) | [ ] | |
-| T2.6 | `src/runner/engine.rs`: endpoint + probe + quirks + `RunnerEngine` trait | [ ] | |
+| T2.6 | Engine abstraction: endpoint + probe + quirks | [x] | `src/runner/docker.rs`: `Endpoint` (npipe/unix parsed, `tcp://`/`ssh://` refused as remote), `/_ping` + `/version` probe, chunked/Content-Length/close-delimited parsing. `RunnerEngine` trait lands with the `BuildEngine` impl |
+| T2.7 | Global cache volume mounted at `/cache` | [x] | `CACHE_VOLUME = saife-runner-cache`, created idempotently, `UsageData.Size` read from `/system/df`; slot body asserts the mount (unit test) |
+| T2.8 | `saife runner status` / `saife runner prewarm <project>` | [x] | status: cache MB + image + slots (live, prints `empty or not reported` before the first prewarm); prewarm: ensure volume → pack project → network-on container → `gradlew --version` + dependency resolution → remove → report size. Only the prewarm container ever has network |
 | T3.1 | Project root resolution: reparse/UNC/subst/install-dir refusals | [ ] | |
 | T3.2 | Sync in (tar) into `/src`, `/cache` created at slot start | [x] | `sync::pack_dir` + `PUT /archive`; live leg: a tree with a nested file arrives inside the slot (`cat` sees it). Skip list keeps `build/` out of the input |
 | T3.3 | Sync out (filtered) | [x] | `GET /archive` + `unpack_into_at(strip_top)`: the engine's answers are relative to the *parent*, so `path=/src/out` yields `out/art.txt`. Live leg round-trips an artifact back to the host; the filter decides what lands | |

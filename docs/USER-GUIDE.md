@@ -597,6 +597,39 @@ saife learned clear
 
 ---
 
+## 8a. Building in the sandbox (the runner)
+
+Some toolchains cannot work inside a session at all: Gradle's daemon, its workers and its
+compiler daemons all talk over loopback, and loopback is closed inside a session in both
+directions (`connect()` fails with `WSAEACCES 10013`, and nothing outside can dial in).
+Rather than punch a hole, saife can **run the build outside the session** and hand the result
+back: a runner container (Docker engine) built from a digest-pinned image, reached by the
+workload **through the supervisor's facade** — no port, no loopback, no new hole.
+
+```powershell
+saife runner status                  # cache size, image, slots on this machine
+saife runner prewarm C:\work\app    # download the toolchain ONCE (network on, this once)
+```
+
+`prewarm` is the only step that uses the network, and it is deliberate: it fills the cache
+volume so builds run `--offline`. Everything a build does happens in a container created with
+`NetworkMode: none`.
+
+**The cache is one global named volume**, `saife-runner-cache`, mounted at `/cache`:
+
+- shared by every project and every session — that is what makes the second build fast, and
+  it is why `prewarm` is a command you run rather than something a build does silently;
+- measured cost: ~900 MB for one Spring Boot project (Gradle distribution + dependencies);
+- **nothing evicts it in v1**: the size is reported by `saife runner status`, and removing it
+  is a deliberate act (`docker volume rm saife-runner-cache`);
+- **sessions share it**, so a build in one session can influence what another session reads.
+  Acceptable while saife is single-user on one machine; treat the cache as trusted state.
+
+Two limits worth knowing before relying on it: the runner's container reaches the host's
+**entire loopback** through the engine's host gateway (measured), which is why v1 gives it no
+network at all; and the audit chain records the facade requests, not what happens inside the
+container.
+
 ## 9. Troubleshooting
 
 | Symptom | Cause | Fix |

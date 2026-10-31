@@ -95,6 +95,7 @@ fn main() {
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { action } => profile_cmd(action),
+        Cmd::Runner { subcommand } => runner_cmd(subcommand),
         Cmd::Learned {
             subcommand,
             profile,
@@ -179,6 +180,115 @@ fn profile_cmd(action: cli::ProfileAction) -> i32 {
             0
         }
         ProfileAction::Show { name, expanded } => profile::show_profile(&name, expanded),
+    }
+}
+
+/// `saife runner ...`: the cache volume and its warm-up.
+fn runner_cmd(action: cli::RunnerSub) -> i32 {
+    use cli::RunnerSub;
+
+    let endpoint = match crate::runner::docker::Endpoint::resolve() {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            eprintln!("[saife] {e:#}");
+            return 1;
+        }
+    };
+    let engine = crate::runner::docker::Engine::connect(endpoint);
+
+    match action {
+        RunnerSub::Status => {
+            if let Err(e) = engine.ping() {
+                eprintln!("[saife] no engine: {e:#}");
+                return 1;
+            }
+            let size = engine.cache_volume_bytes().unwrap_or(None);
+            let size_text = match size {
+                Some(bytes) => format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0)),
+                None => "empty or not reported".to_string(),
+            };
+            let slots = engine.list_slots().unwrap_or_default();
+            println!(
+                "cache:   {}  {}",
+                crate::runner::docker::CACHE_VOLUME,
+                size_text
+            );
+            println!("image:   {}", crate::runner::docker::RUNNER_IMAGE);
+            println!(
+                "slots:   {} labelled container(s), {} of them listed as slots",
+                slots.len(),
+                slots.len()
+            );
+            0
+        }
+        RunnerSub::Prewarm { project } => {
+            let dir = std::path::Path::new(&project);
+            if !dir.is_dir() {
+                eprintln!("[saife] prewarm: `{project}` is not a directory");
+                return 1;
+            }
+            if let Err(e) = engine.ping() {
+                eprintln!("[saife] no engine: {e:#}");
+                return 1;
+            }
+            if let Err(e) = engine.ensure_cache_volume() {
+                eprintln!("[saife] {e:#}");
+                return 1;
+            }
+            let tar = match crate::runner::sync::pack_dir(dir, &[".gradle", "build", ".git"]) {
+                Ok(tar) => tar,
+                Err(e) => {
+                    eprintln!("[saife] prewarm: {e:#}");
+                    return 1;
+                }
+            };
+            // A prewarm container is the one place with network, and it exists only for the
+            // length of the download: visible in the output, removed even on failure.
+            let session = format!("prewarm{}", std::process::id());
+            let mut spec = crate::runner::docker::SlotSpec::new(&session);
+            spec.allow_network = true;
+            let slot = match engine.create_slot(&spec) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    eprintln!("[saife] prewarm: {e:#}");
+                    return 1;
+                }
+            };
+            let result = (|| -> anyhow::Result<()> {
+                engine.start_slot(&slot)?;
+                engine.put_archive(&slot.id, "/src", &tar)?;
+                println!(
+                    "[saife] prewarm: downloading into {} (network on, this once)",
+                    crate::runner::docker::CACHE_VOLUME
+                );
+                let exec = engine.exec_create(
+                    &slot.id,
+                    &["sh".to_string(), "-c".to_string(),
+                      "cd /src && export GRADLE_USER_HOME=/cache && sh ./gradlew --version && sh ./gradlew dependencies --configuration runtimeClasspath --quiet".to_string()],
+                    "/src",
+                    &[],
+                )?;
+                engine.exec_stream(&exec, |chunk| {
+                    print!("{}", String::from_utf8_lossy(chunk));
+                })?;
+                let code = engine.exec_exit(&exec)?;
+                if code != Some(0) {
+                    anyhow::bail!("prewarm exited with {code:?}");
+                }
+                Ok(())
+            })();
+            let _ = engine.remove_slot(&slot);
+            if let Err(e) = result {
+                eprintln!("[saife] prewarm failed: {e:#}");
+                return 1;
+            }
+            let size = engine.cache_volume_bytes().unwrap_or(None).unwrap_or(0);
+            println!(
+                "[saife] prewarm: cache is now {:.0} MB",
+                size as f64 / (1024.0 * 1024.0)
+            );
+            0
+        }
     }
 }
 

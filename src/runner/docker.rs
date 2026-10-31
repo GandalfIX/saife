@@ -298,6 +298,15 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>> {
 /// The image a slot runs. Pinned by digest, because a floating tag is a silent upgrade of
 /// the toolchain inside a boundary the operator audited: `eclipse-temurin:25-jdk` resolved
 /// here on 2026-10-30, and the sample project's conventions require Java 25.
+/// The cache volume every slot mounts at `/cache`.
+///
+/// Global and shared on purpose: one warm Gradle cache is what makes an offline build
+/// possible at all (904 MB for one Spring Boot project, measured), and a per-session volume
+/// would pay the download again every session. The cost is that sessions share state -
+/// acceptable while saife is single-user on one machine, and written down as a limit
+/// rather than discovered later (see `docs/USER-GUIDE.md`, "Building in the sandbox").
+pub const CACHE_VOLUME: &str = "saife-runner-cache";
+
 pub const RUNNER_IMAGE: &str =
     "eclipse-temurin@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507";
 
@@ -319,6 +328,10 @@ pub struct SlotSpec {
     pub image: String,
     pub name: String,
     pub session: String,
+    /// Slots are created with **no** network. The single exception is the explicit
+    /// `saife runner prewarm`, which downloads the toolchain into the cache and must be a
+    /// deliberate, visible step rather than something a build does on its own.
+    pub allow_network: bool,
 }
 
 impl SlotSpec {
@@ -327,6 +340,7 @@ impl SlotSpec {
             image: RUNNER_IMAGE.to_string(),
             name: format!("saife-runner-{session}"),
             session: session.to_string(),
+            allow_network: false,
         }
     }
 }
@@ -344,20 +358,7 @@ impl Engine {
     /// environment, and the label is what makes it findable.
     pub fn create_slot(&self, spec: &SlotSpec) -> Result<Slot> {
         require_digest(&spec.image)?;
-        let body = serde_json::json!({
-            "Image": spec.image,
-            // `/src` must exist before the first archive upload (the engine unpacks INTO a
-            // directory, it does not create it), and `/cache` is where the toolchain's
-            // download cache lives. Established here so the slot is ready the moment it runs;
-            // a runner image without a shell is therefore not usable, which is stated rather
-            // than discovered at the first build.
-            "Cmd": ["sh", "-c", "mkdir -p /src /cache && exec sleep infinity"],
-            "Labels": { "saife.runner": "1", "saife.session": spec.session },
-            "HostConfig": {
-                "NetworkMode": "none",
-                "AutoRemove": false,
-            },
-        });
+        let body = slot_create_body(spec);
         let path = format!("/{API}/containers/create?name={}", urlencode(&spec.name));
         let r = self.request("POST", &path, body.to_string().as_bytes())?;
         if r.status != 201 {
@@ -679,6 +680,72 @@ impl Engine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The cache volume
+// ---------------------------------------------------------------------------
+
+impl Engine {
+    /// Create the cache volume if it is not there. Idempotent: the engine answers 201 on
+    /// create and the same body on an existing name, so both are success.
+    pub fn ensure_cache_volume(&self) -> Result<()> {
+        let body = serde_json::json!({
+            "Name": CACHE_VOLUME,
+            "Labels": { "saife.runner": "1" },
+        });
+        let r = self.request(
+            "POST",
+            &format!("/{API}/volumes/create"),
+            body.to_string().as_bytes(),
+        )?;
+        if r.status != 201 && r.status != 200 {
+            bail!(
+                "runner: could not create the cache volume ({}) {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+        Ok(())
+    }
+
+    /// Bytes the cache volume holds, from the engine's own accounting. `None` when the
+    /// engine does not report usage for it (Podman's compat layer does not, reliably).
+    pub fn cache_volume_bytes(&self) -> Result<Option<u64>> {
+        let r = self.request("GET", &format!("/{API}/system/df"), &[])?;
+        if r.status != 200 {
+            return Ok(None);
+        }
+        let Ok(v) = r.json() else {
+            return Ok(None);
+        };
+        for vol in v["Volumes"].as_array().cloned().unwrap_or_default() {
+            if vol["Name"].as_str() == Some(CACHE_VOLUME) {
+                let size = vol["UsageData"]["Size"].as_u64().unwrap_or(0);
+                return Ok(Some(size));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The create body for a slot, as JSON. Extracted so the properties that matter - no
+/// network, the cache volume, the session label - are asserted without an engine.
+fn slot_create_body(spec: &SlotSpec) -> serde_json::Value {
+    serde_json::json!({
+        "Image": spec.image,
+        "Cmd": ["sh", "-c", "mkdir -p /src /cache && exec sleep infinity"],
+        "Labels": { "saife.runner": "1", "saife.session": spec.session },
+        "HostConfig": {
+            "NetworkMode": if spec.allow_network { "bridge" } else { "none" },
+            "AutoRemove": false,
+            "Mounts": [{
+                "Type": "volume",
+                "Source": CACHE_VOLUME,
+                "Target": "/cache",
+            }],
+        },
+    })
+}
+
 /// Percent-encode a query value. The runner only ever passes container names, labels and
 /// filters, but a name is caller-adjacent enough to encode rather than trust.
 fn urlencode(s: &str) -> String {
@@ -808,6 +875,30 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\n\r\nOK";
         assert_eq!(parse_response(raw).unwrap().body, b"OK");
     }
+    /// The properties that matter are in the create body, so they can be asserted without
+    /// an engine: no network, the cache volume, and the session label the sweep looks for.
+    #[test]
+    fn a_slot_is_created_without_network_and_with_the_cache_volume() {
+        let spec = SlotSpec::new("s1");
+        let body = slot_create_body(&spec);
+        assert_eq!(body["HostConfig"]["NetworkMode"], "none");
+        assert_eq!(body["HostConfig"]["Mounts"][0]["Source"], CACHE_VOLUME);
+        assert_eq!(body["HostConfig"]["Mounts"][0]["Target"], "/cache");
+        assert_eq!(body["Labels"]["saife.session"], "s1");
+        assert!(
+            body["Image"].as_str().unwrap().contains("@sha256:"),
+            "the image is digest-pinned"
+        );
+
+        // ... and the prewarm container is the one exception, by explicit flag only.
+        let mut warm = SlotSpec::new("p1");
+        warm.allow_network = true;
+        assert_eq!(
+            slot_create_body(&warm)["HostConfig"]["NetworkMode"],
+            "bridge"
+        );
+    }
+
     /// A slot that removes itself even when the test panics: the first failing runs of these
     /// legs left containers behind, which is exactly the leak the start-up sweep exists to
     /// clean up - the tests should not be the thing that creates the mess.

@@ -334,7 +334,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream as StdTcpStream;
     use std::sync::Mutex as StdMutex;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const TOKEN: &str = "runner-token-0123456789abcdef";
 
@@ -394,13 +394,20 @@ mod tests {
         }
     }
 
+    /// These legs each bind a listener, spawn a thread and dial it; run in parallel they
+    /// contend for the same ephemeral ports and thread slots, which showed up as a flaky
+    /// one-in-two failure. Serialising them costs well under a second and removes the class.
+    static SERVER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct Harness {
         server: RunnerServer,
         engine: Arc<FakeEngine>,
         _dir: std::path::PathBuf,
+        _serialised: std::sync::MutexGuard<'static, ()>,
     }
 
     fn harness() -> Harness {
+        let guard = SERVER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("saife-runner-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = Arc::new(FakeEngine::default());
@@ -410,28 +417,37 @@ mod tests {
             engine: engine.clone(),
         });
         let server = spawn(state).expect("runner listener");
+        // Readiness: one round trip that must be answered before any test uses the port.
+        // Without it a test can connect in the window between `bind` and the accept loop's
+        // first poll, which surfaced as a one-in-ten failure under load.
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", server.port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Harness {
             server,
             engine,
             _dir: dir,
+            _serialised: guard,
         }
     }
 
-    fn send(port: u16, request: &str) -> String {
-        // Connect with a retry: on a loaded machine (the first run of a suite is a
-        // compile in parallel with the tests) a single connect can lose the race with
-        // the listener thread, which is a flake and not a defect.
-        let mut s = None;
-        for _ in 0..40 {
-            match StdTcpStream::connect(("127.0.0.1", port)) {
-                Ok(stream) => {
-                    s = Some(stream);
-                    break;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+    /// Connect with a retry: under load (a suite compiles in parallel with its own tests) a
+    /// single connect can lose the race with the listener thread. A flake, not a defect.
+    fn connect(port: u16) -> StdTcpStream {
+        for _ in 0..60 {
+            if let Ok(stream) = StdTcpStream::connect(("127.0.0.1", port)) {
+                return stream;
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        let mut s = s.expect("connect runner");
+        panic!("connect runner on port {port}");
+    }
+
+    fn send(port: u16, request: &str) -> String {
+        let mut s = connect(port);
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         s.write_all(request.as_bytes()).unwrap();
         let mut out = Vec::new();
@@ -517,38 +533,64 @@ mod tests {
         let resp = post_build(h.server.port, Some(TOKEN), GOOD);
         assert!(resp.contains(r#""b1""#), "got: {resp}");
 
-        h.engine.push_line("b1", "line 1\n");
         let port = h.server.port;
-        let started = Instant::now();
-        let reader = std::thread::spawn(move || {
-            let mut s = StdTcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut s = connect(port);
             s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             s.write_all(
                 format!("GET /build?id=b1&follow=1 HTTP/1.0\r\nX-Facade-Token: {TOKEN}\r\n\r\n")
                     .as_bytes(),
             )
             .unwrap();
-            let mut out = Vec::new();
             let mut buf = [0u8; 512];
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                out.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&out).contains("line 1") {
-                    break;
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if tx.send(text).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
-            out
         });
 
-        // The first line must arrive while the build is still running.
-        std::thread::sleep(Duration::from_millis(300));
-        let first = reader.join().unwrap();
+        // The build stays running until the test says otherwise, so a line arriving now can
+        // only have been streamed. No sleeps: waiting for the event is the assertion.
+        h.engine.push_line("b1", "line 1\n");
+        // The first read is the response head, so accumulate until the line shows up. The
+        // build is still `Running`, which is what makes "arrived now" mean "streamed".
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut all = String::new();
+        while std::time::Instant::now() < deadline && !all.contains("line 1") {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(text) => all.push_str(&text),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         assert!(
-            String::from_utf8_lossy(&first).contains("line 1"),
-            "the first line must be delivered before the build ends: {first:?}"
+            all.contains("line 1"),
+            "the first line must arrive while the build runs, got: {all:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let state = h.engine.state("b1").unwrap();
+        assert!(
+            !state.is_terminal(),
+            "the build must still be running when the line arrives"
+        );
+
+        h.engine.push_line("b1", "line 2\n");
+        let mut more = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !more.contains("line 2") {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(text) => more.push_str(&text),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(more.contains("line 2"), "got: {more:?}");
     }
 }

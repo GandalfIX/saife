@@ -224,6 +224,21 @@ What must never happen: the runner reaching the internet directly. That is an eg
 outside the session's policy and outside the audit chain, and it would be one line of
 configuration away at all times.
 
+### The cache volume (decided 2026-10-30)
+
+An offline build needs a warm `~/.gradle` (904 MB measured), and slots are created with
+`NetworkMode: none`, so the cache must outlive a container. Decision:
+
+- **one global named volume**, `saife-runner-cache`, mounted at `/cache` by every slot —
+  per-session volumes would pay the download again every session, which is the cost the whole
+  design exists to avoid;
+- **`prewarm` is explicit**: `saife runner prewarm <project>` is the only step with network,
+  it prints what it is doing, and it removes its container whether it succeeds or not;
+- **no eviction in v1**; `saife runner status` reports the size, and removal is a deliberate
+  `docker volume rm`;
+- **the cache is shared state and trusted state.** A build in one session can influence what
+  another reads. Written down in the USER-GUIDE rather than assumed acceptable.
+
 ## 6. Audit and facts
 
 The facade already records requests. What is missing is the outcome: for each build, the
