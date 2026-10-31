@@ -178,6 +178,18 @@ impl Engine {
     }
 
     pub fn request(&self, method: &str, path: &str, body: &[u8]) -> Result<Response> {
+        self.request_typed(method, path, body, "application/json")
+    }
+
+    /// The same exchange with an explicit content type: `/archive` takes a tar, and the
+    /// engine is entitled to reject a body labelled as JSON.
+    pub fn request_typed(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> Result<Response> {
         let mut file = self.endpoint.open()?;
         // One request per connection: `Connection: close` makes the response
         // end-delimited, which is what the engine supports on a pipe.
@@ -185,7 +197,7 @@ impl Engine {
             "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
         );
         if !body.is_empty() {
-            head.push_str("Content-Type: application/json\r\n");
+            head.push_str(&format!("Content-Type: {content_type}\r\n"));
             head.push_str(&format!("Content-Length: {}\r\n", body.len()));
         }
         head.push_str("\r\n");
@@ -334,7 +346,12 @@ impl Engine {
         require_digest(&spec.image)?;
         let body = serde_json::json!({
             "Image": spec.image,
-            "Cmd": ["sleep", "infinity"],
+            // `/src` must exist before the first archive upload (the engine unpacks INTO a
+            // directory, it does not create it), and `/cache` is where the toolchain's
+            // download cache lives. Established here so the slot is ready the moment it runs;
+            // a runner image without a shell is therefore not usable, which is stated rather
+            // than discovered at the first build.
+            "Cmd": ["sh", "-c", "mkdir -p /src /cache && exec sleep infinity"],
             "Labels": { "saife.runner": "1", "saife.session": spec.session },
             "HostConfig": {
                 "NetworkMode": "none",
@@ -612,6 +629,56 @@ fn read_exact_or_eof(file: &mut std::fs::File, buf: &mut [u8]) -> Result<bool> {
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// The volume: a project in, declared outputs out
+// ---------------------------------------------------------------------------
+
+impl Engine {
+    /// Replace `path` inside the container with the archive's contents.
+    ///
+    /// `PUT /containers/{id}/archive` unpacks the tar into the directory named by `path`
+    /// (which must exist), so the runner creates `/src` when the slot is made.
+    pub fn put_archive(&self, container: &str, path: &str, tar: &[u8]) -> Result<()> {
+        let r = self.request_typed(
+            "PUT",
+            &format!(
+                "/{API}/containers/{container}/archive?path={}",
+                urlencode(path)
+            ),
+            tar,
+            "application/x-tar",
+        )?;
+        if r.status != 200 {
+            bail!(
+                "runner: put archive ({}) {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+        Ok(())
+    }
+
+    /// Read `path` back as a tar. Missing path is an empty result, not an error: a build
+    /// that produced no outputs is a build that failed, and the caller reports that.
+    pub fn get_archive(&self, container: &str, path: &str) -> Result<Vec<u8>> {
+        let r = self.request(
+            "GET",
+            &format!(
+                "/{API}/containers/{container}/archive?path={}",
+                urlencode(path)
+            ),
+            &[],
+        )?;
+        if r.status == 404 {
+            return Ok(Vec::new());
+        }
+        if r.status != 200 {
+            bail!("runner: get archive answered {}", r.status);
+        }
+        Ok(r.body)
+    }
+}
+
 /// Percent-encode a query value. The runner only ever passes container names, labels and
 /// filters, but a name is caller-adjacent enough to encode rather than trust.
 fn urlencode(s: &str) -> String {
@@ -798,5 +865,63 @@ mod tests {
             Some("none"),
             "a slot is created with no network: {inspect}"
         );
+    }
+    /// LIVE (`-- --ignored`): a project goes in through the archive API, a command sees it,
+    /// and its output comes back out. The two directions the runner needs before it can
+    /// build anything.
+    #[test]
+    #[ignore = "needs a running container engine and the pinned runner image"]
+    fn live_a_tree_round_trips_through_the_slot() {
+        let g = SlotGuard::start(&format!("sync{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("saife-sync-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("hello.txt"), b"packed").unwrap();
+        std::fs::write(src.join("nested/deep.txt"), b"deep").unwrap();
+        let tar = crate::runner::sync::pack_dir(&src, &[]).expect("pack");
+
+        g.engine
+            .put_archive(&g.slot.id, "/src", &tar)
+            .expect("put the tree");
+
+        let exec_id = g
+            .engine
+            .exec_create(
+                &g.slot.id,
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat /src/hello.txt; mkdir -p /src/out; echo built > /src/out/art.txt"
+                        .to_string(),
+                ],
+                "/src",
+                &[],
+            )
+            .expect("create exec");
+        let mut seen = String::new();
+        g.engine
+            .exec_stream(&exec_id, |c| seen.push_str(&String::from_utf8_lossy(c)))
+            .expect("stream");
+        assert_eq!(seen.trim(), "packed", "the file arrived inside the slot");
+        assert_eq!(g.engine.exec_exit(&exec_id).unwrap(), Some(0));
+
+        let out_tar = g
+            .engine
+            .get_archive(&g.slot.id, "/src/out")
+            .expect("get archive");
+        assert!(!out_tar.is_empty(), "the output directory came back");
+        let dest = std::env::temp_dir().join(format!("saife-sync-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        let n =
+            crate::runner::sync::unpack_into_at(&out_tar, &dest, true, &|_| true).expect("unpack");
+        assert!(n >= 1, "at least the artifact: {n}");
+        assert_eq!(
+            std::fs::read(dest.join("art.txt")).expect("artifact on the host"),
+            b"built\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

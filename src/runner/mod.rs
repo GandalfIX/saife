@@ -15,6 +15,7 @@
 use anyhow::{Context, Result, bail};
 
 pub mod docker;
+pub mod sync;
 pub mod server;
 use std::path::{Path, PathBuf};
 

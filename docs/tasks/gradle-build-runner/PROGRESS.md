@@ -29,8 +29,8 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T2.5 | Caps + slot facts (`slot_id`, digest) | [ ] | |
 | T2.6 | `src/runner/engine.rs`: endpoint + probe + quirks + `RunnerEngine` trait | [ ] | |
 | T3.1 | Project root resolution: reparse/UNC/subst/install-dir refusals | [ ] | |
-| T3.2 | Sync in (delta) into `/src` volume, `/cache`, HOME inside | [ ] | |
-| T3.3 | Sync out (declared outputs, filtered); agent edits never overwritten | [ ] | |
+| T3.2 | Sync in (tar) into `/src`, `/cache` created at slot start | [x] | `sync::pack_dir` + `PUT /archive`; live leg: a tree with a nested file arrives inside the slot (`cat` sees it). Skip list keeps `build/` out of the input |
+| T3.3 | Sync out (filtered) | [x] | `GET /archive` + `unpack_into_at(strip_top)`: the engine's answers are relative to the *parent*, so `path=/src/out` yields `out/art.txt`. Live leg round-trips an artifact back to the host; the filter decides what lands | |
 | T3.4 | Windows semantics documented (case, CRLF, locks, long paths) | [ ] | |
 | T3.5 | Sync semantics tests: delete, rename, exec bit, CRLF, mid-build edit | [ ] | |
 | T4.1 | `profiles/gradle-runner.json` + README row | [ ] | |
