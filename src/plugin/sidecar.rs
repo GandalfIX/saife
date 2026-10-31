@@ -776,4 +776,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(&log_path);
     }
+
+    /// LIVE (`-- --ignored`): does a facade response **stream**, or does it arrive
+    /// in one lump at the end?
+    ///
+    /// A build log that only appears when the build finishes is useless, so this is
+    /// the S-0.1 gate for the build runner: the fixture sidecar emits one line per
+    /// second for 20 s, and the assertion is on *arrival timing* at the workload -
+    /// first byte early, last byte after the proxy's 15 s `HEAD_READ_TIMEOUT`.
+    ///
+    /// Run: `cargo test --bin saife plugin::sidecar::tests::a_build_log_streams -- --ignored`
+    #[ignore = "starts the streaming fixture sidecar; takes ~25 s"]
+    #[test]
+    fn a_build_log_streams_through_the_facade_past_the_head_timeout() {
+        use crate::net::intent::{DEFAULT_TTL, IntentRegistry};
+        use crate::net::learned::LearnedStore;
+        use crate::net::prompt::{
+            DialogFn, DialogRequest, DialogUnavailable, PromptConfig, PromptCoordinator,
+            PromptPolicy,
+        };
+        use crate::net::proxy::{self, PromptGate, ProxyConfig};
+        use crate::net::token::RunToken;
+        use std::io::Read as _;
+        use std::sync::Mutex as StdMutex;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("stream-sidecar");
+        let manifest = crate::plugin::read_manifest(&dir.join("plugin.json"), "stream-sidecar")
+            .expect("the streaming fixture's manifest");
+        assert_eq!(manifest.mount, "build");
+
+        let sid = format!("stream-live-{}-{}", std::process::id(), nanos());
+        let sidecar = Sidecar::start(&dir, &manifest, &sid).expect("the sidecar must be healthy");
+        let registry = Arc::new(crate::plugin::FacadeRegistry::new());
+        registry
+            .insert(sidecar.facade_target())
+            .expect("register the mount");
+
+        let base = std::env::temp_dir().join(format!("sandbox-stream-live-{sid}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let learned = Arc::new(StdMutex::new(
+            LearnedStore::load_in(&base, Some("stream-live")).expect("empty learned store"),
+        ));
+        let dialog: DialogFn = Arc::new(|_: &DialogRequest| Err(DialogUnavailable));
+        let prompt = PromptGate {
+            enabled: false,
+            config: PromptConfig {
+                timeout: Duration::ZERO,
+                on_unavailable: PromptPolicy::Deny,
+            },
+            coordinator: Arc::new(PromptCoordinator::with_dialog(dialog)),
+            intent: Arc::new(IntentRegistry::new(DEFAULT_TTL)),
+            learned,
+        };
+        let token = RunToken::for_tests(&format!("stream-live-{}", nanos()));
+        let writer = Arc::new(crate::audit::AuditWriter::open(&sid, false).unwrap());
+        let handle = proxy::spawn(ProxyConfig {
+            session_id: sid.clone(),
+            token: token.clone(),
+            allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
+            upstream: None,
+            writer,
+            prompt,
+            facade: Arc::clone(&registry),
+        })
+        .expect("spawn the session proxy");
+
+        let auth = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{}", token.value()))
+        };
+        // GET for the timing leg: the proxy's action table refuses non-GET methods
+        // today (501, see `facade_action`), which is recorded as T1.5 - the response
+        // direction is what this leg measures, and it is method-independent.
+        let request = format!(
+            "GET http://build.sandbox.invalid/build HTTP/1.1\r\n\
+             Host: build.sandbox.invalid\r\n\
+             Proxy-Authorization: Basic {auth}\r\n\
+             Connection: close\r\n\r\n"
+        );
+
+        // Read with a deadline and RECORD WHEN each chunk arrived: the point of the
+        // leg is timing, not content.
+        let addr = SocketAddr::from(([127, 0, 0, 1], handle.port));
+        let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .expect("connect to the session proxy");
+        sock.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        use std::io::Write as _;
+        sock.write_all(request.as_bytes()).unwrap();
+
+        let started = std::time::Instant::now();
+        let mut buffer = [0u8; 4096];
+        let mut chunks: Vec<(u128, String)> = Vec::new();
+        let mut all = String::new();
+        while started.elapsed() < Duration::from_secs(45) {
+            match sock.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&buffer[..n]).to_string();
+                    all.push_str(&text);
+                    chunks.push((started.elapsed().as_millis(), text));
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("read from the proxy failed: {e}"),
+            }
+            if all.contains("done\n") {
+                break;
+            }
+        }
+
+        let status = all.split("\r\n").next().unwrap_or("");
+        assert!(
+            status.starts_with("HTTP/1.0 200") || status.starts_with("HTTP/1.1 200"),
+            "the sidecar's status line must be relayed: {status}"
+        );
+        let body_start = all.find("\r\n\r\n").map(|i| i + 4).unwrap_or(all.len());
+        let first_body_at = chunks
+            .iter()
+            .find(|(_, text)| text.len() > body_start.saturating_sub(text.len()))
+            .map(|(ms, _)| *ms)
+            .unwrap_or(0);
+        let last_at = chunks.last().map(|(ms, _)| *ms).unwrap_or(0);
+        let lines = all.matches("line ").count();
+
+        assert!(
+            first_body_at < 8_000,
+            "the first body bytes must arrive while the sidecar is still producing, not \
+             buffered until the end; first chunk at {first_body_at} ms"
+        );
+        assert!(
+            last_at > 15_000,
+            "the stream must survive past the proxy's 15 s head timeout; last chunk at {last_at} ms"
+        );
+        assert!(
+            all.contains("done\n"),
+            "the stream must end with the sidecar's final line, got {lines} lines: {all:.300}"
+        );
+        eprintln!(
+            "S0.1: {lines} lines, first body at {first_body_at} ms, last chunk at {last_at} ms"
+        );
+
+        drop(sidecar);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(crate::audit::audit_log_path(&sid));
+    }
 }
