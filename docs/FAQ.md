@@ -63,14 +63,27 @@ surfacing through PowerShell's own startup diagnostics.
 
 ## How do I run Gradle (or a JVM build / local server test) inside the sandbox?
 
-**Short answer for Gradle specifically: do not run it inside the session — the runner is the
-answer, and it is not in a released build yet.** When it lands, `saife runner prewarm <project>`
-fills a shared cache once and builds run in a digest-pinned container with no network, reached
-through the facade (design and limits:
-[USER-GUIDE §8a](USER-GUIDE.md#8a-building-in-the-sandbox-the-runner)). Until then: use
-`--backend appcontainer` (elevated, and mind the DACL cap) or build outside the sandbox. The
-long answer below is what *inside* the session costs, and it is kept because other JVM tools
-hit the same wall.
+**Short answer: do not run Gradle inside the session.** Its daemon, workers and compiler
+daemons talk over loopback, and loopback is closed in both directions inside a session, so
+neither a grant nor `--no-daemon` changes the outcome (both measured — see
+[below](#why---no-daemon-is-not-the-answer-measured)). Three answers exist, in the order worth
+trying them:
+
+| answer | state | cost |
+|---|---|---|
+| **the runner** — the build runs in a digest-pinned container with **no network**, reached through the supervisor's facade, artifacts synced back | **on `feat/gradle-build-runner`; in no released build** | a container engine (Rancher Desktop / Docker Desktop), the pinned image, and one `saife runner prewarm <project>` |
+| **`--backend appcontainer`** | works today | an elevated shell; the session SID is exempted for **all** loopback; its DACL walk truncates at 20 000 objects, which an agent's own state dirs exceed — so a separate, lean build session, not the agent session |
+| **build outside the sandbox** (a plain host shell) | always | no containment at all — say so out loud rather than implying the tool did something |
+
+What the runner looks like where it exists: `saife runner status` (cache size, image, slots) and
+`saife runner prewarm <project>` (the one step with network) are implemented and were run;
+the piece that lets a *session* ask for a build — the facade mount — is not wired yet, so no
+`saife run` session builds through it today. Shape, cache rules and the sync's Windows
+semantics: [USER-GUIDE §8a](USER-GUIDE.md#8a-building-in-the-sandbox-the-runner). The decision
+and its rejected alternatives: [ADR-0006](adr/0006-build-runner.md).
+
+The long answer below is what *inside* the session costs, and it stays because every other JVM
+tool hits the same wall.
 
 **Symptom.** A `gradlew.bat build` inside a sandboxed agent session fails with
 some combination of:
@@ -164,6 +177,63 @@ Verify with `saife audit show <sid>`: `CONNECT … allowed` leaves for
 - run the build inside the agent session on `appcontainer` — the agent's own
   state dirs exceed the 20k-object grant cap before Gradle is even involved.
 
+### Why `--no-daemon` is not the answer (measured)
+
+**Measured, not assumed.** The current Gradle docs claim that with
+`org.gradle.daemon=false` *and* the client JVM's args matching
+`org.gradle.jvmargs` the daemon is skipped entirely and the build runs in the
+client JVM. On Gradle 9.2.0 under `mxc` we tried four configurations (plain
+`--no-daemon`; `daemon=false` + `GRADLE_OPTS` args matching the default
+daemonOpts; `daemon=false` + `org.gradle.jvmargs` mirrored in
+`gradle.properties` with the proxy props moved out of `GRADLE_OPTS` so they
+could not break the equality; the same mirrored into `JAVA_OPTS` as well). All
+four still forked a single-use daemon and died with `Could not connect to the
+Gradle daemon` at the refused loopback. Until the in-client path can actually
+be triggered, treat **any Gradle build under `mxc` as impossible**. The
+daemon-free path stays a design question: F-6 (a WFP callout driver, per-port)
+inside the session, or the runner outside it — the short answer at the top of
+the Gradle entry.
+
+## Why does `mvn` fail with "SocketException: Permission denied: getsockopt" when the hosts are allow-listed?
+
+**Symptom.** `mvn` (and `gradlew`, before its daemon stage) dies with
+`SocketException: Permission denied: getsockopt` on an allow-listed host, while
+PowerShell in the same session downloads from that host without trouble.
+
+**Cause: the JVM ignores the proxy environment, and the wrapper's own
+downloader ignores the proxy credentials.**
+
+Java ignores the injected `HTTP_PROXY`/`HTTPS_PROXY` env vars entirely, so the
+build tool tries a direct connect — the error reads like a missing grant and is
+not one. It has to be pointed at the session proxy explicitly, and the session
+env carries everything needed to do it:
+
+```powershell
+$u = [Uri]$env:HTTP_PROXY                      # http://sandbox:<token>@127.0.0.1:<port>
+$sandbox, $token = ($u.UserInfo -split ':', 2) # PS 5.1: [Uri].UserName/.Password are EMPTY
+$env:GRADLE_OPTS = "-Dhttps.proxyHost=$($u.Host) -Dhttps.proxyPort=$($u.Port) " +
+                   "-Dhttp.proxyHost=$($u.Host) -Dhttp.proxyPort=$($u.Port) " +
+                   "-Dhttps.proxyUser=$sandbox -Dhttps.proxyPassword=$token " +
+                   "-Dhttp.proxyUser=$sandbox -Dhttp.proxyPassword=$token"
+```
+
+Verified on Gradle 9.2.0 (2026-10-24): with these props the wrapper reached the
+proxy and was **challenged 407** — but never authenticated, because the
+dist-download step of the wrapper uses plain `HttpURLConnection`, which ignores
+`proxyUser`/`proxyPassword` (those properties are read by Gradle's OWN build
+client, not by Java's URL stack). The proxy turned the session into a
+`workload_cannot_authenticate` guardrail refusal. Consequence: bootstrap the
+wrapper distribution OUTSIDE the sandbox first (`gradlew.bat --version` once on
+the host so `~/.gradle/wrapper/dists` holds the unpacked dist); the in-sandbox
+wrapper then never downloads, and dependency resolution rides Gradle's own
+client, which honors the properties.
+
+Verify via the audit (`saife audit show <sid>`): `CONNECT … allow` leaves for
+`services.gradle.org` + `downloads.gradle.org` (wrapper dist) and
+`plugins.gradle.org` + `repo.maven.apache.org` (dependency resolution). A
+`workload_cannot_authenticate` guardrail line means a client stack reached the
+proxy but answered no credential — the 407 story above, not a deny rule.
+
 ## Do I need to clean up grants after a crash (or regularly)?
 
 **Short answer: no schedule needed — but know the one residue that does
@@ -211,55 +281,6 @@ cleanup debt (no shipped sweeper yet).
 `.root`/`.sig`/`.ndjson` per session) is evidence by design and is never
 pruned by saife; journals are deleted after successful restore; `mxc` sessions
 write no host ACLs at all (only `%TEMP%` scratch dirs).
-
-### Maven and Gradle under `mxc`: the proxy must be handed to the JVM
-
-Java ignores the injected `HTTP_PROXY`/`HTTPS_PROXY` env vars entirely, so
-`gradlew`/`mvn` try direct connects and die with
-`SocketException: Permission denied: getsockopt` even when the profile
-allow-lists their hosts and PowerShell downloads work in the same session. The
-build tool has to be pointed at the session proxy explicitly, and the session
-env carries everything needed to do it:
-
-```powershell
-$u = [Uri]$env:HTTP_PROXY                      # http://sandbox:<token>@127.0.0.1:<port>
-$sandbox, $token = ($u.UserInfo -split ':', 2) # PS 5.1: [Uri].UserName/.Password are EMPTY
-$env:GRADLE_OPTS = "-Dhttps.proxyHost=$($u.Host) -Dhttps.proxyPort=$($u.Port) " +
-                   "-Dhttp.proxyHost=$($u.Host) -Dhttp.proxyPort=$($u.Port) " +
-                   "-Dhttps.proxyUser=$sandbox -Dhttps.proxyPassword=$token " +
-                   "-Dhttp.proxyUser=$sandbox -Dhttp.proxyPassword=$token"
-```
-
-Verified on Gradle 9.2.0 (2026-10-24): with these props the wrapper reached the
-proxy and was **challenged 407** — but never authenticated, because the
-dist-download step of the wrapper uses plain `HttpURLConnection`, which ignores
-`proxyUser`/`proxyPassword` (those properties are read by Gradle's OWN build
-client, not by Java's URL stack). The proxy turned the session into a
-`workload_cannot_authenticate` guardrail refusal. Consequence: bootstrap the
-wrapper distribution OUTSIDE the sandbox first (`gradlew.bat --version` once on
-the host so `~/.gradle/wrapper/dists` holds the unpacked dist); the in-sandbox
-wrapper then never downloads, and dependency resolution rides Gradle's own
-client, which honors the properties.
-
-Verify via the audit (`saife audit show <sid>`): `CONNECT … allow` leaves for
-`services.gradle.org` + `downloads.gradle.org` (wrapper dist) and
-`plugins.gradle.org` + `repo.maven.apache.org` (dependency resolution). A
-`workload_cannot_authenticate` guardrail line means a client stack reached the
-proxy but answered no credential — the 407 story above, not a deny rule.
-
-**No-daemon mode does not rescue this — measured, not assumed.** The current
-Gradle docs claim that with `org.gradle.daemon=false` *and* the client JVM's
-args matching `org.gradle.jvmargs` the daemon is skipped entirely and the
-build runs in the client JVM. On Gradle 9.2.0 under `mxc` we tried four
-configurations (plain `--no-daemon`; `daemon=false` + `GRADLE_OPTS` args
-matching the default daemonOpts; `daemon=false` + `org.gradle.jvmargs`
-mirrored in `gradle.properties` with the proxy props moved out of
-`GRADLE_OPTS` so they could not break the equality; the same mirrored into
-`JAVA_OPTS` as well). All four still forked a single-use daemon and died with
-`Could not connect to the Gradle daemon` at the refused loopback. Until the
-in-client path can actually be triggered, treat **any Gradle build under
-`mxc` as impossible**; the daemon-free path remains a design question
-(F-6 loopback) or a sidecar-deputy job.
 
 ## Why did my session just end with "workload_budget_exceeded"?
 

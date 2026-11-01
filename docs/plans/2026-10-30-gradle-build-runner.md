@@ -61,6 +61,29 @@ request/response exchanges. A build emits logs for minutes. The proxy's `HEAD_RE
 the client's own read timeouts. If a build log cannot stream, this plan needs a different
 transport and §9 changes before any code is written.
 
+### The sibling plan: loopback egress inside the session
+
+The sibling plan `docs/plans/2026-10-28-gradle-daemon-loopback.md` (branch
+`feat/gradle-daemon-loopback`) decides the same problem the other way: keep the build inside the
+session and make loopback legal for exactly one address and port — `egress.allow = 127.0.0.1/32 :
+<port>`, with `org.gradle.daemon.port` and `org.gradle.daemon.registry.base` pinning Gradle's
+otherwise ephemeral port so a single rule covers it, and no relay. It is the narrower change (no
+container, no second containment domain, no image to own) and the only answer for a tool that has to
+talk loopback *inside* the session. The two do not conflict: that plan widens one `(address, port)`
+pair in the session's container policy for the session's own children, this one leaves the session's
+policy exactly as it is and moves the toolchain out of it, so neither depends on the other landing
+and nothing here is made redundant by it. They overlap only on Gradle, where the choice is cost, not
+safety — a pinned port keeps the daemon, its workers and its JVMs inside the session's memory and
+CPU and adds a policy-widening primitive to the default backend, while the runner costs 1.67 s on a
+warm build with the daemon outside the boundary and refuses by name when no engine is running. If
+the loopback allowance lands first, the repo's `jvm` profile stops needing the elevated
+`appcontainer` workaround, which is a good outcome for both plans; the runner stays the answer for
+toolchains whose daemons make the in-session model impractical. One place they rub, stated rather
+than smoothed over: that plan rejects the blog's container-build solution because `AGENTS.md` says
+"no container runtime", and this plan asks for exactly a container. The rejection is about what a
+*session* may require; the runner is an optional deputy that a machine without an engine refuses by
+name, so saife's default path still runs with no container runtime at all.
+
 ## 2. The contract: the runner is policy, not an executor
 
 If the workload can name the image, the command, the mounts or the flags, the sidecar is a

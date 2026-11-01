@@ -84,6 +84,43 @@ carries the paths, but it is unverified until Maven is. Create the directory
 first (`mkdir %USERPROFILE%\.m2`) — an allow entry cannot create the root it
 grants.
 
+## `gradle-runner.json` — a session that builds through the runner
+
+**Not in a released build.** The runner lives on `feat/gradle-build-runner`; the
+commands named below do not exist in 0.3.x, and this profile is documented so
+the shape is reviewable before the code is merged.
+
+| access | path | why |
+|---|---|---|
+| read-write | `$CWD` | the sources the runner copies **in**, and `build/libs` it copies **back** |
+| read-only | `$HOME/.gitconfig` | git's identity, for the commit a build session usually ends with |
+| deny | `$HOME/.ssh`, `$HOME/.aws` | the same secrets every other sample denies |
+| network | **none** (`block_net: true`) | the build's network is the container's, and the container has none |
+| limits | `workloadTimeoutSecs: 7200` | a build session is a long session; the default is 30 min |
+
+What it deliberately does **not** grant: the JDK and `$USERPROFILE/.gradle`. The
+image carries the toolchain (the sample project's conventions require Java 25,
+and the pinned digest is a JDK 25 image), and the cache volume carries
+`~/.gradle` *inside* the container at `/cache`. Granting either on the host
+would hand the session back exactly what moving the build out of it was for;
+`jvm.json` is the profile that needs both, because it runs Gradle on the host.
+
+**The runner's `profile` field is not this file.** A build request names
+`"profile": "gradle"`, which is one of the runner's own names
+(`src/runner/mod.rs::PROFILES`), not a saife profile. This file is the session
+posture *around* the runner: what the agent may touch, and that it has no
+network at all.
+
+**The one honest gap.** `block_net: true` names **no listener**
+(`net::resolve_network_with` returns `NetworkConfig::Blocked`; test
+`a_facade_does_not_survive_block_net`), and the runner is reached through the
+supervisor's facade, which lives in that listener. So this is the "build-only,
+no egress at all" posture. A session that has to *ask* the runner for a build
+needs the facade flag rather than `block_net`, and that wiring does not exist
+yet (nothing outside `src/runner/` calls `runner::server::spawn` or
+`DockerBuilds`). When it lands, the choice between "no listener" and "a listener
+with an empty allow-list" belongs to that task, not to a profile.
+
 ## `opencode.json` — see the user guide
 
 `opencode` has its own section in `docs/USER-GUIDE.md` (interactive tools); its

@@ -402,7 +402,8 @@ rule in `docs/design/testing-principles.md`.
   run works on both backends, the audit model, build/test gates, recipes and the
   invariants a change must keep. `AGENTS.md` holds the house rules for agents.
 - `docs/adr/` — accepted decisions (0001 network hardening, 0002 MXC integration
-  surface, 0003 base-container enforcement, 0004 GA unelevated egress).
+  surface, 0003 base-container enforcement, 0004 GA unelevated egress, 0006 the build
+  runner).
 - `docs/design/prd/prd-sandbox.md` — full product requirements.
 - `docs/design/specs/us-3-network-exfiltration-blocked/spec.md` — US-3 spec
   (including the loopback-exemption deferral finding).

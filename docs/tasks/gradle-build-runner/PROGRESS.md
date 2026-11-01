@@ -3,7 +3,11 @@
 Plan: [2026-10-30-gradle-build-runner.md](../../plans/2026-10-30-gradle-build-runner.md)
 Related: [gradle-daemon-loopback](../../plans/2026-10-28-gradle-daemon-loopback.md) (the in-session alternative this plan may not need)
 
-Status: **plan only.** Nothing implemented, nothing measured. S-0 is a blocking gate.
+Status: **in progress on `feat/gradle-build-runner`; in no released build.** S-0 is measured;
+the engine, the slot, exec, sync in/out, the cache volume, prewarm and the build protocol are
+implemented and gated. Open: the session-facing facade mount (nothing outside `src/runner/`
+calls `runner::server::spawn`), the idle kill and start-up sweep (T2.3/T2.4), and the CRLF,
+delete/rename and case rows of T3.5.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated · `[!]` blocked
 
@@ -36,14 +40,14 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T3.1 | Project root resolution: reparse/UNC/subst/install-dir refusals | [x] | Lexical (UNC, device, rooted, `..`) at parse; filesystem half in `validate_on_disk` called by the listener: canonicalise and require containment in the workspace, and refuse any reparse point on the path. Test creates a real junction out of the workspace and proves the refusal |
 | T3.2 | Sync in (tar) into `/src`, `/cache` created at slot start | [x] | `sync::pack_dir` + `PUT /archive`; live leg: a tree with a nested file arrives inside the slot (`cat` sees it). Skip list keeps `build/` out of the input |
 | T3.3 | Sync out (filtered) | [x] | `GET /archive` + `unpack_into_at(strip_top)`: the engine's answers are relative to the *parent*, so `path=/src/out` yields `out/art.txt`. Live leg round-trips an artifact back to the host; the filter decides what lands | |
-| T3.4 | Windows semantics documented (case, CRLF, locks, long paths) | [ ] | |
+| T3.4 | Windows semantics documented (case, CRLF, locks, long paths) | [x] | `docs/USER-GUIDE.md` §8a, "What the copy does to a Windows tree": one row per behaviour, each marked **handled** / **refused** / **known limitation** — CRLF verbatim both ways (repo's job, not the sync's), exec bit uniform `0o755` (pinned by a test), a locked file refuses the whole pack by path on the way in, copy-out failure leaves a green build with `[saife] sync out failed` in the log, >260 chars unsupported, case-only collision is last-writer-wins, delete/rename not propagated (open), mid-build edit = snapshot |
 | T3.5 | Sync semantics tests: delete, rename, exec bit, CRLF, mid-build edit | [~] | exec bit done and pinned by a test (the first real build failed with exit 126: Windows has no mode, so every packed file is 0o755); delete/rename/CRLF/mid-build still open |
-| T4.1 | `profiles/gradle-runner.json` + README row | [ ] | |
+| T4.1 | `profiles/gradle-runner.json` + README row | [x] | `$CWD` read-write, `$HOME/.gitconfig` read-only, `.ssh`/`.aws` denied, `network.block_net: true`, `limits.workloadTimeoutSecs` 7200; README section states why the JDK and `~/.gradle` are deliberately absent and that `block_net` names no listener (so the facade route is the wiring task's decision). `saife profile show gradle-runner --expanded` resolves it; docs guard green |
 | T4.2 | Invocation, JAVA_HOME, exit codes, timeout/cancel | [ ] | |
-| T4.3 | Prewarm at image build time, documented refresh step | [ ] | |
+| T4.3 | Prewarm at image build time, documented refresh step | [x] | USER-GUIDE §8a "Prewarming the cache": what the command does and removes, warm 10.2 s / 880 MB, cold >10 min on a slow link is a download and not a hang, an interrupted fill leaves an offline build failing on one named artifact, and the global-volume reason from plan §4.1 (per-session would pay 88.6 s / 904 MB again) |
 | T4.4 | Offline failure UX naming the missing dependency | [x] | observed, not invented: Gradle's own `No cached version of org.osgi:…:1.1.2 available for offline mode` reached the client through the stream. The prewarm banner now warns that a cold fill takes many minutes and that killing it leaves exactly that failure |
 | T4.5 | Live leg: real project builds through the runner | [x] | sample-gradle: offline build in a `--network none` slot, BUILD SUCCESSFUL in 8 s, 43 log lines streamed, `sample-gradle-1.0.0-plain.jar` synced back to `build/libs` |
-| T5.1 | ADR-0006 build runner | [ ] | |
-| T5.2 | FAQ rewrite, `--no-daemon` evidence kept, appcontainer fallback | [ ] | |
-| T5.3 | DEVELOPERS invariants | [ ] | |
-| T5.4 | Cross-link the sibling loopback plan | [ ] | |
+| T5.1 | ADR-0006 build runner | [x] | `docs/adr/0006-build-runner.md`: context (10013 in both directions, four `--no-daemon` configurations), decision D-1..D-7 (slot, copy in/out, `NetworkMode: none`, global cache volume, declared-operations facade, engine as API + support table, request shape), consequences incl. the audit gap in plain words, rejected: bind mounts, ephemeral, networked slot, host sidecar, socket, generic executor, VM per build, appcontainer, remote CI |
+| T5.2 | FAQ rewrite, `--no-daemon` evidence kept, appcontainer fallback | [x] | Gradle entry: three answers table (runner / `--backend appcontainer` / outside the sandbox) with the runner marked "on `feat/gradle-build-runner`; in no released build" and the unwired facade mount said out loud; the four measured `--no-daemon` configurations moved under it as their own H3; the JVM proxy-props recipe promoted from an H3 nested in the cleanup entry to its own FAQ entry |
+| T5.3 | DEVELOPERS invariants | [x] | `docs/DEVELOPERS.md` §6 items 9-15: policy not executor, no network on a slot, no bind mounts, fixed argv, cache volume is shared trust, a build never mutates the source, the facade stays a declaration list; plus the `src/runner/` repository-map row and ADR-0006 in §7 |
+| T5.4 | Cross-link the sibling loopback plan | [~] | runner plan §1, "The sibling plan: loopback egress inside the session": what each decided and why they do not conflict, including the `AGENTS.md` "no container runtime" rub stated instead of smoothed over. The reverse paragraph is **not** in this branch: `docs/plans/2026-10-28-gradle-daemon-loopback.md` exists only on `feat/gradle-daemon-loopback` (1bcd7fc), so it has to be applied there |

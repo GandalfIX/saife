@@ -632,6 +632,50 @@ volume so builds run `--offline`. Everything a build does happens in a container
 - **sessions share it**, so a build in one session can influence what another session reads.
   Acceptable while saife is single-user on one machine; treat the cache as trusted state.
 
+### Prewarming the cache — once per image, before the first build
+
+`saife runner prewarm <project>` is the refresh step, and it belongs to
+image-build time: run it once against the pinned digest, before any session
+uses that image.
+
+- It creates `saife-runner-cache` if it is missing, packs the project, starts
+  **one** container with the network on, runs the wrapper's `gradlew --version`
+  and a dependency-resolution pass against `/cache`, removes that container
+  whether it succeeded or not, and reports the volume's size afterwards
+  (`cache is now 880 MB` on this machine, warm).
+- Warm, it takes **10.2 s**. Cold, on a slow link, it takes **many minutes** —
+  measured at more than ten minutes for Gradle 9.8.2 and its dependencies. That
+  is a download, not a hang; there is no progress line yet, which is exactly why
+  it was misread as one.
+- **An interrupted fill leaves a cache that looks warm and is not.** The next
+  offline build then fails naming one artifact —
+  `No cached version of <group>:<artifact>:<version> available for offline mode`
+  — because `--offline` turns a partial cache into a resolution error instead of
+  a download. Re-run `prewarm`; never "fix" it by giving a build network.
+- The volume is **global on purpose** (plan §4.1): one warm `~/.gradle` is what
+  makes an offline build possible at all, and a per-session volume would pay the
+  first build's **88.6 s** and **904 MB** again in every session. The price is
+  that sessions share it — the cache bullets above.
+
+### What the copy does to a Windows tree
+
+The project is copied in, not mounted ([ADR-0006](adr/0006-build-runner.md)), so
+Windows-specific facts get a defined answer instead of being left to whatever
+the filesystem does. Each row says which of the three it is: **handled**,
+**refused**, or a **known limitation**.
+
+| behaviour | what happens | status |
+|---|---|---|
+| line endings (CRLF) | bytes are copied verbatim; nothing normalises in either direction. A script with CRLF fails inside the Linux container with a shell error about a carriage return (`$'\r': command not found`, or `bad interpreter` for the shebang) — and a `gradlew` checked out with `core.autocrlf=true` is such a script. | **documented**: fix it in the repo (`.gitattributes`), never in the sync |
+| executable bit | the host has no mode, so every packed file is `0o755` — which is what makes `./gradlew` runnable (before it, the first real build died with exit 126). | **handled**, pinned by a test |
+| a file locked by another process, copy-in | the pack opens every file; one that is open without sharing fails the **whole** sync with `runner: open <path>` naming it. Nothing is half-copied, nothing is silently skipped. | **refused**, by name |
+| a file locked during copy-out | the build still reports success and its log carries `[saife] sync out failed: …`, so a jar can be missing from `build/libs` while the build is green. | **documented**: read the last lines of the log, not just the exit code |
+| paths longer than 260 characters | unsupported: the sync adds no `\\?\` prefix and nothing declares the process long-path aware, so a deeper path fails the pack, naming the file. | **known limitation** |
+| two names differing only in case | NTFS cannot hold the pair, so the collision can only be *created inside the container*; copying out writes both onto a case-insensitive directory and the second silently replaces the first. | **known limitation** (last writer wins, no message) |
+| a file deleted or renamed on the host | the copy only adds: a removed file stays in `/src` for the rest of the session, so a build can compile a source the agent deleted. | **known limitation**, open (T3.5) |
+| an edit made during a build | the copy happens once, before the container's command starts, so the build sees the tree as of that moment; the edit lands only in the **next** build. | **handled by design** — a snapshot, not a live tree |
+| `build/`, `.gradle/`, `.git/` | excluded from the copy: the first two would make a build start from a stale output, and `.git` is skipped too — so a plugin that stamps the commit hash sees no repository. | **known limitation** (open) |
+
 Two limits worth knowing before relying on it: the runner's container reaches the host's
 **entire loopback** through the engine's host gateway (measured), which is why v1 gives it no
 network at all; and the audit chain records the facade requests, not what happens inside the
