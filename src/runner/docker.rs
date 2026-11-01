@@ -207,7 +207,38 @@ impl Engine {
         body: &[u8],
         content_type: &str,
     ) -> Result<Response> {
-        let mut file = self.endpoint.open()?;
+        // The named pipe supports no read timeout, so the bound is a thread and a channel:
+        // measured, a stalled `PUT /archive` hung the CLI indefinitely with the container left
+        // up and `/src` empty (T6.2). An engine that does not answer in two minutes is an error
+        // the user can read, not a command that never returns.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let endpoint = self.endpoint.clone();
+        let (m, p, b, ct) = (method.to_string(), path.to_string(), body.to_vec(), content_type.to_string());
+        std::thread::Builder::new()
+            .name("saife-engine-request".into())
+            .spawn(move || {
+                let _ = tx.send(one_request(&endpoint, &m, &p, &b, &ct));
+            })
+            .context("runner: spawn the engine request")?;
+        match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(r) => r,
+            Err(_) => bail!(
+                "runner: the engine did not answer {method} {path} within 120s - it is up, but this \
+                 request produced no response; a container left behind by it must be removed by hand"
+            ),
+        }
+    }
+}
+
+/// One request on its own connection, extracted so it can run under a timeout.
+fn one_request(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<Response> {
+        let mut file = endpoint.open()?;
         // One request per connection: `Connection: close` makes the response
         // end-delimited, which is what the engine supports on a pipe.
         let mut head = format!(
@@ -228,7 +259,6 @@ impl Engine {
         file.read_to_end(&mut raw)
             .context("runner: read the engine's response")?;
         parse_response(&raw)
-    }
 }
 
 /// Parse one HTTP/1.x response: status line, headers, then a body that is `Content-Length`
