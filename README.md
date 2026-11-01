@@ -321,7 +321,9 @@ and the network proxy status. Exits non-zero if the host is unsupported.
 ## Network filtering status
 
 **`--block-net` works fully unprivileged.** It removes the AppContainer
-network capability (or, under `mxc`, provides no proxy at all) - every
+network capability (or, under `mxc`, no egress at all: no proxy without a
+facade, and a session that asked for one - `--runner`, `--plugin` - gets a
+listener that denies every origin with `network_blocked`) - every
 `connect()` is kernel-denied. Backs AC-3.1, AC-3.2, AC-3.13 from the spec.
 
 **`--allow-domain` / `--network-profile` work, and under the default `mxc`

@@ -1280,7 +1280,7 @@
         token: RunToken,
     ) -> T36 {
         try_t36_token_cfg(
-            label, allow, deny, dialog, enabled, timeout, policy, upstream, token,
+            label, allow, deny, dialog, enabled, timeout, policy, upstream, token, false,
         )
         .expect("spawn test proxy")
     }
@@ -1300,6 +1300,7 @@
         policy: PromptPolicy,
         upstream: Option<Arc<UpstreamDialer>>,
         token: RunToken,
+        blocked: bool,
     ) -> Result<T36> {
         let token_value = token.value().to_string();
         let learned_base = std::env::temp_dir().join(format!(
@@ -1340,6 +1341,7 @@
             writer,
             prompt: gate,
             facade,
+            blocked,
         }) {
             Ok(handle) => handle,
             Err(e) => {
@@ -1374,6 +1376,26 @@
             PromptPolicy::Deny,
             None,
         )
+    }
+
+    /// A listener with the `--block-net` posture of T6.1: a facade-only session's
+    /// proxy. No allow-list, no deny-list, and `blocked: true` — but prompting is
+    /// left ENABLED on purpose, so that a dialog firing would be visible; the
+    /// posture itself has to be what keeps the operator out of the decision.
+    fn t36_setup_blocked(label: &str, dialog: DialogFn) -> T36 {
+        try_t36_token_cfg(
+            label,
+            &[],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(5),
+            PromptPolicy::Deny,
+            None,
+            unique_test_token(),
+            true,
+        )
+        .expect("spawn blocked test proxy")
     }
 
     /// One blocking request/response round-trip against the test proxy.
@@ -3818,6 +3840,7 @@
             PromptPolicy::Deny,
             None,
             token.clone(),
+            false,
         )
         .err()
         .expect("a duplicate live credential must be refused");
@@ -3945,6 +3968,7 @@
             PromptPolicy::Deny,
             None,
             token.clone(),
+            false,
         )
         .err()
         .expect("a clone of a live token must still be refused");
@@ -5786,6 +5810,7 @@
             token: RunToken::for_tests(TEST_TOKEN),
             deny: Vec::new(),
             allow: vec!["api.example.com".to_string()],
+            blocked: false,
             writer,
             upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
             prompt,
@@ -6314,6 +6339,121 @@
             connect_events(&t.sid).is_empty(),
             "a refused facade tunnel is not a consultation"
         );
+    }
+
+    // ---- T6.1: a blocked session that serves a facade ----------------------
+    //
+    // `--runner` (and `--plugin`) reach the workload through the proxy, so a
+    // `--block-net` session that asks for one gets a listener. The posture it
+    // carries is the point: the listener is the transport for a host-side
+    // capability, never an egress grant that happened to come with it.
+
+    /// Every host that is not a facade mount is refused, at the first rung, with
+    /// the one reason that describes the session rather than the host. The dialog
+    /// is armed with "allow" on purpose: if the posture did not answer first, the
+    /// refusal would be a decision the operator made, and the assertions below
+    /// would see it.
+    #[test]
+    fn a_blocked_listener_denies_egress_without_a_dialog() {
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup_blocked("blocked-egress", dialog);
+
+        let resp = exchange(
+            t.port,
+            &format!("GET http://example.com/ HTTP/1.1\r\n{}\r\n", auth_header()),
+        );
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(
+            resp.contains("network_blocked"),
+            "the refusal must name the posture, not a host rule: {resp}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a blocked listener has nothing to ask: an egress decision cannot be granted \
+             by answering a dialog"
+        );
+
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["host"], "example.com");
+        assert_eq!(ev["disposition"], "deny");
+        assert_eq!(ev["source"], "hard-deny");
+        assert_eq!(ev["reason"], "network_blocked");
+        assert_eq!(ev["persisted"], false);
+    }
+
+    /// CONNECT is the same answer, and it is the one a TLS client asks for.
+    #[test]
+    fn a_blocked_listener_denies_connect_without_a_dialog() {
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup_blocked("blocked-connect", dialog);
+
+        let resp = exchange(t.port, &connect_req("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("network_blocked"), "got: {resp}");
+        assert!(calls.lock().unwrap().is_empty(), "never prompt under --block-net");
+        assert_eq!(last_connect_event(&t.sid)["reason"], "network_blocked");
+    }
+
+    /// The other half: the facade the listener exists for still works. This is the
+    /// runner's own declaration — a `POST /build` with a body — relayed over a
+    /// listener that grants nothing else.
+    #[test]
+    fn a_blocked_listener_still_relays_a_declared_facade_post() {
+        const BODY: &str = "BUILD SUCCESSFUL in 9s";
+        let (sidecar_port, seen) = fake_sidecar_with_body(BODY);
+        let (dialog, calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup_blocked("blocked-facade", dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(FacadeTarget {
+                mount: "build".into(),
+                port: sidecar_port,
+                token: "runnertoken".into(),
+                operations: vec![crate::plugin::Operation {
+                    method: "POST".into(),
+                    path: "/build".into(),
+                }],
+            })
+            .unwrap();
+
+        let payload = r#"{"task":"build","profile":"gradle-runner"}"#;
+        let resp = exchange(
+            t.port,
+            &format!(
+                "POST http://build.sandbox.invalid/build HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n{}",
+                auth_header(),
+                payload.len(),
+                payload
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.0 200 OK"),
+            "the sidecar's answer is relayed: {resp}"
+        );
+        assert!(resp.ends_with(BODY), "got: {resp}");
+
+        let head = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("the sidecar must have been called");
+        assert!(head.starts_with("POST /build HTTP/1.0\r\n"), "{head}");
+        assert!(head.contains("Host: build\r\n"), "{head}");
+        assert!(head.contains("X-Facade-Token: runnertoken\r\n"), "{head}");
+        assert!(head.contains(payload), "the body must arrive: {head}");
+
+        assert!(calls.lock().unwrap().is_empty(), "a facade is not a prompt");
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "a facade request is not an egress consultation"
+        );
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1, "one request, one leaf: {leaves:?}");
+        assert_eq!(leaves[0]["disposition"], "allow");
+        assert_eq!(leaves[0]["mount"], "build");
+        assert_eq!(leaves[0]["path"], "/build");
     }
 
     /// [G-44] is about not becoming a tunnel to host services. A host STRING check

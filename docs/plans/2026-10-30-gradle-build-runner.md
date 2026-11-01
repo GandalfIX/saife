@@ -388,8 +388,9 @@ before S-1 starts.
       reaches a plugin — one declared `(method, path)` pair, one audit path, no new port. The
       wiring is a `Drop` guard: the listener stops and the engine is told (`BuildEngine::shutdown`,
       which removes the slot) on the clean path *and* on every `?` unwind. Refused by name on
-      `--block-net` (`runner_requires_proxy`) and on `--backend appcontainer`
-      (`runner_unsupported_backend`, exit 5). This closes the gap that made a build unreachable
+      `--backend appcontainer` (`runner_unsupported_backend`, exit 5). A `--block-net` session
+      serves the facade too: it gets a listener with egress denied outright (`--allow-domain`
+      no longer buys the socket; T6.1). This closes the gap that made a build unreachable
       from inside a session even though every piece of it was built.
 
 ### S-2 — Slot lifecycle (on top of the engine abstraction)

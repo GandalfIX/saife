@@ -254,7 +254,10 @@ nothing changes for existing callers.
 saife run --allow-cwd --block-net -- cmd /c echo offline
 ```
 
-No proxy is started and every `connect()` is kernel-denied.
+No proxy is started and every `connect()` is kernel-denied. (A `--block-net`
+run that asks for a host-side facade — `--runner`, `--plugin` — does get that
+listener, exactly so the capability works without an egress grant; it denies
+every origin with `403 network_blocked`, see §6.)
 
 ### 4.2 Allowing hosts
 
@@ -465,8 +468,11 @@ it, so repo-local plugins are usable only when you name the directory:
 saife run --plugin-dir .\.saife\plugins --plugin tngtech -- <workload>
 ```
 
-Plugins are wired on `--backend mxc` (the default) only, and they need the
-session proxy: `--block-net` refuses `--plugin`.
+Plugins are wired on `--backend mxc` (the default) only. They need the session
+proxy, and a session that asked for a facade always gets one: `--block-net
+--plugin tngtech` starts the listener with egress denied outright, so the mount
+is reachable and every non-facade host is `403 network_blocked`. There is no
+grant to add — `--allow-domain` is not what buys the socket.
 
 ### The sample: `tngtech`
 

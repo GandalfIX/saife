@@ -135,6 +135,13 @@ pub struct ProxyConfig {
     /// allow-list ([G-32, G-33]). Wired in D-3.2; the full prompt/learned-deny
     /// pipeline lands in D-3.6.
     pub deny_domain: Vec<String>,
+    /// Egress denied outright (T6.1). Set by a `--block-net` session that still
+    /// needs the listener for a facade mount (`--runner`, `--plugin`): the facade
+    /// routes are answered *before* the decision pipeline, so this denies exactly
+    /// the requests that would leave the machine while the host-side capability
+    /// stays reachable. No prompt is ever raised, because there is nothing left to
+    /// ask — the answer is the session's posture, not a per-host choice.
+    pub blocked: bool,
     /// Upstream chaining dialer ([G-10, G-22]). `None` = direct dial
     /// only. Parsed once by the supervisor at startup and shared by
     /// every handler through the `Arc`.
@@ -183,6 +190,10 @@ struct ConnCtx {
     token: RunToken,
     deny: Vec<String>,
     allow: Vec<String>,
+    /// Egress denied outright (T6.1). Checked first in [`decide`], so a
+    /// `--block-net` session that only needs the facade cannot be talked into an
+    /// origin by a list, a learned entry or a dialog.
+    blocked: bool,
     writer: Arc<AuditWriter>,
     upstream: Option<Arc<UpstreamDialer>>,
     prompt: PromptGate,
@@ -1001,6 +1012,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         token,
         allow_domain,
         deny_domain,
+        blocked,
         writer,
         upstream,
         prompt,
@@ -1022,6 +1034,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         token,
         deny: deny_domain,
         allow: allow_domain,
+        blocked,
         writer,
         upstream,
         prompt,
@@ -1486,6 +1499,22 @@ async fn decide(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
             scope: None,
             persisted: false,
             reason: Some("loopback_refused".into()),
+            intent_hint: false,
+        };
+    }
+    // (2b) `--block-net` with a listener (T6.1): the facade mounts are answered
+    // before this function is ever called, so everything that arrives here is a
+    // request that would leave the machine. Denied as the session's posture, at
+    // the first rung: no list, no learned entry and no dialog can reach a rule
+    // that admits it, because there is no rule to reach — the operator said
+    // "no egress" and this listener exists only for the host-side capability.
+    if ctx.blocked {
+        return Decision {
+            allowed: false,
+            source: "hard-deny",
+            scope: None,
+            persisted: false,
+            reason: Some("network_blocked".into()),
             intent_hint: false,
         };
     }

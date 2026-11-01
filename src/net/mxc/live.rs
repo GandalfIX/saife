@@ -1557,6 +1557,7 @@
                 token: token.clone(),
                 allow_domain: allow.iter().map(|s| s.to_string()).collect(),
                 deny_domain: Vec::new(),
+                blocked: false,
                 upstream: None,
                 writer: writer.clone(),
                 prompt,

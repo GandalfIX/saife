@@ -804,7 +804,8 @@ fn run_inner(
     // `--plugin` needs the listener (the facade route lives in the proxy) but
     // grants no origin: the allow-list is whatever the operator declared, and an
     // empty one still denies every host that is not a facade mount. `--block-net`
-    // remains an explicit "no listener" and refuses `--plugin` downstream.
+    // still resolves to `Blocked` — no origin, no prompt — and the listener such a
+    // session needs for its facade is `start_session_proxy`'s decision (T6.1).
     let net_cfg_resolved = net::resolve_network_with(
         &resolved.network,
         block_net,
@@ -972,6 +973,9 @@ fn run_inner(
         &sid,
         audit_writer.clone(),
         std::sync::Arc::new(plugin::FacadeRegistry::new()),
+        // Unchanged: this backend refuses `--plugin` and `--runner` by name
+        // above, so it never has a mount that would need a listener.
+        false,
     )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
 
@@ -1191,8 +1195,11 @@ fn run_mxc_session(
     );
 
     // (5) The SAME listener the AppContainer path starts, with its own per-run
-    //     token; nothing at all under `--block-net`. No loopback exemption is
-    //     registered: this backend's ingress policy allows host loopback, which is
+    //     token. A `--block-net` session gets one only if it asked for a facade
+    //     (`--plugin` here, `--runner` below): that listener serves the mount and
+    //     denies every origin (T6.1), so the capability no longer has to be bought
+    //     with an `--allow-domain` grant. No loopback exemption is registered:
+    //     this backend's ingress policy allows host loopback, which is
     //     why the migration needs no elevation.
     //
     //     The facade registry exists BEFORE the listener so both hold one `Arc`:
@@ -1200,13 +1207,6 @@ fn run_mxc_session(
     //     each sidecar has a port and a token. That ordering is what makes
     //     "proxy binds -> plugins spawn -> child" honest — a request that lands
     //     in between answers `404`, never a stale allow.
-    if !plugins.is_empty() && net_cfg.is_blocked() {
-        eprintln!(
-            "[saife] plugin_requires_proxy: --plugin {} (--block-net starts no listener to route it)",
-            plugins.join(", ")
-        );
-        return Ok(2);
-    }
     let facade = std::sync::Arc::new(plugin::FacadeRegistry::new());
     let proxy = start_session_proxy(
         net_cfg,
@@ -1214,6 +1214,7 @@ fn run_mxc_session(
         sid,
         audit_writer.clone(),
         std::sync::Arc::clone(&facade),
+        enable_runner || !plugins.is_empty(),
     )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
     let token = proxy.as_ref().map(|(_, env)| env.token.value());
@@ -1267,12 +1268,6 @@ fn run_mxc_session(
     // slot dies with it) and the watchdog (an idle slot is stopped, but never one with a
     // build in flight). Bound together because dropping any one of them early is the bug.
     let (_runner_session, _runner_keeper, _runner_watchdog) = if enable_runner {
-        if net_cfg.is_blocked() {
-            eprintln!(
-                "[saife] runner_requires_proxy: --runner (--block-net starts no listener to route its facade mount)"
-            );
-            return Ok(2);
-        }
         let endpoint = match crate::runner::docker::Endpoint::resolve() {
             Ok(endpoint) => endpoint,
             Err(e) => {
@@ -1332,9 +1327,11 @@ fn run_mxc_session(
 
     // (6) Guardrail 1's proof source. With a proxy it is that listener — the one
     //     the child is pointed at, so the proof cannot come from a different
-    //     socket. Under `--block-net` nothing binds and the registry is
-    //     unattached: its proof is structurally zero because the session has no
-    //     proxy to consult, which is what `MustBeAbsent` asserts.
+    //     socket. Under `--block-net` nothing binds (the runner/plugin case is the
+    //     exception, and it DOES bind: that listener is the proxy the child talks
+    //     to, so the proof is the same counter as any networked session's) and the
+    //     registry is unattached: its proof is structurally zero because the
+    //     session has no proxy to consult, which is what `MustBeAbsent` asserts.
     let counters = match &proxy {
         Some((handle, _)) => handle.counters(),
         None => net::proxy::LaunchCounters::new(),
@@ -1664,11 +1661,45 @@ fn start_session_proxy(
     sid: &str,
     writer: std::sync::Arc<audit::AuditWriter>,
     facade: std::sync::Arc<plugin::FacadeRegistry>,
+    // T6.1: start the listener even for a blocked session, because this
+    // session asked for a facade mount (`--runner`, `--plugin`) and the
+    // facade route exists only in the proxy.
+    serve_without_egress: bool,
 ) -> Result<Option<(net::proxy::ProxyHandle, net::ProxyEnv)>> {
     // The listener MUST outlive the child: the caller holds the handle until the
     // child has exited (see `seal_audit`).
     Ok(match net_cfg {
-        net::NetworkConfig::Blocked => None,
+        // Unchanged for a blocked session that asked for nothing: no listener, so
+        // nothing binds, nothing can be proven, and the guardrail leg is
+        // `MustBeAbsent`.
+        net::NetworkConfig::Blocked if !serve_without_egress => None,
+        // T6.1: a blocked session that DID ask for a facade still needs the
+        // listener. It carries no origin and the `blocked` posture, so exactly the
+        // requests that would leave the machine are denied and the host-side
+        // capability is reachable. The alternative — what this replaced — was an
+        // egress grant (`--allow-domain <anything>`) bought only to obtain a
+        // socket, which is a security decision made for the wrong reason.
+        net::NetworkConfig::Blocked => {
+            let token = net::token::RunToken::issue().context("generate session token")?;
+            Some(spawn_session_listener(
+                net::proxy::ProxyConfig {
+                    session_id: sid.to_string(),
+                    token: token.clone(),
+                    allow_domain: Vec::new(),
+                    deny_domain: Vec::new(),
+                    blocked: true,
+                    // No chaining: there is no origin to reach, so an upstream
+                    // dialer would be a second way out wired up for nothing.
+                    upstream: None,
+                    writer,
+                    // Nothing to ask: the answer is the session's posture, not a
+                    // per-host choice, so the dialog is constructed disabled.
+                    prompt: session_prompt_gate(false, "deny", prompt_timeout_secs, None)?,
+                    facade,
+                },
+                token,
+            )?)
+        }
         net::NetworkConfig::Allow {
             allow_domain,
             deny_domain,
@@ -1682,33 +1713,15 @@ fn start_session_proxy(
             // accepts, and the only one its child is given. Minting it here is
             // what makes two concurrent sessions attributable to themselves.
             let token = net::token::RunToken::issue().context("generate session token")?;
-            // Task 3.6 Step 5: load the learned policy BEFORE starting the
-            // proxy. A corrupt learned file is a hard error by design — the
-            // user notices immediately and can fix or revoke it ([G-5]).
-            let learned = net::learned::LearnedStore::load(profile_name.as_deref())
-                .context("load learned policy file ('saife learned clear' resets a corrupt one)")?;
-            // D-4 registry + D-3.5 coordinator: created in the supervisor
-            // (all sync) before the proxy runtime exists and Arc-shared
-            // into every handler. The registry's `Drop` joins its sweeper
-            // once the last reference is gone.
-            let intent =
-                std::sync::Arc::new(net::intent::IntentRegistry::new(net::intent::DEFAULT_TTL));
-            let coordinator = std::sync::Arc::new(net::prompt::PromptCoordinator::new());
-            let on_unavailable = if on_unavailable == "allow" {
-                net::prompt::PromptPolicy::Allow
-            } else {
-                net::prompt::PromptPolicy::Deny
-            };
-            let prompt = net::proxy::PromptGate {
-                enabled: *prompt_enabled,
-                config: net::prompt::PromptConfig {
-                    timeout: std::time::Duration::from_secs(u64::from(prompt_timeout_secs)),
-                    on_unavailable,
-                },
-                coordinator,
-                intent,
-                learned: std::sync::Arc::new(std::sync::Mutex::new(learned)),
-            };
+            // The prompt/intent/learned wiring, built by the ONE constructor both
+            // postures share (T6.1): a second construction is a second place for
+            // the prompt posture to drift.
+            let prompt = session_prompt_gate(
+                *prompt_enabled,
+                on_unavailable,
+                prompt_timeout_secs,
+                profile_name.as_deref(),
+            )?;
             // [G-10] Upstream chaining: profile `network.upstreamProxy` > host
             // `HTTPS_PROXY` > `HTTP_PROXY` > none, resolved here once in the
             // supervisor. The child never sees any of it — it keeps the
@@ -1755,27 +1768,83 @@ fn start_session_proxy(
                 },
                 None => None,
             };
-            let handle = net::proxy::spawn(net::proxy::ProxyConfig {
-                session_id: sid.to_string(),
-                token: token.clone(),
-                allow_domain: allow_domain.clone(),
-                deny_domain: deny_domain.clone(),
-                upstream,
-                writer: writer.clone(),
-                prompt,
-                facade,
-            })
-            .context("start localhost proxy")?;
-            let proxy_env = net::ProxyEnv {
-                port: handle.port,
+            Some(spawn_session_listener(
+                net::proxy::ProxyConfig {
+                    session_id: sid.to_string(),
+                    token: token.clone(),
+                    allow_domain: allow_domain.clone(),
+                    deny_domain: deny_domain.clone(),
+                    blocked: false,
+                    upstream,
+                    writer: writer.clone(),
+                    prompt,
+                    facade,
+                },
                 // The child's copy of this run's credential; the listener holds
                 // the same value and refuses every other. Cloning the `RunToken`
                 // (rather than its `String`) keeps the env edge typed (P1.6(c)).
-                token: token.clone(),
-            };
-            Some((handle, proxy_env))
+                token,
+            )?)
         }
     })
+}
+
+/// The prompt/intent/learned wiring one listener carries.
+///
+/// Extracted in T6.1 so both postures build their gate in one place. The
+/// blocked posture passes `prompt_enabled: false` — nothing it can reach has a
+/// per-host answer, so a dialog would be a question with no consequence — but it
+/// still loads the learned store, so a corrupt one is reported in both postures
+/// instead of only sometimes ([G-5]).
+fn session_prompt_gate(
+    prompt_enabled: bool,
+    on_unavailable: &str,
+    prompt_timeout_secs: u32,
+    profile_name: Option<&str>,
+) -> Result<net::proxy::PromptGate> {
+    // Task 3.6 Step 5: load the learned policy BEFORE starting the
+    // proxy. A corrupt learned file is a hard error by design — the
+    // user notices immediately and can fix or revoke it ([G-5]).
+    let learned = net::learned::LearnedStore::load(profile_name)
+        .context("load learned policy file ('saife learned clear' resets a corrupt one)")?;
+    // D-4 registry + D-3.5 coordinator: created in the supervisor
+    // (all sync) before the proxy runtime exists and Arc-shared
+    // into every handler. The registry's `Drop` joins its sweeper
+    // once the last reference is gone.
+    let intent = std::sync::Arc::new(net::intent::IntentRegistry::new(net::intent::DEFAULT_TTL));
+    let coordinator = std::sync::Arc::new(net::prompt::PromptCoordinator::new());
+    let on_unavailable = if on_unavailable == "allow" {
+        net::prompt::PromptPolicy::Allow
+    } else {
+        net::prompt::PromptPolicy::Deny
+    };
+    Ok(net::proxy::PromptGate {
+        enabled: prompt_enabled,
+        config: net::prompt::PromptConfig {
+            timeout: std::time::Duration::from_secs(u64::from(prompt_timeout_secs)),
+            on_unavailable,
+        },
+        coordinator,
+        intent,
+        learned: std::sync::Arc::new(std::sync::Mutex::new(learned)),
+    })
+}
+
+/// The listener plus the child's [`net::ProxyEnv`], from a fully-built config.
+///
+/// One spawn site for both postures: the env must name the port the listener
+/// actually bound and the credential it accepts, and building those twice is how
+/// a child ends up pointed at a proxy that will not admit it.
+fn spawn_session_listener(
+    cfg: net::proxy::ProxyConfig,
+    token: net::token::RunToken,
+) -> Result<(net::proxy::ProxyHandle, net::ProxyEnv)> {
+    let handle = net::proxy::spawn(cfg).context("start localhost proxy")?;
+    let proxy_env = net::ProxyEnv {
+        port: handle.port,
+        token,
+    };
+    Ok((handle, proxy_env))
 }
 
 /// Commit this run's audit root + signature and release the writer (US-4a).

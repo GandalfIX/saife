@@ -919,9 +919,11 @@ mod tests {
         assert_eq!(leaves[0]["parent"], Value::Null);
     }
 
-    /// Acceptance 4/5 (P2.3): `--block-net` starts no listener, so the endpoint is
-    /// null — never a placeholder port, never a credential — while the tier facts
-    /// are still recorded.
+    /// Acceptance 4/5 (P2.3): a `--block-net` session with no facade starts no
+    /// listener, so the endpoint is null — never a placeholder port, never a
+    /// credential — while the tier facts are still recorded. (A blocked session
+    /// that serves a facade DOES bind; that arm is `start_session_proxy`'s
+    /// `serve_without_egress`, and it records a real endpoint.)
     #[test]
     fn a_blocked_session_records_no_proxy_endpoint() {
         let sid = fresh_sid("block-net");

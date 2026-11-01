@@ -143,7 +143,9 @@ pub fn resolve_network(
 /// are skipped and the resolved `Allow` keeps exactly the allow-list the operator
 /// declared (usually empty, i.e. every non-facade host is denied or prompted as
 /// before). An explicit block still wins: `--block-net` and the `none` network
-/// profile name no listener at all, so `--plugin` is refused there by the caller.
+/// profile name resolve to `Blocked`, so this function grants nothing — the
+/// listener such a session gets is `start_session_proxy`'s `serve_without_egress`
+/// decision, and it carries `ProxyConfig::blocked` (T6.1).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_network_with(
     profile_net: &NetworkSlice,
@@ -358,8 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn a_facade_does_not_survive_block_net() {
-        // `--block-net` names no listener, so asking for a plugin cannot open one.
+    fn block_net_still_resolves_to_blocked_with_a_facade() {
+        // `--block-net` grants no origin and no prompt, so resolution stays
+        // `Blocked` even when a facade was requested. The LISTENER such a session
+        // needs is the supervisor's decision (`serve_without_egress` in
+        // `start_session_proxy`), and what it starts is a listener with
+        // `blocked: true` — never an `Allow` whose empty lists are one learned
+        // entry, or one dialog, away from an origin (T6.1).
         let cfg = resolve_network_with(&empty_slice(), true, &[], &[], false, None, true);
         assert!(cfg.is_blocked(), "--block-net must still win over --plugin");
     }
