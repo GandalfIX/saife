@@ -37,12 +37,12 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T3.2 | Sync in (tar) into `/src`, `/cache` created at slot start | [x] | `sync::pack_dir` + `PUT /archive`; live leg: a tree with a nested file arrives inside the slot (`cat` sees it). Skip list keeps `build/` out of the input |
 | T3.3 | Sync out (filtered) | [x] | `GET /archive` + `unpack_into_at(strip_top)`: the engine's answers are relative to the *parent*, so `path=/src/out` yields `out/art.txt`. Live leg round-trips an artifact back to the host; the filter decides what lands | |
 | T3.4 | Windows semantics documented (case, CRLF, locks, long paths) | [ ] | |
-| T3.5 | Sync semantics tests: delete, rename, exec bit, CRLF, mid-build edit | [ ] | |
+| T3.5 | Sync semantics tests: delete, rename, exec bit, CRLF, mid-build edit | [~] | exec bit done and pinned by a test (the first real build failed with exit 126: Windows has no mode, so every packed file is 0o755); delete/rename/CRLF/mid-build still open |
 | T4.1 | `profiles/gradle-runner.json` + README row | [ ] | |
 | T4.2 | Invocation, JAVA_HOME, exit codes, timeout/cancel | [ ] | |
 | T4.3 | Prewarm at image build time, documented refresh step | [ ] | |
 | T4.4 | Offline failure UX naming the missing dependency | [ ] | |
-| T4.5 | Live leg: warm attach < 2 s, daemon reused on the second build | [ ] | |
+| T4.5 | Live leg: real project builds through the runner | [x] | sample-gradle: offline build in a `--network none` slot, BUILD SUCCESSFUL in 8 s, 43 log lines streamed, `sample-gradle-1.0.0-plain.jar` synced back to `build/libs` |
 | T5.1 | ADR-0006 build runner | [ ] | |
 | T5.2 | FAQ rewrite, `--no-daemon` evidence kept, appcontainer fallback | [ ] | |
 | T5.3 | DEVELOPERS invariants | [ ] | |

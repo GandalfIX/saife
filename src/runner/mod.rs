@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, bail};
 
+pub mod builds;
 pub mod docker;
 pub mod sync;
 pub mod server;

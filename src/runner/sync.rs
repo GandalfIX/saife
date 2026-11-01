@@ -30,8 +30,18 @@ pub fn pack_dir(root: &Path, skip: &[&str]) -> Result<Vec<u8>> {
         } else {
             let mut file = std::fs::File::open(&path)
                 .with_context(|| format!("runner: open {}", path.display()))?;
+            // Mode is explicit on purpose. Windows has no executable bit, so the metadata
+            // the tar crate reads produces an entry without one - and the first real build
+            // failed with `exec: "./gradlew": permission denied` (exit 126) because of it.
+            // 0o755 for every file is what git-on-Windows effectively does (core.fileMode
+            // is false there), and inside a throwaway container it costs nothing.
+            let mut header = tar::Header::new_gnu();
+            header.set_metadata(&file.metadata()?);
+            header.set_mode(0o755);
+            header.set_size(file.metadata()?.len());
+            header.set_cksum();
             builder
-                .append_file(&name, &mut file)
+                .append_data(&mut header, &name, &mut file)
                 .with_context(|| format!("runner: pack {}", path.display()))?;
         }
     }
@@ -128,6 +138,29 @@ mod tests {
             !dest.join("build/stale.class").exists(),
             "the skip list must keep outputs out of the input tree"
         );
+    }
+
+    /// The executable bit has to survive packing: without it a `gradlew` arrives in the
+    /// container unexecutable (measured as exit 126 on the first real build).
+    #[test]
+    fn packed_files_carry_the_executable_bit() {
+        let src = scratch("mode");
+        std::fs::write(src.join("gradlew"), b"#!/bin/sh\n").unwrap();
+        let tar = pack_dir(&src, &[]).expect("pack");
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let entry = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.path()
+                    .map(|p| p.to_string_lossy().ends_with("gradlew"))
+                    .unwrap_or(false)
+            })
+            .expect("the gradlew entry");
+        let mode = entry.header().mode().expect("a mode");
+        assert_eq!(mode & 0o111, 0o111, "mode was {mode:o}");
     }
 
     #[test]
