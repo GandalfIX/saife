@@ -30,14 +30,45 @@ not skip.
      failure, not a bug.
 
 ### QA-02 · first build in a session
-Same command shape as the live leg: from `C:\Users\marku\projekte\temp`, run
-`saife run --block-net --runner --allow-cwd -- powershell -File <leg.ps1>` where the script POSTs
-`{"project":"sample-gradle","task":"build","profile":"gradle"}` to `http://build.sandbox.invalid/build`
-and then streams `&follow=1`.
-- **expect**: `{"id":"b1"}`, `BUILD SUCCESSFUL`, `[saife] artifacts -> …\build\libs`,
-  `[saife] build {"exited":0}`, exit `0`.
-- **judge for yourself**: is the log readable while it runs, or only at the end? That is the
-  difference between a usable runner and a 90-second staring contest.
+
+Open a shell **inside** the session, so nothing has to be quoted through `saife run`:
+
+```
+cd C:\Users\marku\projekte\temp
+saife run --block-net --runner --allow-cwd -- powershell -NoProfile
+```
+
+At the session's prompt, paste these five lines as they are:
+
+```powershell
+$body = '{"project":"sample-gradle","task":"build","profile":"gradle"}'
+Set-Content -NoNewline -Encoding ascii "$env:TEMP\saife-qa-body.json" $body
+$start = curl.exe -sS -m 60 -X POST "http://build.sandbox.invalid/build" -H "Content-Type: application/json" --data-binary "@$env:TEMP\saife-qa-body.json"
+$start
+$id = ($start | ConvertFrom-Json).id
+curl.exe -sS -N -m 300 "http://build.sandbox.invalid/build?id=$id&follow=1"
+```
+
+What each line is for, because all three have bitten:
+
+- the body goes through a **file**: PowerShell 5.1 rewrites quotes when handing them to a native
+  command, so `--data-binary $body` reaches curl with the quotes stripped and the runner answers
+  `key must be a string at line 1 column 2`
+- `$start` is printed before parsing, so a refusal (`network_blocked`, `runner_slot_cap_reached`,
+  `403 facade_operation_not_declared`) is visible as itself instead of as a null dereference
+- `&follow=1` streams; without it you get the id and nothing else
+
+**expect**: `{"id":"b1"}`, then `BUILD SUCCESSFUL`, `[saife] artifacts -> …\build\libs`,
+`[saife] build {"exited":0}`.
+**judge**: is the log readable *while* the build runs, or does it arrive in one lump at the end?
+
+For a scripted run instead of an interactive one, the same thing as a single command — note the
+outer double quotes and the escaped inner ones, which is why the interactive form is preferred
+for QA:
+
+```
+saife run --block-net --runner --allow-cwd -- powershell -NoProfile -Command "$b='{\"project\":\"sample-gradle\",\"task\":\"build\",\"profile\":\"gradle\"}'; Set-Content -NoNewline -Encoding ascii \"$env:TEMP\saife-qa-body.json\" $b; $r=curl.exe -sS -m 60 -X POST 'http://build.sandbox.invalid/build' -H 'Content-Type: application/json' --data-binary \"@$env:TEMP\saife-qa-body.json\"; $r; $i=($r | ConvertFrom-Json).id; curl.exe -sS -N -m 300 \"http://build.sandbox.invalid/build?id=$i&follow=1\""
+```
 
 ---
 
@@ -69,7 +100,7 @@ Run two builds in the same session. The second must not pay a cold daemon.
 ### QA-06 · a build past its deadline
 1. Copy `profiles/gradle-runner.json` into `%USERPROFILE%\.saife\profiles\` and set
    `limits.workloadTimeoutSecs` to `5`.
-2. `saife run --block-net --runner --profile gradle-runner --allow-cwd -- <leg>`
+2. Run QA-02's five lines again with the edited profile (`saife run --block-net --runner --profile gradle-runner --allow-cwd -- powershell -NoProfile`)
 - **expect**: `TimedOut`, a log line naming `limits.workloadTimeoutSecs`, **no container left**,
   and the supervisor's own exit code (not the build's).
 
@@ -144,7 +175,7 @@ Commit a CRLF source file; build; then check the same file on the host is still 
 2. `pwsh -File packaging\install-local.ps1`
    - **expect**: installs, reports `SAIFE Sandbox 0.4.0`, and the installed binary contains
      `--runner` (`saife.exe run --help | Select-String runner`).
-3. `saife --version`, then run QA-02 with the **installed** binary, not the debug build.
+3. `saife --version`, then run QA-02 again with the **installed** binary, not the debug build.
 - **judge**: would you ship this zip to someone who has never seen the project?
 
 ---
