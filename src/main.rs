@@ -848,6 +848,7 @@ fn run_inner(
                 &net_cfg_resolved,
                 &fs,
                 &limits,
+                &resolved.runner.paths,
                 audit_strict,
                 print_sid,
                 no_interactive,
@@ -1110,6 +1111,9 @@ fn run_mxc_session(
     net_cfg: &net::NetworkConfig,
     fs: &profile::FilesystemSlice,
     limits: &profile::Limits,
+    // The session profile's `runner.sync.paths`: what a build request that names no paths
+    // inherits. Empty is the whole project, i.e. what every profile without the block gets.
+    runner_paths: &[String],
     audit_strict: bool,
     print_sid: bool,
     no_interactive: bool,
@@ -1299,7 +1303,13 @@ fn run_mxc_session(
             std::time::Duration::from_secs(u64::from(limits.workload_timeout_secs)),
         ));
         let as_engine: std::sync::Arc<dyn crate::runner::server::BuildEngine> = builds.clone();
-        match crate::runner::wiring::RunnerWiring::start(&facade, cwd, as_engine, token) {
+        match crate::runner::wiring::RunnerWiring::start(
+            &facade,
+            cwd,
+            runner_paths,
+            as_engine,
+            token,
+        ) {
             Ok(wiring) => {
                 if std::env::var_os("SAIFE_DIAG").is_some() {
                     eprintln!(

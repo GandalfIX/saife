@@ -663,6 +663,31 @@ uses that image.
   first build's **88.6 s** and **904 MB** again in every session. The price is
   that sessions share it — the cache bullets above.
 
+### What the copy takes — the allow-list
+
+A build request may name `paths`, and a session profile may default them with
+`runner.sync.paths` ([profiles/README.md](../profiles/README.md)). **The list is closed:**
+
+- absent, `[]`, or neither list set → the whole project, minus `build/`, `.gradle/` and
+  `.git/` at every level;
+- present → exactly those entries, relative to the project (a directory brings its subtree),
+  with the same skip list applied inside them — and to an entry itself, so naming `build`
+  copies nothing;
+- a request's `paths` wins **entirely**; it is not merged with the profile's;
+- every entry must exist and be a real path. A missing entry, a `..`, a rooted/UNC/device
+  path, or a link/junction (on the entry or anywhere below a listed directory) is refused —
+  the request answers **400 naming the entry**, never a partial copy. A profile default is
+  checked the same way, so a bad `runner.sync.paths` refuses the build instead of quietly
+  copying less than the profile promised.
+
+Because nothing is added on the caller's behalf, naming one Gradle project in a monorepo
+means also naming what its build reads through the root: `settings.gradle.kts`, every
+`includeBuild(...)` root (typically `build-logic`), and any version catalogue
+(`gradle/libs.versions.toml`) or `gradle.properties` it uses. Omit one and Gradle fails at
+configuration time naming the missing script — the intended, visible failure. Measured cost
+of the copy itself: ~0.1 ms per file, so 20 000 files ≈ 2 s and a 10 % subset ≈ 0.2 s
+([measurements §10](research/build-runner/measurements.md)).
+
 ### What the copy does to a Windows tree
 
 The project is copied in, not mounted ([ADR-0006](adr/0006-build-runner.md)), so

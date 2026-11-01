@@ -19,6 +19,17 @@ use std::sync::{Arc, Mutex};
 /// starts from a stale one is not the build the user asked for.
 const SKIP_IN_PROJECT: &[&str] = &["build", ".gradle", ".git"];
 
+/// What the copy's header line says about the allow-list, or nothing when the whole project
+/// travels. A closed list is only reviewable if the log that shows the failure also shows
+/// the list that caused it.
+fn copy_scope(paths: &[String]) -> String {
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!(" (paths: {})", paths.join(", "))
+    }
+}
+
 /// The JDK inside the slot, as the pinned image publishes it (`eclipse-temurin`'s
 /// `JAVA_HOME`). `gradlew` consults `JAVA_HOME` before `PATH`, so naming it makes the
 /// toolchain the DIGEST's choice even for an image that stops setting the variable.
@@ -162,8 +173,16 @@ impl BuildEngine for DockerBuilds {
 
         // Sync in: the measured-cheap direction (2.8 s for 20 000 files against 53 s for a
         // bind mount read of the same tree).
-        let tar = sync::pack_dir(&req.project, SKIP_IN_PROJECT)
-            .with_context(|| format!("runner: pack {}", req.project.display()))?;
+        //
+        // A request that named its paths copies exactly those; one that named none copies the
+        // whole project, minus the skip list. The listener has already substituted the session
+        // profile's `runner.sync.paths` into an empty list, so there is no third case here.
+        let tar = if req.paths.is_empty() {
+            sync::pack_dir(&req.project, SKIP_IN_PROJECT)
+        } else {
+            sync::pack_paths(&req.project, &req.paths, SKIP_IN_PROJECT)
+        }
+        .with_context(|| format!("runner: pack {}", req.project.display()))?;
         inner
             .engine
             .put_archive(&slot.id, "/src", &tar)
@@ -188,7 +207,12 @@ impl BuildEngine for DockerBuilds {
             id.clone(),
             BuildRecord {
                 state: BuildState::Running,
-                lines: vec![format!("[saife] {} {}\n", req.task, shown)],
+                lines: vec![format!(
+                    "[saife] {} {}{}\n",
+                    req.task,
+                    shown,
+                    copy_scope(&req.paths)
+                )],
             },
         );
 
@@ -554,6 +578,25 @@ mod tests {
                 StreamEnd::Lost
             ),
             "a disconnected stream thread is a lost build, not a deadline"
+        );
+    }
+
+    /// A closed allow-list is only reviewable if the log says which one was applied: a build
+    /// that fails at configuration time because `settings.gradle.kts` was not named has to
+    /// show the list that caused it, in the same log the failure appears in.
+    #[test]
+    fn the_log_names_the_allow_list_it_copied() {
+        assert_eq!(
+            copy_scope(&[]),
+            "",
+            "the whole project needs no note: that is the default case"
+        );
+        assert_eq!(
+            copy_scope(&[
+                "apps/payments".to_string(),
+                "settings.gradle.kts".to_string()
+            ]),
+            " (paths: apps/payments, settings.gradle.kts)"
         );
     }
 

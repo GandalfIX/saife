@@ -18,6 +18,72 @@ pub fn pack_dir(root: &Path, skip: &[&str]) -> Result<Vec<u8>> {
     builder.into_inner().context("runner: finish the tar")
 }
 
+/// Pack exactly the entries `paths` names, relative to `root`; a directory entry brings its
+/// whole subtree.
+///
+/// The list is CLOSED on purpose. It is what the container sees, and nothing is added on the
+/// caller's behalf: a Gradle build whose `settings.gradle.kts` or composite (`includeBuild`)
+/// root is not named fails at configuration time - visibly - rather than the runner guessing
+/// which extra files a build "must have needed" and producing a copy nobody can predict from
+/// the list it was given.
+///
+/// The skip list applies here exactly as it does in a whole-project copy, entry names
+/// included, so an allow-list cannot smuggle a stale `build/` into the container.
+pub fn pack_paths(root: &Path, paths: &[String], skip: &[&str]) -> Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in paths {
+        // `.` names the project itself, and `./apps/x` is the entry `apps/x`.
+        let rel: PathBuf = Path::new(entry)
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
+        if rel.as_os_str().is_empty() {
+            walk(&mut builder, root, Path::new(""), skip)?;
+            continue;
+        }
+        if rel
+            .file_name()
+            .map(|name| skip.iter().any(|s| name.to_string_lossy() == *s))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let source = root.join(&rel);
+        if std::fs::metadata(&source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            builder
+                .append_dir(&rel, &source)
+                .with_context(|| format!("runner: pack {}", source.display()))?;
+            walk(&mut builder, &source, &rel, skip)?;
+        } else {
+            append_file(&mut builder, &source, &rel)?;
+        }
+    }
+    builder.into_inner().context("runner: finish the tar")
+}
+
+/// One file into the archive, with the mode every packed file gets.
+fn append_file(builder: &mut tar::Builder<Vec<u8>>, path: &Path, rel: &Path) -> Result<()> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("runner: open {}", path.display()))?;
+    // Mode is explicit on purpose. Windows has no executable bit, so the metadata
+    // the tar crate reads produces an entry without one - and the first real build
+    // failed with `exec: "./gradlew": permission denied` (exit 126) because of it.
+    // 0o755 for every file is what git-on-Windows effectively does (core.fileMode
+    // is false there), and inside a throwaway container it costs nothing.
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&file.metadata()?);
+    header.set_mode(0o755);
+    header.set_size(file.metadata()?.len());
+    header.set_cksum();
+    builder
+        .append_data(&mut header, rel, &mut file)
+        .with_context(|| format!("runner: pack {}", path.display()))?;
+    Ok(())
+}
+
 /// Depth-first, applying `skip` to **every** directory, not just the root.
 ///
 /// Measured on a real project with a composite build: `sample-gradle/build-logic/build/classes`
@@ -25,13 +91,10 @@ pub fn pack_dir(root: &Path, skip: &[&str]) -> Result<Vec<u8>> {
 /// / 304 KB. Two wrongs at once - the container starts from the host's stale compiled output, so
 /// "a build sees a snapshot of the sources" was false for every subproject, and every copy was
 /// fourteen times larger than it needed to be.
-fn walk(
-    builder: &mut tar::Builder<Vec<u8>>,
-    root: &Path,
-    rel: &Path,
-    skip: &[&str],
-) -> Result<()> {
-    for entry in std::fs::read_dir(root).with_context(|| format!("runner: read {}", root.display()))? {
+fn walk(builder: &mut tar::Builder<Vec<u8>>, root: &Path, rel: &Path, skip: &[&str]) -> Result<()> {
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("runner: read {}", root.display()))?
+    {
         let entry = entry?;
         let name = entry.file_name();
         if skip.iter().any(|s| name.to_string_lossy() == *s) {
@@ -45,21 +108,7 @@ fn walk(
                 .with_context(|| format!("runner: pack {}", path.display()))?;
             walk(builder, &path, &rel_path, skip)?;
         } else {
-            let mut file = std::fs::File::open(&path)
-                .with_context(|| format!("runner: open {}", path.display()))?;
-            // Mode is explicit on purpose. Windows has no executable bit, so the metadata
-            // the tar crate reads produces an entry without one - and the first real build
-            // failed with `exec: "./gradlew": permission denied` (exit 126) because of it.
-            // 0o755 for every file is what git-on-Windows effectively does (core.fileMode
-            // is false there), and inside a throwaway container it costs nothing.
-            let mut header = tar::Header::new_gnu();
-            header.set_metadata(&file.metadata()?);
-            header.set_mode(0o755);
-            header.set_size(file.metadata()?.len());
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &rel_path, &mut file)
-                .with_context(|| format!("runner: pack {}", path.display()))?;
+            append_file(builder, &path, &rel_path)?;
         }
     }
     Ok(())
@@ -198,6 +247,166 @@ mod tests {
         assert!(dest.join("out/keep.jar").exists());
         assert!(!dest.join("out/log.txt").exists());
     }
+    fn names(tar: &[u8]) -> Vec<String> {
+        tar::Archive::new(std::io::Cursor::new(tar))
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    /// The allow-list IS the copy: the root build script and one app travel, the other app
+    /// and the root script do not. This is the "several Gradle projects in one repo" case
+    /// the feature exists for, and the closed-set caveat: `settings.gradle.kts` has to be
+    /// named explicitly, because it is what `includeBuild`/`include` resolves through.
+    #[test]
+    fn a_request_that_names_its_paths_copies_only_those() {
+        let root = scratch("paths");
+        std::fs::create_dir_all(root.join("apps/payments/src")).unwrap();
+        std::fs::write(root.join("apps/payments/src/Pay.java"), b"class Pay {}").unwrap();
+        std::fs::create_dir_all(root.join("apps/checkout/src")).unwrap();
+        std::fs::write(root.join("apps/checkout/src/Cart.java"), b"class Cart {}").unwrap();
+        std::fs::write(root.join("settings.gradle.kts"), b"rootProject.name").unwrap();
+        std::fs::write(root.join("build.gradle.kts"), b"plugins {}").unwrap();
+
+        let tar = pack_paths(
+            &root,
+            &[
+                "apps/payments".to_string(),
+                "settings.gradle.kts".to_string(),
+            ],
+            &["build", ".gradle", ".git"],
+        )
+        .expect("pack");
+        let names = names(&tar);
+        assert!(
+            names.iter().any(|n| n == "apps/payments/src/Pay.java"),
+            "the named directory's subtree must travel: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "settings.gradle.kts"),
+            "the named file must travel: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("checkout")),
+            "an app nobody named must not travel: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "build.gradle.kts"),
+            "an unnamed root file must not travel: {names:?}"
+        );
+    }
+
+    /// The skip list is a boundary, not a preference an allow-list can override: naming a
+    /// directory copies its sources, not its previous build.
+    #[test]
+    fn the_skip_list_still_applies_inside_a_listed_directory() {
+        let root = scratch("paths-skip");
+        std::fs::create_dir_all(root.join("apps/payments/src")).unwrap();
+        std::fs::write(root.join("apps/payments/src/Pay.java"), b"class Pay {}").unwrap();
+        std::fs::create_dir_all(root.join("apps/payments/build/classes")).unwrap();
+        std::fs::write(root.join("apps/payments/build/classes/Pay.class"), b"junk").unwrap();
+        std::fs::create_dir_all(root.join("apps/payments/.gradle/9.8.2")).unwrap();
+        std::fs::write(root.join("apps/payments/.gradle/9.8.2/state.bin"), b"junk").unwrap();
+
+        let tar = pack_paths(
+            &root,
+            &["apps/payments".to_string()],
+            &["build", ".gradle", ".git"],
+        )
+        .expect("pack");
+        let entries = names(&tar);
+        assert!(
+            entries.iter().any(|n| n == "apps/payments/src/Pay.java"),
+            "{entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|n| n.contains("/build/") || n.contains("/.gradle/")),
+            "outputs and caches must not travel: {entries:?}"
+        );
+
+        let direct = pack_paths(
+            &root,
+            &["apps/payments/build".to_string()],
+            &["build", ".gradle", ".git"],
+        )
+        .expect("pack");
+        assert!(
+            names(&direct).is_empty(),
+            "an entry that names a skipped directory copies nothing: {:?}",
+            names(&direct)
+        );
+    }
+
+    /// `"."` is the whole project, spelled as a profile default can spell it. It must not
+    /// become a `./`-prefixed tar the container unpacks into a subdirectory of `/src`.
+    #[test]
+    fn a_dot_entry_is_the_whole_project() {
+        let root = scratch("paths-dot");
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/out.txt"), b"out").unwrap();
+
+        let tar = pack_paths(&root, &[".".to_string()], &["build"]).expect("pack");
+        assert_eq!(
+            names(&tar),
+            vec!["a.txt".to_string()],
+            "`.` is the project root, with the skip list still applied"
+        );
+    }
+
+    /// MEASUREMENT (`cargo test -- --ignored --nocapture twenty_thousand`): the number that
+    /// decides whether a monorepo copy needs a different strategy. Writes ~20 000 small files,
+    /// times a whole-tree pack against a 10 % allow-list, and removes the tree on the way out -
+    /// on a panic too, because a leftover 20 k-file tree is the one thing this must not do.
+    #[test]
+    #[ignore = "measurement: writes ~20 000 files into the temp dir; run with -- --ignored --nocapture"]
+    fn a_twenty_thousand_file_tree_packs_in_seconds_not_minutes() {
+        struct Tree(PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = scratch("measure-tree");
+        let _tree = Tree(root.clone());
+        const FILES: usize = 20_000;
+        const DIRS: usize = 200;
+        for d in 0..DIRS {
+            let dir = root.join(format!("libs/mod{d:03}/src"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..FILES / DIRS {
+                std::fs::write(dir.join(format!("F{f:03}.java")), vec![b'x'; 1024]).unwrap();
+            }
+        }
+        let subset: Vec<String> = (0..DIRS / 10).map(|d| format!("libs/mod{d:03}")).collect();
+
+        let started = std::time::Instant::now();
+        let all = pack_dir(&root, &["build", ".gradle", ".git"]).expect("pack everything");
+        let whole = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let some =
+            pack_paths(&root, &subset, &["build", ".gradle", ".git"]).expect("pack the subset");
+        let part = started.elapsed();
+
+        eprintln!(
+            "measure: {FILES} files, whole tree {whole:?} ({} bytes) | 10% allow-list {part:?} ({} bytes)",
+            all.len(),
+            some.len()
+        );
+        assert!(
+            some.len() * 5 < all.len(),
+            "the 10% subset must be a fraction of the archive: {} vs {}",
+            some.len(),
+            all.len()
+        );
+    }
+
     /// A composite build has its own `build/` and `.gradle/` one level down. Skipping only the
     /// root copied 4.1 MB where 304 KB of sources exist, and made "the build sees a snapshot of
     /// the sources" false for every subproject.
@@ -221,11 +430,15 @@ mod tests {
             .map(|e| e.path().unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
 
-        assert!(names.iter().any(|n| n.ends_with("src/main/java/A.java")), "{names:?}");
         assert!(
-            !names.iter().any(|n| n.contains("/build/") || n.contains("/.gradle/") || n.starts_with("build/")),
+            names.iter().any(|n| n.ends_with("src/main/java/A.java")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("/build/")
+                || n.contains("/.gradle/")
+                || n.starts_with("build/")),
             "nested outputs must not travel: {names:?}"
         );
     }
-
 }

@@ -21,5 +21,10 @@
   },
   "limits": {
     "workloadTimeoutSecs": 7200
+  },
+  "runner": {
+    "sync": {
+      "paths": ["."]
+    }
   }
 }

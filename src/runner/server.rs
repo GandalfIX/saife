@@ -8,6 +8,7 @@
 
 //! ```
 //! POST /build                      {"project":"app","task":"build","profile":"gradle"}
+//!                                  optional: "paths":["apps/payments","settings.gradle.kts"]
 //! GET  /build?id=<build>[&follow=1]   status JSON, or the log stream
 //! ```
 
@@ -79,6 +80,10 @@ pub struct RunnerState {
     pub token: String,
     /// The session workspace every request's `project` is resolved against.
     pub workspace: std::path::PathBuf,
+    /// The session profile's `runner.sync.paths`: the copy allow-list a request inherits when
+    /// it names none. Empty means the whole project, which is what every caller that never
+    /// heard of the field gets.
+    pub default_paths: Vec<String>,
     pub engine: Arc<dyn BuildEngine>,
 }
 
@@ -195,12 +200,19 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
     match (method, path) {
         ("POST", "/build") => {
             let body = read_body(&mut sock, &head).await;
-            let req = match BuildRequest::parse(&body, &state.workspace) {
+            let mut req = match BuildRequest::parse(&body, &state.workspace) {
                 Ok(req) => req,
                 Err(e) => {
                     return respond(&mut sock, "400 Bad Request", "", &format!("{e:#}\n")).await;
                 }
             };
+            // Precedence, decided once, here: the request's list wins entirely; an empty one
+            // is "not named", so the profile's `runner.sync.paths` applies; with neither, the
+            // whole project travels. Substituting before validation means the profile's
+            // entries get the same disk checks as a caller's, not a quieter version.
+            if req.paths.is_empty() {
+                req.paths = state.default_paths.clone();
+            }
             if let Err(e) = req.validate_on_disk(&state.workspace) {
                 return respond(&mut sock, "400 Bad Request", "", &format!("{e:#}\n")).await;
             }
@@ -367,9 +379,21 @@ mod tests {
     struct FakeEngine {
         builds: StdMutex<HashMap<String, (Vec<String>, BuildState)>>,
         next: StdMutex<usize>,
+        /// The last request the listener handed to the engine. The copy list is decided
+        /// above the engine, so this is how precedence is asserted without a container.
+        last: StdMutex<Option<BuildRequest>>,
     }
 
     impl FakeEngine {
+        fn last_paths(&self) -> Vec<String> {
+            self.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.paths.clone())
+                .unwrap_or_default()
+        }
+
         fn push_line(&self, id: &str, line: &str) {
             self.builds
                 .lock()
@@ -398,7 +422,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(id.clone(), (vec![], BuildState::Running));
-            let _ = req;
+            *self.last.lock().unwrap() = Some(req);
             Ok(id)
         }
         fn state(&self, id: &str) -> Result<BuildState> {
@@ -426,11 +450,16 @@ mod tests {
     struct Harness {
         server: RunnerServer,
         engine: Arc<FakeEngine>,
-        _dir: std::path::PathBuf,
+        dir: std::path::PathBuf,
         _serialised: std::sync::MutexGuard<'static, ()>,
     }
 
     fn harness() -> Harness {
+        harness_with(&[])
+    }
+
+    /// The same listener, with the session profile's `runner.sync.paths` as its default.
+    fn harness_with(default_paths: &[&str]) -> Harness {
         let guard = SERVER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("saife-runner-{}", std::process::id()));
         // The workspace needs a real project directory: the listener refuses a request whose
@@ -440,6 +469,7 @@ mod tests {
         let state = Arc::new(RunnerState {
             token: TOKEN.to_string(),
             workspace: dir.clone(),
+            default_paths: default_paths.iter().map(|p| p.to_string()).collect(),
             engine: engine.clone(),
         });
         let server = spawn(state).expect("runner listener");
@@ -455,7 +485,7 @@ mod tests {
         Harness {
             server,
             engine,
-            _dir: dir,
+            dir,
             _serialised: guard,
         }
     }
@@ -595,6 +625,69 @@ mod tests {
         assert!(
             resp.contains("image"),
             "the refusal names the field: {resp}"
+        );
+    }
+
+    /// Precedence, as the workload sees it: a request's list wins ENTIRELY; one that names
+    /// none falls back to the session profile's `runner.sync.paths`; with neither, the
+    /// engine gets the empty list that means "the whole project".
+    #[test]
+    fn the_profile_default_applies_only_when_the_request_names_no_paths() {
+        let h = harness_with(&["apps/payments", "settings.gradle.kts"]);
+        // The profile's default has to exist on disk, exactly like a request's entry: the
+        // listener validates whichever list ended up applying.
+        std::fs::create_dir_all(h.dir.join("app").join("apps").join("payments")).unwrap();
+        std::fs::create_dir_all(h.dir.join("app").join("apps").join("checkout")).unwrap();
+        std::fs::write(
+            h.dir.join("app").join("settings.gradle.kts"),
+            b"rootProject.name",
+        )
+        .unwrap();
+
+        let resp = post_build(h.server.port, Some(TOKEN), GOOD);
+        assert!(resp.starts_with("HTTP/1.0 202"), "got: {resp}");
+        assert_eq!(
+            h.engine.last_paths(),
+            vec!["apps/payments", "settings.gradle.kts"],
+            "a request with no list inherits the profile's"
+        );
+
+        let body =
+            r#"{"project":"app","task":"build","profile":"gradle","paths":["apps/checkout"]}"#;
+        let resp = post_build(h.server.port, Some(TOKEN), body);
+        assert!(resp.starts_with("HTTP/1.0 202"), "got: {resp}");
+        assert_eq!(
+            h.engine.last_paths(),
+            vec!["apps/checkout"],
+            "the request's list wins entirely - it is not merged with the profile's"
+        );
+    }
+
+    /// A profile default is validated like a request entry: a session whose `paths` names
+    /// something that is not there refuses the build by name instead of quietly copying a
+    /// smaller tree than the profile promised.
+    #[test]
+    fn a_profile_default_that_names_nothing_is_refused_by_name() {
+        let h = harness_with(&["apps/nope"]);
+        let resp = post_build(h.server.port, Some(TOKEN), GOOD);
+        assert!(resp.starts_with("HTTP/1.0 400"), "got: {resp}");
+        assert!(
+            resp.contains("apps/nope"),
+            "the refusal names the entry: {resp}"
+        );
+    }
+
+    /// The listener is where a bad entry becomes a 400: the lexical half of the policy has
+    /// to be reachable from the wire, not only from a unit test on the parser.
+    #[test]
+    fn a_path_entry_outside_the_project_is_a_400_naming_it() {
+        let h = harness();
+        let body = r#"{"project":"app","task":"build","profile":"gradle","paths":["../outside"]}"#;
+        let resp = post_build(h.server.port, Some(TOKEN), body);
+        assert!(resp.starts_with("HTTP/1.0 400"), "got: {resp}");
+        assert!(
+            resp.contains("../outside"),
+            "the refusal names the entry: {resp}"
         );
     }
 

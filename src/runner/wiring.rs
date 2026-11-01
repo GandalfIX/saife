@@ -56,6 +56,7 @@ impl RunnerWiring {
     pub fn start(
         facade: &FacadeRegistry,
         workspace: &Path,
+        default_paths: &[String],
         engine: Arc<dyn BuildEngine>,
         proxy_token: Option<&str>,
     ) -> Result<Self> {
@@ -64,6 +65,9 @@ impl RunnerWiring {
         let state = Arc::new(RunnerState {
             token: token.clone(),
             workspace: workspace.to_path_buf(),
+            // The session profile's `runner.sync.paths`, threaded here the same way the
+            // workspace is: the listener is the one place a request meets session policy.
+            default_paths: default_paths.to_vec(),
             engine: Arc::clone(&engine),
         });
         let server = server::spawn(state)?;
@@ -191,6 +195,7 @@ mod tests {
         let wiring = RunnerWiring::start(
             &facade,
             &ws,
+            &[],
             engine.clone() as Arc<dyn BuildEngine>,
             proxy_token,
         )

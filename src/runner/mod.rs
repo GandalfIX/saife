@@ -91,6 +91,10 @@ pub struct BuildRequest {
     pub task: String,
     /// A profile from [`PROFILES`].
     pub profile: String,
+    /// The copy allow-list, relative to `project`. Empty means the whole project: the
+    /// listener substitutes the session profile's `runner.sync.paths` before this type is
+    /// validated, so by the time a build starts, `paths` is the list that governs the copy.
+    pub paths: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -99,6 +103,115 @@ struct RawBuildRequest {
     project: String,
     task: String,
     profile: String,
+    /// Absent and empty are the same thing here, deliberately: `paths: []` cannot mean
+    /// "copy nothing", because a build on an empty tree is not a build anyone asks for. An
+    /// empty list falls back to the profile's list, or to the whole project.
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+/// The runner's one lexical path policy: a value that names something inside `container`,
+/// spelled relatively, with no way out of it.
+///
+/// Shared by `project` and every allow-list entry so the two cannot drift into different
+/// rules, and re-run by [`BuildRequest::validate_on_disk`] because a profile default never
+/// passes through [`BuildRequest::parse`].
+fn refuse_unsafe_relative(label: &str, value: &str, container: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("runner: {label} is empty");
+    }
+    let path = Path::new(value);
+    // A UNC path, a device path or any rooted path names something the container cannot be
+    // said to be inside, so it is refused before it is joined.
+    if value.starts_with("\\\\")
+        || value.starts_with("//")
+        || value.starts_with('/')
+        || path.is_absolute()
+    {
+        bail!(
+            "runner: {label} `{value}` must be a path inside {container}, not a rooted or network path"
+        );
+    }
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                // `C:foo` is *drive-relative*: `is_absolute()` says no, it does not start with
+                // a separator, and it resolves against the drive's own working directory - the
+                // one shape that slipped through both checks above. Any prefix or root is a
+                // refusal, whatever spelling produced it.
+                | std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+        )
+    }) {
+        bail!(
+            "runner: {label} `{value}` must be a plain relative path inside {container} \
+             (no `..`, no drive, no root)"
+        );
+    }
+    Ok(())
+}
+
+/// Whether this directory entry is a link, a junction or another reparse point.
+///
+/// Windows gives a junction a real path and a real directory attribute, so only the
+/// attribute tells it apart from the directory it names.
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// `target` and every ancestor below `stop` must be a real path, not a link.
+///
+/// A reparse point inside the tree is refused even when it happens to point inside: the
+/// mount step's promise is "what you see is what gets copied".
+fn refuse_reparse_in_chain(target: &Path, stop: &Path, what: &str) -> Result<()> {
+    for ancestor in target.ancestors() {
+        if ancestor == stop {
+            break;
+        }
+        let meta = match std::fs::symlink_metadata(ancestor) {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+        if is_reparse_point(&meta) {
+            bail!(
+                "runner: {} is a link or junction; {what} must be a real path",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Nothing inside a listed directory may be a link either: an entry names a tree, and a
+/// junction inside it would copy a tree the caller never named.
+fn refuse_reparse_below(dir: &Path, what: &str) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("runner: read {}", dir.display()))?
+    {
+        let path = entry?.path();
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("runner: inspect {}", path.display()))?;
+        if is_reparse_point(&meta) {
+            bail!(
+                "runner: {} is a link or junction; {what} must be a real path",
+                path.display()
+            );
+        }
+        if meta.is_dir() {
+            refuse_reparse_below(&path, what)?;
+        }
+    }
+    Ok(())
 }
 
 impl BuildRequest {
@@ -127,29 +240,11 @@ impl BuildRequest {
         }
 
         let project = Path::new(&raw.project);
-        if raw.project.trim().is_empty() {
-            bail!("runner: project is empty");
-        }
-        // A UNC path, a device path or any rooted path names something the workspace
-        // boundary cannot contain, so it is refused before it is joined.
-        if raw.project.starts_with("\\\\")
-            || raw.project.starts_with("//")
-            || raw.project.starts_with('/')
-            || project.is_absolute()
-        {
-            bail!(
-                "runner: project `{}` must be a path inside the session workspace, not a rooted or network path",
-                raw.project
-            );
-        }
-        if project
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            bail!(
-                "runner: project `{}` must not climb out of the session workspace (`..`)",
-                raw.project
-            );
+        refuse_unsafe_relative("project", &raw.project, "the session workspace")?;
+        // Each entry, not just the list: a caller with ten entries has to be able to find
+        // the one that was wrong.
+        for entry in &raw.paths {
+            refuse_unsafe_relative("paths entry", entry, "the project")?;
         }
 
         let resolved = workspace.join(project);
@@ -157,6 +252,7 @@ impl BuildRequest {
             project: resolved,
             task: raw.task,
             profile: raw.profile,
+            paths: raw.paths,
         })
     }
     /// The filesystem half of the validation: the lexical checks above can be satisfied by a
@@ -184,34 +280,38 @@ impl BuildRequest {
                 canonical.display()
             );
         }
-        // A reparse point inside the tree is refused even when it happens to point inside:
-        // the mount step's promise is "what you see is what gets copied".
-        for ancestor in canonical.ancestors() {
-            if ancestor == canonical_ws.as_path() {
-                break;
-            }
-            let meta = match std::fs::symlink_metadata(ancestor) {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    bail!(
-                        "runner: {} is a link or junction; the project must be a real directory",
-                        ancestor.display()
-                    );
-                }
-            }
-            #[cfg(not(windows))]
-            if meta.file_type().is_symlink() {
-                bail!(
-                    "runner: {} is a symlink; the project must be a real directory",
-                    ancestor.display()
-                );
-            }
+        refuse_reparse_in_chain(&canonical, &canonical_ws, "the project")?;
+        for entry in &self.paths {
+            self.validate_path_entry(&canonical, entry)?;
+        }
+        Ok(())
+    }
+
+    /// One allow-list entry, checked the way `project` is - plus the two things an entry
+    /// adds: it must exist, and it must not be (or contain) a link.
+    ///
+    /// The lexical half is repeated here because the session profile's `runner.sync.paths`
+    /// never passes through [`BuildRequest::parse`]: the listener substitutes it afterwards.
+    fn validate_path_entry(&self, canonical_project: &Path, entry: &str) -> Result<()> {
+        refuse_unsafe_relative("paths entry", entry, "the project")?;
+        let joined = self.project.join(entry);
+        let canonical = std::fs::canonicalize(&joined).with_context(|| {
+            format!(
+                "runner: paths entry `{entry}` does not exist under {}",
+                self.project.display()
+            )
+        })?;
+        if !canonical.starts_with(canonical_project) {
+            bail!(
+                "runner: paths entry `{entry}` resolves to {}, which is outside the project",
+                canonical.display()
+            );
+        }
+        refuse_reparse_in_chain(&joined, &self.project, "the listed path")?;
+        if canonical.is_dir() {
+            // Metadata only, so this is cheap next to the pack: the pack reads every file,
+            // and this only asks the directory whether any entry is a link.
+            refuse_reparse_below(&canonical, "the listed tree")?;
         }
         Ok(())
     }
@@ -386,6 +486,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// Absent and empty are the same thing: an allow-list is either a list or it is not
+    /// there. `paths: []` meaning "copy nothing" would turn a caller's empty default into a
+    /// build on an empty tree, which is never what was meant.
+    #[test]
+    fn a_request_without_paths_is_the_whole_project() {
+        for body in [
+            r#"{"project":"app","task":"build","profile":"gradle"}"#,
+            r#"{"project":"app","task":"build","profile":"gradle","paths":[]}"#,
+        ] {
+            let r = BuildRequest::parse(body.as_bytes(), &ws()).expect("a well-formed request");
+            assert!(r.paths.is_empty(), "`{body}` must copy the whole project");
+        }
+    }
+
+    #[test]
+    fn a_request_with_paths_carries_them_verbatim() {
+        let r = BuildRequest::parse(
+            br#"{"project":"app","task":"build","profile":"gradle","paths":["apps/payments","settings.gradle.kts"]}"#,
+            &ws(),
+        )
+        .expect("a well-formed request");
+        assert_eq!(
+            r.paths,
+            vec!["apps/payments", "settings.gradle.kts"],
+            "the caller's spelling is what the log and the copy both use"
+        );
+    }
+
+    /// The same lexical policy as `project`, applied to each entry - and the refusal names
+    /// the ENTRY, because a caller with ten entries has to find the one that was wrong.
+    #[test]
+    fn a_path_entry_that_leaves_the_project_is_refused_by_name() {
+        for entry in [
+            "../other",
+            "C:/Windows",
+            "//server/share",
+            r"\\?\C:\Windows",
+            "/etc",
+            "",
+        ] {
+            let body = format!(
+                r#"{{"project":"app","task":"build","profile":"gradle","paths":[{}]}}"#,
+                serde_json::to_string(entry).unwrap()
+            );
+            let err = BuildRequest::parse(body.as_bytes(), &ws())
+                .expect_err(&format!("paths entry {entry:?} must be refused"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("paths entry"),
+                "the refusal says which field: {msg}"
+            );
+            if !entry.is_empty() {
+                assert!(msg.contains(entry), "the refusal names the entry: {msg}");
+            }
+        }
+    }
+
+    /// A named entry that is not there is a 400, never a partial copy: a build that silently
+    /// misses one of its modules fails later, at configuration time, naming a symbol instead
+    /// of the path the caller typed.
+    #[test]
+    fn a_missing_path_entry_is_refused_by_name() {
+        let ws =
+            std::env::temp_dir().join(format!("saife-runner-paths-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("app")).unwrap();
+        std::fs::write(ws.join("app/settings.gradle.kts"), b"rootProject.name").unwrap();
+        let req = BuildRequest::parse(
+            br#"{"project":"app","task":"build","profile":"gradle","paths":["settings.gradle.kts","apps/nope"]}"#,
+            &ws,
+        )
+        .expect("lexically fine");
+        let err = req
+            .validate_on_disk(&ws)
+            .expect_err("a missing entry must be refused, not skipped");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("apps/nope"),
+            "the refusal names the entry: {msg}"
+        );
+        assert!(msg.contains("does not exist"), "{msg}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Removes a scratch tree on the way out, including when an assertion fails: a test that
+    /// creates junctions must not leave them behind for the next run to trip over.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A junction is a real directory with a real path, so only the attribute check sees it;
+    /// inside a listed directory it would put files into the container that the list never
+    /// named - which is the whole promise of naming paths.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_entry_that_contains_a_junction_is_refused() {
+        let ws = std::env::temp_dir().join(format!(
+            "saife-runner-paths-junction-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ws_guard = Scratch(ws.clone());
+        std::fs::create_dir_all(ws.join("app/tree/src")).unwrap();
+        std::fs::write(ws.join("app/tree/src/A.java"), b"class A {}").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("saife-runner-paths-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        let _outside_guard = Scratch(outside.clone());
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+
+        let link = ws.join("app").join("tree").join("linked");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .expect("mklink runs");
+        assert!(
+            status.success(),
+            "the junction must be created for this test"
+        );
+
+        let req = BuildRequest::parse(
+            br#"{"project":"app","task":"build","profile":"gradle","paths":["tree"]}"#,
+            &ws,
+        )
+        .expect("lexically fine");
+        let err = req
+            .validate_on_disk(&ws)
+            .expect_err("a junction inside a listed directory must be refused");
+        assert!(format!("{err:#}").contains("link or junction"), "{err:#}");
+    }
+
     /// A writer that fails the way a closed pipe does, after the first chunk.
     struct Closing {
         writes: usize,
@@ -458,4 +695,27 @@ mod tests {
         assert_eq!(out.bytes, b"one\ntwo\n");
         assert_eq!(out.flushes, 2, "one flush per chunk, not one at the end");
     }
+    /// `C:foo` is drive-relative: not absolute, no leading separator, and it resolves against
+    /// the drive's working directory - so it passed both earlier checks. Refused now.
+    #[test]
+    fn a_drive_relative_path_is_refused() {
+        let ws = std::env::temp_dir().join(format!("saife-runner-drive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("app")).unwrap();
+        // Refused at parse (the lexical policy is shared by `project` and every `paths`
+        // entry), or at the disk check - either is a refusal, and the message must say why.
+        let refusal = match BuildRequest::parse(
+            br#"{"project":"app","task":"build","profile":"gradle","paths":["C:secret"]}"#,
+            &ws,
+        ) {
+            Err(e) => format!("{e:#}"),
+            Ok(req) => match req.validate_on_disk(&ws) {
+                Err(e) => format!("{e:#}"),
+                Ok(()) => panic!("a drive-relative entry must not be accepted"),
+            },
+        };
+        assert!(refusal.contains("no drive"), "got: {refusal}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
 }

@@ -247,3 +247,30 @@ docker run --rm -v probevol:/dst:ro alpine:3.20 `
 
 Cleanup after each block (AGENTS.md): `docker rm -f` probes, `docker volume rm probevol`,
 `docker ps -a` and `docker volume ls` free of `probe*`, and the scratch tree removed.
+
+## 10. Copying a monorepo: whole tree vs a 10 % allow-list (2026-11-01)
+
+A monorepo holds several Gradle projects, so the runner has two questions to answer: is
+copying *all* of it affordable, and is naming a subset cheaper? Measured with the two
+functions a build actually calls (`sync::pack_dir` and `sync::pack_paths`), on a synthetic
+tree of **20 000 files of 1 KB in 200 module directories**, 64-bit Windows, **debug** build,
+warm file cache:
+
+| copy | files | archive | pack time | ms per file |
+|---|---|---|---|---|
+| whole project | 20 000 | 30.9 MB | **1.98 s** | 0.099 |
+| allow-list, 10 % (`libs/mod000` … `libs/mod019`) | 2 000 | 3.09 MB | **0.196 s** | 0.098 |
+
+Reproduce: `cargo test --bin saife twenty_thousand -- --ignored --nocapture`. The test writes
+the tree, times both packs, and removes the tree on the way out (including on a panic).
+
+**What it means.** Packing is I/O-bound and linear in the file count — ~**0.1 ms per file**,
+the same order as the 2.8 s tar round trip of 20 000 files through the engine in §3. So:
+
+- a 20 000-file monorepo costs ~2 s of copy-in per build. Against a warm incremental build
+  (1.5–1.7 s, §5) that is a doubling; against a cold 88.6 s build it is noise;
+- an allow-list shrinks the copy in proportion to what it names (10 % of the files, 10 % of
+  the time), not by a constant: there is no fixed overhead to amortise. A subset is therefore
+  worth naming for the copy time as well as for what the container can see;
+- no different strategy is needed at this size. A delta sync (mtime/size) is the lever past
+  ~100 000 files and is not part of this feature.
