@@ -207,6 +207,20 @@ impl Engine {
         body: &[u8],
         content_type: &str,
     ) -> Result<Response> {
+        self.request_typed_within(method, path, body, content_type, ENGINE_DEADLINE)
+    }
+
+    /// [`request_typed`] with an explicit deadline. Callers that know how long their request
+    /// *should* take use this: a copy of a 300 KB tree that has not answered in seconds is not
+    /// slow, it is stuck (`PUT /archive` was measured never answering at all).
+    pub fn request_typed_within(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        content_type: &str,
+        deadline: std::time::Duration,
+    ) -> Result<Response> {
         // The named pipe supports no read timeout, so the bound is a thread and a channel:
         // measured, a stalled `PUT /archive` hung the CLI indefinitely with the container left
         // up and `/src` empty (T6.2). An engine that does not answer in two minutes is an error
@@ -220,11 +234,12 @@ impl Engine {
                 let _ = tx.send(one_request(&endpoint, &m, &p, &b, &ct));
             })
             .context("runner: spawn the engine request")?;
-        match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        match rx.recv_timeout(deadline) {
             Ok(r) => r,
             Err(_) => bail!(
-                "runner: the engine did not answer {method} {path} within 120s - it is up, but this \
-                 request produced no response; a container left behind by it must be removed by hand"
+                "runner: the engine did not answer {method} {path} within {}s - it is up, but this \
+                 request produced no response",
+                deadline.as_secs()
             ),
         }
     }
@@ -352,6 +367,9 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>> {
 /// would pay the download again every session. The cost is that sessions share state -
 /// acceptable while saife is single-user on one machine, and written down as a limit
 /// rather than discovered later (see `docs/USER-GUIDE.md`, "Building in the sandbox").
+/// How long any engine request may take before it is treated as stuck.
+pub const ENGINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub const CACHE_VOLUME: &str = "saife-runner-cache";
 
 pub const RUNNER_IMAGE: &str =
@@ -842,23 +860,35 @@ impl Engine {
     /// `PUT /containers/{id}/archive` unpacks the tar into the directory named by `path`
     /// (which must exist), so the runner creates `/src` when the slot is made.
     pub fn put_archive(&self, container: &str, path: &str, tar: &[u8]) -> Result<()> {
-        let r = self.request_typed(
-            "PUT",
-            &format!(
-                "/{API}/containers/{container}/archive?path={}",
-                urlencode(path)
-            ),
-            tar,
-            "application/x-tar",
-        )?;
-        if r.status != 200 {
-            bail!(
-                "runner: put archive ({}) {}",
-                r.status,
-                String::from_utf8_lossy(&r.body)
-            );
+        // Measured: this is the one call that sometimes never answers - the engine is up, the
+        // container is running, and the PUT returns nothing at all until a deadline fires. A
+        // copy this size takes milliseconds when it works, so waiting is pointless: retry on a
+        // short deadline. Overwriting a partially extracted tree is harmless (same bytes), and
+        // the alternative is a session that dies before its first build.
+        const ATTEMPTS: u32 = 3;
+        let mut last = String::new();
+        for attempt in 1..=ATTEMPTS {
+            match self.request_typed_within(
+                "PUT",
+                &format!(
+                    "/{API}/containers/{container}/archive?path={}",
+                    urlencode(path)
+                ),
+                tar,
+                "application/x-tar",
+                std::time::Duration::from_secs(20),
+            ) {
+                Ok(r) if r.status == 200 => return Ok(()),
+                Ok(r) => {
+                    last = format!("status {}: {}", r.status, String::from_utf8_lossy(&r.body));
+                }
+                Err(e) => last = format!("{e:#}"),
+            }
+            if attempt < ATTEMPTS {
+                eprintln!("[saife] runner: the project copy did not take ({last}); retrying");
+            }
         }
-        Ok(())
+        bail!("runner: put archive to {path} failed {ATTEMPTS} times - last: {last}")
     }
 
     /// Read `path` back as a tar. Missing path is an empty result, not an error: a build
