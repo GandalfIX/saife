@@ -28,7 +28,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T2.4 | Single-session ownership, kill on end, start-up sweep | [ ] | |
 | T2.5 | Caps + slot facts (`slot_id`, digest) | [ ] | |
 | T2.7 | Cache volume `saife-runner-cache` at `/cache`; refuse a slot whose mount failed | [ ] | Decided 2026-10-30: one global volume, prewarmed explicitly, no eviction, shared trust stated |
-| T2.8 | `saife runner prewarm` (the only networked runner container) | [ ] | |
+| T2.8 | `saife runner prewarm` (the only networked runner container) | [ ] | warm cache: 10.2 s, prints `cache is now 880 MB`, leaves no container. **Cold fill is slow** on a slow link (measured >10 min for Gradle 9.8.2 + deps); a progress line would make that distinguishable from a hang — it was misread as one, and an interrupted fill leaves a cache that fails offline with the missing artifact named |
 | T2.9 | `saife runner status`: cache size, slot state, pinned digest | [ ] | |
 | T2.6 | Engine abstraction: endpoint + probe + quirks | [x] | `src/runner/docker.rs`: `Endpoint` (npipe/unix parsed, `tcp://`/`ssh://` refused as remote), `/_ping` + `/version` probe, chunked/Content-Length/close-delimited parsing. `RunnerEngine` trait lands with the `BuildEngine` impl |
 | T2.7 | Global cache volume mounted at `/cache` | [x] | `CACHE_VOLUME = saife-runner-cache`, created idempotently, `UsageData.Size` read from `/system/df`; slot body asserts the mount (unit test) |
