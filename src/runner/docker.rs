@@ -227,7 +227,12 @@ impl Engine {
         // the user can read, not a command that never returns.
         let (tx, rx) = std::sync::mpsc::channel();
         let endpoint = self.endpoint.clone();
-        let (m, p, b, ct) = (method.to_string(), path.to_string(), body.to_vec(), content_type.to_string());
+        let (m, p, b, ct) = (
+            method.to_string(),
+            path.to_string(),
+            body.to_vec(),
+            content_type.to_string(),
+        );
         std::thread::Builder::new()
             .name("saife-engine-request".into())
             .spawn(move || {
@@ -253,27 +258,27 @@ fn one_request(
     body: &[u8],
     content_type: &str,
 ) -> Result<Response> {
-        let mut file = endpoint.open()?;
-        // One request per connection: `Connection: close` makes the response
-        // end-delimited, which is what the engine supports on a pipe.
-        let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
-        );
-        if !body.is_empty() {
-            head.push_str(&format!("Content-Type: {content_type}\r\n"));
-            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-        head.push_str("\r\n");
-        file.write_all(head.as_bytes())
-            .context("runner: write the request head to the engine")?;
-        if !body.is_empty() {
-            file.write_all(body)
-                .context("runner: write the request body to the engine")?;
-        }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .context("runner: read the engine's response")?;
-        parse_response(&raw)
+    let mut file = endpoint.open()?;
+    // One request per connection: `Connection: close` makes the response
+    // end-delimited, which is what the engine supports on a pipe.
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if !body.is_empty() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    file.write_all(head.as_bytes())
+        .context("runner: write the request head to the engine")?;
+    if !body.is_empty() {
+        file.write_all(body)
+            .context("runner: write the request body to the engine")?;
+    }
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)
+        .context("runner: read the engine's response")?;
+    parse_response(&raw)
 }
 
 /// Parse one HTTP/1.x response: status line, headers, then a body that is `Content-Length`
@@ -859,6 +864,27 @@ impl Engine {
     ///
     /// `PUT /containers/{id}/archive` unpacks the tar into the directory named by `path`
     /// (which must exist), so the runner creates `/src` when the slot is made.
+    /// Create the directories a slot needs before anything is copied into it.
+    ///
+    /// The slot's own command does `mkdir -p /src /cache` before `sleep infinity`, but nothing
+    /// synchronises with it: `PUT /archive` requires the target directory to EXIST and answers
+    /// `404 Could not find the file /src` when it loses that race. Measured - this was T6.2,
+    /// which looked like a stalled request because the caller waited on a failure that had
+    /// already happened. One exec costs ~70 ms and removes the race deterministically.
+    pub fn ensure_dirs(&self, container: &str, dirs: &[&str]) -> Result<()> {
+        let mut argv = vec!["mkdir".to_string(), "-p".to_string()];
+        argv.extend(dirs.iter().map(|d| d.to_string()));
+        let exec = self.exec_create(container, &argv, "/", &[])?;
+        let mut sink = std::io::sink();
+        self.exec_stream(&exec, |chunk| {
+            let _ = std::io::Write::write_all(&mut sink, chunk);
+        })?;
+        match self.exec_exit(&exec)? {
+            Some(0) => Ok(()),
+            other => bail!("runner: could not prepare {dirs:?} in the slot (exit {other:?})"),
+        }
+    }
+
     pub fn put_archive(&self, container: &str, path: &str, tar: &[u8]) -> Result<()> {
         // Measured: this is the one call that sometimes never answers - the engine is up, the
         // container is running, and the PUT returns nothing at all until a deadline fires. A

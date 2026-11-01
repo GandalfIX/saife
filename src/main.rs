@@ -274,6 +274,7 @@ fn runner_cmd(action: cli::RunnerSub) -> i32 {
             };
             let result = (|| -> anyhow::Result<()> {
                 engine.start_slot(&slot)?;
+                engine.ensure_dirs(&slot.id, &["/src", "/cache"])?;
                 engine.put_archive(&slot.id, "/src", &tar)?;
                 println!(
                     "[saife] prewarm: filling {} (network on, this once). The first fill \
@@ -285,7 +286,7 @@ fn runner_cmd(action: cli::RunnerSub) -> i32 {
                 let exec = engine.exec_create(
                     &slot.id,
                     &["sh".to_string(), "-c".to_string(),
-                      "cd /src && export GRADLE_USER_HOME=/cache && sh ./gradlew --version && sh ./gradlew dependencies --configuration runtimeClasspath --quiet".to_string()],
+                      "cd /src && export GRADLE_USER_HOME=/cache && sh ./gradlew --version && sh ./gradlew dependencies --quiet".to_string()],
                     "/src",
                     &[],
                 )?;

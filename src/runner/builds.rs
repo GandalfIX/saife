@@ -451,6 +451,10 @@ impl DockerBuilds {
         let admission =
             lifecycle::admit(&self.inner.engine, &lifecycle::SlotPolicy::default(), &spec)?;
         self.inner.engine.start_slot(&admission.slot)?;
+        // Same race as prewarm: the archive PUT needs `/src` to exist (T6.2).
+        self.inner
+            .engine
+            .ensure_dirs(&admission.slot.id, &["/src", "/cache"])?;
         if let Some(reason) = &admission.recycle_reason {
             // Say it once on the runner's own stream: a recycled slot means a cold daemon,
             // which is the difference between a 2 s and a 90 s build.
