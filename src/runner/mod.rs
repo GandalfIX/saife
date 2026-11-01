@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 
 pub mod builds;
 pub mod docker;
+pub mod lifecycle;
 pub mod server;
 pub mod sync;
 pub mod wiring;

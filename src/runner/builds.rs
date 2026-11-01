@@ -6,6 +6,7 @@
 
 use crate::runner::BuildRequest;
 use crate::runner::docker::{Engine, Slot, SlotSpec};
+use crate::runner::lifecycle;
 use crate::runner::server::{BuildEngine, BuildState};
 use crate::runner::sync;
 use anyhow::{Context, Result};
@@ -395,6 +396,20 @@ impl Drop for Inner {
 }
 
 impl DockerBuilds {
+    /// Whether a build is running in this session's slot.
+    ///
+    /// The idle watchdog asks this before reaping: a build that takes longer than the idle
+    /// window (a cold Gradle run on a big project can) must not lose its container because
+    /// nothing has *asked* for ten minutes.
+    pub fn busy(&self) -> bool {
+        self.inner
+            .builds
+            .lock()
+            .unwrap()
+            .values()
+            .any(|r| matches!(r.state, BuildState::Running))
+    }
+
     /// Create and start the slot if this runner does not have a live one.
     fn ensure_slot(&self) -> Result<Slot> {
         let mut guard = self.inner.slot.lock().unwrap();
@@ -405,16 +420,20 @@ impl DockerBuilds {
         }
         self.inner.engine.ensure_cache_volume()?;
         let spec = SlotSpec::new(&self.inner.session);
-        // A previous run of this session may have left the container behind.
-        for old in self.inner.engine.list_slots().unwrap_or_default() {
-            if old.name == spec.name {
-                let _ = self.inner.engine.remove_slot(&old);
-            }
+        // Admission, not a name sweep: this code used to remove any container whose name
+        // matched, which is how a session steals another live session's slot. `admit` checks
+        // ownership (pid + creation time), the image digest, the JDK, idleness and the cap,
+        // and refuses by name rather than guessing.
+        let admission =
+            lifecycle::admit(&self.inner.engine, &lifecycle::SlotPolicy::default(), &spec)?;
+        self.inner.engine.start_slot(&admission.slot)?;
+        if let Some(reason) = &admission.recycle_reason {
+            // Say it once on the runner's own stream: a recycled slot means a cold daemon,
+            // which is the difference between a 2 s and a 90 s build.
+            eprintln!("[saife] runner: slot recycled: {reason}");
         }
-        let slot = self.inner.engine.create_slot(&spec)?;
-        self.inner.engine.start_slot(&slot)?;
-        *guard = Some(slot.clone());
-        Ok(slot)
+        *guard = Some(admission.slot.clone());
+        Ok(admission.slot)
     }
 }
 

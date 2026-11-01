@@ -131,6 +131,10 @@ impl Endpoint {
 }
 
 /// One HTTP exchange with the engine.
+///
+/// `Clone` because a slot outlives the call that made it: the idle watchdog and the session's
+/// teardown both need their own handle, and the endpoint is immutable anyway.
+#[derive(Clone)]
 pub struct Engine {
     endpoint: Endpoint,
 }
@@ -323,6 +327,24 @@ pub const CACHE_VOLUME: &str = "saife-runner-cache";
 pub const RUNNER_IMAGE: &str =
     "eclipse-temurin@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507";
 
+/// The JDK the pinned image carries, as a slot records it.
+///
+/// It travels as a label of its own even though the digest already pins the toolchain: the
+/// sample project requires Java 25 (measured 2026-10-30), and a pin that moves the toolchain
+/// must be visible as a *stale slot*, not as a build that fails with a toolchain error
+/// half-way through. A slot whose `saife.jdk` is not this value is replaced.
+pub const RUNNER_JDK: &str = "25";
+
+/// Where a slot records when it was last used, **inside** the container.
+///
+/// The engine cannot say when a slot last ran a build (it knows when the container started,
+/// not when it was used), so the fact is written by the runner and read back by whoever asks -
+/// `saife runner status` in one process, the idle watchdog in another. Inside the container
+/// rather than on the host on purpose: the marker dies with the container, so it can never
+/// describe a slot that no longer exists.
+pub const LAST_USE_DIR: &str = "/run/saife";
+pub const LAST_USE_PATH: &str = "/run/saife/last-use";
+
 /// Refuse a reference that is not digest-pinned. A tag can move; a digest cannot.
 fn require_digest(image: &str) -> Result<()> {
     if !image.contains("@sha256:") {
@@ -345,6 +367,16 @@ pub struct SlotSpec {
     /// `saife runner prewarm`, which downloads the toolchain into the cache and must be a
     /// deliberate, visible step rather than something a build does on its own.
     pub allow_network: bool,
+    /// The JDK the pin carries, recorded on the container so a toolchain change is a stale
+    /// slot rather than a failed build (see [`RUNNER_JDK`]).
+    pub jdk: String,
+    /// The process that created the slot, and that process's creation time.
+    ///
+    /// A label pair, not a name: the sweep has to decide "is the session that owns this slot
+    /// still running" from the container alone, and a pid on its own is not an answer because
+    /// Windows reuses pids. The creation time makes the answer exact.
+    pub owner_pid: u32,
+    pub owner_created: i64,
 }
 
 impl SlotSpec {
@@ -354,6 +386,9 @@ impl SlotSpec {
             name: format!("saife-runner-{session}"),
             session: session.to_string(),
             allow_network: false,
+            jdk: RUNNER_JDK.to_string(),
+            owner_pid: std::process::id(),
+            owner_created: crate::sandbox::dacl_journal::current_process_creation_time(),
         }
     }
 }
@@ -363,6 +398,64 @@ impl SlotSpec {
 pub struct Slot {
     pub id: String,
     pub name: String,
+}
+
+/// Everything the lifecycle and `saife runner status` need to know about a slot, read from the
+/// engine's list answer plus the slot's own last-use marker.
+///
+/// One struct rather than an inspect per question: the sweep, the cap, the staleness check and
+/// the status line all ask about the same slot, and four round trips to answer four questions
+/// about one container is how the answers start disagreeing with each other.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SlotFacts {
+    pub slot_id: String,
+    pub name: String,
+    /// The session label the slot was created with. Empty for a container made before the
+    /// label existed, which is what makes it unowned.
+    pub session: String,
+    /// The digest-pinned reference the container was created from (`saife.image`), so a moved
+    /// pin is visible as a fact rather than inferred from an image id.
+    pub image: String,
+    /// The JDK the pin carried at create time (`saife.jdk`).
+    pub jdk: String,
+    /// Unix seconds, the engine's own `Created`.
+    pub created_at: i64,
+    pub owner_pid: u32,
+    pub owner_created: i64,
+    pub running: bool,
+    /// Unix seconds of the last build that used the slot, from [`LAST_USE_PATH`]. `None` when
+    /// the marker cannot be read - which never makes a slot look idle (see
+    /// `runner::lifecycle::idle_expired`).
+    pub last_use: Option<i64>,
+}
+
+impl SlotFacts {
+    pub fn slot(&self) -> Slot {
+        Slot {
+            id: self.slot_id.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    /// The creation time for a report: a wall clock a human can read, in the one format the
+    /// rest of the repo prints (`2026-11-01T10:02:00Z`).
+    pub fn created_iso(&self) -> String {
+        iso8601(self.created_at)
+    }
+
+    /// "Idle since" for a report, or `None` when the slot cannot be dated.
+    pub fn idle_since_iso(&self) -> Option<String> {
+        self.last_use.map(iso8601)
+    }
+}
+
+fn iso8601(unix_secs: i64) -> String {
+    let ts = if unix_secs >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs as u64)
+    } else {
+        std::time::UNIX_EPOCH
+    };
+    crate::net::proxy::rfc3339_utc(ts)
 }
 
 impl Engine {
@@ -418,6 +511,12 @@ impl Engine {
         Ok(v["State"]["Running"].as_bool().unwrap_or(false))
     }
 
+    /// Remove the slot, running or not.
+    ///
+    /// `force=1` and **no stop first**, which is measured rather than assumed: the slot's pid 1
+    /// is `sleep`, pid 1 ignores a default-action SIGTERM, so `stop` waits out its whole timeout
+    /// (5.13 s measured with `t=5`) while `remove --force` finishes in 0.16 s. A graceful stop is
+    /// therefore not graceful here, just five seconds per slot on every teardown.
     pub fn remove_slot(&self, slot: &Slot) -> Result<()> {
         let r = self.request(
             "DELETE",
@@ -435,9 +534,55 @@ impl Engine {
         Ok(())
     }
 
+    /// Record "this slot was used now" inside the container.
+    ///
+    /// The engine has no notion of when a container was last *used*, and the idle kill has to
+    /// be a fact rather than a guess - so the slot keeps it. One exec per acquisition (measured
+    /// 73 ms against a 1.67 s warm build); a slot that cannot be dated is simply never
+    /// idle-killed, which is why a failure here must not fail a build.
+    pub fn touch_slot(&self, slot: &Slot) -> Result<()> {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("mkdir -p {LAST_USE_DIR} && date +%s > {LAST_USE_PATH}"),
+        ];
+        let exec_id = self.exec_create(&slot.id, &cmd, "/", &[])?;
+        self.exec_stream(&exec_id, |_| {})?;
+        Ok(())
+    }
+
+    /// When this slot was last used, as recorded by [`Engine::touch_slot`].
+    ///
+    /// `None` covers every honest reason the marker is not there (never touched, an older slot,
+    /// a stopped container that cannot be exec'd into): the caller must treat that as "not
+    /// idle", never as "idle".
+    pub fn slot_last_use(&self, slot: &Slot) -> Result<Option<i64>> {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat {LAST_USE_PATH} 2>/dev/null"),
+        ];
+        let exec_id = self.exec_create(&slot.id, &cmd, "/", &[])?;
+        let mut out = Vec::new();
+        self.exec_stream(&exec_id, |chunk| out.extend_from_slice(chunk))?;
+        Ok(String::from_utf8_lossy(&out).trim().parse::<i64>().ok())
+    }
+
     /// Every slot container on the engine, running or not: the start-up sweep (T2.4) uses
     /// this to clean up after a supervisor that died without removing its slot.
     pub fn list_slots(&self) -> Result<Vec<Slot>> {
+        Ok(self
+            .list_slot_facts()?
+            .into_iter()
+            .map(|f| f.slot())
+            .collect())
+    }
+
+    /// The same list with the facts attached (labels, creation time, owner, running state).
+    ///
+    /// Deliberately *without* the last-use marker: that costs an exec per slot, so it is read
+    /// where it is needed (`lifecycle::facts_for_status`) instead of on every sweep.
+    pub fn list_slot_facts(&self) -> Result<Vec<SlotFacts>> {
         let filters = r#"{"label":["saife.runner=1"]}"#;
         let r = self.request(
             "GET",
@@ -450,23 +595,55 @@ impl Engine {
         if r.status != 200 {
             bail!("runner: list containers answered {}", r.status);
         }
-        let v = r.json()?;
-        let mut out = Vec::new();
-        for c in v.as_array().cloned().unwrap_or_default() {
-            let id = c["Id"].as_str().unwrap_or_default().to_string();
-            let name = c["Names"]
-                .as_array()
-                .and_then(|n| n.first())
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .trim_start_matches('/')
-                .to_string();
-            if !id.is_empty() {
-                out.push(Slot { id, name });
-            }
-        }
-        Ok(out)
+        Ok(slot_facts_from_json(&r.json()?))
     }
+}
+
+/// The engine's `/containers/json` answer, reduced to slot facts.
+///
+/// Every field comes from the container itself: the pin and the owner are labels the create
+/// body wrote, so a slot cannot describe itself as something it is not.
+fn slot_facts_from_json(list: &serde_json::Value) -> Vec<SlotFacts> {
+    let mut out = Vec::new();
+    for c in list.as_array().cloned().unwrap_or_default() {
+        let slot_id = c["Id"].as_str().unwrap_or_default().to_string();
+        if slot_id.is_empty() {
+            continue;
+        }
+        let name = c["Names"]
+            .as_array()
+            .and_then(|n| n.first())
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+        let labels = &c["Labels"];
+        let label = |key: &str| labels[key].as_str().unwrap_or_default().to_string();
+        let image = {
+            let labelled = label("saife.image");
+            if labelled.is_empty() {
+                // A container from before the label existed: the engine only knows the image
+                // *id*, which is a fact too - and it will not match a pinned digest, which is
+                // exactly the right answer (the slot is stale).
+                c["Image"].as_str().unwrap_or_default().to_string()
+            } else {
+                labelled
+            }
+        };
+        out.push(SlotFacts {
+            slot_id,
+            name,
+            session: label("saife.session"),
+            image,
+            jdk: label("saife.jdk"),
+            created_at: c["Created"].as_i64().unwrap_or(0),
+            owner_pid: label("saife.owner_pid").parse().unwrap_or(0),
+            owner_created: label("saife.owner_created").parse().unwrap_or(0),
+            running: c["State"].as_str() == Some("running"),
+            last_use: None,
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +904,20 @@ impl Engine {
 fn slot_create_body(spec: &SlotSpec) -> serde_json::Value {
     serde_json::json!({
         "Image": spec.image,
-        "Cmd": ["sh", "-c", "mkdir -p /src /cache && exec sleep infinity"],
-        "Labels": { "saife.runner": "1", "saife.session": spec.session },
+        // The marker's directory has to exist before the first `touch_slot`, and this command
+        // is the only thing that runs before then.
+        "Cmd": ["sh", "-c", format!("mkdir -p /src /cache {LAST_USE_DIR} && exec sleep infinity")],
+        // The pin, the JDK and the owner travel as labels: the sweep and `status` read them
+        // from the list answer, without an inspect and without a host-side table that could
+        // disagree with the container it describes.
+        "Labels": {
+            "saife.runner": "1",
+            "saife.session": spec.session,
+            "saife.image": spec.image,
+            "saife.jdk": spec.jdk,
+            "saife.owner_pid": spec.owner_pid.to_string(),
+            "saife.owner_created": spec.owner_created.to_string(),
+        },
         "HostConfig": {
             "NetworkMode": if spec.allow_network { "bridge" } else { "none" },
             "AutoRemove": false,
@@ -1009,5 +1198,147 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// The facts a sweep and `saife runner status` need, parsed from the engine's own list
+    /// answer: the pin and the owner travel as labels, so neither reader needs an inspect per
+    /// container and neither can drift from the container it describes.
+    #[test]
+    fn slot_facts_come_from_the_engine_list_and_the_labels_on_the_container() {
+        let body = serde_json::json!([
+            {
+                "Id": "abc123",
+                "Names": ["/saife-runner-s1"],
+                "Image": "sha256:deadbeef",
+                "Created": 1_700_000_000_i64,
+                "State": "running",
+                "Labels": {
+                    "saife.runner": "1",
+                    "saife.session": "s1",
+                    "saife.image": RUNNER_IMAGE,
+                    "saife.jdk": RUNNER_JDK,
+                    "saife.owner_pid": "8120",
+                    "saife.owner_created": "133000000000000000"
+                }
+            },
+            {
+                "Id": "def456",
+                "Names": ["/saife-runner-s2"],
+                "Image": "sha256:cafe",
+                "Created": 1_700_000_100_i64,
+                "State": "exited",
+                "Labels": { "saife.runner": "1" }
+            }
+        ]);
+
+        let facts = slot_facts_from_json(&body);
+        assert_eq!(facts.len(), 2, "both containers are slots");
+
+        let mine = &facts[0];
+        assert_eq!(mine.slot_id, "abc123");
+        assert_eq!(mine.name, "saife-runner-s1", "the leading slash is dropped");
+        assert_eq!(mine.session, "s1");
+        assert_eq!(
+            mine.image, RUNNER_IMAGE,
+            "the report carries the pinned digest"
+        );
+        assert_eq!(mine.jdk, RUNNER_JDK);
+        assert_eq!(mine.owner_pid, 8120);
+        assert_eq!(mine.owner_created, 133_000_000_000_000_000);
+        assert_eq!(mine.created_at, 1_700_000_000);
+        assert!(mine.running);
+        assert_eq!(mine.last_use, None, "the marker needs a call of its own");
+
+        // A container from before the labels existed: unowned (so the sweep may take it) and
+        // dated by the engine alone.
+        let old = &facts[1];
+        assert_eq!(old.session, "");
+        assert_eq!(old.owner_pid, 0);
+        assert_eq!(old.image, "sha256:cafe");
+        assert!(!old.running);
+    }
+
+    /// The pin and the owner are labels so that the sweep and `status` read them from the
+    /// list answer instead of inspecting every container, and so a *host-side* table never
+    /// becomes a second source of truth for who owns what.
+    #[test]
+    fn the_pin_the_jdk_and_the_owner_are_labels_on_the_container() {
+        let spec = SlotSpec::new("s1");
+        let body = slot_create_body(&spec);
+        assert_eq!(body["Labels"]["saife.image"], RUNNER_IMAGE);
+        assert_eq!(body["Labels"]["saife.jdk"], RUNNER_JDK);
+        assert_eq!(
+            body["Labels"]["saife.owner_pid"],
+            std::process::id().to_string()
+        );
+        assert_eq!(
+            body["Labels"]["saife.owner_created"],
+            spec.owner_created.to_string(),
+            "the PID-reuse guard travels with the slot"
+        );
+        // The marker's directory has to exist before the first build touches it, and the
+        // slot's own command is the only thing that runs before then.
+        assert!(
+            body["Cmd"][2]
+                .as_str()
+                .unwrap_or_default()
+                .contains(LAST_USE_DIR),
+            "the slot prepares the last-use marker's directory: {}",
+            body["Cmd"][2]
+        );
+    }
+
+    /// The owner is this process, captured at create time: a slot cannot be handed a pid it
+    /// did not have.
+    #[test]
+    fn a_spec_records_the_pin_the_jdk_and_its_owning_process() {
+        let spec = SlotSpec::new("s1");
+        assert_eq!(spec.name, "saife-runner-s1");
+        assert_eq!(spec.owner_pid, std::process::id());
+        assert_eq!(spec.jdk, RUNNER_JDK);
+        assert!(spec.image.contains("@sha256:"));
+        assert!(
+            spec.owner_created > 0,
+            "the creation time is the PID-reuse guard, and the OS reports it"
+        );
+    }
+
+    /// `status` prints times, not epoch integers: one formatter, shared with the rest of the
+    /// repo (`net::proxy::rfc3339_utc`), so the report reads like every other timestamp.
+    #[test]
+    fn the_facts_format_their_times_for_the_status_line() {
+        let facts = SlotFacts {
+            slot_id: "abc123".to_string(),
+            name: "saife-runner-s1".to_string(),
+            session: "s1".to_string(),
+            image: RUNNER_IMAGE.to_string(),
+            jdk: RUNNER_JDK.to_string(),
+            created_at: 1_700_000_000,
+            owner_pid: 1,
+            owner_created: 2,
+            running: true,
+            last_use: Some(1_700_000_060),
+        };
+        assert_eq!(facts.created_iso(), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            facts.idle_since_iso().as_deref(),
+            Some("2023-11-14T22:14:20Z")
+        );
+        assert_eq!(
+            SlotFacts {
+                last_use: None,
+                ..facts.clone()
+            }
+            .idle_since_iso(),
+            None,
+            "an undatable slot says so instead of inventing a time"
+        );
+        assert_eq!(
+            facts.slot(),
+            Slot {
+                id: "abc123".to_string(),
+                name: "saife-runner-s1".to_string()
+            }
+        );
     }
 }

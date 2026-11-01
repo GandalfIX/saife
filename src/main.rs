@@ -216,11 +216,27 @@ fn runner_cmd(action: cli::RunnerSub) -> i32 {
                 size_text
             );
             println!("image:   {}", crate::runner::docker::RUNNER_IMAGE);
-            println!(
-                "slots:   {} labelled container(s), {} of them listed as slots",
-                slots.len(),
-                slots.len()
-            );
+            println!("slots:   {}", slots.len());
+            match crate::runner::lifecycle::facts_for_status(&engine) {
+                Ok(facts) => {
+                    for f in facts {
+                        println!(
+                            "         {} {} session={} created={} idle since={} owner={}",
+                            f.slot_id,
+                            if f.running { "running" } else { "stopped" },
+                            if f.session.is_empty() {
+                                "-"
+                            } else {
+                                f.session.as_str()
+                            },
+                            f.created_iso(),
+                            f.idle_since_iso().unwrap_or_else(|| "-".to_string()),
+                            f.owner_pid
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[saife] slot facts unavailable: {e:#}"),
+            }
             0
         }
         RunnerSub::Prewarm { project } => {
@@ -1247,7 +1263,10 @@ fn run_mxc_session(
     //      the declared `(method, path)` and audited by the path that already exists.
     //      Bound after `proxy`, so the wiring is dropped BEFORE it: a route never
     //      outlives the listener it points at, on the clean path and on every `?`.
-    let _runner_session = if enable_runner {
+    // Three values, one lifetime: the wiring (listener + mount), the keeper (this session's
+    // slot dies with it) and the watchdog (an idle slot is stopped, but never one with a
+    // build in flight). Bound together because dropping any one of them early is the bug.
+    let (_runner_session, _runner_keeper, _runner_watchdog) = if enable_runner {
         if net_cfg.is_blocked() {
             eprintln!(
                 "[saife] runner_requires_proxy: --runner (--block-net starts no listener to route its facade mount)"
@@ -1264,13 +1283,25 @@ fn run_mxc_session(
         // The build shares the workload's clock: a build IS work the workload asked for,
         // so `limits.workloadTimeoutSecs` is the deadline rather than a second term an
         // operator would have to discover before a runaway build could be stopped.
+        let engine = crate::runner::docker::Engine::connect(endpoint);
+        let policy = crate::runner::lifecycle::SlotPolicy::default();
+        // Slots whose owner process is gone. Never a live session's: liveness is the owner's
+        // pid *and* its creation time, so a recycled pid cannot adopt a slot.
+        match crate::runner::lifecycle::sweep(&engine, &crate::runner::lifecycle::owner_is_alive) {
+            Ok(swept) if !swept.is_empty() => {
+                eprintln!("[saife] runner: swept {} orphaned slot(s)", swept.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[saife] runner: sweep skipped: {e:#}"),
+        }
         let builds = std::sync::Arc::new(crate::runner::builds::DockerBuilds::new(
-            crate::runner::docker::Engine::connect(endpoint),
+            engine.clone(),
             cwd.to_path_buf(),
             sid.to_string(),
             std::time::Duration::from_secs(u64::from(limits.workload_timeout_secs)),
         ));
-        match crate::runner::wiring::RunnerWiring::start(&facade, cwd, builds, token) {
+        let as_engine: std::sync::Arc<dyn crate::runner::server::BuildEngine> = builds.clone();
+        match crate::runner::wiring::RunnerWiring::start(&facade, cwd, as_engine, token) {
             Ok(wiring) => {
                 if std::env::var_os("SAIFE_DIAG").is_some() {
                     eprintln!(
@@ -1279,7 +1310,16 @@ fn run_mxc_session(
                         crate::runner::wiring::MOUNT
                     );
                 }
-                Some(wiring)
+                let keeper = crate::runner::lifecycle::SlotKeeper::new(engine.clone(), sid);
+                let busy = std::sync::Arc::clone(&builds);
+                let watchdog = crate::runner::lifecycle::spawn_idle_watchdog(
+                    engine,
+                    policy,
+                    sid.to_string(),
+                    std::time::Duration::from_secs(60),
+                    std::sync::Arc::new(move |_| busy.busy()),
+                )?;
+                (Some(wiring), Some(keeper), Some(watchdog))
             }
             Err(e) => {
                 eprintln!("[saife] runner refused: {e:#}");
@@ -1287,7 +1327,7 @@ fn run_mxc_session(
             }
         }
     } else {
-        None
+        (None, None, None)
     };
 
     // (6) Guardrail 1's proof source. With a proxy it is that listener — the one
