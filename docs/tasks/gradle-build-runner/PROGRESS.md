@@ -33,7 +33,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T2.6 | Engine abstraction: endpoint + probe + quirks | [x] | `src/runner/docker.rs`: `Endpoint` (npipe/unix parsed, `tcp://`/`ssh://` refused as remote), `/_ping` + `/version` probe, chunked/Content-Length/close-delimited parsing. `RunnerEngine` trait lands with the `BuildEngine` impl |
 | T2.7 | Global cache volume mounted at `/cache` | [x] | `CACHE_VOLUME = saife-runner-cache`, created idempotently, `UsageData.Size` read from `/system/df`; slot body asserts the mount (unit test) |
 | T2.8 | `saife runner status` / `saife runner prewarm <project>` | [x] | status: cache MB + image + slots (live, prints `empty or not reported` before the first prewarm); prewarm: ensure volume → pack project → network-on container → `gradlew --version` + dependency resolution → remove → report size. Only the prewarm container ever has network |
-| T3.1 | Project root resolution: reparse/UNC/subst/install-dir refusals | [ ] | |
+| T3.1 | Project root resolution: reparse/UNC/subst/install-dir refusals | [x] | Lexical (UNC, device, rooted, `..`) at parse; filesystem half in `validate_on_disk` called by the listener: canonicalise and require containment in the workspace, and refuse any reparse point on the path. Test creates a real junction out of the workspace and proves the refusal |
 | T3.2 | Sync in (tar) into `/src`, `/cache` created at slot start | [x] | `sync::pack_dir` + `PUT /archive`; live leg: a tree with a nested file arrives inside the slot (`cat` sees it). Skip list keeps `build/` out of the input |
 | T3.3 | Sync out (filtered) | [x] | `GET /archive` + `unpack_into_at(strip_top)`: the engine's answers are relative to the *parent*, so `path=/src/out` yields `out/art.txt`. Live leg round-trips an artifact back to the host; the filter decides what lands | |
 | T3.4 | Windows semantics documented (case, CRLF, locks, long paths) | [ ] | |
@@ -41,7 +41,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T4.1 | `profiles/gradle-runner.json` + README row | [ ] | |
 | T4.2 | Invocation, JAVA_HOME, exit codes, timeout/cancel | [ ] | |
 | T4.3 | Prewarm at image build time, documented refresh step | [ ] | |
-| T4.4 | Offline failure UX naming the missing dependency | [ ] | |
+| T4.4 | Offline failure UX naming the missing dependency | [x] | observed, not invented: Gradle's own `No cached version of org.osgi:…:1.1.2 available for offline mode` reached the client through the stream. The prewarm banner now warns that a cold fill takes many minutes and that killing it leaves exactly that failure |
 | T4.5 | Live leg: real project builds through the runner | [x] | sample-gradle: offline build in a `--network none` slot, BUILD SUCCESSFUL in 8 s, 43 log lines streamed, `sample-gradle-1.0.0-plain.jar` synced back to `build/libs` |
 | T5.1 | ADR-0006 build runner | [ ] | |
 | T5.2 | FAQ rewrite, `--no-daemon` evidence kept, appcontainer fallback | [ ] | |

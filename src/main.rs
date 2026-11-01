@@ -258,7 +258,10 @@ fn runner_cmd(action: cli::RunnerSub) -> i32 {
                 engine.start_slot(&slot)?;
                 engine.put_archive(&slot.id, "/src", &tar)?;
                 println!(
-                    "[saife] prewarm: downloading into {} (network on, this once)",
+                    "[saife] prewarm: filling {} (network on, this once). The first fill \
+                     downloads the Gradle distribution and the project's dependencies - on a \
+                     slow link that is many minutes, and killing it leaves a cache that fails \
+                     offline later with one artifact named",
                     crate::runner::docker::CACHE_VOLUME
                 );
                 let exec = engine.exec_create(

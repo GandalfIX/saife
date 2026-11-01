@@ -105,6 +105,57 @@ impl BuildRequest {
             profile: raw.profile,
         })
     }
+    /// The filesystem half of the validation: the lexical checks above can be satisfied by a
+    /// path that a junction redirects somewhere else entirely (a link inside the workspace
+    /// pointing at `%USERPROFILE%` would copy `.ssh` into the runner). Called by the listener
+    /// before a build starts, because this is the first place the path is touched.
+    pub fn validate_on_disk(&self, workspace: &Path) -> Result<()> {
+        let canonical_ws = std::fs::canonicalize(workspace).with_context(|| {
+            format!("runner: the session workspace {} is not readable", workspace.display())
+        })?;
+        let canonical = std::fs::canonicalize(&self.project).with_context(|| {
+            format!("runner: project `{}` does not exist", self.project.display())
+        })?;
+        if !canonical.starts_with(&canonical_ws) {
+            bail!(
+                "runner: project `{}` resolves to {}, which is outside the session workspace - \
+                 a link or junction is not a way out of it",
+                self.project.display(),
+                canonical.display()
+            );
+        }
+        // A reparse point inside the tree is refused even when it happens to point inside:
+        // the mount step's promise is "what you see is what gets copied".
+        for ancestor in canonical.ancestors() {
+            if ancestor == canonical_ws.as_path() {
+                break;
+            }
+            let meta = match std::fs::symlink_metadata(ancestor) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    bail!(
+                        "runner: {} is a link or junction; the project must be a real directory",
+                        ancestor.display()
+                    );
+                }
+            }
+            #[cfg(not(windows))]
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "runner: {} is a symlink; the project must be a real directory",
+                    ancestor.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
@@ -203,4 +254,61 @@ mod tests {
             );
         }
     }
+    /// The lexical checks cannot see a junction: it is a real directory with a real path
+    /// inside the workspace, and its target is somewhere else. This is the check that makes
+    /// "the project directory" mean what it says.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_out_of_the_workspace_is_refused() {
+        let ws = std::env::temp_dir().join(format!("saife-runner-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("real")).unwrap();
+        let outside = std::env::temp_dir().join(format!("saife-runner-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+
+        let link = ws.join("linked");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .expect("mklink runs");
+        assert!(status.success(), "the junction must be created for this test");
+
+        let req = BuildRequest::parse(br#"{"project":"linked","task":"build","profile":"gradle"}"#, &ws)
+            .expect("lexically fine");
+        let err = req
+            .validate_on_disk(&ws)
+            .expect_err("a junction out of the workspace must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("outside the session workspace"), "got: {msg}");
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_real_project_directory_passes_the_disk_check() {
+        let ws = std::env::temp_dir().join(format!("saife-runner-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("app")).unwrap();
+        let req = BuildRequest::parse(br#"{"project":"app","task":"build","profile":"gradle"}"#, &ws)
+            .expect("valid");
+        req.validate_on_disk(&ws).expect("a plain directory is fine");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn a_missing_project_directory_is_refused() {
+        let ws = std::env::temp_dir().join(format!("saife-runner-missing-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&ws);
+        let req = BuildRequest::parse(br#"{"project":"nope","task":"build","profile":"gradle"}"#, &ws)
+            .expect("lexically fine");
+        let err = req.validate_on_disk(&ws).expect_err("a missing project is refused");
+        assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
 }

@@ -186,6 +186,9 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
                     return respond(&mut sock, "400 Bad Request", "", &format!("{e:#}\n")).await;
                 }
             };
+            if let Err(e) = req.validate_on_disk(&state.workspace) {
+                return respond(&mut sock, "400 Bad Request", "", &format!("{e:#}\n")).await;
+            }
             match state.engine.start(req) {
                 Ok(id) => {
                     let body = format!("{{\"id\":{}}}\n", json_str(&id));
@@ -409,7 +412,9 @@ mod tests {
     fn harness() -> Harness {
         let guard = SERVER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("saife-runner-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // The workspace needs a real project directory: the listener refuses a request whose
+        // project does not exist (that is T3.1's disk half).
+        std::fs::create_dir_all(dir.join("app")).unwrap();
         let engine = Arc::new(FakeEngine::default());
         let state = Arc::new(RunnerState {
             token: TOKEN.to_string(),
