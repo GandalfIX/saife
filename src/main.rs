@@ -289,8 +289,11 @@ fn runner_cmd(action: cli::RunnerSub) -> i32 {
                     "/src",
                     &[],
                 )?;
+                // Flush per chunk, and treat a closed pipe as "the log is gone", not as a
+                // reason to kill a download that is already running (T6.2).
+                let mut sink = crate::runner::StreamSink::new(std::io::stdout());
                 engine.exec_stream(&exec, |chunk| {
-                    print!("{}", String::from_utf8_lossy(chunk));
+                    sink.write(chunk);
                 })?;
                 let code = engine.exec_exit(&exec)?;
                 if code != Some(0) {

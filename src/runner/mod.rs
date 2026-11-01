@@ -24,6 +24,56 @@ pub mod sync;
 pub mod wiring;
 use std::path::{Path, PathBuf};
 
+/// Streams a build's log to a writer without letting the writer end the build.
+///
+/// Measured symptom this exists for (T6.2): `prewarm … > out 2> err` works, `prewarm … | tee log`
+/// goes silent and may never return. `print!` per chunk neither flushes - so a file shows nothing
+/// until the process exits - nor survives a closed pipe: the macro panics on a write error, and a
+/// panic while streaming kills a build that has already done its work.
+///
+/// So: write, flush, and treat "the reader is gone" as "stop writing". The caller keeps draining
+/// the stream, because abandoning it would stall the process producing it.
+pub struct StreamSink<W: std::io::Write> {
+    out: W,
+    broken: bool,
+}
+
+impl<W: std::io::Write> StreamSink<W> {
+    pub fn new(out: W) -> Self {
+        StreamSink { out, broken: false }
+    }
+
+    /// Write one chunk. `false` means the writer is gone and further writes are pointless -
+    /// but not fatal: the build continues, only its log is lost.
+    pub fn write(&mut self, bytes: &[u8]) -> bool {
+        if self.broken {
+            return false;
+        }
+        match self.out.write_all(bytes).and_then(|()| self.out.flush()) {
+            Ok(()) => true,
+            Err(e) => {
+                self.broken = true;
+                eprintln!(
+                    "[saife] the log's destination closed ({e}); the build continues without it"
+                );
+                false
+            }
+        }
+    }
+
+    /// Test-only: production code has nothing to do with the answer.
+    #[cfg(test)]
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Take the writer back. Test-only: production code has no reason to unplug a log.
+    #[cfg(test)]
+    fn into_inner_for_test(self) -> W {
+        self.out
+    }
+}
+
 /// Tasks the runner will execute. An allow-list, not a pattern: a task string reaches
 /// a process's argv, and everything not listed here is refused rather than escaped.
 pub const TASKS: &[&str] = &["assemble", "build", "check", "clean", "test"];
@@ -115,10 +165,16 @@ impl BuildRequest {
     /// before a build starts, because this is the first place the path is touched.
     pub fn validate_on_disk(&self, workspace: &Path) -> Result<()> {
         let canonical_ws = std::fs::canonicalize(workspace).with_context(|| {
-            format!("runner: the session workspace {} is not readable", workspace.display())
+            format!(
+                "runner: the session workspace {} is not readable",
+                workspace.display()
+            )
         })?;
         let canonical = std::fs::canonicalize(&self.project).with_context(|| {
-            format!("runner: project `{}` does not exist", self.project.display())
+            format!(
+                "runner: project `{}` does not exist",
+                self.project.display()
+            )
         })?;
         if !canonical.starts_with(&canonical_ws) {
             bail!(
@@ -159,7 +215,6 @@ impl BuildRequest {
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -267,7 +322,8 @@ mod tests {
         let ws = std::env::temp_dir().join(format!("saife-runner-junction-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(ws.join("real")).unwrap();
-        let outside = std::env::temp_dir().join(format!("saife-runner-outside-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("saife-runner-outside-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("secret.txt"), b"x").unwrap();
@@ -279,10 +335,16 @@ mod tests {
             .arg(&outside)
             .status()
             .expect("mklink runs");
-        assert!(status.success(), "the junction must be created for this test");
+        assert!(
+            status.success(),
+            "the junction must be created for this test"
+        );
 
-        let req = BuildRequest::parse(br#"{"project":"linked","task":"build","profile":"gradle"}"#, &ws)
-            .expect("lexically fine");
+        let req = BuildRequest::parse(
+            br#"{"project":"linked","task":"build","profile":"gradle"}"#,
+            &ws,
+        )
+        .expect("lexically fine");
         let err = req
             .validate_on_disk(&ws)
             .expect_err("a junction out of the workspace must be refused");
@@ -298,9 +360,13 @@ mod tests {
         let ws = std::env::temp_dir().join(format!("saife-runner-real-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(ws.join("app")).unwrap();
-        let req = BuildRequest::parse(br#"{"project":"app","task":"build","profile":"gradle"}"#, &ws)
-            .expect("valid");
-        req.validate_on_disk(&ws).expect("a plain directory is fine");
+        let req = BuildRequest::parse(
+            br#"{"project":"app","task":"build","profile":"gradle"}"#,
+            &ws,
+        )
+        .expect("valid");
+        req.validate_on_disk(&ws)
+            .expect("a plain directory is fine");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -308,11 +374,88 @@ mod tests {
     fn a_missing_project_directory_is_refused() {
         let ws = std::env::temp_dir().join(format!("saife-runner-missing-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&ws);
-        let req = BuildRequest::parse(br#"{"project":"nope","task":"build","profile":"gradle"}"#, &ws)
-            .expect("lexically fine");
-        let err = req.validate_on_disk(&ws).expect_err("a missing project is refused");
+        let req = BuildRequest::parse(
+            br#"{"project":"nope","task":"build","profile":"gradle"}"#,
+            &ws,
+        )
+        .expect("lexically fine");
+        let err = req
+            .validate_on_disk(&ws)
+            .expect_err("a missing project is refused");
         assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// A writer that fails the way a closed pipe does, after the first chunk.
+    struct Closing {
+        writes: usize,
+        flushed: usize,
+    }
+    impl std::io::Write for Closing {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes > 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe closed",
+                ));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushed += 1;
+            Ok(())
+        }
+    }
+
+    /// The second chunk hits a closed pipe: it must report "stop writing", not panic, and the
+    /// third must not touch the writer again.
+    #[test]
+    fn a_closed_pipe_stops_writing_instead_of_killing_the_build() {
+        let mut sink = StreamSink::new(Closing {
+            writes: 0,
+            flushed: 0,
+        });
+        assert!(sink.write(b"first\n"), "the first chunk lands");
+        assert!(
+            !sink.write(b"second\n"),
+            "the closed pipe is reported, not panicked on"
+        );
+        assert!(sink.is_broken());
+        assert!(
+            !sink.write(b"third\n"),
+            "and nothing is attempted afterwards"
+        );
+    }
+
+    /// A writer that never fails, so the flush count can be asserted directly.
+    struct Recording {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+    impl std::io::Write for Recording {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    /// Every chunk is flushed as it arrives: a file must show the log while the build runs, which
+    /// is the half of T6.2 that made `> out` look empty until exit.
+    #[test]
+    fn every_chunk_is_flushed_not_buffered_until_the_end() {
+        let mut sink = StreamSink::new(Recording {
+            bytes: Vec::new(),
+            flushes: 0,
+        });
+        assert!(sink.write(b"one\n"));
+        assert!(sink.write(b"two\n"));
+        let out = sink.into_inner_for_test();
+        assert_eq!(out.bytes, b"one\ntwo\n");
+        assert_eq!(out.flushes, 2, "one flush per chunk, not one at the end");
+    }
 }
