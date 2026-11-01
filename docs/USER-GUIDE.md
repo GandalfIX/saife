@@ -599,6 +599,13 @@ saife learned clear
 
 ## 8a. Building in the sandbox (the runner)
 
+> **Not in a released build yet.** This section describes the runner being implemented on
+> `feat/gradle-build-runner`: the `saife runner` commands do not exist in 0.3.x, and the
+> design, measurements and remaining tasks are in
+> [the plan](../plans/2026-10-30-gradle-build-runner.md) and
+> [the measurements](../research/build-runner/measurements.md). It is documented here so the
+> shape is reviewable before the code lands, not to promise a shipped feature.
+
 Some toolchains cannot work inside a session at all: Gradle's daemon, its workers and its
 compiler daemons all talk over loopback, and loopback is closed inside a session in both
 directions (`connect()` fails with `WSAEACCES 10013`, and nothing outside can dial in).

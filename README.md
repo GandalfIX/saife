@@ -42,6 +42,13 @@ Implemented pillars:
   `INCOMPLETE` for a session that did not end cleanly rather than silently
   accepting it.
 
+**Planned, not shipped: a build runner.** Toolchains whose daemons need loopback (Gradle,
+Maven, a test harness over TCP) cannot run inside a session, and loopback is closed in both
+directions by design. The answer being built is a runner: the build happens in a digest-pinned
+container with no network, reached through the supervisor's facade, with one prewarmed cache
+volume shared by sessions. Design, measurements and the accepted limits are in
+`docs/plans/2026-10-30-gradle-build-runner.md`; nothing of it is in a released build yet.
+
 Default backend is `mxc` in a build with `--features mxc-backend` (P3.2);
 `--backend appcontainer` remains for workloads whose client stack cannot use a
 proxy. Out of scope for the MVP: undo/rollback, credential injection, ghost

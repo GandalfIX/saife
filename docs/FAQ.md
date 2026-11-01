@@ -63,11 +63,14 @@ surfacing through PowerShell's own startup diagnostics.
 
 ## How do I run Gradle (or a JVM build / local server test) inside the sandbox?
 
-**Short answer for Gradle specifically: do not run it inside the session — use the runner.**
-`saife runner prewarm <project>` fills a shared cache once, and builds then run in a
-digest-pinned container with no network, reached through the facade (see
-[USER-GUIDE §8a](USER-GUIDE.md#8a-building-in-the-sandbox-the-runner)). The long answer below
-is what *inside* the session costs, and it is kept because other JVM tools hit the same wall.
+**Short answer for Gradle specifically: do not run it inside the session — the runner is the
+answer, and it is not in a released build yet.** When it lands, `saife runner prewarm <project>`
+fills a shared cache once and builds run in a digest-pinned container with no network, reached
+through the facade (design and limits:
+[USER-GUIDE §8a](USER-GUIDE.md#8a-building-in-the-sandbox-the-runner)). Until then: use
+`--backend appcontainer` (elevated, and mind the DACL cap) or build outside the sandbox. The
+long answer below is what *inside* the session costs, and it is kept because other JVM tools
+hit the same wall.
 
 **Symptom.** A `gradlew.bat build` inside a sandboxed agent session fails with
 some combination of:
