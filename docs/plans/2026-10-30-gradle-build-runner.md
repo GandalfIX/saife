@@ -171,7 +171,25 @@ Support statement this buys, to be written into the ADR verbatim:
 Because the engine is reachable only from the runner and never from the workload, none of
 this touches the containment invariants — it changes latency, licensing and API gaps only.
 
-## 4. The project is synced, not mounted
+### 4.1 The cache volume (decided 2026-10-30)
+
+An `--offline` build needs a warm `~/.gradle` — 904 MB of Gradle distribution and dependencies
+(measured, §8 of the measurements doc). `/cache` cannot be per-container, or every new slot
+starts empty and either fails offline or has to download, and the slot has `NetworkMode: none`.
+
+**Decision: one global named volume, `saife-runner-cache`, mounted at `/cache` in every slot.**
+
+| aspect | decision | why |
+|---|---|---|
+| scope | one global volume, shared by every session and project | what the measurements assumed; per-session means paying the 88 s first build again in every session |
+| prewarm | explicit, documented command (`saife runner prewarm`) that reports the size | the first fill needs network and a slot has none; an implicit networked build would contradict `--network none` |
+| growth | no eviction in v1; the size is reported (`saife runner status`) | silent deletion of a cache is worse than a visible large one; the operator can remove the volume |
+| trust | **shared state between sessions**, stated as a limit (§10.5) | a build in session A can poison what session B reads; acceptable while saife is single-user on one machine, and said out loud |
+
+Per-session caching is one line away and buys isolation at the price of the 88 s download per
+session; it stays a future switch, not the default.
+
+### 4.2 The project is synced, not mounted
 
 Measured (S0.3, `docs/research/build-runner/measurements.md` §3): a live Windows bind mount
 costs **2.65 ms per file** on this engine — 53 s to read 20 000 small files — while the same
@@ -341,6 +359,15 @@ before S-1 starts.
 
 ### S-2 — Slot lifecycle (on top of the engine abstraction)
 
+- [ ] **T2.7** The cache volume: create `saife-runner-cache` once, mount it at `/cache` in every
+      slot (`HostConfig.Mounts`), and refuse a slot whose mount failed rather than building into
+      an ephemeral `/cache`.
+- [ ] **T2.8** `saife runner prewarm`: a networked, one-off run of the image that fills `/cache`
+      (distribution + a dependency resolution pass), reporting the bytes added. The only place in
+      the design where a runner container has network.
+- [ ] **T2.9** `saife runner status`: cache volume size, slot state, pinned image digest — the
+      facts an operator needs before wondering why a build is slow or the disk is full.
+
 - [ ] **T2.6** `src/runner/engine.rs`: `EngineEndpoint` + `EngineProbe` + `EngineQuirks` +
       the `RunnerEngine` trait from §3. Tests: `DOCKER_HOST` parsing for all three schemes,
       `tcp://` refused by name, containerd-mode Rancher refused by name, and a probe fixture
@@ -397,23 +424,27 @@ before S-1 starts.
 
 ## 10. The risks this design does NOT remove
 
-1. **A second containment domain is not a stronger guarantee.** The workload is contained;
-   the runner is trusted code running on the host with docker/podman rights. Its IPC is
-   therefore part of saife's attack surface, and §2 is the only thing keeping it small.
-2. **The project tree crosses the boundary twice** (sandbox writes, runner builds), so a
-   build's inputs can change mid-build, and Windows file locks can fail a build in ways a
-   native build would not.
-3. **The engine is assumed running, and that assumption can be false.** Rancher/Docker
-   Desktop may be closed, updating, or in a broken state; the runner must detect it in
-   milliseconds and refuse by name rather than wait.
+1. **A second containment domain is not a stronger guarantee.** The workload is contained; the
+   runner is trusted code running on the host with container-engine rights. Its IPC is therefore
+   part of saife's attack surface, and §2 is the only thing keeping it small.
+2. **The project tree crosses the boundary twice** (sandbox writes, runner builds), so a build's
+   inputs can change mid-build, and Windows file locks can fail a build where a native one would
+   not.
+3. **The engine is assumed running, and that assumption can be false.** Rancher/Docker Desktop
+   may be closed, updating, or broken; the runner detects it in milliseconds and refuses by name
+   rather than waiting.
 4. **The substrate is a dependency we do not control.** Docker Desktop requires a paid
-   subscription for larger organisations, updates itself, and is itself a VM; Podman machine
-   and a bare WSL2 distro are alternatives with different gaps. S-0 picks one on numbers.
-4. **Audit stops at the facade.** Container-internal actions are invisible to saife.
-5. **Warm slots cost RAM** even when idle, and a leaked slot is a stale build environment —
-   hence the start-up sweep, which has to be right.
-6. **Nested isolation can look like more than it is.** "Gradle runs in a container" does not
-   mean the container cannot reach the network; §5 is what makes it true.
+   subscription for larger organisations, updates itself, and is itself a VM; Podman machine and
+   a bare WSL2 distro are alternatives with different gaps.
+5. **The cache is shared trust** (§4.1). One global volume means a build in one session can leave
+   something another session's build reads — a poisoned dependency, a rewritten Gradle
+   distribution. Accepted for a single-user machine, written down here and in the ADR, and
+   reversible by switching to a per-session volume.
+6. **Audit stops at the facade.** Container-internal actions are invisible to saife.
+7. **A live daemon costs RAM** until the idle kill (measured 479 MB), and a leaked container is a
+   stale build environment — hence the start-up sweep, which has to be right.
+8. **Nested isolation can look like more than it is.** "Gradle runs in a container" does not mean
+   the container cannot reach the network; `--network none` plus §5 is what makes it true.
 
 ## 11. Open questions
 

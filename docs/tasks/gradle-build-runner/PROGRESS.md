@@ -27,6 +27,9 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done and gated ·
 | T2.3 | Idle kill, recycle, invalidate on digest/JDK change | [ ] | |
 | T2.4 | Single-session ownership, kill on end, start-up sweep | [ ] | |
 | T2.5 | Caps + slot facts (`slot_id`, digest) | [ ] | |
+| T2.7 | Cache volume `saife-runner-cache` at `/cache`; refuse a slot whose mount failed | [ ] | Decided 2026-10-30: one global volume, prewarmed explicitly, no eviction, shared trust stated |
+| T2.8 | `saife runner prewarm` (the only networked runner container) | [ ] | |
+| T2.9 | `saife runner status`: cache size, slot state, pinned digest | [ ] | |
 | T2.6 | Engine abstraction: endpoint + probe + quirks | [x] | `src/runner/docker.rs`: `Endpoint` (npipe/unix parsed, `tcp://`/`ssh://` refused as remote), `/_ping` + `/version` probe, chunked/Content-Length/close-delimited parsing. `RunnerEngine` trait lands with the `BuildEngine` impl |
 | T2.7 | Global cache volume mounted at `/cache` | [x] | `CACHE_VOLUME = saife-runner-cache`, created idempotently, `UsageData.Size` read from `/system/df`; slot body asserts the mount (unit test) |
 | T2.8 | `saife runner status` / `saife runner prewarm <project>` | [x] | status: cache MB + image + slots (live, prints `empty or not reported` before the first prewarm); prewarm: ensure volume → pack project → network-on container → `gradlew --version` + dependency resolution → remove → report size. Only the prewarm container ever has network |

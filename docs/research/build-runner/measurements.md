@@ -196,7 +196,24 @@ That second fact inverts the "offline is simpler" argument into a containment re
   the container shares the host's loopback: an authenticated proxy is a weak boundary when the
   same container can dial anything else on `127.0.0.1` directly.
 
-## 8. Still open
+## 8. What the cache volume has to hold
+
+From §5's legs: the Gradle distribution plus resolved dependencies for the sample project came
+to **904 MB** in `/cache`, and a session's first build without it pays 88.6 s of download. That
+is the argument for a shared, prewarmed volume, and it is a decision rather than a detail - the
+plan records it in §4.1.
+
+| fact | value |
+|---|---|
+| `/cache` after one Spring Boot build | 904 MB |
+| first build with a cold cache (network) | 88.6 s |
+| clean `--offline` build with a warm cache | 8.5 s |
+| per-session cache instead of global | every session pays the 88.6 s again |
+
+The volume is user-visible state: its size belongs in `saife runner status`, and its sharing
+between sessions is a trust limit recorded in the plan (§4.1, §10.5) and the ADR (T5.1).
+
+## 8.1 Still open
 
 | leg | why it is not answered |
 |---|---|
