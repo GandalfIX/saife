@@ -27,6 +27,12 @@ pub enum BuildState {
     Running,
     Succeeded(i32),
     Failed(i32),
+    /// The runner stopped the build at its deadline (`limits.workloadTimeoutSecs`).
+    ///
+    /// Not an exit code: the build did not decide to end, the supervisor did. It is
+    /// spelled as its own state so a caller polling `GET /build` can tell a stop
+    /// from a compiler's failure without knowing that 124 is `timeout(1)`'s number.
+    TimedOut,
     Refused(String),
 }
 
@@ -40,6 +46,7 @@ impl BuildState {
             BuildState::Running => "\"running\"".to_string(),
             BuildState::Succeeded(code) => format!("{{\"exited\":{code}}}"),
             BuildState::Failed(code) => format!("{{\"failed\":{code}}}"),
+            BuildState::TimedOut => "{\"timed_out\":true}".to_string(),
             BuildState::Refused(why) => format!("{{\"refused\":{}}}", json_str(why)),
         }
     }
@@ -55,6 +62,14 @@ pub trait BuildEngine: Send + Sync {
     fn state(&self, id: &str) -> Result<BuildState>;
     /// Log lines produced after the first `from` lines already delivered.
     fn lines(&self, id: &str, from: usize) -> Result<Vec<String>>;
+    /// Release this engine's resources because its session is ending.
+    ///
+    /// Part of the contract rather than the wiring's business: "a slot dies with its
+    /// session" (invariant 4) is something only the engine can keep, and the caller
+    /// gets it for free on every path — the wiring's `Drop` runs on a `?` unwind just
+    /// as it does on a clean exit. A no-op default, because an engine with nothing to
+    /// release should not have to say so.
+    fn shutdown(&self) {}
 }
 
 pub struct RunnerState {
@@ -341,6 +356,12 @@ mod tests {
 
     const TOKEN: &str = "runner-token-0123456789abcdef";
 
+    /// CRLF, spelled as escapes: rustc normalises a real line break inside a string
+    /// literal to a bare LF, so a head written across source lines reaches the listener
+    /// as `\\n\\n` and never terminates - a 20 s hang instead of a
+    /// failure. The escapes cannot be mangled by an editor or a formatter.
+    const CRLF: &str = "\u{000d}\u{000a}";
+
     /// An engine that does exactly what a test asks it to: no container, no Docker.
     #[derive(Default)]
     struct FakeEngine {
@@ -488,6 +509,22 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.0 401"), "got: {resp}");
     }
 
+    /// A build the runner stopped at its deadline is not a build that failed: the
+    /// verdict is the supervisor's, so it gets its own terminal shape instead of a
+    /// magic exit code a caller would have to know (`timeout(1)`'s 124). The log
+    /// stream says the same thing in words, but a poller only sees this.
+    #[test]
+    fn a_timed_out_build_is_terminal_and_says_so() {
+        let timed_out = BuildState::TimedOut;
+        assert!(timed_out.is_terminal(), "a deadline verdict ends the build");
+        assert_eq!(timed_out.as_json(), "{\"timed_out\":true}");
+        assert_ne!(
+            BuildState::Failed(124).as_json(),
+            timed_out.as_json(),
+            "a deadline must not be indistinguishable from an exit code"
+        );
+    }
+
     #[test]
     fn only_the_declared_operations_exist() {
         let h = harness();
@@ -501,6 +538,37 @@ mod tests {
                 "{method} {path} got: {resp}"
             );
         }
+    }
+
+    /// The exit code reaches the caller through the wire, in the shape the workload
+    /// reads: a build that failed says WHICH code failed, and a build the runner stopped
+    /// says so instead of borrowing one. Both are the poller's whole view of the outcome.
+    #[test]
+    fn a_finished_build_reports_its_verdict() {
+        let h = harness();
+        let resp = post_build(h.server.port, Some(TOKEN), GOOD);
+        assert!(resp.contains(r#""b1""#), "got: {resp}");
+
+        h.engine.finish("b1", BuildState::Failed(3));
+        let status = send(
+            h.server.port,
+            &format!("GET /build?id=b1 HTTP/1.0{CRLF}X-Facade-Token: {TOKEN}{CRLF}{CRLF}"),
+        );
+        assert!(status.starts_with("HTTP/1.0 200"), "got: {status}");
+        assert!(
+            status.contains(r#""state":{"failed":3}"#),
+            "the exit code must survive the protocol: {status}"
+        );
+
+        h.engine.finish("b1", BuildState::TimedOut);
+        let stopped = send(
+            h.server.port,
+            &format!("GET /build?id=b1 HTTP/1.0{CRLF}X-Facade-Token: {TOKEN}{CRLF}{CRLF}"),
+        );
+        assert!(
+            stopped.contains(r#""state":{"timed_out":true}"#),
+            "a deadline is its own verdict: {stopped}"
+        );
     }
 
     #[test]

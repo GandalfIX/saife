@@ -7,17 +7,20 @@
 //! `-v C:\:/host` through the deputy, so the request type has no field for either and
 //! the JSON parser refuses unknown keys by name.
 
-// Exercised only by its own tests until T1.2 wires the declared `POST /build` facade
-// operation into it; in a binary crate `pub` does not silence dead-code, and a blanket
-// allow here would hide a genuine regression later - so it goes away with T1.2.
-#![allow(dead_code)]
+// The session wiring (`wiring.rs`) is reached only from the MXC session path, which a
+// `--no-default-features` build does not have: there, the runner is compiled but
+// unreachable, and the chain below is how that is said once instead of as a dozen
+// per-item gates that would also drop these tests from that lane. In the default build
+// nothing is exempt: an item with no caller is a finding, not background noise.
+#![cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 
 use anyhow::{Context, Result, bail};
 
 pub mod builds;
 pub mod docker;
-pub mod sync;
 pub mod server;
+pub mod sync;
+pub mod wiring;
 use std::path::{Path, PathBuf};
 
 /// Tasks the runner will execute. An allow-list, not a pattern: a task string reaches

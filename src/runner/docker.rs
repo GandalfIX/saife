@@ -139,11 +139,19 @@ pub struct Engine {
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
+    /// Kept parsed, not dropped: the engine's capability probe (T2.6) reads answers
+    /// like `X-Docker-Experiment` off them, and a response that threw its headers away
+    /// would have to re-dial to see them.
+    #[allow(dead_code)]
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 impl Response {
+    /// Look a header up by its **lowercased** name (the parser stores keys that way).
+    /// No caller in the slot lifecycle yet: the headers exist for the probe, so the
+    /// accessor that reads them exists with them.
+    #[allow(dead_code)]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -173,6 +181,11 @@ impl Engine {
     }
 
     /// The engine version block, for the support line and for the API negotiation.
+    ///
+    /// No caller in the session path yet: `ping` is what a build needs, and the version
+    /// block belongs to the capability probe (T2.6) that reports *which* engine answered.
+    /// The live leg in this module is what exercises it today.
+    #[allow(dead_code)]
     pub fn version(&self) -> Result<serde_json::Value> {
         self.request("GET", "/version", &[])?.json()
     }
@@ -610,24 +623,6 @@ impl Engine {
         }
         Ok(v["ExitCode"].as_i64().map(|c| c as i32))
     }
-}
-
-/// `Ok(true)` when the buffer was filled; `Ok(false)` on a clean EOF at the first byte.
-fn read_exact_or_eof(file: &mut std::fs::File, buf: &mut [u8]) -> Result<bool> {
-    let mut got = 0;
-    while got < buf.len() {
-        match file.read(&mut buf[got..]) {
-            Ok(0) => {
-                if got == 0 {
-                    return Ok(false);
-                }
-                bail!("runner: truncated stream");
-            }
-            Ok(n) => got += n,
-            Err(e) => return Err(e).context("runner: read the exec stream"),
-        }
-    }
-    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

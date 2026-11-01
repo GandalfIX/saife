@@ -353,9 +353,21 @@ before S-1 starts.
       `400 facade_method_invalid`, and bodies are forwarded up to `MAX_FACADE_BODY` (4 KiB) with
       `413 facade_body_too_large` past it. Tests: declared `POST /build` reaches the sidecar with
       its body and a `POST /build HTTP/1.0` request line; `DELETE` → 403; oversized → 413.
-- [~] **T1.4** Runner token — the listener requires its own `X-Facade-Token` and refuses any
-      other (401 `runner_token_invalid`). The "never the same value as the proxy token" assertion
-      needs the session wiring, where both exist; it lands with T1.2b.
+- [x] **T1.4** Runner token — **done**: the listener requires its own `X-Facade-Token` and
+      refuses any other (401 `runner_token_invalid`); the session wiring mints it from the system
+      RNG (128 bits, hex) and refuses a value equal to the proxy token by name
+      (`runner_token_shared`). Test `the_runner_token_is_not_the_proxy_token` proves both halves:
+      the values differ, and the listener rejects the credential the workload DOES hold.
+
+- [x] **T1.6** The session wiring — **done** (`src/runner/wiring.rs`): `saife run --runner`
+      (opt-in) starts the listener and registers `build.sandbox.invalid` with `POST /build` and
+      `GET /build` in the session's facade registry, so a workload reaches the runner the way it
+      reaches a plugin — one declared `(method, path)` pair, one audit path, no new port. The
+      wiring is a `Drop` guard: the listener stops and the engine is told (`BuildEngine::shutdown`,
+      which removes the slot) on the clean path *and* on every `?` unwind. Refused by name on
+      `--block-net` (`runner_requires_proxy`) and on `--backend appcontainer`
+      (`runner_unsupported_backend`, exit 5). This closes the gap that made a build unreachable
+      from inside a session even though every piece of it was built.
 
 ### S-2 — Slot lifecycle (on top of the engine abstraction)
 
@@ -400,8 +412,16 @@ before S-1 starts.
 
 - [ ] **T4.1** `profiles/gradle-runner.json` + `profiles/README.md` row: project grant, no
       network, runner profile name.
-- [ ] **T4.2** Invocation: `gradlew --offline <task>` with `JAVA_HOME` from the image; exit
-      code propagated; timeout and cancel wired to the session deadline.
+- [x] **T4.2** Invocation — **done**: `./gradlew --offline --console=plain <task>` as a fixed
+      argv, with `JAVA_HOME` pinned to the image's JDK (`/opt/java/openjdk`, measured off the
+      pinned digest) and `GRADLE_USER_HOME=/cache`; the supervisor's own `JAVA_HOME` is never
+      passed through (a Windows path cannot exist in the slot) and a test pins that. The exec's
+      exit code is propagated, not squashed (0 → `Succeeded`, N → `Failed(N)`, no code →
+      `Failed(-1)`). The deadline is `limits.workloadTimeoutSecs` — the workload's own clock —
+      and a build past it is cancelled: the log names the setting, the state is its own terminal
+      verdict (`{"timed_out":true}`, not a borrowed 124), and the slot is removed so the next
+      session cannot inherit it. Live legs (`#[ignore]`): a real build succeeds and leaves no
+      container; a 1-second deadline stops a real build in 1.6 s and leaves none either.
 - [ ] **T4.3** Prewarm at image build time (wrapper distribution + dependencies), documented as
       an install/refresh step.
 - [ ] **T4.4** Offline failure UX: missing dependency → message naming it and the refresh

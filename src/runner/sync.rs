@@ -52,6 +52,7 @@ pub fn pack_dir(root: &Path, skip: &[&str]) -> Result<Vec<u8>> {
 ///
 /// Returns how many entries were written. The filter is what makes "declared outputs only"
 /// true: syncing a whole tree back would overwrite the agent's edits with snapshot content.
+#[allow(dead_code)] // the production path always knows whether to strip; the tests use both
 pub fn unpack_into(tar: &[u8], dest: &Path, keep: &dyn Fn(&Path) -> bool) -> Result<usize> {
     unpack_into_at(tar, dest, false, keep)
 }

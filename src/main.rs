@@ -72,6 +72,7 @@ fn main() {
             sid,
             plugin,
             plugin_dir,
+            runner,
             cmd,
         } => run_cmd(
             backend,
@@ -90,6 +91,7 @@ fn main() {
             sid,
             plugin,
             plugin_dir,
+            runner,
             cmd,
         ),
         Cmd::Ps { json, .. } => ps_cmd(json),
@@ -681,6 +683,8 @@ fn run_cmd(
     // P4.1/P1.x: `--plugin` / `--plugin-dir`, repeatable and order-sensitive.
     plugin: Vec<String>,
     plugin_dir: Vec<String>,
+    // `--runner`: the build runner's facade mount for this session.
+    runner: bool,
     cmd: Vec<String>,
 ) -> i32 {
     // Backend selection is refused before anything is spawned or created. The
@@ -729,6 +733,7 @@ fn run_cmd(
         sid.as_deref(),
         &plugin,
         &plugin_dir,
+        runner,
         &cmd,
     ) {
         Ok(code) => code,
@@ -767,6 +772,8 @@ fn run_inner(
     plugins: &[String],
     // `--plugin-dir` roots, in the order given (repeatable).
     plugin_dirs: &[String],
+    // `--runner`: wire the build runner's facade mount and listener for this session.
+    enable_runner: bool,
     cmd: &[String],
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
@@ -826,6 +833,7 @@ fn run_inner(
                 no_interactive,
                 plugins,
                 plugin_dirs,
+                enable_runner,
                 cmd,
             );
         }
@@ -848,6 +856,16 @@ fn run_inner(
         eprintln!(
             "[saife] plugin_unsupported_backend: --plugin {} (plugins are wired on --backend mxc only)",
             plugins.join(", ")
+        );
+        return Ok(2);
+    }
+    // Same rule for the runner: refused BY NAME rather than started or ignored. The
+    // facade exists on both backends, so this is a wiring gap and not a containment one
+    // — but a capability that silently does not appear is exactly the failure mode this
+    // project exists to prevent.
+    if enable_runner {
+        eprintln!(
+            "[saife] runner_unsupported_backend: --runner (the build runner is wired on --backend mxc only)"
         );
         return Ok(2);
     }
@@ -1009,6 +1027,15 @@ const EXIT_TIMEOUT: i32 = 124;
 #[cfg(feature = "mxc-backend")]
 const EXIT_PLUGIN_REFUSED: i32 = 5;
 
+/// Exit code for a session the BUILD RUNNER refused: no engine, no mount, a token it
+/// could not mint.
+///
+/// The same value as [`EXIT_PLUGIN_REFUSED`] and for the same reason — "a capability I
+/// asked for was not available" — kept as its own name because the two are different
+/// capabilities and a caller reading a script should not have to infer that from 5.
+#[cfg(feature = "mxc-backend")]
+const EXIT_RUNNER_REFUSED: i32 = 5;
+
 /// Exit code for a session a guardrail refused.
 ///
 /// `126` is `timeout(1)`'s "found but could not be executed", which is what a
@@ -1065,6 +1092,8 @@ fn run_mxc_session(
     no_interactive: bool,
     plugins: &[String],
     plugin_dirs: &[String],
+    // `--runner`: start the build runner and publish its facade mount.
+    enable_runner: bool,
     cmd: &[String],
 ) -> Result<i32> {
     // Decision 7: `--print-sid` yields the id and returns, exactly as the
@@ -1211,6 +1240,55 @@ fn run_mxc_session(
         }
         sidecars.push(sidecar);
     }
+
+    // (5c) The build runner (T1.6, T4.2). Its mount goes into the same registry the
+    //      plugins use, so a workload reaches it exactly as it reaches a plugin: an
+    //      ordinary proxied request to `http://build.sandbox.invalid/…`, checked against
+    //      the declared `(method, path)` and audited by the path that already exists.
+    //      Bound after `proxy`, so the wiring is dropped BEFORE it: a route never
+    //      outlives the listener it points at, on the clean path and on every `?`.
+    let _runner_session = if enable_runner {
+        if net_cfg.is_blocked() {
+            eprintln!(
+                "[saife] runner_requires_proxy: --runner (--block-net starts no listener to route its facade mount)"
+            );
+            return Ok(2);
+        }
+        let endpoint = match crate::runner::docker::Endpoint::resolve() {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                eprintln!("[saife] runner refused: {e:#}");
+                return Ok(EXIT_RUNNER_REFUSED);
+            }
+        };
+        // The build shares the workload's clock: a build IS work the workload asked for,
+        // so `limits.workloadTimeoutSecs` is the deadline rather than a second term an
+        // operator would have to discover before a runaway build could be stopped.
+        let builds = std::sync::Arc::new(crate::runner::builds::DockerBuilds::new(
+            crate::runner::docker::Engine::connect(endpoint),
+            cwd.to_path_buf(),
+            sid.to_string(),
+            std::time::Duration::from_secs(u64::from(limits.workload_timeout_secs)),
+        ));
+        match crate::runner::wiring::RunnerWiring::start(&facade, cwd, builds, token) {
+            Ok(wiring) => {
+                if std::env::var_os("SAIFE_DIAG").is_some() {
+                    eprintln!(
+                        "[saife] SAIFE_DIAG: build runner on 127.0.0.1:{} as {}.sandbox.invalid",
+                        wiring.port(),
+                        crate::runner::wiring::MOUNT
+                    );
+                }
+                Some(wiring)
+            }
+            Err(e) => {
+                eprintln!("[saife] runner refused: {e:#}");
+                return Ok(EXIT_RUNNER_REFUSED);
+            }
+        }
+    } else {
+        None
+    };
 
     // (6) Guardrail 1's proof source. With a proxy it is that listener — the one
     //     the child is pointed at, so the proof cannot come from a different

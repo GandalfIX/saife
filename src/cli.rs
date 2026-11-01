@@ -255,6 +255,17 @@ pub enum Cmd {
         #[arg(long, hide = true)]
         print_sid: bool,
 
+        /// Enable the build runner for this session: the workload may then ask the
+        /// supervisor to build its project in a container, through the facade host
+        /// `build.sandbox.invalid` (`POST /build`, `GET /build?id=…&follow=1`).
+        ///
+        /// Opt-in on purpose. It costs a long-lived container and a second mount in
+        /// the session, and a workload that never builds should not pay either. Needs
+        /// the proxy (the facade is how the request travels), so `--block-net` refuses
+        /// it; with the runner on, `--backend mxc` must be in use.
+        #[arg(long)]
+        runner: bool,
+
         /// Reuse an existing session id (re-derive its profile + ACLs).
         #[arg(long, value_name = "SID", hide = true)]
         sid: Option<String>,
@@ -503,6 +514,28 @@ mod tests {
             "the order the operator gave is the discovery order"
         );
         assert_eq!(cmd, vec!["cmd".to_string()]);
+    }
+
+    /// The runner is a capability, so it is opt-in: a session that does not ask for it
+    /// gains no mount, no listener and no container. The flag is the whole switch.
+    #[test]
+    fn the_build_runner_is_off_unless_it_is_asked_for() {
+        let cli = Cli::parse_from(["saife", "run", "--", "cmd"]);
+        let Cmd::Run { runner, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        assert!(!runner, "a session must not grow a build runner by default");
+
+        let cli = Cli::parse_from(["saife", "run", "--runner", "--", "cmd"]);
+        let Cmd::Run { runner, cmd, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        assert!(runner, "--runner enables it");
+        assert_eq!(
+            cmd,
+            vec!["cmd".to_string()],
+            "--runner must not swallow the workload"
+        );
     }
 
     #[test]

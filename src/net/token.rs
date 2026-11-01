@@ -141,7 +141,10 @@ fn serial_hex(run: u64) -> String {
 }
 
 /// `bytes` random bytes, hex-encoded.
-fn random_hex(bytes: usize) -> Result<String> {
+///
+/// `pub(crate)` so the build runner can mint its own facade token from the same RNG
+/// rather than a second `BCryptGenRandom` call site that could drift.
+pub(crate) fn random_hex(bytes: usize) -> Result<String> {
     let mut buf = vec![0u8; bytes];
     // SAFETY: `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` and a
     // `None` algorithm handle fills `buf` from the system-preferred RNG. The
