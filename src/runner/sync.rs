@@ -14,19 +14,36 @@ use std::path::{Path, PathBuf};
 /// inputs wants `build/` gone (it is the output), while a caller syncing a cache wants it.
 pub fn pack_dir(root: &Path, skip: &[&str]) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
-    for entry in
-        std::fs::read_dir(root).with_context(|| format!("runner: read {}", root.display()))?
-    {
+    walk(&mut builder, root, Path::new(""), skip)?;
+    builder.into_inner().context("runner: finish the tar")
+}
+
+/// Depth-first, applying `skip` to **every** directory, not just the root.
+///
+/// Measured on a real project with a composite build: `sample-gradle/build-logic/build/classes`
+/// and `build-logic/.gradle/**` were copied in, 645 files / 4.1 MB where the sources are 26 files
+/// / 304 KB. Two wrongs at once - the container starts from the host's stale compiled output, so
+/// "a build sees a snapshot of the sources" was false for every subproject, and every copy was
+/// fourteen times larger than it needed to be.
+fn walk(
+    builder: &mut tar::Builder<Vec<u8>>,
+    root: &Path,
+    rel: &Path,
+    skip: &[&str],
+) -> Result<()> {
+    for entry in std::fs::read_dir(root).with_context(|| format!("runner: read {}", root.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         if skip.iter().any(|s| name.to_string_lossy() == *s) {
             continue;
         }
         let path = entry.path();
+        let rel_path = rel.join(&name);
         if entry.file_type()?.is_dir() {
             builder
-                .append_dir_all(&name, &path)
+                .append_dir(&rel_path, &path)
                 .with_context(|| format!("runner: pack {}", path.display()))?;
+            walk(builder, &path, &rel_path, skip)?;
         } else {
             let mut file = std::fs::File::open(&path)
                 .with_context(|| format!("runner: open {}", path.display()))?;
@@ -41,11 +58,11 @@ pub fn pack_dir(root: &Path, skip: &[&str]) -> Result<Vec<u8>> {
             header.set_size(file.metadata()?.len());
             header.set_cksum();
             builder
-                .append_data(&mut header, &name, &mut file)
+                .append_data(&mut header, &rel_path, &mut file)
                 .with_context(|| format!("runner: pack {}", path.display()))?;
         }
     }
-    builder.into_inner().context("runner: finish the tar")
+    Ok(())
 }
 
 /// Unpack an archive into `dest`, keeping only entries `keep` accepts.
@@ -181,4 +198,34 @@ mod tests {
         assert!(dest.join("out/keep.jar").exists());
         assert!(!dest.join("out/log.txt").exists());
     }
+    /// A composite build has its own `build/` and `.gradle/` one level down. Skipping only the
+    /// root copied 4.1 MB where 304 KB of sources exist, and made "the build sees a snapshot of
+    /// the sources" false for every subproject.
+    #[test]
+    fn nested_outputs_and_caches_are_skipped_too() {
+        let root = scratch("nested");
+        std::fs::create_dir_all(root.join("src/main/java")).unwrap();
+        std::fs::write(root.join("src/main/java/A.java"), b"class A {}").unwrap();
+        std::fs::create_dir_all(root.join("build-logic/build/classes")).unwrap();
+        std::fs::write(root.join("build-logic/build/classes/A.class"), b"junk").unwrap();
+        std::fs::create_dir_all(root.join("build-logic/.gradle/9.8.2")).unwrap();
+        std::fs::write(root.join("build-logic/.gradle/9.8.2/state.bin"), b"junk").unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/root.class"), b"junk").unwrap();
+
+        let tar = pack_dir(&root, &["build", ".gradle", ".git"]).expect("pack");
+        let names: Vec<String> = tar::Archive::new(std::io::Cursor::new(tar))
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(names.iter().any(|n| n.ends_with("src/main/java/A.java")), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("/build/") || n.contains("/.gradle/") || n.starts_with("build/")),
+            "nested outputs must not travel: {names:?}"
+        );
+    }
+
 }
