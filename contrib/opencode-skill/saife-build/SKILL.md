@@ -1,69 +1,88 @@
 ---
 name: saife-build
-description: "Use when the user asks to build, test or check a JVM/Gradle project inside a saife session. Runs the build in saife's runner (a container reached through the facade), never in the session."
+description: "Use when asked to build, test or check a Gradle project inside a saife session. Asks the supervisor's runner to run Gradle in a container, because Gradle cannot run in the session itself."
 ---
 
 # Building with saife's runner
 
-Gradle cannot build inside a saife session: its daemon, workers and compiler daemons all talk
-over loopback, and loopback is closed in both directions in a session (`connect()` fails with
-`WSAEACCES 10013`). `--no-daemon` does not help - Gradle forks a single-use daemon anyway.
+Gradle cannot run inside a saife session: there is no network and no loopback, and Gradle's
+daemon, workers and compiler daemons all speak over loopback (`WSAEACCES 10013` in both
+directions). `--no-daemon` does not help - Gradle forks a single-use daemon anyway.
 
-The build therefore happens **outside** the session, in a container the supervisor manages, and
-the result is synced back. You trigger it; you do not run `gradlew` yourself.
+So you do not run `./gradlew`. You ask for a build over the session's own proxy, and the
+supervisor runs it in a container it owns.
 
-## How to trigger a build
+## Ask for a build
 
 ```powershell
-saife-build                 # task "build", project "."
-saife-build test            # any of: assemble, build, check, clean, test
-saife-build build ../other  # a project directory inside the session workspace
+# the shim, if it is on PATH inside the session
+saife-build build
+saife-build test ../other
+
+# or by hand - the body goes through a FILE: PowerShell 5.1 strips quotes when handing
+# arguments to a native command, and the runner then answers "key must be a string"
+$body = '{"project":"app","task":"build","profile":"gradle"}'
+Set-Content -NoNewline -Encoding ascii "$env:TEMP\body.json" $body
+$start = curl.exe -sS -m 60 -X POST "http://build.sandbox.invalid/build" -H "Content-Type: application/json" --data-binary "@$env:TEMP\body.json"
+$start
+$id = ($start | ConvertFrom-Json).id
+curl.exe -sS -N -m 300 "http://build.sandbox.invalid/build?id=$id&follow=1"
 ```
 
-`saife-build` is a two-line HTTP client over the session proxy. Everything it can ask for is
-what the runner accepts:
+The log **streams** while the build runs and ends with a verdict: `{"exited":0}`,
+`{"failed":N}`, or `{"timed_out":true}`.
 
-```http
-POST http://build.sandbox.invalid/build
-{"project":"app","task":"build","profile":"gradle"}
-```
+## What you may ask for
 
-## What you cannot ask for - on purpose
-
-There is **no field** for an image, a mount, an environment variable, a command line or a flag.
-Those are constants on the supervisor's side, because a request that could name them would be a
-sandbox escape (`-v C:\:/host`, `--privileged`). If a task seems to need one, it is not a task
-this runner supports - say so instead of trying to work around it.
-
-The only free choices are:
-
-| field | allowed values |
+| field | values |
 |---|---|
 | `task` | `assemble`, `build`, `check`, `clean`, `test` |
-| `project` | a path inside the session workspace (no `..`, no absolute or UNC path) |
+| `project` | a path inside the session workspace (no `..`, no drive, no UNC, no junction) |
+| `paths` | optional allow-list of relative paths to copy; absent = the whole project |
 | `profile` | `gradle` |
 
-## Reading the result
+There is **no field** for an image, a mount, an environment variable or a command line. Those are
+constants on the supervisor's side, because a request that could name them would be a sandbox
+escape. If a task seems to need one, it is not a task this runner supports - say so.
 
-- The log streams **while the build runs** (line per line, not at the end). Watch it; do not
-  assume success from a quiet terminal.
-- The exit code is the build's. A non-zero code means the build failed: read the log rather
-  than retrying.
-- Artifacts appear in the project directory on the host (`build/libs/*.jar`), synced back when
-  the build ends. Everything else in `build/` stays in the container.
+The body must stay under 4 KiB, and only `POST /build` and `GET /build` are relayed; anything else
+is `403 facade_operation_not_declared`.
 
-## Common failures, and what they mean
+## Prewarm, and the offline failure
+
+Builds run `./gradlew --offline` in a container with no network. Anything not already in the cache
+fails with `No cached version of <group>:<artifact>:<version> available for offline mode`.
+
+That is not something you can fix by retrying. The user runs:
+
+```
+saife runner prewarm <project>
+```
+
+which resolves every configuration (compile, runtime, test-compile, test-runtime) and takes
+seconds when warm, minutes when cold. So the loop is: **edit `build.gradle.kts` -> prewarm ->
+build**, and a build never goes to the network.
+
+## Failures, and what they mean
 
 | message | meaning |
 |---|---|
-| `runner_engine_unavailable` | no container engine is running (Rancher/Docker Desktop is closed). Start it; the runner will not wait for it. |
-| `runner_toolchain_missing` | the pinned image does not carry the JDK your build asks for. Not something to fix by editing the build - report it. |
-| a dependency resolution failure with `--offline` | the cache is cold or missing that artifact. Ask the user to run `saife runner prewarm <project>`; a build never goes to the network. |
-| `runner_build_id_missing`, `runner_operation_unknown` | your request was malformed - use `saife-build`, not hand-rolled HTTP. |
+| `No cached version of …` | cache is cold or missing that artifact -> prewarm |
+| `the project copy did not take (…); retrying` | the copy is retried 3x; if it still fails, say so |
+| `runner_toolchain_missing` | the pinned image lacks the required JDK -> report it, do not lower the requirement |
+| `runner_engine_unavailable`, exit 5 | no container engine is running -> start it |
+| `timed_out` | `limits.workloadTimeoutSecs` ran out -> narrower task, or raise the limit |
+| `runner_slot_cap_reached` | 4 slots busy -> close an idle session |
 
-## What this skill is not
+## Rules
 
-It is documentation, not enforcement. The control is the facade: the supervisor relays only the
-`(method, path)` pairs the runner declares (`POST /build`, `GET /build`), the request type has no
-field for anything else, and every request is in the session's audit chain. If this skill and the
-socket disagree, the socket is right.
+1. Never invoke `gradlew` in the session - it cannot work there, and the failure looks like a
+   Gradle problem when it is a policy refusal.
+2. Never invent a field; a refused request means a supported field was missing.
+3. Read the log before retrying: a failed build is usually a real compile error.
+4. Only `build/libs` comes back, into the project directory on the host.
+5. Judge success by the verdict and the artifacts, not by a quiet terminal - the log streams, so
+   silence mid-build is a slow task, not a dead one.
+
+Fuller reference, including the copy/monorepo rules and how to watch the container:
+`EXPLANATION.md` next to this file.
