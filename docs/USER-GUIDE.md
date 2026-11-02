@@ -9,6 +9,9 @@ session.
 
 ---
 
+> **In a hurry?** [`RECIPES.md`](RECIPES.md) is task-first: *if you want to
+> achieve X, run Y*. This guide explains the model behind those commands.
+
 ## 1. The model in one minute
 
 A run gets **only what you grant it**:
