@@ -73,42 +73,15 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
         let mut done: Vec<String> = Vec::new();
         let raw = load_raw_chain(name, &cwd, &mut stack, &mut done)?
             .expect("the requested profile is always merged");
-        validate_schema_version(&raw)?;
         let groups = raw
             .security
             .as_ref()
             .map(|s| s.groups.clone())
             .unwrap_or_default();
-        let mut fs = resolve_filesystem(&raw.filesystem, &cwd)?;
-        let resolved_name = raw
-            .meta
-            .as_ref()
-            .map(|m| m.name.clone())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| name.to_string());
-        if let Some(sec) = &raw.security
-            && !sec.groups.is_empty()
-        {
-            let probe = crate::security_groups::HostEnv;
-            let grants = crate::security_groups::resolve_groups(&probe, &sec.groups);
-            for g in grants {
-                fs.read_only.push(g.path);
-            }
-            fs.read_only = dedupe_paths(fs.read_only);
-            let allow_keys: std::collections::BTreeSet<String> = fs
-                .allow
-                .iter()
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .collect();
-            fs.read_only
-                .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
-        }
-        let resolved = ResolvedProfile {
-            name: resolved_name,
-            filesystem: fs,
-            network: resolve_network_slice(&raw.network),
-            limits: resolve_limits_slice(&raw.limits),
-        };
+        // One resolver for enforcement and display: a second copy is how the two
+        // drifted (the display listed a directory twice after the resolver had been
+        // taught not to).
+        let resolved = resolve_raw(&raw, &cwd, name)?;
         let groups_expanded = expand_groups_for_show(&groups);
         println!("{}", to_expanded_json(&resolved, &groups_expanded));
     } else {
@@ -684,14 +657,31 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
     let mut done: Vec<String> = Vec::new();
     let raw = load_raw_chain(name, cwd, &mut stack, &mut done)?
         .expect("the root profile is always merged");
-    validate_schema_version(&raw)?;
+    resolve_raw(&raw, cwd, name)
+}
+
+/// Turn a merged raw profile into the enforced slice: expand the paths, expand
+/// the security groups, and dedupe.
+///
+/// Both the enforcing path ([`load_and_resolve`]) and the display path
+/// (`profile show --expanded`) go through here. They used to carry a copy each,
+/// which is how `--expanded` kept listing one directory twice after the resolver
+/// had been taught not to.
+fn resolve_raw(raw: &RawProfile, cwd: &Path, requested: &str) -> Result<ResolvedProfile> {
+    validate_schema_version(raw)?;
     let mut fs = resolve_filesystem(&raw.filesystem, cwd)?;
+    // Two spellings can be one directory once expanded: `$APPDATA/OpenCode` and
+    // `$USERPROFILE/AppData/Roaming/opencode` are the same NTFS directory, while the
+    // composition pass compared the unexpanded text, where they differ. Dedupe after
+    // expansion or the resolved slice grants - and DACLs - the same directory twice.
+    // `allow` first, so a path granted RWX is not left listed as read-only too.
+    dedupe_against_allow(&mut fs);
     let resolved_name = raw
         .meta
         .as_ref()
         .map(|m| m.name.clone())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| name.to_string());
+        .unwrap_or_else(|| requested.to_string());
 
     // Expand security groups (FR-5.4). Group paths are RX (read_only
     // semantics). They are appended after the profile's own read_only entries
@@ -705,16 +695,7 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
         for g in grants {
             fs.read_only.push(g.path);
         }
-        fs.read_only = dedupe_paths(fs.read_only);
-        // Also drop group paths that already appear in `allow` (RWX),
-        // since dedupe_paths only dedupes within one vector.
-        let allow_keys: std::collections::BTreeSet<String> = fs
-            .allow
-            .iter()
-            .map(|p| p.to_string_lossy().to_lowercase())
-            .collect();
-        fs.read_only
-            .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+        dedupe_against_allow(&mut fs);
     }
 
     Ok(ResolvedProfile {
@@ -723,6 +704,21 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
         network: resolve_network_slice(&raw.network),
         limits: resolve_limits_slice(&raw.limits),
     })
+}
+
+/// Dedupe both grant lists case-insensitively and drop read-only paths that are
+/// already granted read-write. Order is preserved (first occurrence wins), which is
+/// what keeps an RWX grant from being downgraded by a later RX duplicate.
+fn dedupe_against_allow(fs: &mut FilesystemSlice) {
+    fs.allow = dedupe_paths(std::mem::take(&mut fs.allow));
+    fs.read_only = dedupe_paths(std::mem::take(&mut fs.read_only));
+    let allow_keys: std::collections::BTreeSet<String> = fs
+        .allow
+        .iter()
+        .map(|p| p.to_string_lossy().to_lowercase())
+        .collect();
+    fs.read_only
+        .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
 }
 
 /// Recursively load a profile and its `extends` chain. The deepest parent is
@@ -1548,6 +1544,55 @@ mod tests {
         assert!(
             msg.contains("missing required field `meta.schema_version`"),
             "got: {msg}"
+        );
+    }
+
+    /// Two spellings of one directory must resolve to one grant. `$APPDATA/x` and
+    /// `$USERPROFILE/AppData/Roaming/x` are the same directory on NTFS, and the
+    /// composition pass cannot see that (it compares the unexpanded text, where the
+    /// two spellings differ), so the dedupe has to happen after expansion - measured
+    /// on the opencode-desktop profile, whose `$APPDATA/OpenCode` grant met its
+    /// parent's `AppData/Roaming/opencode` and survived alongside it.
+    #[test]
+    fn a_grant_spelled_two_ways_resolves_once() {
+        let dir = temp_dir("two-spellings");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_profile(
+            &dir,
+            "parent",
+            r#"{"meta":{"name":"parent","schema_version":1},
+                "filesystem":{"allow":["$USERPROFILE/AppData/Roaming/opencode"]}}"#,
+        );
+        // A relative `extends` is refused by design (CR-10), so the parent is named
+        // by absolute path; forward slashes keep the JSON escaping honest.
+        let parent = dir.join("parent.json");
+        let parent_json = parent.to_str().unwrap().replace('\\', "/");
+        write_profile(
+            &dir,
+            "child",
+            &format!(
+                r#"{{"meta":{{"name":"child","schema_version":1}},
+                    "extends":["{parent_json}"],
+                    "filesystem":{{"allow":["$APPDATA/OpenCode"]}}}}"#
+            ),
+        );
+        let child = dir.join("child.json");
+        let r = load_and_resolve(child.to_str().unwrap(), &dir).expect("child resolves");
+        let hits: Vec<&std::path::PathBuf> = r
+            .filesystem
+            .allow
+            .iter()
+            .filter(|p| {
+                p.to_string_lossy()
+                    .to_lowercase()
+                    .contains("roaming\\opencode")
+            })
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one directory, one grant: {:?}",
+            r.filesystem.allow
         );
     }
 

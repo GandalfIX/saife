@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "opencode-desktop",
+    "version": "0.2.0",
+    "schema_version": 1
+  },
+  "extends": [
+    "opencode"
+  ],
+  "filesystem": {
+    "allow": [
+      "$APPDATA/ai.opencode.desktop"
+    ],
+    "read_only": [
+      "$LOCALAPPDATA/Programs/ai.opencode.desktop"
+    ]
+  },
+  "network": {
+    "allow_domain": [
+      "models.opencode.ai",
+      "opencode.ai"
+    ]
+  },
+  "limits": {
+    "workloadTimeoutSecs": 14400
+  }
+}
