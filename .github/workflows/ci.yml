@@ -19,6 +19,9 @@ jobs:
       # The prerequisite checker's JSON contract and exit code; cheap, and it runs
       # before the build so a broken check is not discovered after 6 minutes.
       - run: pwsh -NoProfile -File packaging/tests/check-prereqs.ps1
+      # The architecture helper, and the release-asset selection install.ps1 runs on:
+      # the installer's copies are compared against the library, so the two cannot drift.
+      - run: pwsh -NoProfile -File packaging/tests/arch.ps1
       - run: cargo test --bin saife
       - run: cargo test --bin saife --no-default-features
       - run: cargo clippy --all-targets -- -D warnings
@@ -27,3 +30,5 @@ jobs:
       # The release script's pre-tag guard: a tag pushed without the files the
       # release uploads cannot be withdrawn, so it is checked before tagging.
       - run: pwsh -NoProfile -File packaging/tests/release-side-files.ps1
+      # The per-architecture winget rewrite, against the shipped manifest. Offline.
+      - run: pwsh -NoProfile -File packaging/tests/winget-manifest.ps1

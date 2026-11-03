@@ -1,7 +1,9 @@
-﻿# Install a locally built SAIFE release on this machine.
+#Requires -Version 7.0
+# Install a locally built SAIFE release on this machine.
 #
 #   pwsh -File packaging\install-local.ps1                 # the archive matching Cargo.toml
 #   pwsh -File packaging\install-local.ps1 -Zip .\saife-0.3.0-x64.zip
+#   pwsh -File packaging\install-local.ps1 -Arch arm64      # the arm64 archive
 #   pwsh -File packaging\install-local.ps1 -WhatIf
 #   pwsh -File packaging\install-local.ps1 -AllowVersionMismatch   # deliberate, e.g. testing an old build
 #
@@ -25,6 +27,9 @@
 
 param(
     [string]$Zip,
+    # x64 | arm64; default: this host's architecture. Only an archive of this
+    # architecture can be installed - the other one will not start here.
+    [string]$Arch,
     [string]$Destination = (Join-Path $env:LOCALAPPDATA 'Programs\saife'),
     [switch]$WhatIf,
     [switch]$NoPathEntry,
@@ -38,7 +43,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\arch.ps1')
 $root = Split-Path -Parent $PSScriptRoot
+
+# Installing is always for THIS machine, so there is no 'all': the archive of the other
+# architecture does not start here, and picking it silently would install a device of
+# the wrong kind (Windows will refuse it with a bare "not a valid Win32 application").
+$targetArch = Resolve-ArchParam -Arch $Arch
+if ($targetArch -eq 'all') {
+    throw ("-Arch all installs nothing: pick one architecture, e.g. -Arch {0}" -f (Resolve-HostArch))
+}
 
 $toml = Get-Content (Join-Path $root 'Cargo.toml') -Raw
 if ($toml -notmatch '(?sm)\[package\].*?^\s*version\s*=\s*"([^"]+)"') {
@@ -48,37 +62,48 @@ $declared = $Matches[1]
 
 function Get-ArchiveVersion([string]$Path) {
     $name = Split-Path -Leaf $Path
-    if ($name -match '^saife-(?<v>[0-9A-Za-z][0-9A-Za-z.\-]*)-x64\.zip$') { return $Matches['v'] }
+    if ($name -match '^saife-(?<v>[0-9A-Za-z][0-9A-Za-z.\-]*)-(?<arch>x64|arm64)\.zip$') { return $Matches['v'] }
     return $null
 }
 
+function Get-ArchiveArch([string]$Path) {
+    $name = Split-Path -Leaf $Path
+    if ($name -match '^saife-(?<v>[0-9A-Za-z][0-9A-Za-z.\-]*)-(?<arch>x64|arm64)\.zip$') { return $Matches['arch'] }
+    return $null
+}
+
+$buildCommand = "pwsh -File packaging\build-dist.ps1 -Release -Arch $targetArch"
 if (-not $Zip) {
     # Two homes, on purpose: `build-dist.ps1 -Release` leaves the asset at the repo
     # root, `release.ps1` archives it under dist/release/ before publishing.
     $candidates = @(
-        (Join-Path $root "saife-$declared-x64.zip"),
-        (Join-Path $root "dist/release/saife-$declared-x64.zip")
+        (Join-Path $root "saife-$declared-$targetArch.zip"),
+        (Join-Path $root "dist/release/saife-$declared-$targetArch.zip")
     )
     $matching = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $matching) {
-        $any = Get-ChildItem $root, (Join-Path $root 'dist/release') -Filter 'saife-*-x64.zip' -File -ErrorAction SilentlyContinue |
+        $any = Get-ChildItem $root, (Join-Path $root 'dist/release') -Filter "saife-*-$targetArch.zip" -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $found = if ($any) { " (found $((Get-ArchiveVersion $any.FullName)) instead)" } else { '' }
-        throw ("no saife-{0}-x64.zip in {1}{2} - run: pwsh -File packaging\build-dist.ps1 -Release" -f $declared, $root, $found)
+        throw ("no saife-{0}-{1}.zip in {2}{3} - run: {4}" -f $declared, $targetArch, $root, $found, $buildCommand)
     }
     $Zip = $matching
 }
 if (-not (Test-Path $Zip)) { throw "archive not found: $Zip" }
 
-$archiveVersion = Get-ArchiveVersion $Zip
-if (-not $archiveVersion) {
-    throw "cannot read a version from '$Zip' - expected saife-<version>-x64.zip"
+$archiveArch = Get-ArchiveArch $Zip
+if (-not $archiveArch) {
+    throw ("cannot read an architecture from '{0}' - expected saife-<version>-x64.zip or saife-<version>-arm64.zip" -f $Zip)
 }
+if ($archiveArch -ne $targetArch) {
+    throw ("{0} is the {1} archive but {2} was requested - the {1} binary does not run on an {2} host. Build the one you need: {3}  (or pass -Arch {1})" -f (Split-Path -Leaf $Zip), $archiveArch, $targetArch, $buildCommand)
+}
+$archiveVersion = Get-ArchiveVersion $Zip
 if ($archiveVersion -ne $declared) {
     if ($AllowVersionMismatch) {
         Write-Warning ("archive is {0} but Cargo.toml declares {1} - installing anyway (-AllowVersionMismatch)" -f $archiveVersion, $declared)
     } else {
-        throw ("archive is {0} but Cargo.toml declares {1}. Rebuild with: pwsh -File packaging\build-dist.ps1 -Release  (or pass -AllowVersionMismatch to install the older build on purpose)" -f $archiveVersion, $declared)
+        throw ("archive is {0} but Cargo.toml declares {1}. Rebuild with: {2}  (or pass -AllowVersionMismatch to install the older build on purpose)" -f $archiveVersion, $declared, $buildCommand)
     }
 }
 
@@ -100,12 +125,12 @@ if ($newest -and $newest.LastWriteTime -gt $archiveTime.AddSeconds(2)) {
     if ($AllowStaleArchive) {
         Write-Warning ("stale archive: {0} - installing anyway (-AllowStaleArchive)" -f $detail)
     } else {
-        throw ("stale archive: {0}. Same version, older build: the newest changes are NOT in it. Rebuild with: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {1}  (or pass -AllowStaleArchive to install it anyway)" -f $detail, $archiveVersion)
+        throw ("stale archive: {0}. Same version, older build: the newest changes are NOT in it. Rebuild with: pwsh -File packaging\build-dist.ps1 -ReleaseVersion {1} -Arch $targetArch  (or pass -AllowStaleArchive to install it anyway)" -f $detail, $archiveVersion)
     }
 }
 
 $hash = (Get-FileHash $Zip -Algorithm SHA256).Hash
-Write-Host ("version: {0}" -f $archiveVersion)
+Write-Host ("version: {0}  ({1})" -f $archiveVersion, $archiveArch)
 Write-Host ("built:   {0:yyyy-MM-dd HH:mm}" -f $archiveTime)
 Write-Host ("archive: {0}" -f $Zip)
 Write-Host ("sha256:  {0}" -f $hash)
@@ -118,13 +143,23 @@ $manifest = Join-Path $PSScriptRoot 'winget\GandalfIX.SAIFE-Sandbox.installer.ya
 if (Test-Path $manifest) {
     $manifestVersion = (Select-String -Path $manifest -Pattern 'PackageVersion:\s*(\S+)' |
         Select-Object -First 1).Matches[0].Groups[1].Value
-    $expected = (Select-String -Path $manifest -Pattern 'InstallerSha256:\s*([0-9A-Fa-f]+)' |
-        Select-Object -First 1).Matches[0].Groups[1].Value
+    # One Installer block per architecture: the hash to compare against is the one under
+    # THIS archive's Architecture: line. Taking the first InstallerSha256 in the file
+    # would compare an arm64 archive against the x64 hash and report a false mismatch.
+    $expected = $null
+    $manifestArch = $null
+    foreach ($line in [IO.File]::ReadAllLines($manifest)) {
+        $archLine = [regex]::Match($line, '^\s*-\s*Architecture:\s*(\S+)\s*$')
+        if ($archLine.Success) { $manifestArch = $archLine.Groups[1].Value; continue }
+        if ($manifestArch -ne $archiveArch) { continue }
+        $hashLine = [regex]::Match($line, '^\s*InstallerSha256:\s*([0-9A-Fa-f]+)')
+        if ($hashLine.Success) { $expected = $hashLine.Groups[1].Value; break }
+    }
 
     if ($manifestVersion -ne $archiveVersion) {
         Write-Host ("manifest: describes {0}, archive is {1} - not comparable (regenerate it at release time)" -f $manifestVersion, $archiveVersion)
     } elseif (-not $expected) {
-        Write-Warning 'manifest: has no InstallerSha256 to compare'
+        Write-Warning ("manifest: has no InstallerSha256 for Architecture: {0} to compare" -f $archiveArch)
     } elseif ($expected.ToUpper() -eq $hash) {
         Write-Host 'manifest: PackageVersion and InstallerSha256 match'
     } elseif ($AllowUnpublishedBuild) {

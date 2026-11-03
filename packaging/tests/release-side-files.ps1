@@ -23,7 +23,10 @@ function Refuse([string]$message) { throw "release refused: $message" }
 Invoke-Expression $match.Value
 
 $hash = '83e8edf8b82e32f3fe16675c97264ce2b7f544190c9fe9c35b275eecb58a97b2'
+$armHash = '1f0c2c4f6a5d4b3e9c8a7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f60'
+# Both architectures are release assets and one SHA256SUMS.txt carries both lines.
 $name = 'saife-0.3.1-x64.zip'
+$armName = 'saife-0.3.1-arm64.zip'
 $failures = 0
 
 function New-ReleaseDir([string]$sums) {
@@ -55,16 +58,23 @@ function Check([string]$case, [scriptblock]$body, [string]$expectIn) {
 }
 
 $ok = New-ReleaseDir "$hash  $name`n"
+$armOnly = New-ReleaseDir "$armHash  $armName`n"
+$bothArch = New-ReleaseDir "$hash  $name`n$armHash  $armName`n"
 $missing = New-ReleaseDir $null
 $otherName = New-ReleaseDir "$hash  saife-0.3.0-x64.zip`n"
-$otherHash = New-ReleaseDir ("0" * 64 + "  $name`n")
+$otherHash = New-ReleaseDir (("0" * 64) + "  $name`n")
 
-Check 'asset and sums agree' { Assert-ReleaseSideFiles $ok $name $hash } $null
+Check 'asset and sums agree, x64' { Assert-ReleaseSideFiles $ok $name $hash } $null
+Check 'asset and sums agree, arm64' { Assert-ReleaseSideFiles $armOnly $armName $armHash } $null
+Check 'one sums file carries both architectures (x64 line)' { Assert-ReleaseSideFiles $bothArch $name $hash } $null
+Check 'one sums file carries both architectures (arm64 line)' { Assert-ReleaseSideFiles $bothArch $armName $armHash } $null
 Check 'sums missing' { Assert-ReleaseSideFiles $missing $name $hash } 'no SHA256SUMS.txt'
+Check 'sums lists x64 only, the arm64 asset is asked for' { Assert-ReleaseSideFiles $ok $armName $armHash } 'does not list'
 Check 'sums does not list the asset' { Assert-ReleaseSideFiles $otherName $name $hash } 'does not list'
 Check 'sums records another hash' { Assert-ReleaseSideFiles $otherHash $name $hash } 'records'
+Check 'sums records the x64 hash, the arm64 hash is asked for' { Assert-ReleaseSideFiles $bothArch $armName $hash } 'records'
 
-foreach ($dir in @($ok, $missing, $otherName, $otherHash)) { Remove-Item $dir -Recurse -Force }
+foreach ($dir in @($ok, $armOnly, $bothArch, $missing, $otherName, $otherHash)) { Remove-Item $dir -Recurse -Force }
 
 if ($failures -gt 0) {
     Write-Host "$failures case(s) failed"
