@@ -26,6 +26,29 @@ Maven builds in-process, so it runs **inside** the session, and this skill is ab
 and the repository work there. Nothing here weakens containment: egress still passes the supervisor's
 proxy and the allow-list, and loopback is still refused.
 
+## Starting the session (host-side)
+
+A skill can only describe what to do *inside* a session; the session itself is started outside it.
+Both of these belong here rather than in `SKILL.md`, because the agent reading that file is already
+inside and cannot act on them.
+
+```powershell
+saife run --allow-cwd --allow-domain repo.maven.apache.org -- cmd /c powershell
+# add plugins.gradle.org / repo1.maven.org only if the build resolves from them
+```
+
+Without that domain the proxy refuses every download with `network_blocked`, and Maven reports a
+connection failure that looks like a proxy bug.
+
+Check the bootstrap, without a project and without the network:
+
+```powershell
+.\saife-maven.ps1 -SelfTest      # prints "Apache Maven 3.9.11" and the Java it will use
+```
+
+`-SelfTest` exists because `-Goal -v` cannot work: PowerShell reads a leading dash as a parameter
+name, so flags go in `$Rest`, not in the goal.
+
 ## Install (not automated)
 
 ```powershell

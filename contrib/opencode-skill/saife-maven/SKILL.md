@@ -31,22 +31,10 @@ $env:MAVEN_ARGS = "-Dmaven.repo.local=$PWD\.m2\repository -Dmaven.resolver.trans
 .\.m2\apache-maven-3.9.11\bin\mvn.cmd -s .m2\settings.xml package
 ```
 
-The session must be allowed to reach the repository host, or the proxy refuses the request before
-Maven ever sees it:
-
-```powershell
-saife run --allow-cwd --allow-domain repo.maven.apache.org -- cmd /c powershell
-# add plugins.gradle.org / repo1.maven.org only if the build resolves from them
-```
-
-Check the bootstrap worked, without a project and without the network:
-
-```powershell
-.\saife-maven.ps1 -SelfTest      # prints "Apache Maven 3.9.11" and the Java it will use
-```
-
-`-SelfTest` exists because `-Goal -v` cannot work: PowerShell reads a leading dash as a parameter
-name, so flags go in `$Rest`, not in the goal.
+Whether the repository host is reachable was decided **before you started**: the session either
+allows `repo.maven.apache.org` or it does not, and nothing inside the session changes that. A
+download refused with `network_blocked` is therefore not a Maven problem and not something to retry -
+report it, and say which host was refused.
 
 ## Reading the proxy, correctly
 
@@ -71,7 +59,7 @@ work on one machine and fail in a session.
 | `Schwerwiegender Fehler: Compiler-Ressourcen koennen nicht geschlossen werden` | the in-process compiler holds a jar lock | `-Dmaven.compiler.fork=true` |
 | `CRYPT_E_REVOCATION_OFFLINE` | Schannel cannot check revocation through the proxy | `curl.exe --ssl-revoke-best-effort` for downloads |
 | `Access is denied` writing `~\.m2` | the repository is outside the workspace | `-Dmaven.repo.local` inside it |
-| a request never reaches Maven | the host is not allow-listed | `--allow-domain repo.maven.apache.org` |
+| a download never reaches Maven (`network_blocked`) | the session was not started with that host allowed | report it to the user; it is a host-side decision, not retryable |
 
 ## Rules
 

@@ -115,6 +115,9 @@ If you need to prove the JVM can reach the repository through the proxy, this is
 java "-Dhttps.proxyHost=$($p.Host)" "-Dhttps.proxyPort=$($p.Port)" -cp <classes> Probe
 ```
 
+Whether `repo.maven.apache.org` is reachable at all is decided when the session starts, not
+inside it - see the README for the host-side command.
+
 TLS additionally needs an `Authenticator` carrying the proxy credentials and
 `-Djdk.http.auth.tunneling.disabledSchemes=` (empty), because the JDK refuses Basic auth over a
 tunnel by default. Quote every `-D` argument: an unquoted one can arrive split, and the error then
@@ -129,7 +132,7 @@ names a bogus main class.
 | `Compiler-Ressourcen koennen nicht geschlossen werden` | in-process compiler jar lock | `-Dmaven.compiler.fork=true` |
 | `CRYPT_E_REVOCATION_OFFLINE` | Schannel revocation through the proxy | `curl.exe --ssl-revoke-best-effort` |
 | `Access is denied` on `~\.m2` | repository outside the workspace | `-Dmaven.repo.local` inside it |
-| proxy refuses with `network_blocked` | host not allow-listed | `--allow-domain repo.maven.apache.org` |
+| proxy refuses with `network_blocked` | the session was not started with that host allowed | host-side; report which host was refused |
 | `BUILD FAILURE` with no network message | a real compile or test failure | read it; do not retry |
 
 ## What this skill does not cover
