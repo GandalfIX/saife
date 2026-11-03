@@ -171,11 +171,17 @@ installed without the C++ tools — that is the only prerequisite whose absence
 looks like a Rust problem. `rustup show` names the active toolchain; the fix is
 the Visual Studio installer, not another `rustup` command.
 
-Verify all of it in one line:
+Check all of it at once — the script reports each item, prints the exact command for
+anything missing, and offers to run it:
 
 ```powershell
-rustc --version; cargo clippy --version; pwsh --version; git --version; docker version --format '{{.Server.Version}}'
+pwsh -File packaging\check-prereqs.ps1            # report only
+pwsh -File packaging\check-prereqs.ps1 -Install   # ask before installing each item
+pwsh -File packaging\check-prereqs.ps1 -Json      # machine-readable, exit 1 if anything is missing
 ```
+
+It never elevates: a step that needs administrator rights is printed with a note, not run.
+`-SkipOptional` narrows the report to what the build itself needs (no container engine, no `gh`).
 
 Then go to [Build](#build); the contributor conventions (CRLF, no repo-wide
 `cargo fmt`, the two feature states) are in `docs/DEVELOPERS.md`.
