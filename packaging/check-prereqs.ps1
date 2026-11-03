@@ -334,14 +334,16 @@ foreach ($group in @(
     Write-Host $group.Title -ForegroundColor Cyan
     foreach ($r in $group.Items) {
         $mark = if ($r.Ok) { '[ok]  ' } else { '[MISS]' }
-        $colour = if ($r.Ok) { 'DarkGray' } else { 'Yellow' }
+        $colour = if ($r.Ok) { 'Green' } else { 'Red' }
         $found = if ($r.Found) { "  $($r.Found)" } else { '' }
         Write-Host ("  $mark $($r.Name.PadRight($width))$found") -ForegroundColor $colour
         if (-not $r.Ok) {
             Write-Host ("         why: $($r.Why)") -ForegroundColor DarkGray
             foreach ($step in $r.Fix) {
                 $suffix = if ($step.Admin) { '   (run in an elevated shell)' } else { '' }
-                Write-Host ("         fix: $($step.Label)$suffix") -ForegroundColor DarkGray
+                # the command is the actionable part: yellow, so a red row still ends in something
+                # the reader can run rather than in more red
+                Write-Host ("         fix: $($step.Label)$suffix") -ForegroundColor Yellow
             }
             if ($r.Fix.Count -eq 0 -and $r.WhenMissing) {
                 Write-Host ("         see: $($r.WhenMissing)") -ForegroundColor DarkGray
