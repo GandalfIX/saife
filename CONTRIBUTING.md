@@ -51,6 +51,19 @@ gh pr create --fill --base main
 The gate on the pull request is `.github/workflows/ci.yml` (both feature states, clippy
 in both, a release build). The VM lane stays local - see below.
 
+The ruleset `main-protection` enforces that path. A pull request is required for
+`main`, and three checks must be green before it can be merged: `test`, `CodeQL` and
+`Analyze (rust)`. **No approving review is required** - and none can be supplied on a
+solo repository, because GitHub does not let an author approve their own pull request.
+The ruleset has no bypass actors, so this applies to the maintainer too: documentation
+and `docs/tasks/*/PROGRESS.md` updates travel by pull request like everything else. If a
+check is red for an unrelated reason, fix the check or amend the ruleset - do not add
+yourself as a bypass.
+
+Keep the single commit identity (`gandalfix@gandalfix.de`): a commit whose author email
+is not linked to a GitHub account counts as *unattributed*, and the ruleset asks for an
+extra approval for those - which a solo maintainer cannot give.
+
 ## Commits
 
 Conventional-commit subjects (`feat(profile): ...`, `fix(vm-tests): ...`,
