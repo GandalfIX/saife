@@ -49,6 +49,12 @@ if ($clang.Count -ne 1) {
 } elseif ($clang[0].ok -and -not $clang[0].found) {
     $failures += 'ARM64 clang check says ok without saying what it found'
 }
+# A registered VS component is not a usable compiler: cc-rs runs the bare name from PATH. If clang
+# is not resolvable on PATH here, the check must say so - this is the false positive that shipped.
+$onPath = [bool](Get-Command clang -CommandType Application -ErrorAction SilentlyContinue)
+if (-not $onPath -and $clang.Count -eq 1 -and $clang[0].ok) {
+    $failures += 'clang is not on PATH but the check reported it ok'
+}
 if (@($arm.checks | Where-Object { $_.name -match 'ARM64 toolset' }).Count -ne 1) {
     $failures += 'ARM64 target did not add the ARM64 toolset check'
 }

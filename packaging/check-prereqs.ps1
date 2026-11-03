@@ -162,22 +162,36 @@ function Test-VsComponent {
     return [bool]$path
 }
 
-function Get-Clang {
-    foreach ($name in 'clang', 'clang-cl') {
-        if (Test-Command $name) {
-            $v = Get-FirstLine $name @('--version')
-            if ($v) { return $v }
-            return "$name (on PATH)"
+function Resolve-Clang {
+    # cc-rs runs `c.compiler("clang")`, i.e. it resolves the bare name from PATH. A Visual Studio
+    # "C++ Clang compiler for Windows" component puts clang.exe under VC\Tools\Llvm\...\bin and does
+    # NOT add it to PATH - so a registered component is not a usable compiler, and reporting it as
+    # present is how this check lied once. Only PATH counts as ok.
+    $r = @{ OnPath = $null; Elsewhere = @() }
+
+    $cmd = Get-Command 'clang' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) {
+        $v = & $cmd.Source --version 2>$null | Select-Object -First 1
+        $r.OnPath = if ($v) { "$v  ($($cmd.Source))" } else { $cmd.Source }
+        return $r
+    }
+
+    $candidates = @()
+    $llvm = Join-Path ${env:ProgramFiles} 'LLVM\bin\clang.exe'
+    if (Test-Path -LiteralPath $llvm) { $candidates += $llvm }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere) {
+        foreach ($vs in @(& $vswhere -products * -property installationPath 2>$null)) {
+            if (-not $vs) { continue }
+            foreach ($pattern in 'VC\Tools\Llvm\bin\clang.exe', 'VC\Tools\Llvm\*\bin\clang.exe') {
+                $candidates += @(Get-ChildItem -Path (Join-Path $vs $pattern) -ErrorAction SilentlyContinue |
+                    ForEach-Object { $_.FullName })
+            }
         }
     }
-    $llvm = Join-Path ${env:ProgramFiles} 'LLVM\bin\clang.exe'
-    if (Test-Path -LiteralPath $llvm) {
-        return ((& $llvm --version | Select-Object -First 1) + ' (LLVM install)')
-    }
-    if (Test-VsComponent 'Microsoft.VisualStudio.Component.VC.Llvm.Clang') {
-        return 'VS C++ Clang component'
-    }
-    return $null
+    $r.Elsewhere = @($candidates | Where-Object { $_ } | Select-Object -Unique)
+    return $r
 }
 
 function Get-DockerState {
@@ -354,17 +368,26 @@ if ($script:IsArm) {
             Category = 'required'
             Why      = 'ring 0.17.14 forces clang for aarch64-pc-windows-msvc; without it the build stops with ToolNotFound: failed to find tool "clang"'
             Probe    = {
-                $v = Get-Clang
-                if ($v) { return @{ Ok = $true; Found = $v } }
-                return @{ Ok = $false; Found = 'not on PATH, no LLVM install, no VS Clang component' }
+                $c = Resolve-Clang
+                if ($c.OnPath) { return @{ Ok = $true; Found = $c.OnPath } }
+                $first = @($c.Elsewhere | Select-Object -First 1)
+                if ($first.Count -gt 0) {
+                    $v = & $first[0] --version 2>$null | Select-Object -First 1
+                    $what = if ($v) { $v } else { 'did not run' }
+                    return @{ Ok = $false; Found = "found at $($first[0]) ($what) but clang is not on PATH - cc-rs resolves it from PATH" }
+                }
+                return @{ Ok = $false; Found = 'not on PATH and no LLVM install found' }
             }
             Fix      = @(
+                # A PATH change is the user's call, so this one is printed and never executed.
+                @{ Exe = $null; Admin = $false
+                   Label = 'add the LLVM bin directory to PATH for this user, then open a new shell: [Environment]::SetEnvironmentVariable(''Path'', "$env:PATH;<llvm-bin>", ''User'')' }
                 @{ Exe = 'winget'; Args = @('install', '--id', 'LLVM.LLVM', '-e') + $wingetBase; Admin = $true
-                   Label = 'winget install --id LLVM.LLVM -e' }
+                   Label = 'winget install --id LLVM.LLVM -e   (installs LLVM and puts it on PATH)' }
                 @{ Exe = 'winget'; Args = @('install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '-e',
                         '--override', '--quiet --wait --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --includeRecommended') + $wingetBase
                    Admin = $true
-                   Label = 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang"' }
+                   Label = 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang"   (then add its bin directory to PATH - see above)' }
             )
             WhenMissing = 'https://releases.llvm.org or the Visual Studio installer'
         }
@@ -413,9 +436,10 @@ $missing = @($results | Where-Object { -not $_.Ok })
 $installedSomething = $false
 foreach ($r in $missing) {
     if ($r.Fix.Count -eq 0) { continue }
+    if (@($r.Fix | Where-Object { $_.Exe }).Count -eq 0) { continue }
 
     $blocks = @($r.Fix | Where-Object { $_.Admin })
-    $runnable = @($r.Fix | Where-Object { -not $_.Admin })
+    $runnable = @($r.Fix | Where-Object { -not $_.Admin -and $_.Exe })
 
     if (-not $Install) { continue }
     if ($runnable.Count -eq 0) { continue }
