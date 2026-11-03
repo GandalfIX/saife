@@ -56,7 +56,7 @@ this runner supports — say so instead of working around it.
 The body must be under 4 KiB, and the proxy only relays the `(method, path)` pairs the runner
 declares: `POST /build` and `GET /build`. Anything else answers `403 facade_operation_not_declared`.
 
-## Starting a session that can build
+## Starting a session that can build (host-side, not from inside)
 
 ```
 saife run --block-net --runner --allow-cwd -- powershell -NoProfile

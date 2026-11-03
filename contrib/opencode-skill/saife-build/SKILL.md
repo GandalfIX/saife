@@ -53,7 +53,8 @@ is `403 facade_operation_not_declared`.
 Builds run `./gradlew --offline` in a container with no network. Anything not already in the cache
 fails with `No cached version of <group>:<artifact>:<version> available for offline mode`.
 
-That is not something you can fix by retrying. The user runs:
+That is not something you can fix by retrying, and you cannot run it yourself - prewarm happens on
+the host, before or between sessions. **Host-side, not yours:** the user runs
 
 ```
 saife runner prewarm <project>
