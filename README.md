@@ -132,16 +132,53 @@ Then read `docs/USER-GUIDE.md` before pointing an agent at a real repository.
 
 ## Requirements
 
-- **Windows 11 24H2 (build 26100.x) or a later supported servicing build** for
-  the default `mxc` backend — the MXC process container requires it. Builds older
-  than 24H2 cannot run that backend at all.
+### To run saife
+
+- **Windows 11 24H2 (build 26100.x) or a later supported servicing build**, x64,
+  for the default `mxc` backend — the MXC process container requires it. Builds
+  older than 24H2 cannot run that backend at all.
 - The `appcontainer` backend runs on Windows 10 1709 (build 16299) and later.
 - **Administrator rights: not needed for `mxc`.** Network sessions through the
   default backend run unelevated. They ARE needed for `--backend appcontainer`
   when the session has network (`--allow-domain`, a profile with a network
   policy): that backend registers a system-wide loopback exemption for the
   AppContainer SID, which is an admin-only API.
-- Rust toolchain (for building; only needed by developers, not end users).
+- Nothing else. No runtime to install, no service, no VM, no WSL.
+
+### To build from source
+
+Install these once, then `cargo build` is the whole build. Everything in this
+table is needed for a green `cargo test`, `cargo clippy --all-targets` and
+`pwsh -File packaging\build-dist.ps1`.
+
+| what | why | how to get it | check |
+|---|---|---|---|
+| **Rust 1.88 or newer**, MSVC toolchain | the crate is edition 2024 with `rust-version = "1.88"` | <https://rustup.rs>; then `rustup default stable-x86_64-pc-windows-msvc` | `rustc --version` |
+| **Visual Studio Build Tools 2022**, workload *Desktop development with C++* | MSVC `link.exe` — the linker Rust does not ship | <https://aka.ms/vs/17/release/vs_BuildTools.exe> | `cargo build` (see below) |
+| **rustfmt + clippy** components | `rustup component add` — the gates are zero-warning, and `rustfmt.toml` pins `newline_style = "Windows"` | `rustup component add rustfmt clippy` | `cargo clippy --version` |
+| **PowerShell 7** (`pwsh`) | every `packaging/**.ps1` and `tests/**.ps1` script; Windows PowerShell 5.1 cannot run them | `winget install Microsoft.PowerShell` | `pwsh --version` |
+| **git** | and `core.autocrlf` matters: the sources are CRLF and the repo expects it | `winget install Git.Git` | `git --version` |
+| **GitHub CLI** (`gh`) | only for the PR flow and reading CI (`gh pr checks`); not needed to build | `winget install GitHub.cli` | `gh auth status` |
+| **Container engine** — Rancher Desktop or Docker Desktop | **only** for the build runner: `--runner`, `saife runner prewarm`, `saife runner status`. Everything else runs without it | `winget install Rancher.RancherDesktop` | `docker version` |
+
+Windows PowerShell 5.1 is *not* obsolete work: the scripts a session runs inside
+the sandbox are still 5.1, because that is what a stock Windows has. Keep both in
+mind when editing anything under `tests/`.
+
+**If `cargo build` stops with `link.exe not found` or
+`error: linker 'link.exe' not found`**, the MSVC workload is missing or was
+installed without the C++ tools — that is the only prerequisite whose absence
+looks like a Rust problem. `rustup show` names the active toolchain; the fix is
+the Visual Studio installer, not another `rustup` command.
+
+Verify all of it in one line:
+
+```powershell
+rustc --version; cargo clippy --version; pwsh --version; git --version; docker version --format '{{.Server.Version}}'
+```
+
+Then go to [Build](#build); the contributor conventions (CRLF, no repo-wide
+`cargo fmt`, the two feature states) are in `docs/DEVELOPERS.md`.
 
 ## Backends and privileges
 
