@@ -214,6 +214,18 @@ try {
     if ($savedWow) { $env:PROCESSOR_ARCHITEW6432 = $savedWow } else { Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue }
 }
 
+# A script without [CmdletBinding()] collects unknown parameters into $args and ignores them: the
+# pre-arch build-dist.ps1 accepted `-Arch arm64` and quietly produced an x64 archive. Assert the
+# rejection instead, because a packaging tool that ignores a flag builds the wrong thing.
+$script:Root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$buildDist = Join-Path $script:Root 'packaging/build-dist.ps1'
+$bad = & pwsh -NoProfile -File $buildDist -Architecture arm64 2>&1 | Out-String
+Assert-True 'build-dist.ps1: an unknown parameter is refused' ($LASTEXITCODE -ne 0) "exit $LASTEXITCODE"
+Assert-True 'build-dist.ps1: the refusal names the parameter' ($bad -match 'Architecture') $bad.Trim()
+$badArch = & pwsh -NoProfile -File $buildDist -Arch mips 2>&1 | Out-String
+Assert-True 'build-dist.ps1: an unknown -Arch value is refused' ($LASTEXITCODE -ne 0) "exit $LASTEXITCODE"
+Assert-True 'build-dist.ps1: the refusal lists the accepted values' ($badArch -match 'x64' -and $badArch -match 'arm64') $badArch.Trim()
+
 Write-Host ''
 Write-Host ("{0} passed, {1} failed" -f $script:passes, $script:failures)
 if ($script:failures -gt 0) { exit 1 }

@@ -15,6 +15,7 @@
 # about the machine that ran the build; with it the artifact path names the
 # architecture, and a cross-build cannot be mistaken for a native one.
 
+[CmdletBinding()]
 param(
     [switch]$SkipBuild,
     # x64 | arm64 | all. Default: this host's architecture, from PROCESSOR_ARCHITECTURE.
