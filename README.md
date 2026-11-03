@@ -101,6 +101,19 @@ Two archives are published per release. `install.ps1` picks one from
 An x64 host never installs the arm64 archive — Windows cannot run it, and the
 installer says that instead of letting activation fail later.
 
+Building the arm64 archive from an x64 host needs two things beyond the x64
+build: the MSVC ARM64 toolset (a Visual Studio component) and `clang` on `PATH`,
+because `ring` forces clang for `aarch64-pc-windows-msvc`. `winget install
+LLVM.LLVM` is sufficient — measured with LLVM 23.1.4, from a plain shell, no
+`vcvars` and no `INCLUDE` setup:
+
+```powershell
+pwsh -File packaging\build-dist.ps1 -Release -Arch arm64
+```
+
+`packaging\check-prereqs.ps1` reports clang as an *optional* item for exactly
+this reason: absent, the x64 build and every run still work.
+
 The arm64 archives are **cross-built on x64** and **have not been run on ARM
 hardware**. Treat an arm64 install as a build people reported working, not as one
 this project measured: if it misbehaves on an ARM64 machine, the x64 archive under

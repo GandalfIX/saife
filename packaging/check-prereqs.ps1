@@ -412,6 +412,33 @@ if ($script:IsArm) {
     )
 }
 
+# Cross-building the arm64 archive on an x64 host is a supported, optional thing to do: ring forces
+# clang for aarch64, and `winget install LLVM.LLVM` is sufficient - measured, with no INCLUDE prelude
+# and no vcvars shell (that requirement belonged to the llvm-mingw build, not to clang itself).
+if (-not $script:IsArm) {
+    $checks += @(
+        @{
+            Name     = 'clang (LLVM) - optional, for -Arch arm64'
+            Category = 'optional'
+            Why      = 'only needed to CROSS-BUILD the arm64 archive on this x64 host: ring 0.17.14 forces clang for aarch64-pc-windows-msvc. Not needed for the x64 build or to run anything'
+            Probe    = {
+                $c = Resolve-Clang
+                if ($c.OnPath) { return @{ Ok = $true; Found = $c.OnPath } }
+                $first = @($c.Elsewhere | Select-Object -First 1)
+                if ($first.Count -gt 0) {
+                    return @{ Ok = $false; Found = "installed at $($first[0]) but clang is not on PATH" }
+                }
+                return @{ Ok = $false; Found = 'not on PATH and no LLVM install found' }
+            }
+            Fix      = @(
+                @{ Exe = 'winget'; Args = @('install', '--id', 'LLVM.LLVM', '-e') + $wingetBase; Admin = $true
+                   Label = 'winget install --id LLVM.LLVM -e' }
+            )
+            WhenMissing = 'https://releases.llvm.org - or skip it: only `build-dist.ps1 -Arch arm64` needs it'
+        }
+    )
+}
+
 if ($SkipOptional) {
     $checks = $checks | Where-Object { $_.Category -ne 'optional' }
 }
@@ -547,7 +574,7 @@ Write-Host ''
 if ($requiredMissing.Count -eq 0) {
     Write-Host "ready to build: $(@($results | Where-Object { $_.Category -eq 'required' -and $_.Ok }).Count) required checks passed" -ForegroundColor Green
     if ($optionalMissing.Count -gt 0) {
-        Write-Host "$($optionalMissing.Count) optional item(s) missing - the runner and PR flow need them, the build does not" -ForegroundColor DarkGray
+        Write-Host "$($optionalMissing.Count) optional item(s) missing - none blocks the x64 build; see the fix lines above" -ForegroundColor DarkGray
     }
     Write-Host 'next: cargo build --release' -ForegroundColor DarkGray
     exit 0
