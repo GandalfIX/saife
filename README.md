@@ -155,6 +155,9 @@ table is needed for a green `cargo test`, `cargo clippy --all-targets` and
 |---|---|---|---|
 | **Rust 1.88 or newer**, MSVC toolchain | the crate is edition 2024 with `rust-version = "1.88"` | <https://rustup.rs>; then `rustup default stable-x86_64-pc-windows-msvc` | `rustc --version` |
 | **Visual Studio Build Tools 2022**, workload *Desktop development with C++* | MSVC `link.exe` — the linker Rust does not ship | <https://aka.ms/vs/17/release/vs_BuildTools.exe> | `cargo build` (see below) |
+| **Windows SDK** (`um` + `ucrt` libs) | linking needs `kernel32.lib` and the ucrt; a missing SDK fails at **link** time, after a full compile | the Visual Studio installer, *Windows 11 SDK* component | `pwsh -File packaging\check-prereqs.ps1` |
+| **clang / LLVM** — *ARM64 targets only* | `ring 0.17` forces `clang` when the target is `aarch64-pc-windows-msvc`; MSVC's `cl.exe` is not accepted for its ARM64 assembly | `winget install LLVM.LLVM`, or the VS component *C++ Clang compiler for Windows* | `clang --version` |
+| **MSVC ARM64 toolset** — *ARM64 targets only* | a separate Visual Studio component from the x64 toolset; the ARM64 linker and libraries live in it | the Visual Studio installer | `pwsh -File packaging\check-prereqs.ps1` |
 | **rustfmt + clippy** components | `rustup component add` — the gates are zero-warning, and `rustfmt.toml` pins `newline_style = "Windows"` | `rustup component add rustfmt clippy` | `cargo clippy --version` |
 | **PowerShell 7** (`pwsh`) | every `packaging/**.ps1` and `tests/**.ps1` script; Windows PowerShell 5.1 cannot run them | `winget install Microsoft.PowerShell` | `pwsh --version` |
 | **git** | and `core.autocrlf` matters: the sources are CRLF and the repo expects it | `winget install Git.Git` | `git --version` |
@@ -167,8 +170,11 @@ mind when editing anything under `tests/`.
 
 **If `cargo build` stops with `link.exe not found` or
 `error: linker 'link.exe' not found`**, the MSVC workload is missing or was
-installed without the C++ tools — that is the only prerequisite whose absence
-looks like a Rust problem. `rustup show` names the active toolchain; the fix is
+installed without the C++ tools. **If it stops with
+`error occurred in cc-rs: failed to find tool "clang"`**, you are building the
+ARM64 target: `ring` forces `clang` there and MSVC cannot substitute — install
+LLVM. Neither message is a Rust problem, and both cost an afternoon if you take
+them at face value. `rustup show` names the active toolchain; the fix is
 the Visual Studio installer, not another `rustup` command.
 
 Check all of it at once — the script reports each item, prints the exact command for

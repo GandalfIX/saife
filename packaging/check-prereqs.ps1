@@ -93,6 +93,93 @@ function Get-RustComponent {
 
 function Get-WindowsBuild { return [Environment]::OSVersion.Version.Build }
 
+# rustc's host triple and the triple this checkout would build for. `--target` on the command line
+# cannot be seen from here, which is why the report prints the triple it assumed.
+function Get-RustTriple {
+    param([string[]]$Arguments)
+    if (-not (Test-Command 'rustc')) { return $null }
+    $out = & rustc @Arguments 2>$null
+    $line = $out | Where-Object { $_ -match '^host:' }
+    if (-not $line) { return $null }
+    return ($line -replace '^host:\s*', '').Trim()
+}
+
+$script:HostTriple = Get-RustTriple '-vV'
+$script:TargetTriple = $script:HostTriple
+if ($env:CARGO_BUILD_TARGET) {
+    $script:TargetTriple = $env:CARGO_BUILD_TARGET
+} elseif (Test-Command 'cargo') {
+    try {
+        $cfg = (& cargo config get build.target 2>$null | Out-String)
+        $m = [regex]::Match($cfg, '([a-z0-9_]+-[a-z0-9_]+-[a-z0-9_]+)')
+        if ($m.Success) { $script:TargetTriple = $m.Groups[1].Value }
+    } catch { }
+}
+$script:IsArm = [bool]($script:TargetTriple -and $script:TargetTriple -match '^aarch64-')
+
+# One vcvars invocation serves three checks: does cl.exe actually run, which SDK is attached, and
+# is the ARM64 toolset present. Cached, because vcvars costs seconds.
+$script:MsvcProbe = $null
+function Get-MsvcProbe {
+    if ($script:MsvcProbe) { return $script:MsvcProbe }
+    $r = @{ Ok = $false; Cl = $null; Sdk = $null; VcVars = $false; Why = '' ; Vs = '' }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        $r.Why = 'no Visual Studio installer (vswhere.exe)'
+        $script:MsvcProbe = $r; return $r
+    }
+    $vs = & $vswhere -products * -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if (-not $vs) {
+        $r.Why = 'no install with the C++ x64 toolset'
+        $script:MsvcProbe = $r; return $r
+    }
+    $r.Vs = Split-Path -Leaf $vs
+    $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+    if (-not (Test-Path -LiteralPath $vcvars)) {
+        $r.Why = 'VC\Auxiliary\Build\vcvars64.bat is missing (C++ workload incomplete)'
+        $script:MsvcProbe = $r; return $r
+    }
+    $r.VcVars = $true
+    $line = & cmd /c "call `"$vcvars`" >nul 2>&1 & set WindowsSDKVersion & cl 2>&1"
+    $text = ($line | Out-String)
+    $m = [regex]::Match($text, 'Compiler Version\s+([\d.]+)')
+    $sdk = [regex]::Match($text, 'WindowsSDKVersion=([\d.]+)')
+    if (-not $sdk.Success) { $sdk = [regex]::Match($text, 'WindowsSDKVersion=([^\r\n]+)') }
+    if ($m.Success) { $r.Cl = $m.Groups[1].Value }
+    if ($sdk.Success) { $r.Sdk = $sdk.Groups[1].Value }
+    $r.Ok = [bool]$r.Cl
+    if (-not $r.Ok) { $r.Why = 'vcvars64.bat ran but cl.exe did not' }
+    $script:MsvcProbe = $r
+    return $r
+}
+
+function Test-VsComponent {
+    param([string]$Component)
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) { return $false }
+    $path = & $vswhere -products * -latest -requires $Component -property installationPath 2>$null
+    return [bool]$path
+}
+
+function Get-Clang {
+    foreach ($name in 'clang', 'clang-cl') {
+        if (Test-Command $name) {
+            $v = Get-FirstLine $name @('--version')
+            if ($v) { return $v }
+            return "$name (on PATH)"
+        }
+    }
+    $llvm = Join-Path ${env:ProgramFiles} 'LLVM\bin\clang.exe'
+    if (Test-Path -LiteralPath $llvm) {
+        return ((& $llvm --version | Select-Object -First 1) + ' (LLVM install)')
+    }
+    if (Test-VsComponent 'Microsoft.VisualStudio.Component.VC.Llvm.Clang') {
+        return 'VS C++ Clang component'
+    }
+    return $null
+}
+
 function Get-DockerState {
     if (-not (Test-Command 'docker')) { return $null }
     $server = & docker version --format '{{.Server.Version}}' 2>$null
@@ -125,13 +212,14 @@ $checks = @(
         WhenMissing = 'https://rustup.rs'
     }
     @{
-        Name     = 'MSVC C++ build tools (link.exe)'
+        Name     = 'MSVC C++ toolset (cl.exe, link.exe)'
         Category = 'required'
         Why      = 'the linker Rust does not ship; its absence looks like a Rust error'
         Probe    = {
-            $found = Get-MsvcInstall
-            if ($found) { return @{ Ok = $true; Found = $found } }
-            return @{ Ok = $false }
+            $p = Get-MsvcProbe
+            if ($p.Ok) { return @{ Ok = $true; Found = "cl $($p.Cl) - $($p.Vs)" } }
+            if (Get-MsvcInstall) { return @{ Ok = $false; Found = $p.Why } }
+            return @{ Ok = $false; Found = $p.Why }
         }
         Fix      = @(
             @{ Exe = 'winget'; Args = @('install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '-e',
@@ -140,6 +228,27 @@ $checks = @(
                Label = 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"' }
         )
         WhenMissing = 'https://aka.ms/vs/17/release/vs_BuildTools.exe'
+    }
+    @{
+        Name     = 'Windows SDK (um + ucrt libs)'
+        Category = 'required'
+        Why      = 'every Windows link needs kernel32.lib and the ucrt; a missing SDK fails at link time, not at compile time'
+        Probe    = {
+            $p = Get-MsvcProbe
+            if (-not $p.Ok) { return @{ Ok = $false; Found = 'cannot tell without a working toolset' } }
+            if (-not $p.Sdk) { return @{ Ok = $false; Found = 'no Windows SDK reported by vcvars' } }
+            $arch = if ($script:IsArm) { 'arm64' } else { 'x64' }
+            $lib = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Lib\$($p.Sdk)\um\$arch\kernel32.lib"
+            if (Test-Path -LiteralPath $lib) { return @{ Ok = $true; Found = "SDK $($p.Sdk)" } }
+            return @{ Ok = $false; Found = "SDK $($p.Sdk) but no $arch kernel32.lib" }
+        }
+        Fix      = @(
+            @{ Exe = 'winget'; Args = @('install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '-e',
+                    '--override', '--quiet --wait --add Microsoft.VisualStudio.Component.Windows11SDK.26100') + $wingetBase
+               Admin = $true
+               Label = 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Component.Windows11SDK.26100"' }
+        )
+        WhenMissing = 'https://developer.microsoft.com/windows/downloads/windows-sdk/'
     }
     @{
         Name     = 'rustfmt component'
@@ -234,6 +343,52 @@ $checks = @(
     }
 )
 
+# Two prerequisites exist only for ARM64 targets, and both are hard requirements there: ring 0.17
+# forces `clang` when target.arch == AARCH64 (build.rs:563 - MSVC cl.exe is not accepted for its
+# ARM64 assembly), and MSVC's ARM64 toolset is needed to link the result. On x64 neither is used,
+# which is why they are dropped rather than reported as missing.
+if ($script:IsArm) {
+    $checks += @(
+        @{
+            Name     = 'clang (LLVM) - ARM64 target'
+            Category = 'required'
+            Why      = 'ring 0.17.14 forces clang for aarch64-pc-windows-msvc; without it the build stops with ToolNotFound: failed to find tool "clang"'
+            Probe    = {
+                $v = Get-Clang
+                if ($v) { return @{ Ok = $true; Found = $v } }
+                return @{ Ok = $false; Found = 'not on PATH, no LLVM install, no VS Clang component' }
+            }
+            Fix      = @(
+                @{ Exe = 'winget'; Args = @('install', '--id', 'LLVM.LLVM', '-e') + $wingetBase; Admin = $true
+                   Label = 'winget install --id LLVM.LLVM -e' }
+                @{ Exe = 'winget'; Args = @('install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '-e',
+                        '--override', '--quiet --wait --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --includeRecommended') + $wingetBase
+                   Admin = $true
+                   Label = 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang"' }
+            )
+            WhenMissing = 'https://releases.llvm.org or the Visual Studio installer'
+        }
+        @{
+            Name     = 'MSVC ARM64 toolset - ARM64 target'
+            Category = 'required'
+            Why      = 'the ARM64 linker and libraries are a separate Visual Studio component from the x64 toolset'
+            Probe    = {
+                if (Test-VsComponent 'Microsoft.VisualStudio.Component.VC.Tools.ARM64') {
+                    return @{ Ok = $true; Found = 'VC.Tools.ARM64' }
+                }
+                return @{ Ok = $false; Found = 'VC.Tools.ARM64 not installed' }
+            }
+            Fix      = @(
+                @{ Exe = 'winget'; Args = @('install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '-e',
+                        '--override', '--quiet --wait --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --includeRecommended') + $wingetBase
+                   Admin = $true
+                   Label = 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Component.VC.Tools.ARM64"' }
+            )
+            WhenMissing = 'https://aka.ms/vs/17/release/vs_BuildTools.exe'
+        }
+    )
+}
+
 if ($SkipOptional) {
     $checks = $checks | Where-Object { $_.Category -ne 'optional' }
 }
@@ -323,6 +478,15 @@ if ($Json) {
     exit 0
 }
 
+# Which triple these checks were computed for: `--target` on the command line is invisible here,
+# so the assumption is printed instead of hidden.
+$triple = if ($script:TargetTriple) { $script:TargetTriple } else { 'unknown (rustc not found)' }
+$hostNote = if ($script:HostTriple -and $script:HostTriple -ne $script:TargetTriple) { " (host $($script:HostTriple))" } else { '' }
+Write-Host "target: $triple$hostNote" -ForegroundColor DarkGray
+if ($script:IsArm) {
+    Write-Host 'ARM64: ring forces clang for this target, and MSVC needs its separate ARM64 toolset' -ForegroundColor DarkGray
+}
+
 $width = ($results | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
 foreach ($group in @(
         @{ Title = 'BUILD REQUIREMENTS'; Items = @($results | Where-Object { $_.Category -eq 'required' }) }
@@ -335,8 +499,9 @@ foreach ($group in @(
     foreach ($r in $group.Items) {
         $mark = if ($r.Ok) { '[ok]  ' } else { '[MISS]' }
         $colour = if ($r.Ok) { 'Green' } else { 'Red' }
-        $found = if ($r.Found) { "  $($r.Found)" } else { '' }
+        $found = if ($r.Ok -and $r.Found) { "  $($r.Found)" } else { '' }
         Write-Host ("  $mark $($r.Name.PadRight($width))$found") -ForegroundColor $colour
+        if (-not $r.Ok -and $r.Found) { Write-Host ("         found: $($r.Found)") -ForegroundColor DarkGray }
         if (-not $r.Ok) {
             Write-Host ("         why: $($r.Why)") -ForegroundColor DarkGray
             foreach ($step in $r.Fix) {

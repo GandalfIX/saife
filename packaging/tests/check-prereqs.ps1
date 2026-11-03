@@ -35,6 +35,24 @@ if (@($payload.checks | Where-Object { $_.category -eq 'optional' }).Count -ne 0
     $failures += '-SkipOptional still reported optional checks'
 }
 
+# The ARM64 rule is the one that cost a build on another machine: ring forces clang for
+# aarch64-pc-windows-msvc, so the checker must switch it on when the target is ARM.
+$env:CARGO_BUILD_TARGET = 'aarch64-pc-windows-msvc'
+$armRaw = & pwsh -NoProfile -File $checker -Json -SkipOptional 2>&1 | Out-String
+Remove-Item Env:CARGO_BUILD_TARGET
+$arm = $armRaw | ConvertFrom-Json
+$clang = @($arm.checks | Where-Object { $_.name -match 'clang' })
+if ($clang.Count -ne 1) {
+    $failures += "ARM64 target did not add exactly one clang check (got $($clang.Count))"
+} elseif ($clang[0].category -ne 'required') {
+    $failures += "ARM64 clang check is '$($clang[0].category)', must be required"
+} elseif ($clang[0].ok -and -not $clang[0].found) {
+    $failures += 'ARM64 clang check says ok without saying what it found'
+}
+if (@($arm.checks | Where-Object { $_.name -match 'ARM64 toolset' }).Count -ne 1) {
+    $failures += 'ARM64 target did not add the ARM64 toolset check'
+}
+
 $expectedExit = if ($payload.required_ok) { 0 } else { 1 }
 if ($exit -ne $expectedExit) { $failures += "exit $exit does not match required_ok=$($payload.required_ok)" }
 
