@@ -87,6 +87,22 @@ winget manifests on `chore/release-v<version>` and opens a pull request, and onl
 `-Publish` (run on `main` after that merge) tags, publishes and verifies. It refuses to
 push `main` at any point.
 
+## Worktrees
+
+Every worktree lives **inside the repository**, under `.worktrees/`:
+
+```bash
+git worktree add .worktrees/<slug> -b <type>/<slug> origin/main
+git worktree remove .worktrees/<slug>
+```
+
+`.worktrees/` is in `.gitignore` and is where a review or a parallel task belongs.
+Never create one beside the checkout (`../<repo>-wt-<slug>`) - sibling directories are
+outside the repository, so they are invisible to `git worktree list` from a fresh shell,
+survive a clone that was deleted, and are the ones that get forgotten with an uncommitted
+change inside them. `git worktree list` must show the main checkout plus paths under
+`.worktrees/`, and nothing else.
+
 ## Testing
 
 Must follow: If a test needs to change anything on the host system, like setting permissions, ACLs or similar, 
