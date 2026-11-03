@@ -365,6 +365,29 @@ of `$HOME`. Do not try to work around it by moving the launcher: the refusal
 follows the launcher's location. Note it is an `mxc`-backend rule — the
 `appcontainer` backend has no host-side launcher wrapper.
 
+### The same refusal hits the BUILD TREE (and no flag narrows it)
+
+```powershell
+cd target\release
+.\saife.exe run --allow-cwd -- cmd /c echo hello
+[saife] mxc: writable grant "...\target\release" contains the launcher
+        "...\target\release\saife-launch.exe": ...
+```
+
+The workspace is **always** a writable grant - `filesystem_policy` seeds the
+request with `readwrite_paths = [cwd]` before any operator grant is added - so
+when the current directory *is* the one holding `saife-launch.exe`, the refusal
+is unavoidable by flags: `--allow-cwd`, `--read-only .` and `--allow .:read` all
+still produce it (measured). The build output directory can never be a sandbox
+workspace; that is the rule, not a missing switch.
+
+Invoke the freshly built binary by absolute path **from a project directory**:
+
+```powershell
+cd C:\work\project
+& C:\Users\<you>\projekte\saife\target\release\saife.exe run --allow-cwd -- cmd /c echo hello
+```
+
 ## Why does `mxc` refuse with "the probe … reported no tier" on my other machine?
 
 ```
