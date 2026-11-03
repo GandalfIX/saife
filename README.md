@@ -58,8 +58,8 @@ deferred roadmap.
 
 ## Install
 
-End users need Windows 11 24H2 (build 26100) or newer, x64 — and nothing else for
-the default backend: no administrator rights, no service, no MSI.
+End users need Windows 11 24H2 (build 26100) or newer, on x64 or ARM64 — and nothing
+else for the default backend: no administrator rights, no service, no MSI.
 
 ### Install with one command
 
@@ -87,18 +87,51 @@ Piping a remote script straight into a shell is the habit this tool exists to ma
 unnecessary, so the two-step form above is the recommended one. Either way the
 archive is hash-verified before extraction, and a mismatch stops the install.
 
+### Which archive
+
+Two archives are published per release. `install.ps1` picks one from
+`PROCESSOR_ARCHITECTURE`, and never asks:
+
+| this host | archive | behaviour |
+|---|---|---|
+| x64 | `saife-<version>-x64.zip` | |
+| ARM64 | `saife-<version>-arm64.zip` | native ARM64 binary |
+| ARM64, no arm64 archive in the release | `saife-<version>-x64.zip` | **emulation**: it works, but it is the x64 build under Prism emulation, with a warning that says so |
+
+An x64 host never installs the arm64 archive — Windows cannot run it, and the
+installer says that instead of letting activation fail later.
+
+Building the arm64 archive from an x64 host needs two things beyond the x64
+build: the MSVC ARM64 toolset (a Visual Studio component) and `clang` on `PATH`,
+because `ring` forces clang for `aarch64-pc-windows-msvc`. `winget install
+LLVM.LLVM` is sufficient — measured with LLVM 23.1.4, from a plain shell, no
+`vcvars` and no `INCLUDE` setup:
+
+```powershell
+pwsh -File packaging\build-dist.ps1 -Release -Arch arm64
+```
+
+`packaging\check-prereqs.ps1` reports clang as an *optional* item for exactly
+this reason: absent, the x64 build and every run still work.
+
+The arm64 archives are **cross-built on x64** and **have not been run on ARM
+hardware**. Treat an arm64 install as a build people reported working, not as one
+this project measured: if it misbehaves on an ARM64 machine, the x64 archive under
+emulation is the fallback while the native path is being fixed.
+
 ### Manual download
 
-1. Take `saife-<version>-x64.zip` and `SHA256SUMS.txt` from the
+1. Take `saife-<version>-x64.zip` (or `saife-<version>-arm64.zip` on an ARM64
+   machine) and `SHA256SUMS.txt` from the
    [latest release](https://github.com/GandalfIX/saife/releases/latest).
 2. Check the download against the published hash:
    ```powershell
-   Get-FileHash .\saife-*-x64.zip -Algorithm SHA256     # compare with SHA256SUMS.txt
+   Get-FileHash .\saife-<version>-<arch>.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
    ```
 3. Extract it to a permanent directory and put that directory on your **user**
    PATH:
    ```powershell
-   Expand-Archive .\saife-*-x64.zip -DestinationPath "$env:LOCALAPPDATA\Programs\saife"
+   Expand-Archive .\saife-<version>-<arch>.zip -DestinationPath "$env:LOCALAPPDATA\Programs\saife"
    [Environment]::SetEnvironmentVariable(
      'Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$env:LOCALAPPDATA\Programs\saife", 'User')
    ```
@@ -134,9 +167,10 @@ Then read `docs/USER-GUIDE.md` before pointing an agent at a real repository.
 
 ### To run saife
 
-- **Windows 11 24H2 (build 26100.x) or a later supported servicing build**, x64,
-  for the default `mxc` backend — the MXC process container requires it. Builds
-  older than 24H2 cannot run that backend at all.
+- **Windows 11 24H2 (build 26100.x) or a later supported servicing build**, x64 or
+  ARM64, for the default `mxc` backend — the MXC process container requires it.
+  Builds older than 24H2 cannot run that backend at all. The arm64 archive is the
+  same code built for `aarch64-pc-windows-msvc`.
 - The `appcontainer` backend runs on Windows 10 1709 (build 16299) and later.
 - **Administrator rights: not needed for `mxc`.** Network sessions through the
   default backend run unelevated. They ARE needed for `--backend appcontainer`
@@ -150,6 +184,12 @@ Then read `docs/USER-GUIDE.md` before pointing an agent at a real repository.
 Install these once, then `cargo build` is the whole build. Everything in this
 table is needed for a green `cargo test`, `cargo clippy --all-targets` and
 `pwsh -File packaging\build-dist.ps1`.
+
+`packaging\build-dist.ps1 -Arch all` builds both release archives
+(`saife-<version>-x64.zip`, `saife-<version>-arm64.zip`) and one `SHA256SUMS.txt`
+covering them. The arm64 one is cross-built on x64 and is never started on the build
+host, so its identity is checked from the PE header (machine `0xAA64`) and from the
+resource version rather than by running it.
 
 | what | why | how to get it | check |
 |---|---|---|---|

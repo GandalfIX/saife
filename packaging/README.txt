@@ -11,7 +11,7 @@ to install on the target machine.
 
 Contents
 --------
-  saife.exe                         the supervisor (x64)
+  saife.exe                         the supervisor (x64 or ARM64 - VERSION.txt names the target of this archive)
   saife-launch.exe                      the wrapper launcher - MUST stay beside saife.exe
   profiles/demo.json                  portable example profile
   profiles/node.json                  Node.js / npm (cache, nvm trees, registry hosts)
@@ -26,7 +26,7 @@ Contents
 
 Requirements on the target machine
 ----------------------------------
-  * Windows 11 24H2 (build 26100.x) or newer, x64.
+  * Windows 11 24H2 (build 26100.x) or newer, x64 or ARM64.
       - The default backend (mxc) needs the in-box base-container / PSEC support.
       - `--backend appcontainer` also runs on Windows 10 1709+, but network sessions
         there require an elevated shell (loopback firewall exemption).

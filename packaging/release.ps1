@@ -22,6 +22,12 @@
 #     FLAT because winget's NestedInstallerFiles are relative to the archive root.
 #   * After publishing, the release URL is downloaded again and hashed. "gh said ok"
 #     is not evidence that the bytes a user gets are the bytes that were built.
+#   * The two architectures are two assets: saife-<v>-x64.zip and saife-<v>-arm64.zip.
+#     The archive NAME is all that tells them apart - both contain saife.exe, because
+#     winget's NestedInstallerFiles are relative to the archive root - so every archive
+#     present in dist/release is uploaded and every one has its own Installer entry.
+#     An architecture with no archive is a refusal, never a manifest that points at a
+#     404.
 #
 # Exit codes: 0 success, 1 a gate refused or a step failed.
 
@@ -36,12 +42,18 @@ param(
     [switch]$VerifyOnly,
     # Release notes: default is the CHANGELOG section for this version.
     [string]$NotesFile,
+    # x64 | arm64 | all: which archives to build and publish. Default 'all' - a release
+    # that silently drops an architecture is a surprise to the people running on it.
+    # -Arch x64 still works, but the manifest then has to lose its arm64 entry, and the
+    # script says so instead of publishing a URL that 404s.
+    [string]$Arch = 'all',
     [string]$Repository = 'GandalfIX/saife'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $wingetDir = Join-Path $root 'packaging/winget'
+. (Join-Path $PSScriptRoot 'lib\arch.ps1')
 
 function Step([string]$message) {
     Write-Host ''
@@ -75,6 +87,42 @@ function Assert-ReleaseSideFiles([string]$dir, [string]$name, [string]$hash) {
     }
 }
 
+# Rewrite one Installer entry per architecture. The single-arch version replaced the
+# first InstallerUrl/InstallerSha256 in the file; with two entries that writes the same
+# URL and hash into both, so the arch each block belongs to is tracked while the file
+# is walked. CRLF is rebuilt explicitly (the manifests are CRLF and .gitattributes pins
+# it). Every architecture that has an archive must have an entry, and every entry must
+# have an archive: either mismatch publishes a URL that 404s or a hash for bytes that
+# were never built.
+function Update-WingetInstaller([string]$text, [hashtable]$installers, [string]$fileName) {
+    $lines = [regex]::Split($text, "`r`n|`n")
+    $current = $null
+    $seen = @{}
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        $m = [regex]::Match($line, '^\s*-\s*Architecture:\s*(\S+)\s*$')
+        if ($m.Success) { $current = $m.Groups[1].Value; continue }
+        if (-not $current) { continue }
+        if ($line -match '^(\s*)InstallerUrl:') {
+            if (-not $installers.ContainsKey($current)) {
+                Refuse "$fileName declares Architecture: $current, but no saife-$version-$current.zip was built - build it (-Arch all), or delete that installer entry"
+            }
+            $seen[$current] = $true
+            $lines[$i] = $Matches[1] + 'InstallerUrl: ' + $installers[$current].Url
+        } elseif ($line -match '^(\s*)InstallerSha256:') {
+            if (-not $installers.ContainsKey($current)) { continue }
+            $seen[$current] = $true
+            $lines[$i] = $Matches[1] + 'InstallerSha256: ' + $installers[$current].Sha256
+        }
+    }
+    foreach ($arch in @($installers.Keys)) {
+        if (-not $seen.ContainsKey($arch)) {
+            Refuse "$fileName has no 'Architecture: $arch' installer entry, but saife-$version-$arch.zip was built - add one, or that archive is not installable through winget"
+        }
+    }
+    return ($lines -join "`r`n")
+}
+
 if ($Prepare -and $Publish) { Refuse 'pass -Prepare or -Publish, not both' }
 if ($VerifyOnly -and $Publish) { Refuse 'pass -VerifyOnly or -Publish, not both' }
 $mode = if ($Publish) { 'publish' } elseif ($VerifyOnly) { 'verify' } else { 'prepare' }
@@ -87,13 +135,40 @@ if ($toml -notmatch '(?sm)\[package\].*?^\s*version\s*=\s*"([^"]+)"') {
 }
 $version = $Matches[1]
 $tag = "v$version"
-$assetName = "saife-$version-x64.zip"
-$assetUrl = "https://github.com/$Repository/releases/download/$tag/$assetName"
 $releaseBranch = "chore/release-$tag"
 $releaseDir = Join-Path $root 'dist/release'
-$assetPath = Join-Path $releaseDir $assetName
+$hostArch = Resolve-HostArch
+# Fixed order: the sums file and the manifest are compared between runs.
+$archNames = @('x64', 'arm64')
 
-Write-Host "mode: $mode   version: $version   tag: $tag   asset: $assetName"
+function Get-AssetUrl([string]$name) {
+    return "https://github.com/$Repository/releases/download/$tag/$name"
+}
+
+# Every architecture that has an archive on disk, with the facts the manifests and the
+# upload need. Discovery rather than a name the caller supplies: a release publishes
+# what was built, and refuses loudly when that is nothing.
+function Get-ReleaseAssets {
+    $found = @()
+    foreach ($arch in $archNames) {
+        $name = Get-AssetName -Version $version -Arch $arch
+        $path = Join-Path $releaseDir $name
+        if (-not (Test-Path $path)) { continue }
+        $found += [pscustomobject]@{
+            Arch   = $arch
+            Name   = $name
+            Path   = $path
+            Url    = (Get-AssetUrl $name)
+            Sha256 = (Get-FileHash $path -Algorithm SHA256).Hash
+        }
+    }
+    if ($found.Count -eq 0) {
+        Refuse "no saife-$version-<arch>.zip in $releaseDir - build one with: pwsh -File packaging/build-dist.ps1 -Release -Arch $Arch"
+    }
+    return $found
+}
+
+Write-Host "mode: $mode   version: $version   tag: $tag   host: $hostArch"
 if ($version -match '-') {
     Write-Host 'note: this version carries a pre-release suffix; GitHub will not mark it "latest" unless published as such.' -ForegroundColor Yellow
 }
@@ -119,24 +194,38 @@ function Save-ReleaseNotes([string]$text) {
     return $path
 }
 
-# Extract the asset, insist on the flat layout, and ask the binary what it is.
-function Test-Asset([string]$zipPath) {
+# Extract the asset, insist on the flat layout, and ask the binary what it is. The
+# binary is only STARTED when the archive matches this host's architecture: an arm64
+# archive cross-built on an x64 host cannot be executed here, so its PE machine field
+# is what proves the bytes are ARM64 - the one check that works cross-architecture and
+# the one that catches a "cross-build" that quietly produced a host binary.
+function Test-Asset([string]$zipPath, [string]$arch) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
     try { $entries = $zip.Entries.FullName } finally { $zip.Dispose() }
+    $leaf = [IO.Path]::GetFileName($zipPath)
     foreach ($required in 'saife.exe', 'saife-launch.exe', 'README.txt') {
         if ($entries -notcontains $required) {
-            Refuse "$([IO.Path]::GetFileName($zipPath)) is not flat: '$required' is not at the archive root (entries: $($entries -join ', '))"
+            Refuse "$leaf is not flat: '$required' is not at the archive root (entries: $($entries -join ', '))"
         }
     }
     $probeDir = Join-Path ([IO.Path]::GetTempPath()) ("saife-probe-" + [guid]::NewGuid().ToString('N'))
     try {
         Expand-Archive -Path $zipPath -DestinationPath $probeDir
-        $probe = (& (Join-Path $probeDir 'saife.exe') --version) -join ' '
-        if ($probe -notlike "*SAIFE Sandbox $version*") {
-            Refuse "$([IO.Path]::GetFileName($zipPath)) contains a binary that reports '$($probe.Trim())'"
+        $machine = Get-PeMachine -Path (Join-Path $probeDir 'saife.exe')
+        $expected = Get-ArchMachine -Arch $arch
+        if ($machine -ne $expected) {
+            Refuse ("{0} carries a 0x{1:X4} image but its name says {2} (expected 0x{3:X4})" -f $leaf, $machine, $arch, $expected)
         }
-        Write-Host "probe: $($probe.Trim())"
+        if ($arch -eq $hostArch) {
+            $probe = (& (Join-Path $probeDir 'saife.exe') --version) -join ' '
+            if ($probe -notlike "*SAIFE Sandbox $version*") {
+                Refuse "$leaf contains a binary that reports '$($probe.Trim())'"
+            }
+            Write-Host ("probe: {0}  (PE machine 0x{1:X4}, {2})" -f $probe.Trim(), $machine, $arch)
+        } else {
+            Write-Host ("probe: PE machine 0x{0:X4} ({1}) - not executed, this host is {2}" -f $machine, $arch, $hostArch)
+        }
     } finally {
         Remove-Item $probeDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -190,17 +279,28 @@ Write-Host '---------------------'
 
 if ($mode -eq 'verify') {
     Step "verifying the published release $tag"
-    $published = Get-PublishedHash $assetUrl
-    if (-not $published) { Refuse "$assetUrl is not published (or requires auth)" }
-    if (Test-Path $assetPath) {
-        $localHash = (Get-FileHash $assetPath -Algorithm SHA256).Hash
-        if ($localHash -ne $published.Hash) {
-            Refuse "published hash $($published.Hash) differs from the local build $localHash"
+    $checked = 0
+    foreach ($arch in $archNames) {
+        $name = Get-AssetName -Version $version -Arch $arch
+        $url = Get-AssetUrl $name
+        $local = Join-Path $releaseDir $name
+        $published = Get-PublishedHash $url
+        if (-not $published) {
+            Write-Host "not published: $name"
+            continue
         }
-        Write-Host "hash matches the local build: $localHash"
-    } else {
-        Write-Host "published hash: $($published.Hash)  ($([math]::Round($published.Size / 1KB)) KB)"
+        $checked++
+        if (Test-Path $local) {
+            $localHash = (Get-FileHash $local -Algorithm SHA256).Hash
+            if ($localHash -ne $published.Hash) {
+                Refuse "published hash $($published.Hash) for $name differs from the local build $localHash"
+            }
+            Write-Host "hash matches the local build: $name $localHash"
+        } else {
+            Write-Host "published hash: $name $($published.Hash)  ($([math]::Round($published.Size / 1KB)) KB)"
+        }
     }
+    if ($checked -eq 0) { Refuse "no saife-$version-<arch>.zip is published for $tag" }
     exit 0
 }
 
@@ -215,24 +315,29 @@ if ($mode -eq 'prepare') {
         if ($LASTEXITCODE -ne 0) { Refuse 'clippy is not clean' }
     }
 
-    Step 'build and package (static CRT, flat release asset)'
-    & (Join-Path $PSScriptRoot 'build-dist.ps1') -Release
-    $builtAsset = Join-Path $root $assetName
-    if (-not (Test-Path $builtAsset)) { Refuse "$builtAsset was not produced" }
+    Step 'build and package (static CRT, flat release asset per architecture)'
+    & (Join-Path $PSScriptRoot 'build-dist.ps1') -Release -Arch $Arch
     if (-not (Test-Path $releaseDir)) { New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null }
-    Move-Item $builtAsset $assetPath -Force
+    foreach ($arch in $archNames) {
+        $built = Join-Path $root (Get-AssetName -Version $version -Arch $arch)
+        if (-not (Test-Path $built)) { continue }
+        Move-Item $built (Join-Path $releaseDir (Split-Path -Leaf $built)) -Force
+    }
+    $assets = Get-ReleaseAssets
 
-    Step 'probe the asset (flat layout, reports the declared version)'
-    Test-Asset $assetPath
+    Step 'probe every asset (flat layout, reports the declared version)'
+    foreach ($asset in $assets) { Test-Asset $asset.Path $asset.Arch }
 
-    $hash = (Get-FileHash $assetPath -Algorithm SHA256).Hash
-    Write-Host ("asset:  {0}  ({1:N0} KB)" -f $assetPath, ((Get-Item $assetPath).Length / 1KB))
-    Write-Host "sha256: $hash"
+    foreach ($asset in $assets) {
+        Write-Host ("asset:  {0}  ({1:N0} KB)" -f $asset.Path, ((Get-Item $asset.Path).Length / 1KB))
+        Write-Host ("sha256: {0}" -f $asset.Sha256)
+    }
 
     # LF, because sha256sum -c reads a trailing CR as part of the file name.
+    $sumLines = $assets | ForEach-Object { '{0}  {1}' -f $_.Sha256.ToLower(), $_.Name }
     [IO.File]::WriteAllText(
         (Join-Path $releaseDir 'SHA256SUMS.txt'),
-        "$($hash.ToLower())  $assetName`n",
+        (($sumLines -join "`n") + "`n"),
         (New-Object System.Text.UTF8Encoding($false)))
 
     # The notes file is written after packaging: build-dist.ps1 recreates dist/ wholesale.
@@ -249,14 +354,20 @@ if ($mode -eq 'prepare') {
         if (Test-Path $manifestTarget) { Remove-Item $manifestTarget -Recurse -Force }
         Copy-Item $wingetDir $manifestTarget -Recurse
     }
+    # One Installer block per architecture; `installers` is what each one is rewritten to.
+    $installers = @{}
+    foreach ($asset in $assets) {
+        $installers[$asset.Arch] = @{ Url = $asset.Url; Sha256 = $asset.Sha256 }
+    }
     foreach ($file in Get-ChildItem $manifestTarget -Filter '*.yaml') {
         $raw = [IO.File]::ReadAllText($file.FullName)
         $before = $raw
         # `[^\r\n]*` rather than `.*$`: .NET's `.` matches CR, so `.*$` swallows the
         # carriage return and leaves one LF line among CRLFs.
         $raw = [regex]::Replace($raw, '(?m)^PackageVersion:[^\r\n]*', "PackageVersion: $version")
-        $raw = [regex]::Replace($raw, '(?m)^(\s*)InstallerUrl:[^\r\n]*', "`${1}InstallerUrl: $assetUrl")
-        $raw = [regex]::Replace($raw, '(?m)^(\s*)InstallerSha256:[^\r\n]*', "`${1}InstallerSha256: $hash")
+        if ($file.Name -match '\.installer\.ya?ml$') {
+            $raw = Update-WingetInstaller $raw $installers $file.Name
+        }
         if ($raw -ne $before) {
             Write-Host ("rewrote {0} -> {1}" -f $file.Name, $version)
             if (-not $DryRun) {
@@ -276,8 +387,8 @@ if ($mode -eq 'prepare') {
 
     if ($DryRun) {
         Step 'dry run: stopping before the branch and the pull request'
-        Write-Host "would build:   $assetName  ($hash)"
-        Write-Host "would commit:  packaging/winget (PackageVersion $version, InstallerUrl, InstallerSha256)"
+        foreach ($asset in $assets) { Write-Host ("would publish: {0}  ({1})" -f $asset.Name, $asset.Sha256) }
+        Write-Host "would commit:  packaging/winget (PackageVersion $version, one InstallerUrl + InstallerSha256 per architecture)"
         Write-Host "would push:    branch $releaseBranch (never main)"
         Write-Host "would open:    a pull request $releaseBranch -> main"
         Write-Host 'then:          merge it, and run  pwsh -File packaging/release.ps1 -Publish'
@@ -299,28 +410,28 @@ if ($mode -eq 'prepare') {
     }
     Invoke-Git 'push' '--quiet' '--set-upstream' 'origin' $releaseBranch | Out-Null
 
+    $assetLines = ($assets | ForEach-Object { "- {0} -> {1} ({2})" -f $_.Name, $_.Url, $_.Sha256 }) -join "`n"
     $body = @'
-Rewrites the winget manifests for {0} from the asset built by packaging/release.ps1.
+Rewrites the winget manifests for {0} from the assets built by packaging/release.ps1.
 
 - PackageVersion -> {1}
-- InstallerUrl -> {2}
-- InstallerSha256 -> {3}
+{2}
 
 winget validate passes on this set. Merge it, then on main:
 
     pwsh -File packaging/release.ps1 -Publish
 
 which tags the merge commit, publishes the release and re-verifies the published
-archive. Do not rebuild between the merge and -Publish: the asset is published from
-the machine that built it, because a zip is not byte-reproducible.
-'@ -f $tag, $version, $assetUrl, $hash
+archives. Do not rebuild between the merge and -Publish: the assets are published from
+the machine that built them, because a zip is not byte-reproducible.
+'@ -f $tag, $version, $assetLines
 
     $prUrl = & $gh pr create --repo $Repository --base main --head $releaseBranch --title "chore(release): $tag manifests" --body $body
     if ($LASTEXITCODE -ne 0) { Refuse 'gh pr create failed' }
 
     Step 'prepared - nothing published, main untouched'
     Write-Host "pull request: $prUrl"
-    Write-Host "asset kept:   $assetPath  ($hash)"
+    foreach ($asset in $assets) { Write-Host ("asset kept:   {0}  ({1})" -f $asset.Path, $asset.Sha256) }
     Write-Host ''
     Write-Host 'Next: merge the pull request, then'
     Write-Host '   git switch main; git pull; pwsh -File packaging/release.ps1 -Publish'
@@ -330,23 +441,22 @@ the machine that built it, because a zip is not byte-reproducible.
 # ---------------------------------------------------------------- publish
 
 Step 'publish preconditions'
-# origin/main must already describe this exact asset: the merge is what turns a local
+# origin/main must already describe these exact bytes: the merge is what turns a local
 # build into published bytes, and the tag must describe the merge, not the branch.
-if (-not (Test-Path $assetPath)) {
-    Refuse "no local asset at $assetPath - publish from the machine that ran the prepare step (a rebuild changes the hash)"
-}
-$hash = (Get-FileHash $assetPath -Algorithm SHA256).Hash
+$assets = Get-ReleaseAssets
 $mainInstaller = (Invoke-Git 'show' "origin/main:packaging/winget/GandalfIX.SAIFE-Sandbox.installer.yaml" | Out-String)
 if ($mainInstaller -notmatch "(?m)^PackageVersion:\s*$([regex]::Escape($version))\s*$") {
     Refuse "origin/main's manifests are not at $version yet; merge the release pull request first"
 }
-if ($mainInstaller -notmatch "(?m)^\s*InstallerSha256:\s*$([regex]::Escape($hash))\s*$") {
-    Refuse "origin/main's InstallerSha256 does not match the local asset ($hash)"
+foreach ($asset in $assets) {
+    if ($mainInstaller -notmatch "(?m)^\s*InstallerSha256:\s*$([regex]::Escape($asset.Sha256))\s*$") {
+        Refuse "origin/main's InstallerSha256 does not match $($asset.Name) ($($asset.Sha256)); publish from the machine that built it (a rebuild changes the hash)"
+    }
+    # Uploaded after the tag: prove every one of them exists first, per asset.
+    Assert-ReleaseSideFiles $releaseDir $asset.Name $asset.Sha256
 }
-Write-Host "origin/main describes $assetName ($hash)"
+Write-Host ("origin/main describes {0}" -f (($assets | ForEach-Object { $_.Name }) -join ', '))
 
-# Uploaded after the tag: prove every one of them exists first.
-Assert-ReleaseSideFiles $releaseDir $assetName $hash
 if ($NotesFile) {
     if (-not (Test-Path $NotesFile)) { Refuse "notes file $NotesFile does not exist" }
 } else {
@@ -355,10 +465,10 @@ if ($NotesFile) {
     # nothing.
     $NotesFile = Save-ReleaseNotes $section
 }
-Write-Host "release files present: $assetName, SHA256SUMS.txt, $(Split-Path -Leaf $NotesFile)"
+Write-Host ("release files present: {0}, SHA256SUMS.txt, {1}" -f (($assets | ForEach-Object { $_.Name }) -join ', '), (Split-Path -Leaf $NotesFile))
 
-Step 'probe the asset before tagging'
-Test-Asset $assetPath
+Step 'probe every asset before tagging'
+foreach ($asset in $assets) { Test-Asset $asset.Path $asset.Arch }
 
 if (-not $SkipCiCheck) {
     Step 'CI on the release commit'
@@ -379,16 +489,19 @@ Invoke-Git 'tag' '--annotate' $tag '--message' "SAIFE Sandbox $version" | Out-Nu
 Invoke-Git 'push' '--quiet' 'origin' $tag | Out-Null
 
 Step "publish the GitHub release $tag"
-& $gh release create $tag --repo $Repository --title "SAIFE Sandbox $version" --verify-tag --notes-file $NotesFile $assetPath (Join-Path $releaseDir 'SHA256SUMS.txt')
+$assetPaths = @($assets | ForEach-Object { $_.Path })
+& $gh release create $tag --repo $Repository --title "SAIFE Sandbox $version" --verify-tag --notes-file $NotesFile @assetPaths (Join-Path $releaseDir 'SHA256SUMS.txt')
 if ($LASTEXITCODE -ne 0) { Refuse 'gh release create failed' }
 
 Step 'verify what a user would download'
-$published = Get-PublishedHash $assetUrl
-if (-not $published) { Refuse "$assetUrl did not answer 200 after publishing" }
-if ($published.Hash -ne $hash) {
-    Refuse "the published asset hashes to $($published.Hash), the built one to $hash"
+foreach ($asset in $assets) {
+    $published = Get-PublishedHash $asset.Url
+    if (-not $published) { Refuse "$($asset.Url) did not answer 200 after publishing" }
+    if ($published.Hash -ne $asset.Sha256) {
+        Refuse "the published $($asset.Name) hashes to $($published.Hash), the built one to $($asset.Sha256)"
+    }
+    Write-Host ("published asset verified: {0} {1}" -f $asset.Name, $asset.Sha256)
 }
-Write-Host "published asset verified: $hash"
 
 Step 'tidy up'
 Invoke-Git 'push' '--quiet' 'origin' '--delete' $releaseBranch

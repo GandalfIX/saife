@@ -31,9 +31,9 @@ Tags:
   - cli
 ReleaseNotesUrl: https://github.com/GandalfIX/saife/releases
 InstallationNotes: >-
-  Requires Windows 11 24H2 (build 26100) or newer, x64. No administrator rights
-  and no service are needed for the default backend. Verify the installation with
-  `saife setup --check-only`, then run something:
+  Requires Windows 11 24H2 (build 26100) or newer, x64 or ARM64. No administrator
+  rights and no service are needed for the default backend. Verify the installation
+  with `saife setup --check-only`, then run something:
   `saife run --allow-cwd -- cmd /c echo ok`. Profiles live in
   %USERPROFILE%\.saife\profiles and plugin sidecars in
   %USERPROFILE%\.saife\plugins.
