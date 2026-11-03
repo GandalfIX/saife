@@ -108,6 +108,7 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
             filesystem: fs,
             network: resolve_network_slice(&raw.network),
             limits: resolve_limits_slice(&raw.limits),
+            runner: resolve_runner_slice(&raw.runner),
         };
         let groups_expanded = expand_groups_for_show(&groups);
         println!("{}", to_expanded_json(&resolved, &groups_expanded));
@@ -128,7 +129,8 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
 ///   "filesystem": { "allow": [...], "read_only": [...], "deny": [...] },
 ///   "security_groups_expanded": { "python_runtime": ["C:\\..."], ... },
 ///   "network": { "block": false, "allow_domain": [...], "profile": "..." },
-///   "limits": { "prompt_timeout_secs": 60, "workload_timeout_secs": 1800 }
+///   "limits": { "prompt_timeout_secs": 60, "workload_timeout_secs": 1800 },
+///   "runner": { "sync": { "paths": ["apps/payments"] } }
 /// }
 /// ```
 pub fn to_expanded_json(
@@ -165,6 +167,11 @@ pub fn to_expanded_json(
         "limits": {
             "prompt_timeout_secs": resolved.limits.prompt_timeout_secs,
             "workload_timeout_secs": resolved.limits.workload_timeout_secs,
+        },
+        // The build runner's copy allow-list: `[]` means "the whole project", which is what
+        // every profile that predates the field resolves to.
+        "runner": {
+            "sync": { "paths": resolved.runner.paths },
         }
     });
     serde_json::to_string_pretty(&expanded).unwrap_or_else(|_| "{}".into())
@@ -383,6 +390,7 @@ pub struct ResolvedProfile {
     pub filesystem: FilesystemSlice,
     pub network: NetworkSlice,
     pub limits: LimitsSlice,
+    pub runner: RunnerSyncSlice,
 }
 
 /// `"extends": "parent"` or `"extends": ["a", "b"]`. Untagged, so the single-parent
@@ -438,6 +446,9 @@ pub struct RawProfile {
     /// The session-deadline terms (see [`RawLimits`]). Top level, NOT `network.*`.
     #[serde(default)]
     pub limits: Option<RawLimits>,
+    /// What the build runner copies into its container (see [`RawRunner`]).
+    #[serde(default)]
+    pub runner: Option<RawRunner>,
     #[serde(default)]
     pub workdir: Option<Workdir>,
 }
@@ -571,6 +582,35 @@ pub struct Workdir {
     pub access: Option<String>,
 }
 
+/// `runner` block: what the session's build runner is allowed to copy into its container.
+///
+/// Same shape rule as every other optional section: absent means "no default", so a profile
+/// written before this field existed loads and behaves exactly as it did.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RawRunner {
+    #[serde(default)]
+    pub sync: Option<RawRunnerSync>,
+}
+
+/// `runner.sync`: the copy allow-list a build request inherits when it names none.
+///
+/// Entries are relative to the PROJECT root (never to the workspace), so nothing here is
+/// variable-expanded - `$CWD` would name the session's directory, not the project's.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RawRunnerSync {
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// The runner slice of a profile, after merging `extends`: the copy allow-list this session
+/// hands to a request that names none. Empty = the whole project.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RunnerSyncSlice {
+    pub paths: Vec<String>,
+}
+
 /// The set of top-level keys a v1 profile accepts. Used by
 /// [`suggest_unknown_key`] to emit "Did you mean X?" hints (AC-5.13).
 pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
@@ -580,6 +620,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "filesystem",
     "network",
     "limits",
+    "runner",
     "workdir",
 ];
 
@@ -722,6 +763,7 @@ pub fn load_and_resolve(name: &str, cwd: &Path) -> Result<ResolvedProfile> {
         filesystem: fs,
         network: resolve_network_slice(&raw.network),
         limits: resolve_limits_slice(&raw.limits),
+        runner: resolve_runner_slice(&raw.runner),
     })
 }
 
@@ -801,6 +843,7 @@ fn merge_parent_set(parts: &[(String, RawProfile)], child: &RawProfile) -> Resul
     let mut upstream_proxy: Vec<(String, String)> = Vec::new();
     let mut prompt_secs: Vec<(String, u32)> = Vec::new();
     let mut workload_secs: Vec<(String, u32)> = Vec::new();
+    let mut runner_paths: Vec<String> = Vec::new();
 
     for (spelled, part) in parts {
         // The refusal must name the PARENT, not the spelling: a profile reached as
@@ -846,6 +889,11 @@ fn merge_parent_set(parts: &[(String, RawProfile)], child: &RawProfile) -> Resul
             if let Some(v) = l.workload_timeout_secs {
                 workload_secs.push((n.to_string(), v));
             }
+        }
+        if let Some(r) = &part.runner
+            && let Some(s) = &r.sync
+        {
+            runner_paths.extend(s.paths.iter().cloned());
         }
     }
 
@@ -924,6 +972,15 @@ fn merge_parent_set(parts: &[(String, RawProfile)], child: &RawProfile) -> Resul
                 None => agree("limits.workload_timeout_secs", &workload_secs)?,
             },
         }),
+        runner: if runner_paths.is_empty() {
+            None
+        } else {
+            Some(RawRunner {
+                sync: Some(RawRunnerSync {
+                    paths: dedupe_vec(runner_paths),
+                }),
+            })
+        },
         workdir: None,
     })
 }
@@ -1060,6 +1117,24 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
         (None, Some(c)) => Some(c),
         (None, None) => None,
     };
+    // Same rule as every other list: arrays concatenate, so a child ADDS to its parent's
+    // copy list rather than silently narrowing it (a child cannot revoke a parent's entry;
+    // a build request can still win entirely, which is where narrowing belongs).
+    let runner = match (parent.runner, child.runner) {
+        (Some(p), Some(c)) => Some(RawRunner {
+            sync: match (p.sync, c.sync) {
+                (Some(p), Some(c)) => Some(RawRunnerSync {
+                    paths: dedupe_concat(p.paths, c.paths),
+                }),
+                (Some(p), None) => Some(p),
+                (None, Some(c)) => Some(c),
+                (None, None) => None,
+            },
+        }),
+        (Some(p), None) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
     RawProfile {
         meta: child.meta.or(parent.meta),
         extends: None, // chain already resolved
@@ -1074,6 +1149,7 @@ fn merge_profiles(parent: RawProfile, child: RawProfile) -> RawProfile {
         filesystem,
         network,
         limits,
+        runner,
         workdir: child.workdir.or(parent.workdir),
     }
 }
@@ -1131,6 +1207,19 @@ fn resolve_limits_slice(raw: &Option<RawLimits>) -> LimitsSlice {
             workload_timeout_secs: l.workload_timeout_secs,
         },
         None => LimitsSlice::default(),
+    }
+}
+
+/// Resolve the runner slice from the raw `runner` block. No validation here: an entry is
+/// checked where it is used ([`crate::runner::BuildRequest::validate_on_disk`]), so
+/// `profile show --expanded` keeps showing what the file said.
+fn resolve_runner_slice(raw: &Option<RawRunner>) -> RunnerSyncSlice {
+    RunnerSyncSlice {
+        paths: raw
+            .as_ref()
+            .and_then(|r| r.sync.as_ref())
+            .map(|s| s.paths.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1658,6 +1747,7 @@ mod tests {
                 ..Default::default()
             },
             limits: LimitsSlice::default(),
+            runner: RunnerSyncSlice::default(),
         };
         let groups_expanded: Vec<(String, Vec<PathBuf>)> =
             vec![("python_runtime".into(), vec![PathBuf::from(r"C:\Py312")])];
@@ -1719,6 +1809,54 @@ mod tests {
         assert_eq!(n.deny_domain.len(), 2);
     }
 
+    /// `runner.sync.paths` is the session profile's copy allow-list. It is PROJECT-relative,
+    /// so it is not variable-expanded, and a profile without the block is the empty slice -
+    /// which is what keeps every existing profile loading unchanged.
+    #[test]
+    fn a_profile_can_default_the_runner_copy_paths() {
+        let raw: RawProfile = serde_json::from_str(
+            r#"{"meta":{"name":"m","schema_version":1},"runner":{"sync":{"paths":["apps/payments","settings.gradle.kts"]}}}"#,
+        )
+        .expect("the runner block parses");
+        assert_eq!(
+            resolve_runner_slice(&raw.runner).paths,
+            vec!["apps/payments", "settings.gradle.kts"]
+        );
+
+        let bare: RawProfile = serde_json::from_str(r#"{"meta":{"name":"m","schema_version":1}}"#)
+            .expect("a profile without `runner` still parses");
+        assert!(
+            resolve_runner_slice(&bare.runner).paths.is_empty(),
+            "absent means the whole project, not an error"
+        );
+    }
+
+    /// Arrays concatenate across `extends`, the rule every other list in a profile follows.
+    /// A child that wanted to NARROW a parent's list therefore cannot do it by restating a
+    /// shorter one - the runner's own rule is that the request wins entirely, and this is
+    /// the profile half of the same sentence.
+    #[test]
+    fn merge_profiles_concatenates_runner_sync_paths() {
+        let parent = RawProfile {
+            runner: Some(RawRunner {
+                sync: Some(RawRunnerSync {
+                    paths: vec!["apps/payments".into()],
+                }),
+            }),
+            ..Default::default()
+        };
+        let child = RawProfile {
+            runner: Some(RawRunner {
+                sync: Some(RawRunnerSync {
+                    paths: vec!["apps/checkout".into()],
+                }),
+            }),
+            ..Default::default()
+        };
+        let merged = resolve_runner_slice(&merge_profiles(parent, child).runner);
+        assert_eq!(merged.paths, vec!["apps/payments", "apps/checkout"]);
+    }
+
     #[test]
     fn resolve_network_slice_copies_prompt_fields() {
         let raw = RawNetwork {
@@ -1765,6 +1903,7 @@ mod tests {
                 prompt_timeout_secs: Some(60),
                 workload_timeout_secs: None,
             },
+            runner: RunnerSyncSlice::default(),
         };
         let json = to_expanded_json(&resolved, &[]);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1961,6 +2100,7 @@ mod tests {
                 prompt_timeout_secs: Some(30),
                 workload_timeout_secs: Some(3600),
             },
+            runner: RunnerSyncSlice::default(),
         };
         let v: serde_json::Value = serde_json::from_str(&to_expanded_json(&resolved, &[])).unwrap();
         assert_eq!(v["limits"]["prompt_timeout_secs"], 30);
@@ -1972,6 +2112,11 @@ mod tests {
         assert!(
             v["network"].get("workload_timeout_secs").is_none(),
             "the network view must not carry the workload term"
+        );
+        assert_eq!(
+            v["runner"]["sync"]["paths"],
+            serde_json::json!([]),
+            "no list is the empty list here too, which is what means 'the whole project'"
         );
     }
 

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "stream-sidecar",
+  "version": "0.1.0",
+  "description": "Emits a build-log-like stream so a facade response can be timed end to end.",
+  "mount": "build",
+  "command": ["python", "sidecar.py"],
+  "health": { "path": "/status", "timeout_ms": 15000, "interval_ms": 250 },
+  "operations": [
+    { "method": "GET", "path": "/build" },
+    { "method": "POST", "path": "/build" }
+  ],
+  "secrets": [],
+  "config": { "lines": "20", "interval_ms": "1000" }
+}

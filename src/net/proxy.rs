@@ -135,6 +135,13 @@ pub struct ProxyConfig {
     /// allow-list ([G-32, G-33]). Wired in D-3.2; the full prompt/learned-deny
     /// pipeline lands in D-3.6.
     pub deny_domain: Vec<String>,
+    /// Egress denied outright (T6.1). Set by a `--block-net` session that still
+    /// needs the listener for a facade mount (`--runner`, `--plugin`): the facade
+    /// routes are answered *before* the decision pipeline, so this denies exactly
+    /// the requests that would leave the machine while the host-side capability
+    /// stays reachable. No prompt is ever raised, because there is nothing left to
+    /// ask — the answer is the session's posture, not a per-host choice.
+    pub blocked: bool,
     /// Upstream chaining dialer ([G-10, G-22]). `None` = direct dial
     /// only. Parsed once by the supervisor at startup and shared by
     /// every handler through the `Arc`.
@@ -183,6 +190,10 @@ struct ConnCtx {
     token: RunToken,
     deny: Vec<String>,
     allow: Vec<String>,
+    /// Egress denied outright (T6.1). Checked first in [`decide`], so a
+    /// `--block-net` session that only needs the facade cannot be talked into an
+    /// origin by a list, a learned entry or a dialog.
+    blocked: bool,
     writer: Arc<AuditWriter>,
     upstream: Option<Arc<UpstreamDialer>>,
     prompt: PromptGate,
@@ -1001,6 +1012,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         token,
         allow_domain,
         deny_domain,
+        blocked,
         writer,
         upstream,
         prompt,
@@ -1022,6 +1034,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         token,
         deny: deny_domain,
         allow: allow_domain,
+        blocked,
         writer,
         upstream,
         prompt,
@@ -1486,6 +1499,22 @@ async fn decide(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
             scope: None,
             persisted: false,
             reason: Some("loopback_refused".into()),
+            intent_hint: false,
+        };
+    }
+    // (2b) `--block-net` with a listener (T6.1): the facade mounts are answered
+    // before this function is ever called, so everything that arrives here is a
+    // request that would leave the machine. Denied as the session's posture, at
+    // the first rung: no list, no learned entry and no dialog can reach a rule
+    // that admits it, because there is no rule to reach — the operator said
+    // "no egress" and this listener exists only for the host-side capability.
+    if ctx.blocked {
+        return Decision {
+            allowed: false,
+            source: "hard-deny",
+            scope: None,
+            persisted: false,
+            reason: Some("network_blocked".into()),
             intent_hint: false,
         };
     }
@@ -2350,6 +2379,11 @@ async fn write_response(sock: &mut TcpStream, status: &str, headers: &str, body:
     let _ = sock.write_all(r.as_bytes()).await;
 }
 
+/// How much body a facade request may carry. A build request names a task and a
+/// profile; nothing legitimate comes close, and the cap keeps an unbounded body from
+/// becoming a memory amplifier in the supervisor.
+const MAX_FACADE_BODY: usize = 4096;
+
 /// The declared Content-Length of a request head, if present and valid.
 fn content_length(head: &str) -> Option<usize> {
     head.lines().find_map(|line| {
@@ -3188,8 +3222,9 @@ enum FacadeAction {
     NotFacade,
     /// Reserved suffix, but no plugin in this session registered that mount.
     UnknownMount,
-    /// The mount exists and the method is not one this transport relays.
-    MethodUnsupported,
+    /// The mount exists but the method is not a syntactically valid token, so it
+    /// cannot be put on a request line at all. Not a policy answer: a typo is 400.
+    MethodInvalid,
     /// The request is well-formed but the manifest does not declare this
     /// `(method, path)`. The declaration is the operator's reviewed surface, so
     /// anything outside it is refused rather than relayed.
@@ -3219,8 +3254,12 @@ fn facade_action(
     let Some(target) = facade.lookup(&label.to_ascii_lowercase()) else {
         return FacadeAction::UnknownMount;
     };
-    if !method.eq_ignore_ascii_case("GET") {
-        return FacadeAction::MethodUnsupported;
+    // Any method is relayable *if the manifest declares it*: the declaration is the
+    // reviewed control (a build request is a POST), and refusing a declared method
+    // here made the operator's line a lie. The old hard-coded GET gate answered 501
+    // for POST /build even though the manifest said POST /build.
+    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return FacadeAction::MethodInvalid;
     }
     // The path the sidecar will receive, with the query stripped: a manifest
     // declares paths, not queries.
@@ -3251,7 +3290,9 @@ async fn relay_facade(
     writer: &AuditWriter,
     mount: &str,
     target: &FacadeTarget,
+    method: &str,
     path: &str,
+    body: &[u8],
 ) -> Result<()> {
     let mut upstream = match TcpStream::connect(("127.0.0.1", target.port)).await {
         Ok(stream) => stream,
@@ -3275,11 +3316,21 @@ async fn relay_facade(
         }
     };
     let _ = emit_facade(writer, mount, Some(path), "allow", None);
-    let request = format!(
-        "GET {path} HTTP/1.0\r\nHost: {mount}\r\nX-Facade-Token: {}\r\n\r\n",
+    // The method is the declared one, uppercased only when it already is a token
+    // (facade_action refused anything else). The body is the client's, framed by the
+    // supervisor: the sidecar still never sees a single client header.
+    let mut request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: {mount}\r\nX-Facade-Token: {}\r\n",
         target.token
     );
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
     if upstream.write_all(request.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+    if !body.is_empty() && upstream.write_all(body).await.is_err() {
         return Ok(());
     }
     let _ = tokio::io::copy(&mut upstream, sock).await;
@@ -3428,20 +3479,20 @@ async fn handle_forward(
             .await;
             return Ok(());
         }
-        FacadeAction::MethodUnsupported => {
+        FacadeAction::MethodInvalid => {
             let label = crate::plugin::facade_mount(&fwd.host).unwrap_or("");
             let _ = emit_facade(
                 &ctx.writer,
                 &label.to_ascii_lowercase(),
                 Some(fwd.origin_form.as_str()),
                 "deny",
-                Some("facade_method_unsupported"),
+                Some("facade_method_invalid"),
             );
             write_response(
                 &mut sock,
-                "501 Not Implemented",
+                "400 Bad Request",
                 "Content-Type: text/plain\r\nConnection: close\r\n",
-                "facade_method_unsupported\n",
+                "facade_method_invalid\n",
             )
             .await;
             return Ok(());
@@ -3465,12 +3516,35 @@ async fn handle_forward(
             return Ok(());
         }
         FacadeAction::Relay { mount, target } => {
+            // A declared body is forwarded, but only up to a cap: the facade relays
+            // control-plane requests (a build's task and profile name), never file
+            // content, and an unbounded body is a memory amplifier on the supervisor.
+            if content_length(head).unwrap_or(0) > MAX_FACADE_BODY {
+                let _ = emit_facade(
+                    &ctx.writer,
+                    &mount,
+                    Some(fwd.origin_form.as_str()),
+                    "deny",
+                    Some("facade_body_too_large"),
+                );
+                write_response(
+                    &mut sock,
+                    "413 Payload Too Large",
+                    "Content-Type: text/plain\r\nConnection: close\r\n",
+                    "facade_body_too_large\n",
+                )
+                .await;
+                return Ok(());
+            }
+            let body = read_body(&mut sock, head, leftover).await;
             relay_facade(
                 &mut sock,
                 &ctx.writer,
                 &mount,
                 &target,
+                method,
                 fwd.origin_form.as_str(),
+                &body,
             )
             .await?;
             return Ok(());

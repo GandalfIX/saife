@@ -84,6 +84,79 @@ carries the paths, but it is unverified until Maven is. Create the directory
 first (`mkdir %USERPROFILE%\.m2`) — an allow entry cannot create the root it
 grants.
 
+## `gradle-runner.json` — a session that builds through the runner
+
+**Not in a released build.** The runner lives on `feat/gradle-build-runner`; the
+commands named below do not exist in 0.3.x, and this profile is documented so
+the shape is reviewable before the code is merged.
+
+| access | path | why |
+|---|---|---|
+| read-write | `$CWD` | the sources the runner copies **in**, and `build/libs` it copies **back** |
+| read-only | `$HOME/.gitconfig` | git's identity, for the commit a build session usually ends with |
+| deny | `$HOME/.ssh`, `$HOME/.aws` | the same secrets every other sample denies |
+| network | **none** (`block_net: true`) | the build's network is the container's, and the container has none |
+| limits | `workloadTimeoutSecs: 7200` | a build session is a long session; the default is 30 min |
+
+What it deliberately does **not** grant: the JDK and `$USERPROFILE/.gradle`. The
+image carries the toolchain (the sample project's conventions require Java 25,
+and the pinned digest is a JDK 25 image), and the cache volume carries
+`~/.gradle` *inside* the container at `/cache`. Granting either on the host
+would hand the session back exactly what moving the build out of it was for;
+`jvm.json` is the profile that needs both, because it runs Gradle on the host.
+
+### `runner.sync.paths` — what the runner copies in
+
+The sample carries `"runner": { "sync": { "paths": ["."] } }`: `.` is the project root, so
+this is the same "copy everything" the runner does when there is no list at all. Name entries
+instead to copy a subset, which is what a monorepo with several Gradle projects wants:
+
+| key | value | why |
+|---|---|---|
+| `runner.sync.paths` | `["."]` here | the default copy allow-list for build requests that name none |
+
+**The list is closed.** The runner copies exactly the entries named - files or directories,
+relative to the **project** (never to `$CWD`), a directory meaning its subtree - and adds
+nothing on the caller's behalf. So a request that names `apps/payments` must also name what
+that project's build reads through the root: `settings.gradle.kts`, every `includeBuild(...)`
+composite root (typically `build-logic`), and any version catalogue or `gradle.properties` it
+uses. Omit one and the build fails at configuration time naming the missing script - which is
+the intended, visible failure; auto-including them would make the copy something the list
+does not describe. The built-in skip list (`build/`, `.gradle/`, `.git/` at every level) still
+applies inside a listed directory, and to a listed entry itself — naming `build` copies
+nothing. An entry that does not exist, climbs out with `..`, is rooted/UNC, or is (or
+contains) a link or junction is refused by name rather than half-copied.
+
+Precedence: a request that carries `paths` wins **entirely** (it is not merged with this
+list); a request without one inherits this list; with neither, the whole project is copied.
+
+```json
+{
+  "meta": { "name": "monorepo-subset", "version": "1.0.0", "schema_version": 1 },
+  "runner": {
+    "sync": {
+      "paths": ["settings.gradle.kts", "gradle.properties", "build-logic", "apps/payments"]
+    }
+  }
+}
+```
+
+**The runner's `profile` field is not this file.** A build request names
+`"profile": "gradle"`, which is one of the runner's own names
+(`src/runner/mod.rs::PROFILES`), not a saife profile. This file is the session
+posture *around* the runner: what the agent may touch, and that it has no
+network at all.
+
+**The one honest gap.** `block_net: true` names **no listener**
+(`net::resolve_network_with` returns `NetworkConfig::Blocked`; test
+`a_facade_does_not_survive_block_net`), and the runner is reached through the
+supervisor's facade, which lives in that listener. So this is the "build-only,
+no egress at all" posture. A session that has to *ask* the runner for a build
+needs the facade flag rather than `block_net`, and that wiring does not exist
+yet (nothing outside `src/runner/` calls `runner::server::spawn` or
+`DockerBuilds`). When it lands, the choice between "no listener" and "a listener
+with an empty allow-list" belongs to that task, not to a profile.
+
 ## `opencode.json` — see the user guide
 
 `opencode` has its own section in `docs/USER-GUIDE.md` (interactive tools); its

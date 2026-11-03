@@ -1280,7 +1280,7 @@
         token: RunToken,
     ) -> T36 {
         try_t36_token_cfg(
-            label, allow, deny, dialog, enabled, timeout, policy, upstream, token,
+            label, allow, deny, dialog, enabled, timeout, policy, upstream, token, false,
         )
         .expect("spawn test proxy")
     }
@@ -1300,6 +1300,7 @@
         policy: PromptPolicy,
         upstream: Option<Arc<UpstreamDialer>>,
         token: RunToken,
+        blocked: bool,
     ) -> Result<T36> {
         let token_value = token.value().to_string();
         let learned_base = std::env::temp_dir().join(format!(
@@ -1340,6 +1341,7 @@
             writer,
             prompt: gate,
             facade,
+            blocked,
         }) {
             Ok(handle) => handle,
             Err(e) => {
@@ -1374,6 +1376,26 @@
             PromptPolicy::Deny,
             None,
         )
+    }
+
+    /// A listener with the `--block-net` posture of T6.1: a facade-only session's
+    /// proxy. No allow-list, no deny-list, and `blocked: true` — but prompting is
+    /// left ENABLED on purpose, so that a dialog firing would be visible; the
+    /// posture itself has to be what keeps the operator out of the decision.
+    fn t36_setup_blocked(label: &str, dialog: DialogFn) -> T36 {
+        try_t36_token_cfg(
+            label,
+            &[],
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(5),
+            PromptPolicy::Deny,
+            None,
+            unique_test_token(),
+            true,
+        )
+        .expect("spawn blocked test proxy")
     }
 
     /// One blocking request/response round-trip against the test proxy.
@@ -3818,6 +3840,7 @@
             PromptPolicy::Deny,
             None,
             token.clone(),
+            false,
         )
         .err()
         .expect("a duplicate live credential must be refused");
@@ -3945,6 +3968,7 @@
             PromptPolicy::Deny,
             None,
             token.clone(),
+            false,
         )
         .err()
         .expect("a clone of a live token must still be refused");
@@ -5786,6 +5810,7 @@
             token: RunToken::for_tests(TEST_TOKEN),
             deny: Vec::new(),
             allow: vec!["api.example.com".to_string()],
+            blocked: false,
             writer,
             upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
             prompt,
@@ -5930,6 +5955,51 @@
     /// A one-shot HTTP/1.0 sidecar stand-in: records the request head it received
     /// and answers a fixed body. Blocking, on a std thread — the proxy connects to
     /// it from a tokio task, exactly as it reaches the real sidecar.
+    /// Like [`fake_sidecar`], but reads the declared body too, so a relayed POST can
+    /// be checked for what actually arrived.
+    fn fake_sidecar_with_body(body: &'static str) -> (u16, Arc<StdMutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_thread = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut raw = Vec::new();
+                let mut one = [0u8; 1];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut one) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => raw.push(one[0]),
+                    }
+                }
+                // The supervisor frames the body it forwards, so Content-Length is the
+                // only thing to trust here.
+                let head = String::from_utf8_lossy(&raw).into_owned();
+                let want = content_length(&head).unwrap_or(0);
+                let mut body_bytes = vec![0u8; want];
+                let mut got = 0;
+                while got < want {
+                    match s.read(&mut body_bytes[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                seen_in_thread.lock().unwrap().push(format!(
+                    "{head}{}",
+                    String::from_utf8_lossy(&body_bytes[..got])
+                ));
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
     fn fake_sidecar(body: &'static str) -> (u16, Arc<StdMutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -6005,10 +6075,21 @@
             ),
             "an undeclared mount is 404 whatever the method"
         );
-        assert!(matches!(
-            facade_action(&reg, "tngtech.sandbox.invalid", "POST", "/"),
-            FacadeAction::MethodUnsupported
-        ));
+        assert!(
+            matches!(
+                facade_action(&reg, "tngtech.sandbox.invalid", "POST", "/"),
+                FacadeAction::OperationNotDeclared
+            ),
+            "a method the manifest does not declare is a 403, not a 501: the declaration \
+             is the control, and 'this transport only speaks GET' was never true"
+        );
+        assert!(
+            matches!(
+                facade_action(&reg, "tngtech.sandbox.invalid", "GE T", "/"),
+                FacadeAction::MethodInvalid
+            ),
+            "a method that is not a token cannot be put on a request line"
+        );
         match facade_action(&reg, "TNGTECH.sandbox.invalid", "GET", "/") {
             FacadeAction::Relay { mount, target } => {
                 assert_eq!(mount, "tngtech", "the mount is the registry's spelling");
@@ -6016,6 +6097,98 @@
             }
             other => panic!("expected a relay, got {other:?}"),
         }
+    }
+
+    /// T1.5: a declared POST reaches the sidecar **with its body**, and the request
+    /// line names the method the manifest declared. Before this, the facade answered
+    /// 501 for every method but GET and forwarded no body at all - a build request
+    /// (task + profile) had nowhere to go.
+    #[test]
+    fn a_declared_post_reaches_the_sidecar_with_its_body() {
+        const BODY: &str = "{\"task\":\"build\"}";
+        let (sidecar_port, seen) = fake_sidecar_with_body("accepted");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-post", &[], &[], dialog);
+        let mut target = facade_target("fake", sidecar_port, "facadetoken");
+        target.operations.push(crate::plugin::Operation {
+            method: "POST".into(),
+            path: "/build".into(),
+        });
+        t.handle.ctx.facade.insert(target).unwrap();
+
+        let request = format!(
+            "POST http://fake.sandbox.invalid/build HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n{BODY}",
+            auth_header(),
+            BODY.len()
+        );
+        let resp = exchange(t.port, &request);
+        assert!(
+            resp.starts_with("HTTP/1.0 200 OK"),
+            "the sidecar's answer must be relayed: {resp}"
+        );
+
+        let seen = seen.lock().unwrap();
+        let got = seen.first().expect("the sidecar must have been dialled");
+        assert!(
+            got.starts_with("POST /build HTTP/1.0"),
+            "the declared method and path go on the request line: {got}"
+        );
+        assert!(
+            got.ends_with(BODY),
+            "the body must arrive verbatim, got: {got:?}"
+        );
+        assert!(
+            got.contains("Content-Length: ") && got.contains("X-Facade-Token: facadetoken"),
+            "the supervisor frames and authenticates the deputy: {got}"
+        );
+    }
+
+    /// The declaration is the control: a method the manifest does not list is refused
+    /// even though the transport now relays whatever *is* listed.
+    #[test]
+    fn an_undeclared_method_is_refused_with_403_not_501() {
+        let (sidecar_port, _seen) = fake_sidecar("never");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-post-undeclared", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let request = format!(
+            "DELETE http://fake.sandbox.invalid/page HTTP/1.1\r\n{}\r\n",
+            auth_header()
+        );
+        let resp = exchange(t.port, &request);
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(
+            resp.contains("facade_operation_not_declared"),
+            "the refusal names the reason: {resp}"
+        );
+    }
+
+    /// An oversized body is refused before a byte of it is read into memory.
+    #[test]
+    fn a_body_past_the_cap_is_413() {
+        let (sidecar_port, _seen) = fake_sidecar("never");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-body-cap", &[], &[], dialog);
+        let mut target = facade_target("fake", sidecar_port, "facadetoken");
+        target.operations.push(crate::plugin::Operation {
+            method: "POST".into(),
+            path: "/page".into(),
+        });
+        t.handle.ctx.facade.insert(target).unwrap();
+
+        let request = format!(
+            "POST http://fake.sandbox.invalid/page HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n",
+            auth_header(),
+            MAX_FACADE_BODY + 1
+        );
+        let resp = exchange(t.port, &request);
+        assert!(resp.starts_with("HTTP/1.1 413"), "got: {resp}");
+        assert!(resp.contains("facade_body_too_large"), "got: {resp}");
     }
 
     #[test]
@@ -6097,7 +6270,10 @@
     }
 
     #[test]
-    fn facade_non_get_is_501_and_audited_as_a_deny() {
+    fn facade_undeclared_method_is_403_and_audited_as_a_deny() {
+        // T1.5 replaced the hard-coded GET gate: the transport relays whatever the
+        // manifest declares, so the refusal for an undeclared method is the same 403
+        // as for an undeclared path — one rule, one reason, one audit spelling.
         let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
         let t = t36_setup("facade-post", &[], &[], dialog);
         t.handle
@@ -6112,11 +6288,11 @@
                 auth_header()
             ),
         );
-        assert!(resp.starts_with("HTTP/1.1 501"), "got: {resp}");
-        assert!(resp.contains("facade_method_unsupported"), "got: {resp}");
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("facade_operation_not_declared"), "got: {resp}");
         let leaves = facade_leaves(&t.sid);
         assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0]["reason"], "facade_method_unsupported");
+        assert_eq!(leaves[0]["reason"], "facade_operation_not_declared");
     }
 
     #[test]
@@ -6163,6 +6339,121 @@
             connect_events(&t.sid).is_empty(),
             "a refused facade tunnel is not a consultation"
         );
+    }
+
+    // ---- T6.1: a blocked session that serves a facade ----------------------
+    //
+    // `--runner` (and `--plugin`) reach the workload through the proxy, so a
+    // `--block-net` session that asks for one gets a listener. The posture it
+    // carries is the point: the listener is the transport for a host-side
+    // capability, never an egress grant that happened to come with it.
+
+    /// Every host that is not a facade mount is refused, at the first rung, with
+    /// the one reason that describes the session rather than the host. The dialog
+    /// is armed with "allow" on purpose: if the posture did not answer first, the
+    /// refusal would be a decision the operator made, and the assertions below
+    /// would see it.
+    #[test]
+    fn a_blocked_listener_denies_egress_without_a_dialog() {
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup_blocked("blocked-egress", dialog);
+
+        let resp = exchange(
+            t.port,
+            &format!("GET http://example.com/ HTTP/1.1\r\n{}\r\n", auth_header()),
+        );
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(
+            resp.contains("network_blocked"),
+            "the refusal must name the posture, not a host rule: {resp}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a blocked listener has nothing to ask: an egress decision cannot be granted \
+             by answering a dialog"
+        );
+
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["host"], "example.com");
+        assert_eq!(ev["disposition"], "deny");
+        assert_eq!(ev["source"], "hard-deny");
+        assert_eq!(ev["reason"], "network_blocked");
+        assert_eq!(ev["persisted"], false);
+    }
+
+    /// CONNECT is the same answer, and it is the one a TLS client asks for.
+    #[test]
+    fn a_blocked_listener_denies_connect_without_a_dialog() {
+        let (dialog, calls) = recording_dialog(Ok(allow_once()));
+        let t = t36_setup_blocked("blocked-connect", dialog);
+
+        let resp = exchange(t.port, &connect_req("api.example.com:443"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        assert!(resp.contains("network_blocked"), "got: {resp}");
+        assert!(calls.lock().unwrap().is_empty(), "never prompt under --block-net");
+        assert_eq!(last_connect_event(&t.sid)["reason"], "network_blocked");
+    }
+
+    /// The other half: the facade the listener exists for still works. This is the
+    /// runner's own declaration — a `POST /build` with a body — relayed over a
+    /// listener that grants nothing else.
+    #[test]
+    fn a_blocked_listener_still_relays_a_declared_facade_post() {
+        const BODY: &str = "BUILD SUCCESSFUL in 9s";
+        let (sidecar_port, seen) = fake_sidecar_with_body(BODY);
+        let (dialog, calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup_blocked("blocked-facade", dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(FacadeTarget {
+                mount: "build".into(),
+                port: sidecar_port,
+                token: "runnertoken".into(),
+                operations: vec![crate::plugin::Operation {
+                    method: "POST".into(),
+                    path: "/build".into(),
+                }],
+            })
+            .unwrap();
+
+        let payload = r#"{"task":"build","profile":"gradle-runner"}"#;
+        let resp = exchange(
+            t.port,
+            &format!(
+                "POST http://build.sandbox.invalid/build HTTP/1.1\r\n{}Content-Length: {}\r\n\r\n{}",
+                auth_header(),
+                payload.len(),
+                payload
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.0 200 OK"),
+            "the sidecar's answer is relayed: {resp}"
+        );
+        assert!(resp.ends_with(BODY), "got: {resp}");
+
+        let head = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("the sidecar must have been called");
+        assert!(head.starts_with("POST /build HTTP/1.0\r\n"), "{head}");
+        assert!(head.contains("Host: build\r\n"), "{head}");
+        assert!(head.contains("X-Facade-Token: runnertoken\r\n"), "{head}");
+        assert!(head.contains(payload), "the body must arrive: {head}");
+
+        assert!(calls.lock().unwrap().is_empty(), "a facade is not a prompt");
+        assert!(
+            connect_events(&t.sid).is_empty(),
+            "a facade request is not an egress consultation"
+        );
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1, "one request, one leaf: {leaves:?}");
+        assert_eq!(leaves[0]["disposition"], "allow");
+        assert_eq!(leaves[0]["mount"], "build");
+        assert_eq!(leaves[0]["path"], "/build");
     }
 
     /// [G-44] is about not becoming a tunnel to host services. A host STRING check

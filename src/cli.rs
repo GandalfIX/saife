@@ -255,6 +255,17 @@ pub enum Cmd {
         #[arg(long, hide = true)]
         print_sid: bool,
 
+        /// Enable the build runner for this session: the workload may then ask the
+        /// supervisor to build its project in a container, through the facade host
+        /// `build.sandbox.invalid` (`POST /build`, `GET /build?id=…&follow=1`).
+        ///
+        /// Opt-in on purpose. It costs a long-lived container and a second mount in
+        /// the session, and a workload that never builds should not pay either. Needs
+        /// the proxy (the facade is how the request travels), so `--block-net` refuses
+        /// it; with the runner on, `--backend mxc` must be in use.
+        #[arg(long)]
+        runner: bool,
+
         /// Reuse an existing session id (re-derive its profile + ACLs).
         #[arg(long, value_name = "SID", hide = true)]
         sid: Option<String>,
@@ -316,6 +327,12 @@ pub enum Cmd {
         subcommand: LearnedSub,
     },
 
+    /// Manage the build runner: its cache volume and its warm-up.
+    Runner {
+        #[command(subcommand)]
+        subcommand: RunnerSub,
+    },
+
     /// Check host compatibility and feature availability.
     Setup {
         /// Only check and report; do not make changes.
@@ -353,9 +370,7 @@ pub enum AuditAction {
         filter: Option<String>,
     },
     /// Recompute the Merkle root and verify the signed audit log.
-    Verify {
-        session_id: String,
-    },
+    Verify { session_id: String },
 }
 
 #[derive(Subcommand)]
@@ -369,6 +384,18 @@ pub enum ProfileAction {
         /// groups expanded to concrete paths, variables expanded).
         #[arg(long)]
         expanded: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RunnerSub {
+    /// Show the cache volume's size, the image and the slots on this machine.
+    Status,
+    /// Download the toolchain into the cache so builds can run offline.
+    Prewarm {
+        /// Project whose Gradle wrapper and dependencies to fetch (default: cwd).
+        #[arg(default_value = ".")]
+        project: String,
     },
 }
 
@@ -487,6 +514,57 @@ mod tests {
             "the order the operator gave is the discovery order"
         );
         assert_eq!(cmd, vec!["cmd".to_string()]);
+    }
+
+    /// The runner is a capability, so it is opt-in: a session that does not ask for it
+    /// gains no mount, no listener and no container. The flag is the whole switch.
+    #[test]
+    fn the_build_runner_is_off_unless_it_is_asked_for() {
+        let cli = Cli::parse_from(["saife", "run", "--", "cmd"]);
+        let Cmd::Run { runner, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        assert!(!runner, "a session must not grow a build runner by default");
+
+        let cli = Cli::parse_from(["saife", "run", "--runner", "--", "cmd"]);
+        let Cmd::Run { runner, cmd, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        assert!(runner, "--runner enables it");
+        assert_eq!(
+            cmd,
+            vec!["cmd".to_string()],
+            "--runner must not swallow the workload"
+        );
+    }
+
+    #[test]
+    fn parse_runner_status() {
+        let cli = Cli::parse_from(["saife", "runner", "status"]);
+        match cli.cmd {
+            Cmd::Runner {
+                subcommand: RunnerSub::Status,
+            } => {}
+            _ => panic!("expected runner status"),
+        }
+    }
+
+    #[test]
+    fn parse_runner_prewarm_defaults_to_the_cwd() {
+        let cli = Cli::parse_from(["saife", "runner", "prewarm"]);
+        match cli.cmd {
+            Cmd::Runner {
+                subcommand: RunnerSub::Prewarm { project },
+            } => assert_eq!(project, "."),
+            _ => panic!("expected runner prewarm"),
+        }
+        let cli = Cli::parse_from(["saife", "runner", "prewarm", "C:/work/app"]);
+        match cli.cmd {
+            Cmd::Runner {
+                subcommand: RunnerSub::Prewarm { project },
+            } => assert_eq!(project, "C:/work/app"),
+            _ => panic!("expected runner prewarm with a project"),
+        }
     }
 
     #[test]
@@ -826,7 +904,9 @@ mod tests {
             "help must name the product: {help}"
         );
         assert!(
-            help.contains("Isolate and audit AI agents with production-grade Windows containment policies."),
+            help.contains(
+                "Isolate and audit AI agents with production-grade Windows containment policies."
+            ),
             "help must carry the one-line description: {help}"
         );
     }

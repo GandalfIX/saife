@@ -16,6 +16,9 @@ jobs:
     steps:
       # Pinned to a commit SHA: the repository requires SHA-pinned actions.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # The prerequisite checker's JSON contract and exit code; cheap, and it runs
+      # before the build so a broken check is not discovered after 6 minutes.
+      - run: pwsh -NoProfile -File packaging/tests/check-prereqs.ps1
       - run: cargo test --bin saife
       - run: cargo test --bin saife --no-default-features
       - run: cargo clippy --all-targets -- -D warnings

@@ -45,6 +45,7 @@ The tool is bin-only: there is no library target, so every test run is
 | `src/net/learned.rs`, `intent.rs` | persisted learned policy, D-4 intent registry |
 | `src/net/upstream.rs` | corporate upstream proxy chaining (D-2) |
 | `src/audit/` | chain core (`mod`), session-start leaf (`session_start`), `verify`, `show`, `filter` |
+| `src/runner/` | the build runner: request validation and path checks (`mod`), Engine API client and slot lifecycle (`docker`), the facade control surface (`server`), copy in/out (`sync`), the build state machine (`builds`) |
 | `src/sandbox/` | AppContainer specifics: `appcontainer`, `allowlist`, `spawn`, `dacl_journal`, `job` |
 | `src/profile.rs` | profile schema, load, merge, resolve; the `network` / `limits` slices and `Limits::session_budget()` |
 | `src/setup.rs`, `security_groups.rs`, `signing.rs` | setup checks + elevation probe, group expansion, Ed25519 signing |
@@ -310,6 +311,38 @@ refuse, and the legitimate case it must not.
 8. **A gate's scope is stated.** "Listener lifetime" and "launch epoch" are
    different counters; mixing them lets one launch inherit another's evidence.
 
+The runner (`src/runner/`, [ADR-0006](adr/0006-build-runner.md)) adds a second containment domain,
+so its rules are separate and none of them is negotiable for convenience:
+
+9. **The runner is policy, not an executor.** A build request carries `project`, `task` and
+   `profile` and nothing else; the image, the mounts, the environment, the command line and every
+   flag are constants of the shipped binary. `BuildRequest` has no field for them and
+   `deny_unknown_fields` refuses an extra key **by name** — a test asserts it. A "convenience"
+   parameter here is how the deputy becomes an escape.
+10. **No slot ever gets network.** `SlotSpec::allow_network` is false on every session path, and
+    the only networked runner container is `saife runner prewarm` (explicit, prints what it does,
+    removes its container). Reason, measured: a container on this engine reaches **every** host
+    service bound to `127.0.0.1` through the host gateway, so "network" here means the whole
+    loopback, not the internet.
+11. **No bind mounts.** The project is copied in and the outputs copied out (an archive over
+    `PUT`/`GET` on the engine's `/archive` endpoint): a live mount is 2.65 ms per file against
+    0.038 ms in a volume (53.6 s vs 0.76 s for 20 000 files). The sync's semantics are the
+    feature — `docs/USER-GUIDE.md` §8a lists what is handled, what is refused and what is a known
+    limitation; do not "fix" one of them silently.
+12. **A task becomes a fixed argv, never a shell string.** The command is
+    `./gradlew --offline --console=plain <task>`, with `<task>` from `runner::TASKS`. No `sh -c`,
+    no interpolation: a shell re-opens the quoting question the allow-list exists to close.
+13. **The cache volume is shared trust.** `saife-runner-cache` is one global volume at `/cache`,
+    so a build in one session can influence what another session's build reads. Never mount it
+    elsewhere, never split it per session without changing the documented limit, and keep its
+    size reportable (`saife runner status`).
+14. **A build never mutates the source.** Copy-in reads the project and skips `build/`,
+    `.gradle/` and `.git/`; copy-out writes declared outputs only (`build/libs`), so a stale
+    snapshot cannot overwrite the agent's edits.
+15. **The facade stays a declaration list.** `runner::server::OPERATIONS` is `POST /build` and
+    `GET /build`, exact paths, no wildcard. Turning the facade into a general proxy defeats
+    invariant 9 from the other side.
+
 ---
 
 ## 7. Where decisions are recorded
@@ -318,7 +351,7 @@ Folder layout under `docs/` (the two guides are the only files at its root):
 
 | Folder | Contents |
 |---|---|
-| `adr/` | accepted decisions (0001 network hardening, 0002 MXC integration surface, 0003 base-container enforcement, 0004 GA unelevated egress) |
+| `adr/` | accepted decisions (0001 network hardening, 0002 MXC integration surface, 0003 base-container enforcement, 0004 GA unelevated egress, 0006 the build runner) |
 | `design/` | requirements (`design/prd/`, `design/specs/`), critical review, comparison, spikes, testing principles, plan-design docs |
 | `research/` | external-source analysis, impact analysis, capability matrices, backend findings (`research/backends/process-container/`) |
 | `plans/` | implementation plans, one per task or phase |

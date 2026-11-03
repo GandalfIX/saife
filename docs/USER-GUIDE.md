@@ -9,6 +9,9 @@ session.
 
 ---
 
+> **In a hurry?** [`RECIPES.md`](RECIPES.md) is task-first: *if you want to
+> achieve X, run Y*. This guide explains the model behind those commands.
+
 ## 1. The model in one minute
 
 A run gets **only what you grant it**:
@@ -254,7 +257,10 @@ nothing changes for existing callers.
 saife run --allow-cwd --block-net -- cmd /c echo offline
 ```
 
-No proxy is started and every `connect()` is kernel-denied.
+No proxy is started and every `connect()` is kernel-denied. (A `--block-net`
+run that asks for a host-side facade — `--runner`, `--plugin` — does get that
+listener, exactly so the capability works without an egress grant; it denies
+every origin with `403 network_blocked`, see §6.)
 
 ### 4.2 Allowing hosts
 
@@ -465,8 +471,11 @@ it, so repo-local plugins are usable only when you name the directory:
 saife run --plugin-dir .\.saife\plugins --plugin tngtech -- <workload>
 ```
 
-Plugins are wired on `--backend mxc` (the default) only, and they need the
-session proxy: `--block-net` refuses `--plugin`.
+Plugins are wired on `--backend mxc` (the default) only. They need the session
+proxy, and a session that asked for a facade always gets one: `--block-net
+--plugin tngtech` starts the listener with egress denied outright, so the mount
+is reachable and every non-facade host is `403 network_blocked`. There is no
+grant to add — `--allow-domain` is not what buys the socket.
 
 ### The sample: `tngtech`
 
@@ -596,6 +605,115 @@ saife learned clear
 ```
 
 ---
+
+## 8a. Building in the sandbox (the runner)
+
+> **Not in a released build yet.** This section describes the runner being implemented on
+> `feat/gradle-build-runner`: the `saife runner` commands do not exist in 0.3.x, and the
+> design, measurements and remaining tasks are in
+> [the plan](../plans/2026-10-30-gradle-build-runner.md) and
+> [the measurements](../research/build-runner/measurements.md). It is documented here so the
+> shape is reviewable before the code lands, not to promise a shipped feature.
+
+Some toolchains cannot work inside a session at all: Gradle's daemon, its workers and its
+compiler daemons all talk over loopback, and loopback is closed inside a session in both
+directions (`connect()` fails with `WSAEACCES 10013`, and nothing outside can dial in).
+Rather than punch a hole, saife can **run the build outside the session** and hand the result
+back: a runner container (Docker engine) built from a digest-pinned image, reached by the
+workload **through the supervisor's facade** — no port, no loopback, no new hole.
+
+```powershell
+saife runner status                  # cache size, image, slots on this machine
+saife runner prewarm C:\work\app    # download the toolchain ONCE (network on, this once)
+```
+
+`prewarm` is the only step that uses the network, and it is deliberate: it fills the cache
+volume so builds run `--offline`. Everything a build does happens in a container created with
+`NetworkMode: none`.
+
+**The cache is one global named volume**, `saife-runner-cache`, mounted at `/cache`:
+
+- shared by every project and every session — that is what makes the second build fast, and
+  it is why `prewarm` is a command you run rather than something a build does silently;
+- measured cost: ~900 MB for one Spring Boot project (Gradle distribution + dependencies);
+- **nothing evicts it in v1**: the size is reported by `saife runner status`, and removing it
+  is a deliberate act (`docker volume rm saife-runner-cache`);
+- **sessions share it**, so a build in one session can influence what another session reads.
+  Acceptable while saife is single-user on one machine; treat the cache as trusted state.
+
+### Prewarming the cache — once per image, before the first build
+
+`saife runner prewarm <project>` is the refresh step, and it belongs to
+image-build time: run it once against the pinned digest, before any session
+uses that image.
+
+- It creates `saife-runner-cache` if it is missing, packs the project, starts
+  **one** container with the network on, runs the wrapper's `gradlew --version`
+  and a dependency-resolution pass against `/cache`, removes that container
+  whether it succeeded or not, and reports the volume's size afterwards
+  (`cache is now 880 MB` on this machine, warm).
+- Warm, it takes **10.2 s**. Cold, on a slow link, it takes **many minutes** —
+  measured at more than ten minutes for Gradle 9.8.2 and its dependencies. That
+  is a download, not a hang; there is no progress line yet, which is exactly why
+  it was misread as one.
+- **An interrupted fill leaves a cache that looks warm and is not.** The next
+  offline build then fails naming one artifact —
+  `No cached version of <group>:<artifact>:<version> available for offline mode`
+  — because `--offline` turns a partial cache into a resolution error instead of
+  a download. Re-run `prewarm`; never "fix" it by giving a build network.
+- The volume is **global on purpose** (plan §4.1): one warm `~/.gradle` is what
+  makes an offline build possible at all, and a per-session volume would pay the
+  first build's **88.6 s** and **904 MB** again in every session. The price is
+  that sessions share it — the cache bullets above.
+
+### What the copy takes — the allow-list
+
+A build request may name `paths`, and a session profile may default them with
+`runner.sync.paths` ([profiles/README.md](../profiles/README.md)). **The list is closed:**
+
+- absent, `[]`, or neither list set → the whole project, minus `build/`, `.gradle/` and
+  `.git/` at every level;
+- present → exactly those entries, relative to the project (a directory brings its subtree),
+  with the same skip list applied inside them — and to an entry itself, so naming `build`
+  copies nothing;
+- a request's `paths` wins **entirely**; it is not merged with the profile's;
+- every entry must exist and be a real path. A missing entry, a `..`, a rooted/UNC/device
+  path, or a link/junction (on the entry or anywhere below a listed directory) is refused —
+  the request answers **400 naming the entry**, never a partial copy. A profile default is
+  checked the same way, so a bad `runner.sync.paths` refuses the build instead of quietly
+  copying less than the profile promised.
+
+Because nothing is added on the caller's behalf, naming one Gradle project in a monorepo
+means also naming what its build reads through the root: `settings.gradle.kts`, every
+`includeBuild(...)` root (typically `build-logic`), and any version catalogue
+(`gradle/libs.versions.toml`) or `gradle.properties` it uses. Omit one and Gradle fails at
+configuration time naming the missing script — the intended, visible failure. Measured cost
+of the copy itself: ~0.1 ms per file, so 20 000 files ≈ 2 s and a 10 % subset ≈ 0.2 s
+([measurements §10](research/build-runner/measurements.md)).
+
+### What the copy does to a Windows tree
+
+The project is copied in, not mounted ([ADR-0006](adr/0006-build-runner.md)), so
+Windows-specific facts get a defined answer instead of being left to whatever
+the filesystem does. Each row says which of the three it is: **handled**,
+**refused**, or a **known limitation**.
+
+| behaviour | what happens | status |
+|---|---|---|
+| line endings (CRLF) | bytes are copied verbatim; nothing normalises in either direction. A script with CRLF fails inside the Linux container with a shell error about a carriage return (`$'\r': command not found`, or `bad interpreter` for the shebang) — and a `gradlew` checked out with `core.autocrlf=true` is such a script. | **documented**: fix it in the repo (`.gitattributes`), never in the sync |
+| executable bit | the host has no mode, so every packed file is `0o755` — which is what makes `./gradlew` runnable (before it, the first real build died with exit 126). | **handled**, pinned by a test |
+| a file locked by another process, copy-in | the pack opens every file; one that is open without sharing fails the **whole** sync with `runner: open <path>` naming it. Nothing is half-copied, nothing is silently skipped. | **refused**, by name |
+| a file locked during copy-out | the build still reports success and its log carries `[saife] sync out failed: …`, so a jar can be missing from `build/libs` while the build is green. | **documented**: read the last lines of the log, not just the exit code |
+| paths longer than 260 characters | unsupported: the sync adds no `\\?\` prefix and nothing declares the process long-path aware, so a deeper path fails the pack, naming the file. | **known limitation** |
+| two names differing only in case | NTFS cannot hold the pair, so the collision can only be *created inside the container*; copying out writes both onto a case-insensitive directory and the second silently replaces the first. | **known limitation** (last writer wins, no message) |
+| a file deleted or renamed on the host | the copy only adds: a removed file stays in `/src` for the rest of the session, so a build can compile a source the agent deleted. | **known limitation**, open (T3.5) |
+| an edit made during a build | the copy happens once, before the container's command starts, so the build sees the tree as of that moment; the edit lands only in the **next** build. | **handled by design** — a snapshot, not a live tree |
+| `build/`, `.gradle/`, `.git/` | excluded from the copy: the first two would make a build start from a stale output, and `.git` is skipped too — so a plugin that stamps the commit hash sees no repository. | **known limitation** (open) |
+
+Two limits worth knowing before relying on it: the runner's container reaches the host's
+**entire loopback** through the engine's host gateway (measured), which is why v1 gives it no
+network at all; and the audit chain records the facade requests, not what happens inside the
+container.
 
 ## 9. Troubleshooting
 

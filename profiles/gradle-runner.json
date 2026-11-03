@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "name": "gradle-runner",
+    "version": "1.0.0",
+    "schema_version": 1
+  },
+  "filesystem": {
+    "allow": [
+      "$CWD"
+    ],
+    "read_only": [
+      "$HOME/.gitconfig"
+    ],
+    "deny": [
+      "$HOME/.ssh",
+      "$HOME/.aws"
+    ]
+  },
+  "network": {
+    "block_net": true
+  },
+  "limits": {
+    "workloadTimeoutSecs": 7200
+  },
+  "runner": {
+    "sync": {
+      "paths": ["."]
+    }
+  }
+}

@@ -42,6 +42,13 @@ Implemented pillars:
   `INCOMPLETE` for a session that did not end cleanly rather than silently
   accepting it.
 
+**Planned, not shipped: a build runner.** Toolchains whose daemons need loopback (Gradle,
+Maven, a test harness over TCP) cannot run inside a session, and loopback is closed in both
+directions by design. The answer being built is a runner: the build happens in a digest-pinned
+container with no network, reached through the supervisor's facade, with one prewarmed cache
+volume shared by sessions. Design, measurements and the accepted limits are in
+`docs/plans/2026-10-30-gradle-build-runner.md`; nothing of it is in a released build yet.
+
 Default backend is `mxc` in a build with `--features mxc-backend` (P3.2);
 `--backend appcontainer` remains for workloads whose client stack cannot use a
 proxy. Out of scope for the MVP: undo/rollback, credential injection, ghost
@@ -125,16 +132,65 @@ Then read `docs/USER-GUIDE.md` before pointing an agent at a real repository.
 
 ## Requirements
 
-- **Windows 11 24H2 (build 26100.x) or a later supported servicing build** for
-  the default `mxc` backend — the MXC process container requires it. Builds older
-  than 24H2 cannot run that backend at all.
+### To run saife
+
+- **Windows 11 24H2 (build 26100.x) or a later supported servicing build**, x64,
+  for the default `mxc` backend — the MXC process container requires it. Builds
+  older than 24H2 cannot run that backend at all.
 - The `appcontainer` backend runs on Windows 10 1709 (build 16299) and later.
 - **Administrator rights: not needed for `mxc`.** Network sessions through the
   default backend run unelevated. They ARE needed for `--backend appcontainer`
   when the session has network (`--allow-domain`, a profile with a network
   policy): that backend registers a system-wide loopback exemption for the
   AppContainer SID, which is an admin-only API.
-- Rust toolchain (for building; only needed by developers, not end users).
+- Nothing else. No runtime to install, no service, no VM, no WSL.
+
+### To build from source
+
+Install these once, then `cargo build` is the whole build. Everything in this
+table is needed for a green `cargo test`, `cargo clippy --all-targets` and
+`pwsh -File packaging\build-dist.ps1`.
+
+| what | why | how to get it | check |
+|---|---|---|---|
+| **Rust 1.88 or newer**, MSVC toolchain | the crate is edition 2024 with `rust-version = "1.88"` | <https://rustup.rs>; then `rustup default stable-x86_64-pc-windows-msvc` | `rustc --version` |
+| **Visual Studio Build Tools 2022**, workload *Desktop development with C++* | MSVC `link.exe` — the linker Rust does not ship | <https://aka.ms/vs/17/release/vs_BuildTools.exe> | `cargo build` (see below) |
+| **Windows SDK** (`um` + `ucrt` libs) | linking needs `kernel32.lib` and the ucrt; a missing SDK fails at **link** time, after a full compile | the Visual Studio installer, *Windows 11 SDK* component | `pwsh -File packaging\check-prereqs.ps1` |
+| **clang / LLVM, on `PATH`** — *ARM64 targets only* | `ring 0.17` forces `clang` when the target is `aarch64-pc-windows-msvc`; MSVC's `cl.exe` is not accepted for its ARM64 assembly. cc-rs resolves the bare name from `PATH`, so the VS *C++ Clang compiler for Windows* component is **not** enough — its `clang.exe` sits in `VC\Tools\Llvm\...\bin` and is not added to `PATH` | `winget install LLVM.LLVM` (adds itself to `PATH`), or add that VS directory yourself | `clang --version` |
+| **MSVC ARM64 toolset** — *ARM64 targets only* | a separate Visual Studio component from the x64 toolset; the ARM64 linker and libraries live in it | the Visual Studio installer | `pwsh -File packaging\check-prereqs.ps1` |
+| **rustfmt + clippy** components | `rustup component add` — the gates are zero-warning, and `rustfmt.toml` pins `newline_style = "Windows"` | `rustup component add rustfmt clippy` | `cargo clippy --version` |
+| **PowerShell 7** (`pwsh`) | every `packaging/**.ps1` and `tests/**.ps1` script; Windows PowerShell 5.1 cannot run them | `winget install Microsoft.PowerShell` | `pwsh --version` |
+| **git** | and `core.autocrlf` matters: the sources are CRLF and the repo expects it | `winget install Git.Git` | `git --version` |
+| **GitHub CLI** (`gh`) | only for the PR flow and reading CI (`gh pr checks`); not needed to build | `winget install GitHub.cli` | `gh auth status` |
+| **Container engine** — Rancher Desktop or Docker Desktop | **only** for the build runner: `--runner`, `saife runner prewarm`, `saife runner status`. Everything else runs without it | `winget install Rancher.RancherDesktop` | `docker version` |
+
+Windows PowerShell 5.1 is *not* obsolete work: the scripts a session runs inside
+the sandbox are still 5.1, because that is what a stock Windows has. Keep both in
+mind when editing anything under `tests/`.
+
+**If `cargo build` stops with `link.exe not found` or
+`error: linker 'link.exe' not found`**, the MSVC workload is missing or was
+installed without the C++ tools. **If it stops with
+`error occurred in cc-rs: failed to find tool "clang"`**, you are building the
+ARM64 target: `ring` forces `clang` there and MSVC cannot substitute — install
+LLVM. Neither message is a Rust problem, and both cost an afternoon if you take
+them at face value. `rustup show` names the active toolchain; the fix is
+the Visual Studio installer, not another `rustup` command.
+
+Check all of it at once — the script reports each item, prints the exact command for
+anything missing, and offers to run it:
+
+```powershell
+pwsh -File packaging\check-prereqs.ps1            # report only
+pwsh -File packaging\check-prereqs.ps1 -Install   # ask before installing each item
+pwsh -File packaging\check-prereqs.ps1 -Json      # machine-readable, exit 1 if anything is missing
+```
+
+It never elevates: a step that needs administrator rights is printed with a note, not run.
+`-SkipOptional` narrows the report to what the build itself needs (no container engine, no `gh`).
+
+Then go to [Build](#build); the contributor conventions (CRLF, no repo-wide
+`cargo fmt`, the two feature states) are in `docs/DEVELOPERS.md`.
 
 ## Backends and privileges
 
@@ -314,7 +370,9 @@ and the network proxy status. Exits non-zero if the host is unsupported.
 ## Network filtering status
 
 **`--block-net` works fully unprivileged.** It removes the AppContainer
-network capability (or, under `mxc`, provides no proxy at all) - every
+network capability (or, under `mxc`, no egress at all: no proxy without a
+facade, and a session that asked for one - `--runner`, `--plugin` - gets a
+listener that denies every origin with `network_blocked`) - every
 `connect()` is kernel-denied. Backs AC-3.1, AC-3.2, AC-3.13 from the spec.
 
 **`--allow-domain` / `--network-profile` work, and under the default `mxc`
@@ -395,7 +453,8 @@ rule in `docs/design/testing-principles.md`.
   run works on both backends, the audit model, build/test gates, recipes and the
   invariants a change must keep. `AGENTS.md` holds the house rules for agents.
 - `docs/adr/` — accepted decisions (0001 network hardening, 0002 MXC integration
-  surface, 0003 base-container enforcement, 0004 GA unelevated egress).
+  surface, 0003 base-container enforcement, 0004 GA unelevated egress, 0006 the build
+  runner).
 - `docs/design/prd/prd-sandbox.md` — full product requirements.
 - `docs/design/specs/us-3-network-exfiltration-blocked/spec.md` — US-3 spec
   (including the loopback-exemption deferral finding).
