@@ -408,6 +408,7 @@ probe on a representative base request:
 | line reads | meaning |
 |---|---|
 | `base-container (tier_source \`probe\`, needs_dacl_augmentation=false)` | sessions should dispatch normally |
+| `appcontainer-dacl (tier_source \`probe\`, needs_dacl_augmentation=true) — NOT the tier this session requires (\`base-container\`): saife run will refuse here; use --backend appcontainer` | the probe reached the DEGRADED tier: guardrail 2 refuses it by design (build 26100 behaved exactly like this) |
 | `no tier reported (tier_source \`unavailable\`) — the mxc backend refuses at launch on this host; use --backend appcontainer` | `mxc` cannot run here |
 | `probe failed: …` | the SDK probe itself errored — the message is the diagnosis |
 | `not built in: this binary has no \`mxc\` backend` | built with `--no-default-features`; sessions use appcontainer |

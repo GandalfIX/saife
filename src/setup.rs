@@ -175,6 +175,7 @@ fn mxc_tier_line() -> String {
                 record.tier.as_deref(),
                 record.tier_source,
                 record.needs_dacl_augmentation,
+                mxc::REQUIRED_TIER,
             ),
             Err(e) => format!("probe failed: {e}"),
         }
@@ -195,15 +196,22 @@ fn format_mxc_tier_line(
     tier: Option<&str>,
     source: &str,
     needs_dacl: Option<bool>,
+    required: &str,
 ) -> String {
+    let dacl = match needs_dacl {
+        Some(v) => v.to_string(),
+        None => "unknown".to_string(),
+    };
     match tier {
-        Some(tier) => format!(
-            "{tier} (tier_source `{source}`, needs_dacl_augmentation={})",
-            match needs_dacl {
-                Some(v) => v.to_string(),
-                None => "unknown".to_string(),
-            }
+        // A probe can name a tier and still REFUSE the session: guardrail 2 wants
+        // `required` exactly, and the DACL-augmentation tier is a stop-work
+        // condition. Reporting only the name reads like a green light on a host
+        // where every `saife run` will refuse.
+        Some(tier) if tier != required || needs_dacl == Some(true) => format!(
+            "{tier} (tier_source `{source}`, needs_dacl_augmentation={dacl}) — NOT the tier this \
+             session requires (`{required}`): `saife run` will refuse here; use --backend appcontainer"
         ),
+        Some(tier) => format!("{tier} (tier_source `{source}`, needs_dacl_augmentation={dacl})"),
         None => format!(
             "no tier reported (tier_source `{source}`) — the mxc backend refuses at launch on this \
              host; use --backend appcontainer"
@@ -568,17 +576,34 @@ mod tests {
     /// a supported machine reads as supported instead of "unknown".
     #[test]
     fn mxc_tier_line_reports_a_named_tier() {
-        let line = format_mxc_tier_line(Some("base-container"), "probe", Some(false));
+        let line = format_mxc_tier_line(Some("base-container"), "probe", Some(false), "base-container");
         assert!(line.contains("base-container"), "{line}");
         assert!(line.contains("tier_source `probe`"), "{line}");
         assert!(line.contains("needs_dacl_augmentation=false"), "{line}");
+        assert!(!line.contains("will refuse"), "a supported tier is not a refusal: {line}");
+    }
+
+    /// A probe that names a tier the session does not require is NOT a green light:
+    /// `appcontainer-dacl` with DACL augmentation is the degraded tier guardrail 2
+    /// refuses, so the line has to say so (2026-10-26, build 26100 report).
+    #[test]
+    fn mxc_tier_line_calls_out_a_tier_that_will_be_refused() {
+        let line = format_mxc_tier_line(Some("appcontainer-dacl"), "probe", Some(true), "base-container");
+        assert!(line.contains("appcontainer-dacl"), "{line}");
+        assert!(line.contains("NOT the tier this session requires"), "{line}");
+        assert!(line.contains("--backend appcontainer"), "{line}");
+
+        // The same refusal applies when only the DACL fact marks it: the required
+        // name with augmentation still ends in a refused launch.
+        let same_name = format_mxc_tier_line(Some("base-container"), "probe", Some(true), "base-container");
+        assert!(same_name.contains("will refuse"), "{same_name}");
     }
 
     /// An UNKNOWN DACL fact must say `unknown`, never invent `false`: the record
     /// only carries what the probe said.
     #[test]
     fn mxc_tier_line_does_not_invent_a_missing_dacl_fact() {
-        let line = format_mxc_tier_line(Some("processcontainer"), "probe", None);
+        let line = format_mxc_tier_line(Some("processcontainer"), "probe", None, "base-container");
         assert!(line.contains("needs_dacl_augmentation=unknown"), "{line}");
     }
 
@@ -586,7 +611,7 @@ mod tests {
     /// has to say what to DO, not just what is missing.
     #[test]
     fn mxc_tier_line_promises_nothing_and_names_the_way_out() {
-        let line = format_mxc_tier_line(None, "unavailable", None);
+        let line = format_mxc_tier_line(None, "unavailable", None, "base-container");
         assert!(line.contains("no tier reported"), "{line}");
         assert!(line.contains("tier_source `unavailable`"), "{line}");
         assert!(line.contains("--backend appcontainer"), "{line}");
