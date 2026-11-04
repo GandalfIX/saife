@@ -504,8 +504,19 @@ foreach ($asset in $assets) {
 }
 
 Step 'tidy up'
-Invoke-Git 'push' '--quiet' 'origin' '--delete' $releaseBranch
-Write-Host "deleted branch $releaseBranch"
+# The manifest branch is normally deleted by the merge that lands it, so the remote ref is often
+# already gone by the time publishing finishes. That is the expected state, not a failure: the
+# release is published at this point, and reporting "refused" after a successful publish makes the
+# operator re-read a run that worked (it did, on 0.4.0).
+$remoteHeads = (& git -C $root ls-remote --heads origin $releaseBranch) 2>$null
+if ($remoteHeads) {
+    Invoke-Git 'push' '--quiet' 'origin' '--delete' $releaseBranch
+    Write-Host "deleted branch $releaseBranch"
+} else {
+    Write-Host "branch $releaseBranch already gone (the merge deleted it)"
+}
+$localExists = (& git -C $root branch --list $releaseBranch)
+if ($localExists) { & git -C $root branch -D $releaseBranch | Out-Null }
 
 Write-Host ''
 Write-Host "release: https://github.com/$Repository/releases/tag/$tag"
