@@ -531,3 +531,50 @@ saife run --profile <p> -- powershell -NoProfile -Command 'Test-Path "$env:USERP
 directory to writable `allow`: a workload that can replace the binary it is running from is the
 same hazard the launcher rule refuses.
 
+## Why does opencode v2 hang in the sandbox - even with `--standalone`?
+
+opencode v2 is a **thin client plus a local HTTP server**: the server owns sessions,
+configuration, tools and permissions, and every client speaks to it over `127.0.0.1`.
+Under the `mxc` backend loopback is denied by design, so the client can never reach its
+own server and the command hangs instead of failing loudly:
+
+```
+PS> saife run --profile opencode -- opencode
+Starting background server...
+                                    (hangs; nothing further)
+PS> saife run --profile opencode -- opencode run --standalone "Reply with OK"
+                                    (also hangs - still a local server)
+```
+
+Measured (2026-11-04), same connect probe in and out of a session:
+
+```
+inside mxc : WSAEACCES 10013 - "Zugriff ... auf Grund der Zugriffsrechte ... unzulaessig"
+outside    : WSAECONNREFUSED    - a normal closed port
+```
+
+That contrast is the whole diagnosis: the socket is refused by POLICY inside, and merely
+closed outside. It is the same class as the Gradle daemon - client and server are two
+processes, and their channel is loopback.
+
+What does **not** help: `--standalone` (it means "private server", not "no server"),
+`opencode service set disabled true` (it stops the SHARED service; a standalone run still
+starts its own), `--server http://localhost:4096` (same loopback), and any grant.
+
+What does: run the session on the **appcontainer** backend from an elevated shell - the
+loopback exemption is registered automatically when elevated:
+
+```powershell
+saife run --profile opencode --backend appcontainer -- opencode
+```
+
+Unelevated, `appcontainer` prints `warning: loopback exemption failed ... Re-run 'saife run'
+as administrator (loopback is registered automatically when elevated)`, and the workload hits
+the same denial. If neither is acceptable, run opencode outside the sandbox and keep the
+sandbox for workloads that do not need a local server (`--block-net` gives those the strongest
+posture).
+
+The generalisation matters more than the tool: **any** client + local-server architecture
+(Gradle daemon, LSP servers, dev servers, Testcontainers) needs loopback and therefore the
+`appcontainer` backend; `mxc` is for workloads whose only network is outbound.
+
