@@ -497,3 +497,37 @@ copied, nothing is added to the user Path, and the exit code is 1.
 
 <!-- NEXT FAQ ENTRY GOES HERE -->
 
+## Why does `saife-launch` say "failed to start `<cmd>`: 0x80070002" for a command that works outside?
+
+`0x80070002` is `ERROR_FILE_NOT_FOUND` from `CreateProcess`. Bare names are resolved the way
+Windows resolves them - by walking `PATH` - and a `PATH` directory the session may not **read**
+is skipped silently, so a missing grant is reported as a missing file:
+
+```
+PS> saife run --profile opencode -- opencode
+saife-launch: failed to start `opencode`: Das System kann die angegebene Datei nicht finden. (0x80070002)
+```
+
+Measured cause (2026-11-03): `opencode.exe` lives in `C:\Users\<you>\.local\bin`, that
+directory is on the session `PATH` (the child inherits it unchanged), but the profile granted no
+access to it. Inside the session, `Test-Path "$env:USERPROFILE\.local\bin\opencode.exe"`
+returned **Access denied** and `cmd /c where opencode` found nothing - the file was there the
+whole time.
+
+The fix is a read grant on the directory holding the executable:
+
+```json
+{ "filesystem": { "read_only": ["$HOME/.local/bin"] } }
+```
+
+`read_only` grants `RX` (read + execute), so the image can be launched but not replaced - which
+is exactly what an install directory needs. One-line diagnosis inside the session:
+
+```powershell
+saife run --profile <p> -- powershell -NoProfile -Command 'Test-Path "$env:USERPROFILE\.local\bin\mycmd.exe"'
+```
+
+*Access denied* means a missing grant, not a missing file. Do not "fix" it by adding the
+directory to writable `allow`: a workload that can replace the binary it is running from is the
+same hazard the launcher rule refuses.
+
