@@ -40,7 +40,19 @@ let them meet.
 Today's only working answer is the `appcontainer` backend from an elevated shell, where the
 loopback exemption registers automatically. That is a containment downgrade this ADR treats as
 unacceptable for the agent tier: the exemption is machine-wide, all-or-nothing per SID, and
-**accumulates on the machine** (`src/net/loopback.rs`, FAQ 2026-11-03).
+**accumulates on the machine** (`src/net/loopback.rs`, FAQ 2026-11-03). And even that path is
+weaker than it reads, measured in the same effort (session analysis, 2026-11-04): unelevated, the
+backend itself warns `loopback exemption failed ... Re-run 'saife run' as administrator`; elevated,
+it works, but opencode's own state directories blow the per-grant **20,000-object DACL cap** — the
+same launch log truncates `.local/share/opencode`, `npm-cache` and `.gradle` — so files deeper in
+those trees are unreadable inside the session. For the agent tier the "supported path" is thus
+elevated **and** partially blind.
+
+Two further measured facts narrow the problem to exactly loopback: `--standalone` was verified fully
+functional *outside* the sandbox (it reached the provider; only a stale API key failed), and inside
+the sandbox the standalone server *starts* — it is the client's connect that dies on `10013` while
+the CLI retries, which is the observed hang. So opencode v2 needs nothing from this ADR except a
+loopback path between two of its own processes.
 
 ## The three topologies — what "server and client" can mean
 
@@ -90,6 +102,10 @@ rather than by exposure. The open question is whether the mxc config surface can
   bound on the allowed port is owned by a process **in this session's job** (the owning PID is
   visible in the host's TCP table — that is what makes the check possible). A foreign owner refuses
   the allowance.
+- **the port must be pinned by the workload.** The allowance is enumerated; a client+server tool
+  that picks a random port at startup — opencode's TUI does, unless given `--port` — defeats the
+  enumeration. Profiles for such tools pin the port, and arming the allowance refuses if the pinned
+  port is already bound by a foreign owner (the same ownership check as above, run up front).
 - ingress stays closed. `baseContainerSupportsIngressHostLoopbackAllow` is `false` at
   base-container (capability matrix), and this ADR does not want it: a listener inside the session
   that the host can reach is an inbound door, which is a different and worse grant than this one.
@@ -114,8 +130,11 @@ result is the finding.
 the build daemon; opencode's client is Bun's fetch and is unproven. If it ignores the proxy env for
 facade hosts, D-2's path is dead for opencode regardless of S1.
 
-**S3 — end-to-end if S1 succeeds.** One `mxc` session: `opencode serve` inside, TUI inside, client
-pointed at `127.0.0.1:4096` under a per-port allowance. Acceptance: a prompt completes; the server
+**S3 — end-to-end if S1 succeeds.** One `mxc` session: server inside with the port pinned
+(`--port 4096` — the TUI's random port would defeat the enumerated allowance), TUI inside, client
+pointed at `127.0.0.1:4096` under a per-port allowance. The baseline is already established:
+standalone mode works outside the sandbox, so any remaining failure inside is the allowance, not
+opencode. Acceptance: a prompt completes; the server
 executes a tool whose file write lands inside the writable grant; egress from the session is still
 `10013`; the audit leaf carries the allowance and the ownership check; a second session cannot
 reach the first's port (cross-session check).
