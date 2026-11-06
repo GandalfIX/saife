@@ -1,8 +1,10 @@
 # ADR-0007: declared loopback reach — the facade forwarder, and what it cannot do
 
-- **Status:** **Proposed — spike-gated.** The mechanism is decided; the shipping decision is not.
-  No PR opens before the opencode v2 spike (S1–S4 below) has run, because opencode v2 is the
-  acceptance test this ADR exists for.
+- **Status:** **Proposed — spike run 2026-11-06, and it changed the mechanism.** What works is not
+  a per-port allowance but a session mode: drop `runtimeConfig.networkProxy`, let the supervisor
+  inject the proxy environment, and loopback is open while the internet still leaves only through
+  the audited proxy. S1–S3 are measured below. The open decision is a product one — whether to
+  offer a session mode with unscoped loopback — and it is yours, not this document's.
 - **Date:** 2026-11-06
 - **Supersedes:** nothing. It extends ADR-0004's egress model and generalises ADR-0006's facade
   pattern; it changes no rule in ADR-0001..0006.
@@ -84,87 +86,95 @@ This solves T1: a test database on the host, a service the supervisor starts, a 
 **It does not solve opencode v2.** Stating that here, in the ADR that proposes the mechanism, is
 the point: the forwarder is worth having, and it is not the thing that fixes the agent tier.
 
-**D-3 — Mechanism 2, the per-port loopback allowance (in-session targets; substrate-dependent).**
-The substrate already whitelistens one loopback port per session: the proxy. That is the
-`identitylessLoopbackProxy` capability — a host listener the container may connect to by policy
-rather than by exposure. The open question is whether the mxc config surface can whitelist
-*additional* ports the same way. If it can, the shape is:
+**D-3 — Mechanism 2: the rules-mode session (in-session targets). Measured; the per-port idea is
+dead.** The spike (2026-11-06) established four facts, three of them negative:
 
-- `--allow-loopback-port 4096` — enumerated ports, **connect-only**, per-session, never learned,
-  never persisted, printed at startup;
-- the audit leaf records `loopback_ports=4096` and says plainly that traffic on allowed ports is
-  **not content-audited** — the decision pipeline sees nothing; at best WFP 5-tuples exist;
-- **the squatting hole is closed by an ownership check.** Because the container shares the host TCP
-  table, a port allowance has a failure mode the forwarder does not: if a *host* service already
-  holds the port, the in-session bind fails and the session's client happily connects to the host's
-  service instead — an exfiltration channel wearing the grant's name. The supervisor therefore
-  verifies, when the allowance is armed and again when the first connect succeeds, that the socket
-  bound on the allowed port is owned by a process **in this session's job** (the owning PID is
-  visible in the host's TCP table — that is what makes the check possible). A foreign owner refuses
-  the allowance.
-- **the port must be pinned by the workload.** The allowance is enumerated; a client+server tool
-  that picks a random port at startup — opencode's TUI does, unless given `--port` — defeats the
-  enumeration. Profiles for such tools pin the port, and arming the allowance refuses if the pinned
-  port is already bound by a foreign owner (the same ownership check as above, run up front).
-- ingress stays closed. `baseContainerSupportsIngressHostLoopbackAllow` is `false` at
-  base-container (capability matrix), and this ADR does not want it: a listener inside the session
-  that the host can reach is an inbound door, which is a different and worse grant than this one.
+1. **A per-port allowance cannot coexist with the proxy.** Adding any `egress.allow` rule to a
+   proxied session is refused by the contract:
+   `runtimeConfig.networkProxy requires network.egress.default='deny' with no direct allow or deny rules`.
+2. **Without `networkProxy` the rules are legal — and loopback is open anyway.** A session carrying
+   a single unrelated allow rule (`10.9.9.9/32:8080`) still connected to `127.0.0.1:4095` and `:4096`;
+   a session with **no** rules did the same.
+3. **Loopback ignores the rules entirely.** An explicit `deny` for `127.0.0.1/32` did not stop a
+   loopback connect either. There is no port scoping and no deny to build one from.
+4. **What stays closed is what matters.** Direct egress (`1.1.1.1:443`) is still `10013`, and the
+   host still cannot reach a listener inside the session (connect times out, measured with the
+   listener held open).
 
-**D-4 — scope of the guarantee.** With D-3 armed, the containment claim for that session is
-precisely worded: no boundary is crossed by an allowed loopback connection (both ends are inside
-the same session; ingress remains blocked), but the session has gained a channel the audit cannot
-describe beyond 5-tuples. Sessions with the allowance are recorded as such, and any documentation
-that says "audited" must exempt them.
+So the closure measured in proxy mode is a property of **that mode**, not of egress policy: the
+substrate's `identitylessLoopbackProxy` posture both grants the proxy port and shuts the rest of
+loopback; the rules mode has no such posture and leaves loopback alone.
 
-## The spike — the gate for any PR
+The mechanism that works is therefore a session mode, not a flag with a port list:
 
-**S1 — the substrate question (decides everything).** Read `mxc-sdk` 1.0.1's config surface
-(`New-Config` generator, the same one the capability matrix was captured with): can a
-processcontainer policy express loopback *connect* allowances beyond the injected proxy port?
-Then measure: bind a listener inside a session, connect to it from the same session, with and
-without a candidate config knob. Expected without a knob: `10013` (already measured). Any other
-result is the finding.
+- **no `runtimeConfig.networkProxy`**; `egress.default = deny` with no allow rules;
+- the supervisor injects `HTTP_PROXY`/`HTTPS_PROXY` (and `NO_PROXY` empty) into the child, pointing
+  at its own listener — measured working: a real `CONNECT example.com:443` through that listener
+  returned `HTTP/1.1 200 Connection Established` from inside the session, so **all internet traffic
+  still passes the audited decision pipeline**;
+- loopback is open in both directions *within* the session and reachable to the host's loopback
+  services, which is the whole point — and the whole cost.
 
-**S2 — opencode's client and the proxy.** Does the TUI's HTTP client honor `HTTP_PROXY` for
-`--server http://opencode.sandbox.invalid:4096`? The runner proved the facade pattern with curl and
-the build daemon; opencode's client is Bun's fetch and is unproven. If it ignores the proxy env for
-facade hosts, D-2's path is dead for opencode regardless of S1.
+The cost, stated plainly: the session can reach **any** service on the host's loopback — Ollama,
+a dev server, a database, Jupyter — and no rule can close individual ones. That is the
+prompt-injection lateral-movement surface this ADR's D-1 exists to prevent, and there is no
+mitigation inside the substrate. It stays acceptable only because the mode is explicit, per
+session, never a default, and the audit leaf records `loopback=open, scoped=false`.
 
-**S3 — end-to-end if S1 succeeds.** One `mxc` session: server inside with the port pinned
-(`--port 4096` — the TUI's random port would defeat the enumerated allowance), TUI inside, client
-pointed at `127.0.0.1:4096` under a per-port allowance. The baseline is already established:
-standalone mode works outside the sandbox, so any remaining failure inside is the allowance, not
-opencode. Acceptance: a prompt completes; the server
-executes a tool whose file write lands inside the writable grant; egress from the session is still
-`10013`; the audit leaf carries the allowance and the ownership check; a second session cannot
-reach the first's port (cross-session check).
+**D-4 — scope of the guarantee.** In a rules-mode session the containment claim is precisely
+worded: internet egress is proxied and audited exactly as before, direct egress is still denied and
+inbound is still refused — but **loopback is unscoped and unaudited**, and the session can reach
+every loopback service on the host. Sessions in this mode are recorded as such, and any
+documentation that says "loopback is closed" or "audited" must exempt them.
 
-**S4 — if S1 fails.** Document that T3 is unsolvable under 1.0.1 and file the upstream question
-(per-port loopback allowance; or `isolationSessionAvailable`). The honest product answer until then
-remains the FAQ's: `appcontainer` elevated for opencode, `mxc` for outbound-only workloads. The
-forwarder (D-2) may still ship for T1 — it is useful and independent — but it must not be
-marketed as the opencode fix.
+## The spike — results (2026-11-06)
+
+Run on this host, throwaway code only (an env-gated egress rule in the request builder, reverted
+afterwards; no branch, no PR). Each leg is a real `mxc` session with a PowerShell probe inside it.
+
+| leg | configuration | measured |
+|---|---|---|
+| baseline, proxy session | as shipped | self-loopback `10013`; `1.1.1.1:443` `10013`; proxy port connects |
+| S1a | proxy **+** `egress.allow 127.0.0.1/32:4096` | **refused**: `runtimeConfig.networkProxy requires egress.default='deny' with no direct allow or deny rules` |
+| S1b | no `networkProxy`, allow rule `127.0.0.1/32:4096` | self-loopback **OK** — and port 4095 also **OK** |
+| S1c | no `networkProxy`, allow rule for `10.9.9.9/32:8080` only | loopback `4095` and `4096` **OK** — the rule is irrelevant |
+| S1d | no `networkProxy`, **no** allow rules | loopback **OK** |
+| S1e | no `networkProxy`, `deny 127.0.0.1/32` + allow 4096 | loopback **OK** — the deny is ignored |
+| S1f | rules-mode session, supervisor-injected `HTTP_PROXY` | `CONNECT example.com:443` → `HTTP/1.1 200 Connection Established`; `1.1.1.1:443` still `10013` |
+| S2 | host → listener inside a rules-mode session | connect **times out** (inbound stays closed) |
+| S3 | `opencode serve --port 4096` inside a rules-mode session, client from the same session | server process alive; `GET http://127.0.0.1:4096/global/health` → the app answered |
+
+S3 is the acceptance test this ADR exists for, and it passes: **opencode v2's server and client run
+in one `mxc` session**, over the loopback connect that is refused in proxy mode.
+
+Still unmeasured, and stated so rather than implied: the full TUI with a real provider (needs an API
+key and a check that opencode's Bun client honours `HTTP_PROXY` for its model calls — the health
+probe used `--noproxy`), and two concurrent sessions (whether one session's open loopback can reach
+another's listener; the host path times out, but that is not the same test).
 
 ## Consequences
 
 ### Positive
 
 - T1 workloads (test databases, declared host services) work inside sessions with a full audit
-  trail, without opening loopback.
-- If S1 succeeds: the agent tier's flagship case — opencode v2, server and client in one session —
-  works under `mxc` with a grant that is one port wide, connect-only, session-scoped, and
-  ownership-checked. The `appcontainer`-elevated workaround stops being the answer for the tier
-  this product is for.
+  trail, without opening loopback — that is D-2 and it is independently useful.
+- **Measured**: opencode v2's server and client run in one `mxc` session under the rules-mode
+  mode, with internet egress still proxied and audited, direct egress still denied and inbound
+  still refused. The `appcontainer`-elevated workaround stops being the only answer for the agent
+  tier.
 - The generalisation holds for the whole class the FAQ names: any client + local-server tool
   (Gradle daemon, LSP over TCP, dev servers, Testcontainers) gets the same declared path.
 
 ### Negative
 
-- The audit claim is weakened **for sessions that use the allowance**, and the wording must say so.
-  This is the price of D-3 and the reason D-1 still stands for everything else.
-- One more surface to own: the ownership check, the port enumeration, the startup printing.
-- Upstream dependency: if S1 fails, the agent tier stays on the `appcontainer` workaround or waits
-  for upstream — this ADR cannot fix the substrate.
+- **Loopback is all-or-nothing, and unaudited.** The per-port scoping this ADR wanted does not
+  exist: the rules mode leaves the whole of loopback open and ignores both allow and deny rules for
+  it. A prompt-injected session can reach every loopback service on the host.
+- The proxy environment is injected by the supervisor instead of the substrate, so the
+  `identitylessLoopbackProxy` posture is not in play in that mode — a second code path to own and
+  to keep honest about.
+- The audit wording must diverge: "no undeclared channels" holds for the internet, not for loopback,
+  in this mode.
 
 ### Neutral
 
