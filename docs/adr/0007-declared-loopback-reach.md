@@ -1,10 +1,12 @@
 # ADR-0007: declared loopback reach — the facade forwarder, and what it cannot do
 
-- **Status:** **Proposed — spike run 2026-11-06, and it changed the mechanism.** What works is not
-  a per-port allowance but a session mode: drop `runtimeConfig.networkProxy`, let the supervisor
-  inject the proxy environment, and loopback is open while the internet still leaves only through
-  the audited proxy. S1–S3 are measured below. The open decision is a product one — whether to
-  offer a session mode with unscoped loopback — and it is yours, not this document's.
+- **Status:** **Accepted 2026-11-06** (product owner), implemented the same day as
+  `--allow-host-loopback` on the `mxc` backend. The mechanism is the session mode the spike
+  measured: no `runtimeConfig.networkProxy`, supervisor-injected proxy environment, loopback open.
+  What the substrate does **not** offer is port scoping — the flag is all-or-nothing, and that is a
+  documented downgrade the audit leaf records as `loopback: open-unscoped`. **Gradle builds should
+  still prefer the runner (ADR-0006)**: a pinned toolchain, a warm cache, and a declared-operations
+  facade beat an open loopback wherever the runner is available.
 - **Date:** 2026-11-06
 - **Supersedes:** nothing. It extends ADR-0004's egress model and generalises ADR-0006's facade
   pattern; it changes no rule in ADR-0001..0006.
@@ -196,6 +198,18 @@ another's listener; the host path times out, but that is not the same test).
   participate; it requires every workload to embed a tunnel client.
 - **Learned/persisted loopback grants** — a standing hole; loopback reach is per-session or
   nothing.
+
+## Implementation (2026-11-06)
+
+`--allow-host-loopback` (cli.rs, refused against `--block-net` and against the `appcontainer`
+backend, both by table-tested pure functions); the mapping lives in `build_request`
+(`runtimeConfig` absent, egress still `deny` with no rules, proxy env injected by the supervisor);
+the startup warning is a pinned constant (`HOST_LOOPBACK_WARNING`), and the leaf records
+`loopback: open-unscoped` (omitted when not resolved, so "not recorded" and "closed" stay
+distinct). Live verification of the shipped flag: self-loopback connects succeed, a real
+`CONNECT` through the proxy returns `200 Connection Established`, `1.1.1.1:443` stays `10013`,
+and the guardrail 1 proof still gates (`accepted=1 tunnels=1`). Unmeasured and still true:
+the full TUI against a real provider, and session-to-session reachability.
 
 ## What this ADR does not decide
 

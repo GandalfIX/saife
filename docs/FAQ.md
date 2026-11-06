@@ -561,8 +561,22 @@ What does **not** help: `--standalone` (it means "private server", not "no serve
 `opencode service set disabled true` (it stops the SHARED service; a standalone run still
 starts its own), `--server http://localhost:4096` (same loopback), and any grant.
 
-What does: run the session on the **appcontainer** backend from an elevated shell - the
-loopback exemption is registered automatically when elevated:
+What does: **`--allow-host-loopback` on the default mxc backend** (ADR-0007). The session's
+loopback is then open, so the v2 server and its client meet on `127.0.0.1` inside the session:
+
+```powershell
+saife run --profile opencode --allow-host-loopback -- opencode
+```
+
+The flag is an accepted downgrade, not a grant: loopback is open UNSCOPED (the substrate has no
+per-port form), so the workload can reach every loopback service on the host - databases, a dev
+server, Ollama - and loopback traffic crosses no decision point. The startup warning says so, and
+the session's audit leaf records `loopback: open-unscoped`. What does not change: internet egress
+still passes the proxy and its allow-list, direct egress stays kernel-denied, and the host still
+cannot reach a listener inside the session.
+
+The fallback is the appcontainer backend from an elevated shell (the loopback exemption registers
+automatically) - strictly weaker than the flag on every network axis, and it needs elevation:
 
 ```powershell
 saife run --profile opencode --backend appcontainer -- opencode
@@ -575,6 +589,14 @@ sandbox for workloads that do not need a local server (`--block-net` gives those
 posture).
 
 The generalisation matters more than the tool: **any** client + local-server architecture
-(Gradle daemon, LSP servers, dev servers, Testcontainers) needs loopback and therefore the
-`appcontainer` backend; `mxc` is for workloads whose only network is outbound.
+(LSP servers, dev servers, Testcontainers) needs loopback, and the same flag provides it - with
+the same accepted downgrade. Two exceptions worth naming:
+
+- **Gradle: prefer `--runner`** (ADR-0006) over `--allow-host-loopback`. The runner exists for
+  exactly this case and buys more than loopback does: a pinned JDK/Gradle toolchain from the
+  image, a warm cache volume that survives across sessions (`saife runner prewarm`), and a
+  declared-operations facade instead of an open loopback. Use the flag for tools like opencode;
+  use the runner for builds.
+- `--block-net` and `--allow-host-loopback` are mutually exclusive: a session with no proxy has
+  no network session whose loopback could be opened, and `saife run` refuses the combination.
 
