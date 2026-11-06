@@ -214,7 +214,13 @@ if ($reported -notmatch [regex]::Escape($archiveVersion)) {
 Write-Host ''
 Write-Host '== installed, self-check:'
 Write-Host ("{0}  (matches the archive name)" -f $reported)
-& $exe setup --check-only | Select-Object -First 4
+# Capture first, then show four lines. Piping straight into `Select-Object -First 4` stops the
+# pipeline early, which CLOSES the child's stdout while `saife setup` is still printing: the next
+# write fails with ERROR_NO_DATA (232) and Rust panics in the stdio formatter ("failed printing to
+# stdout: Die Pipe wird gerade geschlossen"), so a clean install looks like a crash. The command is
+# fast and cheap, so let it finish and cut the text afterwards.
+$selfCheck = & $exe setup --check-only 2>&1
+$selfCheck | Select-Object -First 4
 
 if (-not $NoPathEntry) {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
