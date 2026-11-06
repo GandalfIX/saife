@@ -73,6 +73,7 @@ fn main() {
             plugin,
             plugin_dir,
             runner,
+            allow_host_loopback,
             cmd,
         } => run_cmd(
             backend,
@@ -92,6 +93,7 @@ fn main() {
             plugin,
             plugin_dir,
             runner,
+            allow_host_loopback,
             cmd,
         ),
         Cmd::Ps { json, .. } => ps_cmd(json),
@@ -705,6 +707,8 @@ fn run_cmd(
     plugin_dir: Vec<String>,
     // `--runner`: the build runner's facade mount for this session.
     runner: bool,
+    // `--allow-host-loopback`: ADR-0007's session mode.
+    allow_host_loopback: bool,
     cmd: Vec<String>,
 ) -> i32 {
     // Backend selection is refused before anything is spawned or created. The
@@ -731,6 +735,15 @@ fn run_cmd(
     // is carried into `run_inner`, which has a session path for both. A binary
     // without the feature never reaches this point (`route_backend` refuses), and
     // `run_inner` re-states that refusal rather than falling back.
+    // ADR-0007: the flag is validated against the rest of the command line
+    // before anything is spawned, like `route_backend`.
+    if let Err(refusal) = cli::check_host_loopback(allow_host_loopback, block_net, backend) {
+        eprintln!("[saife] {}", refusal.message());
+        return 2;
+    }
+    if allow_host_loopback {
+        eprintln!("{}", cli::HOST_LOOPBACK_WARNING);
+    }
     if let Err(e) = setup::check_runtime() {
         eprintln!("[saife] {e:#}");
         return 1;
@@ -754,6 +767,7 @@ fn run_cmd(
         &plugin,
         &plugin_dir,
         runner,
+        allow_host_loopback,
         &cmd,
     ) {
         Ok(code) => code,
@@ -794,6 +808,8 @@ fn run_inner(
     plugin_dirs: &[String],
     // `--runner`: wire the build runner's facade mount and listener for this session.
     enable_runner: bool,
+    // `--allow-host-loopback`: ADR-0007's session mode, threaded to the MXC path.
+    allow_host_loopback: bool,
     cmd: &[String],
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
@@ -856,6 +872,7 @@ fn run_inner(
                 plugins,
                 plugin_dirs,
                 enable_runner,
+                allow_host_loopback,
                 cmd,
             );
         }
@@ -1122,6 +1139,7 @@ fn run_mxc_session(
     plugin_dirs: &[String],
     // `--runner`: start the build runner and publish its facade mount.
     enable_runner: bool,
+    allow_host_loopback: bool,
     cmd: &[String],
 ) -> Result<i32> {
     // Decision 7: `--print-sid` yields the id and returns, exactly as the
@@ -1199,6 +1217,13 @@ fn run_mxc_session(
             readwrite: filesystem.readwrite_paths.clone(),
             readonly: filesystem.readonly_paths.clone(),
             deny: filesystem.denied_paths.clone(),
+        })
+        // ADR-0007: the loopback reach this session launches with - recorded
+        // before the child exists, like every other fact on the leaf.
+        .with_loopback(if allow_host_loopback {
+            audit::session_start::LOOPBACK_OPEN_UNSCOPED
+        } else {
+            audit::session_start::LOOPBACK_CLOSED
         }),
     );
 
@@ -1371,6 +1396,7 @@ fn run_mxc_session(
             // could not authenticate against this listener anyway.
             proxy_token: None,
         },
+        allow_host_loopback,
         // The backend always writes `Some(budget.timeout_ms())`; never trusted here.
         timeout_ms: None,
         // P3.4: a real console for the child when this process has one, so an
