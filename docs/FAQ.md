@@ -531,6 +531,13 @@ saife run --profile <p> -- powershell -NoProfile -Command 'Test-Path "$env:USERP
 directory to writable `allow`: a workload that can replace the binary it is running from is the
 same hazard the launcher rule refuses.
 
+Python via `uv` reports the same failure in different words: the `python.exe` shim in
+`$HOME/.local/bin` starts (it has RX) and then fails with
+`uv trampoline failed to spawn Python child process ... permission denied (os error 5)` —
+the uv-managed interpreter in `%APPDATA%\uv\python` is unreadable. The fix is the same class:
+`"read_only": ["$APPDATA/uv"]` (measured: `python --version` fails without the grant, works
+with it).
+
 ## Why does opencode v2 hang in the sandbox - even with `--standalone`?
 
 opencode v2 is a **thin client plus a local HTTP server**: the server owns sessions,

@@ -21,6 +21,7 @@
     "read_only": [
       "$HOME/.gitconfig",
       "$HOME/.local/bin",
+      "$APPDATA/uv",
       "$USERPROFILE/AppData/Local/Microsoft/WinGet"
     ],
     "deny": [
