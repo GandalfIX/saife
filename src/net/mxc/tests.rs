@@ -35,6 +35,7 @@
                 proxy_port: Some(54_321),
                 proxy_token: None,
             },
+            allow_host_loopback: false,
             timeout_ms: Some(60_000),
             stdio: StdioSelection::Capture,
         }
@@ -3010,4 +3011,76 @@
         for key in ["PATH", "HTTP_PROXYX", "PROXY", "APPDATA"] {
             assert!(!is_blocked_env_key(key), "{key} must not be blocked");
         }
+    }
+
+    // ---- ADR-0007: the host-loopback session mode -------------------------
+
+    /// The mechanism, pinned: a loopback session ships WITHOUT the runtime proxy,
+    /// because the substrate refuses the proxy and explicit rules together
+    /// (`runtimeConfig.networkProxy requires network.egress.default='deny' with
+    /// no direct allow or deny rules`). Measured in the 2026-11-06 spike.
+    #[test]
+    fn loopback_mode_ships_no_runtime_proxy() {
+        let mut i = input();
+        i.allow_host_loopback = true;
+        let req = build(&i);
+        assert!(
+            !req.policy.network_proxy.is_enabled(),
+            "a loopback session must not carry the runtime networkProxy"
+        );
+        // Everything that is not loopback keeps its containment: no rules-mode
+        // escape hatch, egress stays denied by default.
+        let egress = req.policy.network_egress.as_ref().expect("egress");
+        assert_eq!(egress.default, NetworkAction::Deny);
+        assert!(
+            egress.allow.is_empty() && egress.deny.is_empty(),
+            "the proxy is injected as environment, not granted as a rule"
+        );
+    }
+
+    /// The SDK injects proxy env only from `networkProxy`; in loopback mode the
+    /// supervisor must supply it or the workload has no egress at all.
+    #[test]
+    fn loopback_mode_injects_the_proxy_environment() {
+        let mut i = input();
+        i.allow_host_loopback = true;
+        i.network.proxy_token = Some("run-token".to_string());
+        let req = build(&i);
+        let env = req.env.as_ref().expect("explicit environment list");
+        let get = |key: &str| {
+            env.iter()
+                .find(|entry| entry.starts_with(&format!("{key}=")))
+                .map(|entry| entry.to_string())
+        };
+        let http = get("HTTP_PROXY").expect("HTTP_PROXY injected");
+        assert!(
+            http.contains("127.0.0.1:54321"),
+            "points at the session proxy: {http}"
+        );
+        assert!(
+            http.contains("run-token"),
+            "carries the run credential: {http}"
+        );
+        let value_of = |entry: &str| entry.split_once('=').map(|(_, v)| v.to_string());
+        assert_eq!(
+            value_of(&get("HTTPS_PROXY").expect("HTTPS_PROXY injected")),
+            value_of(&http),
+            "same endpoint for both schemes"
+        );
+        assert_eq!(
+            get("NO_PROXY").as_deref(),
+            Some("NO_PROXY="),
+            "loopback must stay direct, never routed through the proxy"
+        );
+    }
+
+    /// Regression guard: the default mode is untouched - the runtime proxy is
+    /// still what carries the environment.
+    #[test]
+    fn default_mode_still_ships_the_runtime_proxy() {
+        let req = build(&input());
+        assert!(
+            req.policy.network_proxy.is_enabled(),
+            "the default must keep the substrate-injected proxy"
+        );
     }

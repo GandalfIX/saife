@@ -637,6 +637,15 @@ pub struct MxcSessionInput {
     pub environment: Vec<(String, String)>,
     pub filesystem: MxcFilesystemInput,
     pub network: MxcNetworkInput,
+    /// ADR-0007's session mode: loopback is open (unscoped, unaudited), the
+    /// runtime proxy is NOT configured, and the supervisor injects the proxy
+    /// environment itself.
+    ///
+    /// The substrate refuses `runtimeConfig.networkProxy` together with any
+    /// explicit egress rule, and without the proxy config it does not filter
+    /// loopback at all - measured 2026-11-06. That is why this is a mode and not
+    /// a per-port grant: there is no port scoping to express.
+    pub allow_host_loopback: bool,
     /// Wall-clock bound for the whole session, in milliseconds. `None` — and
     /// `Some(0)` — means **no deadline**: the SDK maps a zero timeout to
     /// `INFINITE` (`mxc_common::script_runner::get_timeout_milliseconds`).
@@ -2111,7 +2120,7 @@ pub fn build_request(
 
     // Invariant 5: the host's proxy configuration never crosses. Always an
     // explicit list, even when empty — `None` would mean "backend default".
-    let environment: Vec<String> = input
+    let mut environment: Vec<String> = input
         .environment
         .iter()
         .filter(|(key, _)| !is_blocked_env_key(key))
@@ -2126,6 +2135,21 @@ pub fn build_request(
         Some(port) => Some(proxy_url(port, input.network.proxy_token.as_deref())?),
         None => None,
     };
+    // ADR-0007: the loopback mode cannot carry `runtimeConfig.networkProxy` -
+    // the substrate refuses a proxy alongside explicit egress rules, and the
+    // proxy config is what closes loopback. Dropping it is the mechanism, so the
+    // environment injected below is the only channel left.
+    let loopback_mode = input.allow_host_loopback;
+    // The SDK injects proxy env only from `runtimeConfig.networkProxy`, which the
+    // loopback mode does not ship: without this block the workload would have no
+    // egress at all in that mode. The URL is the one the proxy's token gate
+    // expects, and `NO_PROXY` stays set-but-empty so 127.0.0.1 is never routed
+    // back through the proxy.
+    if let (true, Some(url)) = (loopback_mode, &network_proxy) {
+        environment.push(format!("HTTP_PROXY={url}"));
+        environment.push(format!("HTTPS_PROXY={url}"));
+        environment.push("NO_PROXY=".to_string());
+    }
     // Proxy-only egress: everything outbound is denied at the container level and
     // the only path out is the supervisor's loopback proxy. Both ingress fields
     // are mandatory for it (ADR-0004 constraint); with no proxy, no network at
@@ -2248,11 +2272,18 @@ pub fn build_request(
         process_container: contract::OptionalField::present(process_container_contract()),
         lxc: Default::default(),
         seatbelt: Default::default(),
-        runtime_config: match network_proxy {
-            Some(url) => contract::OptionalField::present(contract::RuntimeConfig {
-                network_proxy: contract::OptionalField::present(url),
-            }),
-            None => Default::default(),
+        runtime_config: if loopback_mode {
+            // ADR-0007: no runtime proxy in this mode - the supervisor injected
+            // the environment instead, and this absence is what leaves loopback
+            // unfiltered.
+            Default::default()
+        } else {
+            match network_proxy {
+                Some(url) => contract::OptionalField::present(contract::RuntimeConfig {
+                    network_proxy: contract::OptionalField::present(url),
+                }),
+                None => Default::default(),
+            }
         },
         telemetry: Default::default(),
         wslc: Default::default(),

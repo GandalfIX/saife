@@ -267,6 +267,12 @@ pub struct SessionStartFacts {
     /// (and on the `Drop` path, which never got that far) — an absent section is
     /// distinguishable from an empty policy, which is a session allowed nothing.
     filesystem: Option<FilesystemFacts>,
+    /// ADR-0007: the loopback reach this session was launched with, when the
+    /// caller resolved it before arming. `None` when not recorded (the
+    /// AppContainer path, whose loopback comes from the exemption). Values are
+    /// [`LOOPBACK_CLOSED`] and [`LOOPBACK_OPEN_UNSCOPED`]; the leaf omits the key
+    /// when this is `None`, keeping "not recorded" and "closed" distinguishable.
+    loopback: Option<&'static str>,
 }
 
 impl SessionStartFacts {
@@ -284,6 +290,7 @@ impl SessionStartFacts {
             elevated,
             proxy_endpoint: None,
             filesystem: None,
+            loopback: None,
         }
     }
 
@@ -311,6 +318,13 @@ impl SessionStartFacts {
         self
     }
 
+    /// Record the loopback reach the session was launched with (ADR-0007).
+    #[allow(dead_code)]
+    pub fn with_loopback(mut self, reach: &'static str) -> Self {
+        self.loopback = Some(reach);
+        self
+    }
+
     /// Guardrail 2's record.
     ///
     /// Read-only accessors below: `write_leaf` reads the fields directly, so these
@@ -333,7 +347,22 @@ impl SessionStartFacts {
     pub fn proxy_endpoint(&self) -> Option<LoopbackEndpoint> {
         self.proxy_endpoint
     }
+
+    /// The loopback reach this session launched with, when recorded (ADR-0007).
+    #[allow(dead_code)]
+    pub fn loopback(&self) -> Option<&'static str> {
+        self.loopback
+    }
 }
+
+/// The session's loopback reach (ADR-0007 leaf values).
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub const LOOPBACK_CLOSED: &str = "closed";
+/// Loopback open without port scoping: the workload can reach every loopback
+/// service on the host, and loopback traffic crosses no decision point. The
+/// value is deliberately blunt because the leaf is where a reader learns it.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub const LOOPBACK_OPEN_UNSCOPED: &str = "open-unscoped";
 
 /// Why a guardrail refused a session.
 #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
@@ -595,6 +624,12 @@ fn write_leaf(
         e.insert("fs_readonly".into(), json!(fs.readonly));
         e.insert("fs_deny".into(), json!(fs.deny));
     }
+    // ADR-0007: recorded only when the caller resolved it, so "not recorded"
+    // (AppContainer) and "closed" stay distinguishable - same convention as the
+    // fs_* keys above.
+    if let Some(reach) = facts.loopback {
+        e.insert("loopback".into(), json!(reach));
+    }
     writer.append(e)
 }
 
@@ -698,6 +733,47 @@ mod tests {
         for key in ["fs_workspace", "fs_readwrite", "fs_readonly", "fs_deny"] {
             assert!(leaf.get(key).is_none(), "{key} must be absent: {leaf:?}");
         }
+    }
+
+    #[test]
+    fn the_leaf_records_an_open_loopback_reach() {
+        let sid = fresh_sid("loopback-open");
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            let guard = SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo hi",
+                SessionStartFacts::measured(TierFacts::default(), Some(false))
+                    .with_loopback(LOOPBACK_OPEN_UNSCOPED),
+            );
+            guard.complete(Some(LoopbackEndpoint::new(41_236))).unwrap();
+        }
+        let leaves = leaves(&sid);
+        cleanup(&sid);
+        assert_eq!(leaves[0]["loopback"], json!(LOOPBACK_OPEN_UNSCOPED));
+    }
+
+    #[test]
+    fn a_loopback_reach_that_was_not_resolved_is_omitted() {
+        let sid = fresh_sid("loopback-none");
+        {
+            let writer = Arc::new(AuditWriter::open(&sid, false).unwrap());
+            let guard = SessionStart::arm(
+                writer,
+                &sid,
+                "cmd /c echo hi",
+                SessionStartFacts::appcontainer_dacl(true),
+            );
+            guard.complete(None).unwrap();
+        }
+        let leaves = leaves(&sid);
+        cleanup(&sid);
+        assert!(
+            leaves[0].get("loopback").is_none(),
+            "not-recorded must be absent, not 'closed': {:?}",
+            leaves[0]
+        );
     }
 
     /// Acceptance 1 (P2.3): the AppContainer backend IS the DACL tier, so its

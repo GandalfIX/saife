@@ -163,6 +163,7 @@ fn mxc_tier_line() -> String {
                 denied_paths: Vec::new(),
             },
             network: mxc::MxcNetworkInput::default(),
+            allow_host_loopback: false,
             timeout_ms: None,
             stdio: mxc::StdioSelection::Capture,
         };

@@ -329,6 +329,7 @@
                 proxy_port: Some(port),
                 proxy_token: None,
             },
+            allow_host_loopback: false,
             // The live legs read the child's output, so they capture it.
             stdio: StdioSelection::Capture,
             timeout_ms: None,
@@ -1626,6 +1627,7 @@
                 proxy_port,
                 proxy_token: None,
             },
+            allow_host_loopback: false,
             // An explicit budget: `None` means no deadline at all (D5), which is
             // wrong for a test that could otherwise hang.
             timeout_ms: Some(180_000),

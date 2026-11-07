@@ -141,6 +141,61 @@ impl BackendRefusal {
     }
 }
 
+/// The startup warning for `--allow-host-loopback` (ADR-0007). Printed once,
+/// before anything is spawned; the wording is the product's risk statement, so
+/// it is pinned by a test rather than left to drift.
+pub const HOST_LOOPBACK_WARNING: &str = "[saife] --allow-host-loopback: loopback is OPEN in this session - unscoped and UNAUDITED.\n\
+[saife]   the workload can reach every loopback service on this host (databases, dev servers,\n\
+[saife]   Ollama, ...); loopback traffic crosses no decision point.\n\
+[saife]   unchanged: internet egress passes the proxy and its allow-list; direct egress and inbound stay denied.\n\
+[saife]   for Gradle builds prefer --runner (ADR-0006): pinned toolchain, warm cache, declared facade.";
+
+/// Why `--allow-host-loopback` was refused. The enum carries the decision; the
+/// wording lives here, at the CLI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopbackRefusal {
+    /// `--block-net` binds no proxy: there is no network session to open
+    /// loopback in, and nothing to inject the proxy environment with.
+    BlockNet,
+    /// On the appcontainer backend loopback is governed by the (admin-only,
+    /// machine-wide) loopback exemption, not by this flag - the flag has
+    /// nothing to grant there.
+    AppContainer,
+}
+
+impl LoopbackRefusal {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::BlockNet => {
+                "--allow-host-loopback needs a network session: --block-net binds no proxy, so there is no proxy environment to inject and no session whose loopback could be opened"
+            }
+            Self::AppContainer => {
+                "--allow-host-loopback applies to the mxc backend only: appcontainer's loopback is governed by the loopback exemption (registered when elevated), so the flag has nothing to grant there - drop the flag, or drop --backend appcontainer"
+            }
+        }
+    }
+}
+
+/// Validate `--allow-host-loopback` against the rest of the command line.
+/// Fail-closed before anything is spawned, like [`route_backend`]; pure and
+/// table-testable for the same reason.
+pub fn check_host_loopback(
+    allow_host_loopback: bool,
+    block_net: bool,
+    backend: Backend,
+) -> Result<(), LoopbackRefusal> {
+    if !allow_host_loopback {
+        return Ok(());
+    }
+    if block_net {
+        return Err(LoopbackRefusal::BlockNet);
+    }
+    if backend == Backend::AppContainer {
+        return Err(LoopbackRefusal::AppContainer);
+    }
+    Ok(())
+}
+
 /// Route a `saife run` to a backend, or refuse it — fail-closed, before
 /// anything is spawned or created.
 ///
@@ -265,6 +320,26 @@ pub enum Cmd {
         /// it; with the runner on, `--backend mxc` must be in use.
         #[arg(long)]
         runner: bool,
+
+        /// Open loopback for this session: the workload's own server AND its
+        /// client can then meet on 127.0.0.1 (opencode v2, dev servers, test
+        /// databases).
+        ///
+        /// The risk this accepts, stated plainly: loopback is open UNSCOPED - the
+        /// substrate has no per-port grant, so the workload can reach every
+        /// loopback service on the host (databases, Ollama, a dev server), and
+        /// loopback traffic crosses no decision point. The audit leaf records
+        /// `loopback: open-unscoped` for exactly this reason.
+        ///
+        /// What does NOT change: internet egress still passes the supervisor's
+        /// proxy and its allow-list (the proxy env is injected by the supervisor
+        /// instead of the substrate), direct egress stays kernel-denied, and the
+        /// host still cannot reach a listener inside the session. Measured
+        /// 2026-11-06, ADR-0007. Gradle builds should still prefer
+        /// `--runner` (ADR-0006): a pinned toolchain, a warm cache, and a
+        /// declared-operations facade instead of an open loopback.
+        #[arg(long)]
+        allow_host_loopback: bool,
 
         /// Reuse an existing session id (re-derive its profile + ACLs).
         #[arg(long, value_name = "SID", hide = true)]
@@ -909,5 +984,48 @@ mod tests {
             ),
             "help must carry the one-line description: {help}"
         );
+    }
+
+    #[test]
+    fn host_loopback_flag_passes_where_it_applies() {
+        assert!(check_host_loopback(true, false, Backend::Mxc).is_ok());
+        // flag off: nothing to refuse, whatever the rest of the line says
+        assert!(check_host_loopback(false, true, Backend::Mxc).is_ok());
+        assert!(check_host_loopback(false, true, Backend::AppContainer).is_ok());
+    }
+
+    #[test]
+    fn host_loopback_flag_is_refused_where_it_cannot_apply() {
+        // --block-net binds no proxy; there is nothing to inject
+        assert_eq!(
+            check_host_loopback(true, true, Backend::Mxc),
+            Err(LoopbackRefusal::BlockNet)
+        );
+        // appcontainer's loopback comes from the (elevated) exemption
+        assert_eq!(
+            check_host_loopback(true, false, Backend::AppContainer),
+            Err(LoopbackRefusal::AppContainer)
+        );
+    }
+
+    #[test]
+    fn host_loopback_refusals_name_the_fix() {
+        for refusal in [LoopbackRefusal::BlockNet, LoopbackRefusal::AppContainer] {
+            let message = refusal.message();
+            assert!(message.contains("allow-host-loopback"), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_host_loopback_warning_states_the_risk_it_names() {
+        for needle in [
+            "unscoped",
+            "UNAUDITED",
+            "every loopback service",
+            "allow-list",
+            "--runner",
+        ] {
+            assert!(HOST_LOOPBACK_WARNING.contains(needle), "missing {needle}");
+        }
     }
 }
