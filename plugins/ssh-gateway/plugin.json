@@ -1,0 +1,22 @@
+{
+    "schema_version": 1,
+    "name": "ssh-gateway",
+    "version": "0.1.0",
+    "description": "Generic SSH gateway: runs declared ssh verbs on declared hosts for a sandboxed workload, holding the keys outside the container.",
+    "mount": "ssh",
+    "command": ["python", "sidecar.py"],
+    "health": {
+        "path": "/status",
+        "timeout_ms": 5000,
+        "interval_ms": 250
+    },
+    "operations": [
+        { "method": "GET", "path": "/status" },
+        { "method": "GET", "path": "/hosts" },
+        { "method": "POST", "path": "/exec" }
+    ],
+    "secrets": [],
+    "config": {
+        "gateway_file": "%USERPROFILE%\\.saife\\ssh-gateway.json"
+    }
+}

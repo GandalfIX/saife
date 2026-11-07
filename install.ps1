@@ -295,6 +295,15 @@ try {
 
     Step "installing to $installDir"
     if (Test-Path $installDir) {
+        # A running session locks the old binaries: name the processes instead of
+        # letting Remove-Item fail with a bare "Access to the path is denied".
+        $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -and $_.Path.StartsWith($installDir, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
+        })
+        if ($running.Count -gt 0) {
+            $names = ($running | ForEach-Object { "{0} ({1})" -f $_.ProcessName, $_.Id }) -join ', '
+            Fail ("{0} is in use - a SAIFE session is still running from it: {1}. Close that session (or end the processes) and run this again; Windows cannot replace a running executable." -f $installDir, $names)
+        }
         if ($existingVersion) { Write-Host "   replacing $existingVersion" }
         Remove-Item $installDir -Recurse -Force -ErrorAction Stop
     }
