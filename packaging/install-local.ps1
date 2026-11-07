@@ -46,6 +46,14 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\arch.ps1')
 $root = Split-Path -Parent $PSScriptRoot
 
+# A blocked install is an environment problem, not a script bug: say it in plain
+# text and exit 1. A throw would print a position report the user cannot act on.
+function Fail([string]$message) {
+    Write-Host ''
+    Write-Host "install failed: $message" -ForegroundColor Red
+    exit 1
+}
+
 # Installing is always for THIS machine, so there is no 'all': the archive of the other
 # architecture does not start here, and picking it silently would install a device of
 # the wrong kind (Windows will refuse it with a bare "not a valid Win32 application").
@@ -182,7 +190,18 @@ if (Test-Path $Destination) {
     )
     if ($running.Count -gt 0) {
         $names = ($running | ForEach-Object { "{0} ({1})" -f $_.ProcessName, $_.Id }) -join ', '
-        throw ("{0} is in use - still running from it: {1}. Close that session (or end the process) and run this again; Windows cannot replace a running executable." -f $Destination, $names)
+        $stop = 'Stop-Process -Id ' + (($running | ForEach-Object Id) -join ',')
+        Write-Host ''
+        Write-Host ("install blocked: {0} is in use - a SAIFE session is still running from it:" -f $Destination) -ForegroundColor Red
+        Write-Host ("  {0}" -f $names) -ForegroundColor Red
+        Write-Host ''
+        Write-Host 'Windows cannot replace a running executable. Close that session (its terminal,'
+        Write-Host 'or the workload that started it), or end the processes directly:'
+        Write-Host ("    {0}" -f $stop)
+        Write-Host ''
+        Write-Host 'Ending them by force leaves the session audit INCOMPLETE (no committed root) -'
+        Write-Host 'harmless: the next saife run recovers it. Then run this installer again.'
+        exit 1
     }
 }
 
@@ -194,7 +213,11 @@ if (Test-Path $Destination) {
         if (-not $old) { $old = ((& $existing --version) -join ' ') -replace '.*\s', '' }
         Write-Host ("replacing existing install (version '{0}')" -f $old)
     }
-    Remove-Item $Destination -Recurse -Force
+    try {
+        Remove-Item $Destination -Recurse -Force
+    } catch {
+        Fail ("cannot remove {0}: {1} - something still holds a file there (a shell whose CWD is inside, an editor or an Explorer window). Close it and run this again." -f $Destination, $_.Exception.Message)
+    }
 }
 New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 Expand-Archive -Path $Zip -DestinationPath $Destination -Force
@@ -214,7 +237,11 @@ if ($reported -notmatch [regex]::Escape($archiveVersion)) {
 Write-Host ''
 Write-Host '== installed, self-check:'
 Write-Host ("{0}  (matches the archive name)" -f $reported)
-& $exe setup --check-only | Select-Object -First 4
+# Capture first, print four lines second: `... | Select-Object -First 4` closes the
+# pipe while the probe is still writing, and a closed stdout pipe makes the binary
+# panic with "failed printing to stdout" - an ugly end to an install that worked.
+$probeOut = @(& $exe setup --check-only 2>&1)
+$probeOut | Select-Object -First 4 | ForEach-Object { Write-Host $_ }
 
 if (-not $NoPathEntry) {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
