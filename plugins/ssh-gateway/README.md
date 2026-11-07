@@ -49,7 +49,11 @@ curl.exe -s -X POST -d "{\"host\":\"srv1\",\"verb\":\"version\"}" http://ssh.san
    generosity is per host, never per network.
 3. **No shell lines.** `ssh` is spawned as an argv list; `verb` and `args` are
    charset-checked (no quotes, no `;`, no `$`), so the sidecar cannot be used to
-   inject remote shell syntax.
+   inject remote shell syntax. A `verb` may not begin with `-`: it is a command
+   name, and one that reads like an ssh option would be a trap for a future
+   reordering of the argv (`run_ssh` refuses it with `400`). The same checks run
+   twice on purpose - once in the HTTP handler, once again at the sink - because
+   a sink that trusts its caller is one refactor away from trusting the network.
 4. **Keys stay host-side.** The sidecar reads identities itself; `GET /hosts`
    never echoes identity paths.
 5. **Bounded.** `args` and `stdin` are size-capped, output is capped at

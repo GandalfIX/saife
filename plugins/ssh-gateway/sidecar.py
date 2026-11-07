@@ -39,8 +39,9 @@ Invariants:
     before any process is spawned (403);
   * a verb of "*" admits any verb, but never arbitrary shell syntax: the remote
     command is `verb` + `args`, and BOTH are checked against a strict charset
-    (no quotes, no semicolons, no whitespace in the verb). The remote end is the
-    real guard - keep its sshd ForceCommand;
+    (no quotes, no semicolons, no whitespace in the verb; the verb may not begin
+    with '-' - an ssh-option-looking command name is refused). The remote end is
+    the real guard - keep its sshd ForceCommand;
   * `args`/`stdin` are size-capped; ssh output is capped at
     `max_output_mb` (default 256);
   * every request except /status requires the facade token;
@@ -62,7 +63,10 @@ TOKEN = os.environ.get("SIDECAR_FACADE_TOKEN", "")
 MOUNT = os.environ.get("SIDECAR_MOUNT", "ssh")
 GATEWAY_FILE = os.environ.get("SIDECAR_CFG_GATEWAY_FILE", "")
 
-VERB_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+# First character may not be '-': a verb is a remote command NAME, and one that
+# reads like an ssh option ("-oProxyCommand=...") is a trap for any future
+# refactor that reorders the argv. Dashes inside stay legal ("list-verbose").
+VERB_RE = re.compile(r"^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,63}$")
 ARGS_RE = re.compile(r"^[A-Za-z0-9@._,:=/+\- ]{0,4000}$")
 DEFAULT_MAX_OUTPUT_MB = 256
 MAX_STDIN_BYTES = 4 * 1024 * 1024
@@ -106,8 +110,31 @@ def verb_allowed(entry: dict, verb: str) -> bool:
 
 
 def run_ssh(entry: dict, verb: str, args: str, stdin: bytes) -> tuple[int, bytes]:
-    """Spawn ssh for one verb; return (http_status, body)."""
-    target = entry["target"]
+    """Spawn ssh for one verb; return (http_status, body).
+
+    Request-derived values are re-validated HERE, not only in the HTTP handler.
+    This function is the sink, and a sink must not trust its callers:
+
+      * CodeQL flags the handler-only shape as py/command-line-injection
+        (critical) - the taint path request -> `cmd` is real even when an
+        upstream check exists;
+      * a second call site (a new endpoint, a refactor) would otherwise skip
+        every check the handler makes.
+
+    These checks duplicate `do_POST` ON PURPOSE - do not delete them as
+    redundant. A refusal returns before `subprocess.run`, so a refused request
+    costs zero processes.
+    """
+    if not isinstance(verb, str) or not VERB_RE.match(verb):
+        return 400, b"verb must be 1-64 chars of [A-Za-z0-9_.:] and may not begin with '-'"
+    if not isinstance(args, str) or not ARGS_RE.match(args):
+        return 400, b"args exceed the allowed charset or length"
+    if not verb_allowed(entry, verb):
+        return 403, f"command_not_declared: {verb}".encode()
+
+    target = entry.get("target")
+    if not isinstance(target, str) or not target:
+        return 502, b"host entry has no target"
     port = int(entry.get("port", 22))
     cmd = [
         "ssh",
@@ -236,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
             self._deny(403, f"host_not_declared: {host}")
             return
         if not isinstance(verb, str) or not VERB_RE.match(verb):
-            self._deny(400, "verb must be 1-64 chars of [A-Za-z0-9_.:-]")
+            self._deny(400, "verb must be 1-64 chars of [A-Za-z0-9_.:] and may not begin with '-'")
             return
         if not verb_allowed(entry, verb):
             self._deny(403, f"command_not_declared: {verb} on {host}")
