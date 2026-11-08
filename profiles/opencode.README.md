@@ -38,13 +38,17 @@ workaround.
 ## Network
 
 - `*.trustedtokens.eu` — the model API. The whole profile is pointless without it.
-- `models.opencode.ai` — opencode's **model catalog**. Not optional in practice:
-  the provider registry is rebuilt from the live catalog fetch (every 5 minutes,
-  10-second timeout); when the fetch fails the registry can end up empty, the
-  TUI loses its model list and a session that worked for a few turns "freezes"
-  because there is no model to send the next prompt to. Measured in a real
-  session: 24 × `Failed to fetch models.dev` in two hours while the LLM host was
-  allowed.
+- `models.opencode.ai` — the model **catalogue** opencode is built on. opencode
+  keeps no static model list: at start-up, and then on a five-minute refresh, it
+  fetches `api.json` from this host and rebuilds its **provider registry** from
+  that answer. The model list the TUI shows, the provider a prompt is routed to,
+  and the per-model capability metadata all come from the catalogue. The local
+  cache is a convenience, not a fallback: a failed fetch leaves the registry
+  without providers, and a session with an empty registry cannot route a prompt —
+  it stalls because there is no model to send to. So this host is not an
+  ordinary third-party endpoint to be prompted about; it is part of how the tool
+  resolves its own models, and it belongs in the allow-list beside the model API
+  it complements.
 
 Everything else — npm registry included, via `node` — stays a per-host prompt.
 
