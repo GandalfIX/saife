@@ -33,7 +33,8 @@
     "block_net": false,
     "profile": "developer",
     "allow_domain": [
-      "*.trustedtokens.eu"
+      "*.trustedtokens.eu",
+      "models.opencode.ai"
     ]
   },
   "limits": {

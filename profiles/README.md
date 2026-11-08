@@ -3,6 +3,12 @@
 Copy the one you need to `%USERPROFILE%\.saife\profiles\` and run
 `saife run --profile <name> --allow-cwd -- <command>`.
 
+**Each profile has a companion `<name>.README.md` next to it** that explains,
+grant by grant, why every path, host and limit is what it is — and what was
+measured to prove it. This file is the overview; those are the decisions:
+`node.README.md`, `jvm.README.md`, `gradle-runner.README.md`,
+`opencode.README.md`.
+
 Paths use the variables the loader expands: `$CWD`, `$HOME`, `$USERPROFILE`,
 `$TEMP`, `$LOCALAPPDATA`, `$APPDATA`, `$JAVA_HOME`, `$SID`. (`$LOCALAPPDATA`/`$APPDATA` were
 added on 2026-10-23; before that the samples spelled `AppData/Local` out.
