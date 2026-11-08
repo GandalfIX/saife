@@ -1,0 +1,4 @@
+# Empty on purpose. The sidecar spawns ssh with `-F <this file>` so the user's
+# ~/.ssh/config (ProxyCommand, ForwardAgent, LocalForward, Match blocks) cannot
+# govern a connection the plugin manifest is supposed to define. Add entries
+# ONLY if a remote genuinely needs one, and review them like code.

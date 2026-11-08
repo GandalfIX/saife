@@ -5958,6 +5958,13 @@
     /// Like [`fake_sidecar`], but reads the declared body too, so a relayed POST can
     /// be checked for what actually arrived.
     fn fake_sidecar_with_body(body: &'static str) -> (u16, Arc<StdMutex<Vec<String>>>) {
+        fake_sidecar_with_body_at("200 OK", body)
+    }
+
+    fn fake_sidecar_with_body_at(
+        status: &'static str,
+        body: &'static str,
+    ) -> (u16, Arc<StdMutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -5991,7 +5998,7 @@
                     String::from_utf8_lossy(&body_bytes[..got])
                 ));
                 let resp = format!(
-                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                    "HTTP/1.0 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
@@ -6247,6 +6254,60 @@
         assert_eq!(leaves[0]["mount"], "fake");
         assert_eq!(leaves[0]["path"], "/page?q=1");
         assert_eq!(leaves[0]["reason"], serde_json::Value::Null);
+    }
+
+    /// The leaf answers "did the boundary open" - the sidecar's OWN code answers
+    /// "what did it decide". Both are needed: 403/502 from a plugin used to be
+    /// recorded as a bare `allow`, which reads like a permitted call.
+    #[test]
+    fn the_facade_leaf_carries_the_sidecar_status() {
+        let (sidecar_port, _seen) = fake_sidecar_with_body_at("200 OK", "ok");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-status-200", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://fake.sandbox.invalid/page HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.0 200"), "{resp}");
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves.len(), 1, "{leaves:?}");
+        assert_eq!(leaves[0]["status"], 200, "the leaf must carry the sidecar's code");
+    }
+
+    #[test]
+    fn a_sidecar_refusal_is_recorded_with_its_own_status() {
+        let (sidecar_port, _seen) = fake_sidecar_with_body_at("403 Forbidden", "command_not_declared");
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-status-403", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("fake", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://fake.sandbox.invalid/page HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+        let leaves = facade_leaves(&t.sid);
+        assert_eq!(leaves[0]["status"], 403, "the refusal code must be on the leaf");
+        assert_eq!(
+            leaves[0]["disposition"], "allow",
+            "the proxy DID forward it - the sidecar refused; say both"
+        );
     }
 
     #[test]

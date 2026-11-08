@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Integration test harness for saife.exe (MVP US-1 vertical slice).
@@ -3327,7 +3327,7 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 94
+$script:MaxScenario = 95
 # S-93 is RESERVED, and deliberately not registered at all (P2.4).
 #
 # It is the harness form of guardrail 1's NEGATIVE case (ADR-0004: a session must
@@ -3416,6 +3416,30 @@ $script:ScenarioFunctions = @{
     91 = { Invoke-Scenario-S91 }
     92 = { Invoke-Scenario-S92 }
     94 = { Invoke-Scenario-S94 }
+    95 = { Invoke-Scenario-S95 }
+}
+
+
+# S-95: the ssh-gateway plugin's own unit tests (charset anchors, sink
+# re-validation, concurrency bound, bounded output, kill paths, audit record).
+# They pin invariants the Rust suite does not see; without this wiring a refactor
+# of the plugin could break verb validation and merge green. Skips when python
+# is absent, like S-8.
+function Invoke-Scenario-S95 {
+    $name = 'S-95 (ssh-gateway plugin invariants)'
+    $py = Get-Python
+    if (-not $py) { return @{ Num=95; Name=$name; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
+    $test = Join-Path (Split-Path $PSScriptRoot -Parent) 'plugins\ssh-gateway\test_sidecar.py'
+    if (-not (Test-Path -LiteralPath $test)) {
+        return @{ Num=95; Name=$name; Passed=$false; Skipped=$false; Detail="plugin tests missing: $test" }
+    }
+    $proc = Start-Process -FilePath $py -ArgumentList @($test) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput (Join-Path $env:TEMP 's95-out.txt') `
+        -RedirectStandardError  (Join-Path $env:TEMP 's95-err.txt')
+    $passed = $proc.ExitCode -eq 0
+    $tail = (Get-Content (Join-Path $env:TEMP 's95-err.txt') -ErrorAction SilentlyContinue | Select-Object -Last 3) -join ' | '
+    return @{ Num=95; Name=$name; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'python plugins/ssh-gateway/test_sidecar.py: all green' } else { "exit=$($proc.ExitCode): $tail" } }
 }
 
 function Invoke-Scenario { param([int]$Number)

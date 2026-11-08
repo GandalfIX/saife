@@ -18,3 +18,5 @@
 /target-static/
 /*.zip
 .worktrees/
+# Python bytecode from the plugin sidecars' tests
+__pycache__/
