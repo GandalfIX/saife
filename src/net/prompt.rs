@@ -1921,12 +1921,27 @@ mod tests {
     /// what serialized the two calls of
     /// `distinct_hosts_do_not_coalesce` in the first place.
     fn fake_dialog() -> (FakeHandle, DialogFn) {
+        fake_dialog_after(Duration::ZERO)
+    }
+
+    /// Same fake, but the blocking thread sleeps `record_after` before it records
+    /// the call: the deterministic shape of a loaded CI runner, where a dialog's
+    /// recording can lose against a short budget. A leader hands the dialog to the
+    /// blocking pool and keeps its own async deadline - nothing orders the two -
+    /// so a test that asserts dialog counts right after a `BudgetElapsed` return
+    /// measures the thread pool, not the coordinator (seen live: 60 ms budget,
+    /// CI, `calls().len()` one short). Tests in that shape use this fixture and
+    /// `wait_for_calls`.
+    fn fake_dialog_after(record_after: Duration) -> (FakeHandle, DialogFn) {
         let state: Arc<(StdMutex<FakeState>, Condvar)> =
             Arc::new((StdMutex::new(FakeState::default()), Condvar::new()));
         let calls: Arc<StdMutex<Vec<DialogRequest>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
         let parked = Arc::clone(&state);
         let dialog: DialogFn = Arc::new(move |req: &DialogRequest| {
+            if !record_after.is_zero() {
+                std::thread::sleep(record_after);
+            }
             recorded.lock().unwrap().push(req.clone());
             let host = crate::net::intent::normalize_host(&req.host);
             let (lock, condvar) = &*parked;
@@ -2588,7 +2603,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_returns_unavailable_deny() {
-        let (handle, dialog) = fake_dialog();
+        let (handle, dialog) = fake_dialog_after(Duration::from_millis(250));
         let coord = PromptCoordinator::with_dialog(dialog);
         let cfg = cfg(Duration::from_millis(100), PromptPolicy::Deny);
 
@@ -2601,6 +2616,7 @@ mod tests {
             },
             "a spent budget must be reported as the cause, not as a backend failure"
         );
+        handle.wait_for_calls(1).await;
         assert_eq!(
             handle.calls().len(),
             1,
@@ -2612,7 +2628,7 @@ mod tests {
     async fn timeout_with_allow_policy_returns_unavailable_allow() {
         // A timed-out prompt only defaults to allow when the policy says
         // so — never silently ([G-46]).
-        let (handle, dialog) = fake_dialog();
+        let (handle, dialog) = fake_dialog_after(Duration::from_millis(250));
         let coord = PromptCoordinator::with_dialog(dialog);
         let cfg = cfg(Duration::from_millis(100), PromptPolicy::Allow);
 
@@ -2624,6 +2640,7 @@ mod tests {
                 cause: UnavailableCause::BudgetElapsed,
             }
         );
+        handle.wait_for_calls(1).await;
         assert_eq!(handle.calls().len(), 1);
     }
 
@@ -2813,7 +2830,7 @@ mod tests {
     /// policy-looking denial.
     #[tokio::test]
     async fn timed_out_consultations_release_their_slots() {
-        let (handle, dialog) = fake_dialog();
+        let (handle, dialog) = fake_dialog_after(Duration::from_millis(150));
         // The pool/slot mechanics are pinned here, not the fast-fail policy: nine
         // consecutive unanswered consultations are exactly what item 3 now
         // short-circuits in production, so this coordinator never arms it.
@@ -2863,6 +2880,7 @@ mod tests {
             },
             "the prompt path must still be consulted after N timeouts"
         );
+        handle.wait_for_calls(MAX_CONCURRENT_PROMPTS + 1).await;
         assert_eq!(handle.calls().len(), MAX_CONCURRENT_PROMPTS + 1);
     }
 
@@ -2872,7 +2890,7 @@ mod tests {
     /// instead of spawning one more dialog.
     #[tokio::test]
     async fn abandoned_dialogs_stay_bounded_and_fail_closed() {
-        let (handle, dialog) = fake_dialog();
+        let (handle, dialog) = fake_dialog_after(Duration::from_millis(150));
         // Pool mechanics only — see `timed_out_consultations_release_their_slots`.
         let coord = Arc::new(PromptCoordinator::with_dialog_and_stickiness(
             dialog,
@@ -2897,6 +2915,7 @@ mod tests {
             "a full abandoned pool must refuse the new host, never spawn unbounded dialogs, \
              and the denial must name THAT pool, not the consultation cap"
         );
+        handle.wait_for_calls(MAX_ABANDONED_PROMPTS).await;
         assert_eq!(
             handle.calls().len(),
             MAX_ABANDONED_PROMPTS,
@@ -3139,7 +3158,7 @@ mod tests {
     /// hiccups.
     #[tokio::test]
     async fn a_concurrent_pair_does_not_arm_the_fast_fail_but_a_third_consecutive_does() {
-        let (handle, dialog) = fake_dialog();
+        let (handle, dialog) = fake_dialog_after(Duration::from_millis(150));
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
         let budget = Duration::from_millis(60);
         let cfg = cfg(budget, PromptPolicy::Deny);
@@ -3164,6 +3183,7 @@ mod tests {
                 }
             );
         }
+        handle.wait_for_calls(2).await;
         assert_eq!(handle.calls().len(), 2, "two hosts, two dialogs");
 
         // A third consecutive consultation is still consulted: a pair that elapsed
@@ -3177,6 +3197,7 @@ mod tests {
             },
             "a concurrent pair must not arm the fast-fail: the third still consults"
         );
+        handle.wait_for_calls(3).await;
         assert_eq!(handle.calls().len(), 3);
 
         // Now it is armed: the fourth is refused without a dialog.
@@ -3199,7 +3220,7 @@ mod tests {
     /// explicit choice, and it keeps consulting (and paying the per-host budget).
     #[tokio::test]
     async fn the_fast_fail_never_applies_to_the_allow_policy() {
-        let (handle, dialog) = fake_dialog();
+        let (handle, dialog) = fake_dialog_after(Duration::from_millis(150));
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
         let cfg = cfg(Duration::from_millis(40), PromptPolicy::Allow);
 
@@ -3216,6 +3237,7 @@ mod tests {
                 "host {i}: allow answers, but only after the dialog was consulted"
             );
         }
+        handle.wait_for_calls(5).await;
         assert_eq!(
             handle.calls().len(),
             5,
