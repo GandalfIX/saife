@@ -3,7 +3,7 @@
 //! Grammar (AC-4.13):
 //!   filter  := clause ( "&" clause )*
 //!   clause  := key ( "=" | "~=" | ">=" | "<=" ) value
-//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted" | "reason" | "suppressed" | "tier" | "tier_source" | "tier_needs_dacl_augmentation" | "elevated" | "proxy_endpoint" | "expected_tier" | "fs_workspace" | "fs_readwrite" | "fs_readonly" | "fs_deny"
+//!   key     := "op" | "disposition" | "host" | "path" | "ts" | "pid" | "seq" | "source" | "scope" | "persisted" | "reason" | "suppressed" | "tier" | "tier_source" | "tier_needs_dacl_augmentation" | "elevated" | "proxy_endpoint" | "expected_tier" | "fs_workspace" | "fs_readwrite" | "fs_readonly" | "fs_deny" | "req_id"
 //!   value   := bare-string (no & or = chars)
 //!
 //! Semantics:
@@ -11,11 +11,15 @@
 //!          which are enum-like taxonomy values; case-insensitive otherwise).
 //!          `persisted`/`elevated`/`tier_needs_dacl_augmentation` are booleans:
 //!          `=true` / `=false`, and any other value is a parse error.
+//!          `req_id` is an integer (the leaf writes it as a JSON number, not a
+//!          string): `=17` compares numerically, a non-numeric value is a parse
+//!          error, and a leaf that carries no `req_id` (a pre-M8 leaf, or a
+//!          non-request leaf) never matches — absence is not an id.
 //!   `=` with the literal `null` (any key): the leaf's value for this key is JSON
 //!          null, i.e. "nothing was established here" — for a boolean key that is
 //!          NOT a synonym for `false`.
 //!   `~=` — substring match (case-insensitive).
-//!   `>=` / `<=` — for ts: ISO-8601 lexicographic; for seq/pid: integer.
+//!   `>=` / `<=` — for ts: ISO-8601 lexicographic; for seq/pid/req_id: integer.
 //! Multiple clauses AND together.
 
 use anyhow::{bail, Result};
@@ -80,6 +84,13 @@ const KNOWN_KEYS: &[&str] = &[
     "fs_readwrite",
     "fs_readonly",
     "fs_deny",
+    // M8 follow-up (2026-11-09 verdict doc): `req_id` correlates the leaves one
+    // request produces — the admission `allow` and the post-dial `deny` that
+    // can still refuse it — so "what happened to request 17?" is the question
+    // the field exists to answer. The emitter writes it as a JSON number (see
+    // `INT_KEYS`); a leaf that is not one request carries `null`, and a pre-M8
+    // leaf carries no key at all.
+    "req_id",
 ];
 
 /// Leaf keys whose value is a JSON **array of strings**.
@@ -95,6 +106,20 @@ const ARRAY_KEYS: &[&str] = &["fs_readwrite", "fs_readonly", "fs_deny"];
 /// `tier_needs_dacl_augmentation` are the same shape. A bool compared as a string
 /// silently matches nothing, which is indistinguishable from "no such leaf".
 const BOOL_KEYS: &[&str] = &["persisted", "elevated", "tier_needs_dacl_augmentation"];
+
+/// Leaf keys whose value is a JSON **integer** (u64), so `=` compares
+/// numerically and a non-numeric value is refused at parse time rather than
+/// silently matching nothing.
+///
+/// `req_id` (M8) is the first. The emitter writes it as a JSON number, so the
+/// default `eq_match` path — which calls `Value::as_str` — returns `None` and
+/// the clause matches no leaf, indistinguishable from "no such leaf". A number
+/// must be compared as a number; a typo like `req_id=abc` is a parse error, not
+/// a confident empty result. `null` (handled by `eq_match` before this branch)
+/// still selects a leaf whose `req_id` is JSON null, and a leaf that carries
+/// the key at all never reaches this path: `clause_matches` returns `false` on
+/// a missing key, so absence is not an id.
+const INT_KEYS: &[&str] = &["req_id"];
 
 /// The value that means *this leaf established nothing* — JSON `null`.
 ///
@@ -168,6 +193,18 @@ impl Filter {
                     "`{key}` is a boolean: compare it with `true`, `false` or `null`, not `{value}`"
                 );
             }
+            // M8 follow-up: `req_id` is an integer key, and the emitter writes it
+            // as a JSON number. A non-numeric value has no matching leaf, so
+            // answering it with an empty result would be a confidently wrong
+            // answer to a typo — refuse it here instead. `null` stays legal: it
+            // selects leaves that carry the key as JSON null.
+            if op == Op::Eq
+                && INT_KEYS.contains(&key)
+                && value != NULL_LITERAL
+                && value.parse::<u64>().is_err()
+            {
+                bail!("`{key}` is an integer: compare it with a number (or `null`), not `{value}`");
+            }
             clauses.push(Clause { key: key.to_string(), op, value: value.to_string() });
         }
         Ok(Self { clauses })
@@ -223,6 +260,15 @@ fn eq_match(key: &str, actual: &Value, expected: &str) -> bool {
             return false;
         };
         actual.as_bool() == Some(want)
+    } else if INT_KEYS.contains(&key) {
+        // A first-class integer. The value was refused at parse time unless it
+        // is a number (or `null`, handled above), so this compares numerically:
+        // the default `as_str` path is `None` for a JSON number and would match
+        // nothing, indistinguishable from "no such leaf".
+        let Some(want) = expected.parse::<u64>().ok() else {
+            return false;
+        };
+        actual.as_u64() == Some(want)
     } else if ENUM_KEYS.contains(&key) {
         // case-sensitive for these enums
         actual.as_str().map(|s| s == expected).unwrap_or(false)
@@ -272,7 +318,7 @@ fn ordered_match(key: &str, op: Op, actual: &Value, expected: &str) -> bool {
             _ => unreachable!(),
         }
     } else {
-        // integer compare (seq, pid)
+        // integer compare (seq, pid, req_id)
         let a = match actual.as_i64() { Some(n) => n, None => return false };
         let e: i64 = match expected.parse() { Ok(n) => n, Err(_) => return false };
         let ord = a.cmp(&e);
@@ -581,5 +627,56 @@ mod tests {
         let f = Filter::parse("persisted=false").unwrap();
         assert!(f.matches(&leaf(&[("persisted", json!(false))])));
         assert!(!f.matches(&leaf(&[("persisted", json!(true))])));
+    }
+
+    /// M8 follow-up (2026-11-09 verdict doc, "Known follow-up"): `req_id`
+    /// correlates the leaves one request produces (an admission `allow` and a
+    /// post-dial `deny`), but the filter grammar predates the field, so the
+    /// one question a reader asks after an incident — "what happened to
+    /// request 17?" — was an unknown-key error. The emitter writes `req_id`
+    /// as a JSON number, so the match must be numeric: a number compared as
+    /// a string matches nothing.
+    #[test]
+    fn req_id_is_a_filterable_integer_key() {
+        let f = Filter::parse("req_id=17").unwrap();
+        assert!(f.matches(&leaf(&[("req_id", json!(17))])));
+        assert!(!f.matches(&leaf(&[("req_id", json!(18))])));
+
+        // A leaf that predates M8, or a non-request leaf, carries no `req_id`
+        // at all: absence never matches (there is no request it could be).
+        assert!(!f.matches(&leaf(&[("op", json!("CONNECT"))])));
+
+        // A non-request leaf that carries the key as JSON null is "not one
+        // request": `=null` selects it, `=17` does not.
+        assert!(!f.matches(&leaf(&[("req_id", json!(null))])));
+        assert!(
+            Filter::parse("req_id=null")
+                .unwrap()
+                .matches(&leaf(&[("req_id", json!(null))]))
+        );
+
+        // A non-numeric value is a named parse error, not a silent empty
+        // result.
+        let err = Filter::parse("req_id=abc").expect_err("`req_id=abc` must be a parse error");
+        assert!(
+            err.to_string().contains("req_id"),
+            "the error should name the key: {err}"
+        );
+        assert!(
+            err.to_string().contains("integer"),
+            "the error should name the type: {err}"
+        );
+
+        // Ordered compare works like seq/pid (the grammar already allows
+        // `>=`/`<=` for integer keys).
+        let gte = Filter::parse("req_id>=17").unwrap();
+        assert!(gte.matches(&leaf(&[("req_id", json!(17))])));
+        assert!(gte.matches(&leaf(&[("req_id", json!(100))])));
+        assert!(!gte.matches(&leaf(&[("req_id", json!(16))])));
+
+        // Combined with a taxonomy key, as a reader would write it.
+        let combined = Filter::parse("op=CONNECT&req_id=17").unwrap();
+        assert!(combined.matches(&leaf(&[("op", json!("CONNECT")), ("req_id", json!(17)),])));
+        assert!(!combined.matches(&leaf(&[("op", json!("CONNECT")), ("req_id", json!(18)),])));
     }
 }
