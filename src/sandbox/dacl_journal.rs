@@ -61,7 +61,11 @@ impl DaclJournal {
             .append(true)
             .open(&file)?;
         if f.metadata()?.len() == 0 {
-            writeln!(f, "{}", serde_json::to_string(&header).map_err(std::io::Error::other)?)?;
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&header).map_err(std::io::Error::other)?
+            )?;
             f.sync_all()?;
         }
         Ok(Self { file })
@@ -76,7 +80,11 @@ impl DaclJournal {
             .create(true)
             .append(true)
             .open(&self.file)?;
-        writeln!(f, "{}", serde_json::to_string(entry).map_err(std::io::Error::other)?)?;
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(entry).map_err(std::io::Error::other)?
+        )?;
         f.sync_all()?;
         Ok(())
     }
@@ -107,16 +115,18 @@ impl DaclJournal {
         Ok(())
     }
 
-    /// Every entry (header line excluded). Unparseable lines are skipped.
-    pub fn entries(&self) -> Vec<JournalEntry> {
-        // A journal that cannot be read is NOT an empty journal: `restore_or_warn`
-        // would then report success while leaving every granted ACE on the host.
-        fs::read_to_string(&self.file)
-            .unwrap_or_default()
+    /// Every entry (header line excluded). Unparseable LINES are skipped; an
+    /// UNREADABLE file is an error, never an empty journal — `restore_or_warn`
+    /// treats the error as a restore failure and keeps the journal so the next
+    /// start retries, instead of reporting success while every granted ACE
+    /// stays on the host (M4, security review 2026-11-09).
+    pub fn entries(&self) -> std::io::Result<Vec<JournalEntry>> {
+        let text = fs::read_to_string(&self.file)?;
+        Ok(text
             .lines()
             .skip(1)
             .filter_map(|l| serde_json::from_str(l).ok())
-            .collect()
+            .collect())
     }
 
     pub fn remove_file(&self) {
@@ -132,9 +142,14 @@ impl DaclJournal {
 /// Startup recovery: for every journal in `dir` whose owner is no longer
 /// alive, invoke `reap(&journal)` (restore its entries), then delete it.
 /// Unparseable journals are quarantined as `.corrupt`, never silently
-/// dropped. Returns the number of journals reaped. `is_alive` is injected
-/// for tests (real impl: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) +
-/// GetProcessTimes vs `owner_created`).
+/// dropped. **Unreadable** journals (a sharing violation, a locked file) are
+/// neither quarantined nor deleted: they are kept for the next start, because
+/// a read failure is not evidence of corruption and deleting them would strand
+/// the granted ACEs the file records (M4). Returns the number of journals
+/// actually reaped — a reap that reports failure keeps its journal and does
+/// not count. `is_alive` is injected for tests (real impl:
+/// OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetProcessTimes vs
+/// `owner_created`).
 pub fn recover_orphans(
     dir: &Path,
     is_alive: &dyn Fn(&JournalHeader) -> bool,
@@ -149,9 +164,24 @@ pub fn recover_orphans(
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Some(header) = read_header(&path) else {
-            let _ = fs::rename(&path, path.with_extension("jsonl.corrupt"));
-            continue;
+        let header = match read_header(&path) {
+            Ok(Some(h)) => h,
+            // Readable, but the first line is not a header: quarantine for
+            // inspection (the file was already unusable).
+            Ok(None) => {
+                let _ = fs::rename(&path, path.with_extension("jsonl.corrupt"));
+                continue;
+            }
+            // Unreadable is NOT corrupt and NOT empty. Keep it: the ACEs it
+            // records are still on the host, and the next start can retry.
+            Err(e) => {
+                eprintln!(
+                    "[journal] WARN: cannot read {} ({e}); keeping it for the next start \
+                     - its granted ACEs are still on the host",
+                    path.display()
+                );
+                continue;
+            }
         };
         if header.owner_pid == std::process::id() {
             continue;
@@ -160,10 +190,18 @@ pub fn recover_orphans(
             continue;
         }
         let journal = DaclJournal { file: path };
+        // Count only a reap that actually succeeded: a failed restore keeps
+        // the journal for the next start, so reporting it as reaped would
+        // overstate what was cleaned up.
         if reap(&journal) {
             journal.remove_file();
+            reaped += 1;
+        } else {
+            eprintln!(
+                "[journal] WARN: restore failed for {}; journal retained for the next start",
+                journal.path().display()
+            );
         }
-        reaped += 1;
     }
     reaped
 }
@@ -226,9 +264,16 @@ fn filetime_to_i64(ft: &FILETIME) -> i64 {
     ((ft.dwHighDateTime as i64) << 32) | (ft.dwLowDateTime as i64)
 }
 
-fn read_header(path: &Path) -> Option<JournalHeader> {
-    let first = fs::read_to_string(path).ok()?.lines().next()?.to_string();
-    serde_json::from_str(&first).ok()
+/// Read the header line. `Ok(None)` = the file was read but its first line is
+/// not a header (corrupt: quarantine it). `Err` = the file could not be read
+/// at all (locked, permissions): NOT corrupt, and deleting it would strand the
+/// ACEs it records, so the caller keeps it.
+fn read_header(path: &Path) -> std::io::Result<Option<JournalHeader>> {
+    let text = fs::read_to_string(path)?;
+    Ok(text
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str(l).ok()))
 }
 
 #[cfg(test)]
@@ -266,15 +311,50 @@ mod tests {
         }
     }
 
+    /// Hold `path` open with a share mode of 0, so every other open — including
+    /// `fs::read_to_string` — fails with a sharing violation. That is what a
+    /// journal locked by an AV scanner or a second writer looks like, and it is
+    /// the "unreadable" case M4 is about. Dropping the guard releases it.
+    struct ExclusiveLock(windows::Win32::Foundation::HANDLE);
+    impl Drop for ExclusiveLock {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn exclusive_lock(path: &std::path::Path) -> ExclusiveLock {
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_GENERIC_READ, FILE_SHARE_MODE, OPEN_EXISTING,
+        };
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                FILE_GENERIC_READ.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        }
+        .expect("open the journal exclusively to simulate a locked file");
+        ExclusiveLock(handle)
+    }
+
     #[test]
     fn record_many_roundtrips_batch_in_order() {
         let d = tmpdir("batch");
         let j = DaclJournal::open(&d, header(4242)).unwrap();
-        let entries: Vec<JournalEntry> = (0..3)
-            .map(|i| entry(&format!("C:\\batch{i}")))
-            .collect();
+        let entries: Vec<JournalEntry> = (0..3).map(|i| entry(&format!("C:\\batch{i}"))).collect();
         j.record_many(&entries).unwrap();
-        let read = j.entries();
+        let read = j.entries().unwrap();
         assert_eq!(read.len(), 3, "all batch entries journaled");
         assert_eq!(read[0].path, "C:\\batch0");
         assert_eq!(read[2].path, "C:\\batch2", "order preserved");
@@ -285,8 +365,117 @@ mod tests {
         let d = tmpdir("roundtrip");
         let j = DaclJournal::open(&d, header(4242)).unwrap();
         j.record(&entry("C:\\x")).unwrap();
-        assert_eq!(j.entries().len(), 1);
-        assert_eq!(j.entries()[0].sid, "S-1-15-2-42");
+        assert_eq!(j.entries().unwrap().len(), 1);
+        assert_eq!(j.entries().unwrap()[0].sid, "S-1-15-2-42");
+    }
+
+    /// M4 (security review 2026-11-09, confirmed): an unreadable journal must
+    /// NOT read as an empty one. The bug: `entries()` swallowed the read
+    /// error, `restore_all` then "restored" nothing, reported success, and
+    /// teardown deleted the journal — leaving every granted ACE on the host
+    /// forever, with the module comment claiming the opposite. This pins the
+    /// journal's half of the contract; the teardown half lives in
+    /// appcontainer.rs (`restore_or_warn` must return false).
+    #[test]
+    fn an_unreadable_journal_is_an_error_not_an_empty_inventory() {
+        let d = tmpdir("unreadable");
+        let j = DaclJournal::open(&d, header(4242)).unwrap();
+        j.record(&entry("C:\\locked")).unwrap();
+        let _hold = exclusive_lock(j.path());
+        assert!(
+            j.entries().is_err(),
+            "a sharing violation on the journal must be an error, not Ok([]) - an empty \
+             inventory would let teardown report success and delete the file"
+        );
+    }
+
+    /// M4 teardown half: with the journal unreadable, `restore_or_warn` (the
+    /// function main.rs calls at teardown) must report FAILURE, and the caller
+    /// then keeps the file. Once readable again, a restore that succeeds is
+    /// reported and the file may be removed by the caller.
+    #[test]
+    fn teardown_reports_failure_and_keeps_an_unreadable_journal() {
+        let d = tmpdir("teardown-locked");
+        let j = DaclJournal::open(&d, header(99996)).unwrap();
+        j.record(&entry("C:\\locked")).unwrap();
+        assert!(j.path().exists(), "the journal exists before teardown");
+
+        let _hold = exclusive_lock(j.path());
+        let ok = crate::sandbox::appcontainer::restore_or_warn(&j);
+        assert!(
+            !ok,
+            "an unreadable journal must fail the teardown - restore_or_warn reported success \
+             on an inventory it could not read"
+        );
+        // The teardown contract: `if ok { journal.remove_file() }` (main.rs).
+        if ok {
+            j.remove_file();
+        }
+        assert!(
+            j.path().exists(),
+            "an unreadable journal must survive teardown so the next start retries it"
+        );
+        assert!(
+            !d.join("r99996.jsonl.corrupt").exists(),
+            "an unreadable journal is not corrupt and must not be quarantined"
+        );
+
+        // Negative control: once the lock is gone, the same journal reads and
+        // the restore path can succeed (the reap closure in the next test
+        // exercises deletion on success).
+        drop(_hold);
+        assert!(
+            j.entries().unwrap().len() == 1,
+            "the journal is intact after the lock is released"
+        );
+    }
+
+    /// M4 startup half: `recover_orphans` must count `reaped` only when the
+    /// reap actually succeeded, and keep (not quarantine) a journal it cannot
+    /// read.
+    #[test]
+    fn a_failed_reap_is_not_counted_and_keeps_the_journal() {
+        let d = tmpdir("failed-reap");
+        let dead = DaclJournal::open(&d, header(99995)).unwrap();
+        dead.record(&entry("C:\\y")).unwrap();
+        let reaped = recover_orphans(&d, &|h| h.owner_pid == 4242, &|_| false);
+        assert_eq!(
+            reaped, 0,
+            "a failed restore is not a reaped journal - the count must not overstate cleanup"
+        );
+        assert!(
+            d.join("r99995.jsonl").exists(),
+            "the failed reap must keep the journal for the next start"
+        );
+        // The success path still removes it.
+        let reaped = recover_orphans(&d, &|h| h.owner_pid == 4242, &|_| true);
+        assert_eq!(reaped, 1, "a successful reap counts exactly once");
+        assert!(
+            !d.join("r99995.jsonl").exists(),
+            "the journal is removed on success"
+        );
+    }
+
+    /// M4 startup half: a journal locked against reads is kept as-is — not
+    /// quarantined (a read failure is not corruption), not reaped (its ACEs
+    /// are still on the host), and it is still there for the next start.
+    #[test]
+    fn recover_orphans_keeps_an_unreadable_journal_without_quarantining_it() {
+        let d = tmpdir("locked-recover");
+        let dead = DaclJournal::open(&d, header(99994)).unwrap();
+        dead.record(&entry("C:\\z")).unwrap();
+        let _hold = exclusive_lock(dead.path());
+        let reaped = recover_orphans(&d, &|_| false, &|_| true);
+        drop(_hold);
+        assert_eq!(reaped, 0, "an unreadable journal is not reaped");
+        assert!(
+            d.join("r99994.jsonl").exists(),
+            "an unreadable journal is kept for the next start"
+        );
+        assert!(
+            !d.join("r99994.jsonl.corrupt").exists(),
+            "an unreadable journal must not be quarantined as corrupt"
+        );
     }
 
     #[test]
@@ -333,7 +522,7 @@ mod tests {
         let reaped = recover_orphans(&d, &|h| h.owner_pid != 99998, &|journal| {
             restore_ran.set(true);
             assert_eq!(
-                journal.entries().len(),
+                journal.entries().unwrap().len(),
                 1,
                 "the restore path sees the journaled ACE"
             );

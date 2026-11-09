@@ -128,8 +128,16 @@ Two hard limits worth knowing before you put an agent behind this:
 | `--allow-cwd` | read+write+execute on the current directory |
 | `--allow <path>` | read+write+execute on a path (repeatable) |
 | `--allow <path>:read` | read+execute only |
-| `--allow <path>:write` | write only |
+| `--allow <path>:readwrite` | read+write+execute (the same as a bare `--allow`) |
 | `--read-only <path>` | read-only on a path (repeatable) |
+
+There is no `:write` or `:execute` mode. Both are refused with an error: a
+grant is a single access mask per path on Windows, and a write-only or
+execute-only mask cannot be expressed safely (write-only still needs read to
+open what it wrote; a loader needs read to map an image). The two modes used
+to be accepted and silently widened to full access, which granted read on a
+path the operator meant to keep unread — the refusal is the honest answer.
+Use `:readwrite` for a writable grant and `:read` for a read-only one.
 
 Read-only grants are enforced by the container's policy, not by hope:
 

@@ -649,8 +649,23 @@ fn apply_dacl_kernel(path_str: &str, new_acl: *mut ACL, protected: bool) -> Resu
 /// Revoke our trustee's ACEs and re-grant the journaled prior state for
 /// every entry in the journal (MXC teardown semantics). Applies through
 /// `apply_dacl_kernel` — never through the Marta write path.
+///
+/// An UNREADABLE journal is an error, never an empty inventory (M4, security
+/// review 2026-11-09): `restore_or_warn` turns that into a failed teardown and
+/// main.rs keeps the journal, so a locked or unreadable file cannot be reported
+/// as success-and-deleted while every granted ACE stays on the host.
 pub fn restore_all(journal: &DaclJournal) -> Result<()> {
-    for entry in journal.entries() {
+    let entries = journal.entries().map_err(|e| {
+        Error::new(
+            HRESULT::from_win32(e.raw_os_error().unwrap_or(5) as u32),
+            format!(
+                "cannot read the DACL journal {}: {e} - the ACEs it records are still on \
+                 the host, so the journal is kept for the next start",
+                journal.path().display()
+            ),
+        )
+    })?;
+    for entry in entries {
         restore_one(&entry)?;
     }
     Ok(())
@@ -1568,6 +1583,57 @@ mod propagation_tests {
         );
     }
 
+    /// M5 residual (security review 2026-11-09): the `.sandbox` parent is
+    /// applied with a PROTECTED DACL carrying only traverse + read-attributes,
+    /// so a sibling session's broad `$CWD` allow (inherited) does NOT reach it
+    /// — it cannot LIST the sibling `<sid>` names, and (no
+    /// FILE_ADD_SUBDIRECTORY / FILE_DELETE_CHILD) cannot create or rename a
+    /// sibling entry through it. This is the applied-DACL half; the entry-shape
+    /// half is pinned in allowlist.rs.
+    #[test]
+    fn m5_sandbox_parent_dacl_is_protected_and_grants_no_list_directory() {
+        let sid = make_sid(TEST_SID);
+        let base = tmp_tag("m5-parent");
+        let _guard = TempDir(base.clone());
+        let sandbox = base.join("proj").join(".sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+
+        let entry = AllowEntry {
+            win32_path: sandbox.clone(),
+            access: crate::sandbox::allowlist::ANCESTOR_MASK,
+            label: ".sandbox".into(),
+            deny: false,
+            protected: true,
+            inherit: true,
+        };
+        grant_access(&sid, &[entry], None).unwrap();
+
+        assert!(
+            dacl_is_protected(&sandbox.to_string_lossy()),
+            "the .sandbox parent must carry a PROTECTED DACL (M5 residual)"
+        );
+        // The session SID's allow ACE must intersect no FILE_LIST_DIRECTORY —
+        // a sibling enumerating the dir is the residual the fix closes.
+        let aces = trustee_ace_flags(&sandbox.to_string_lossy(), &sid);
+        assert!(
+            !aces.is_empty(),
+            "the session SID must still be able to traverse .sandbox: {aces:?}"
+        );
+        for (mask, _) in &aces {
+            assert_eq!(
+                mask & FILE_LIST_DIRECTORY.0,
+                0,
+                ".sandbox must not grant FILE_LIST_DIRECTORY to a session SID — \
+                 sibling <sid> names would be enumerable: mask=0x{mask:x}"
+            );
+            assert_ne!(
+                mask & FILE_TRAVERSE.0,
+                0,
+                ".sandbox must still grant FILE_TRAVERSE: mask=0x{mask:x}"
+            );
+        }
+    }
+
     /// C1: the deny trustee is the AppContainer SID, never the user or the
     /// supervisor token. Arming a real `FILE_ALL_ACCESS` deny must therefore
     /// leave the supervisor's own read access untouched — if someone ever
@@ -1636,7 +1702,7 @@ mod propagation_tests {
     #[test]
     #[ignore = "arms a real AppContainer session (creates a profile, writes DACLs); run: cargo test --bin saife c1_live -- --ignored"]
     fn c1_live_armed_appcontainer_denies_file_read_data_on_ssh() {
-        use crate::sandbox::allowlist::build_allowlist;
+        use crate::sandbox::allowlist::build_allowlist_with;
 
         let _env = crate::env_lock();
         let base = tmp_tag("c1-live");
@@ -1675,7 +1741,24 @@ mod propagation_tests {
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let entries = build_allowlist(&sid, &home, &fs).expect("build the allowlist");
+        // M3: `build_allowlist` roots the builtin credential denies at the
+        // OS-known profile directory, so repointing USERPROFILE no longer
+        // moves them onto the scratch tree. The deny set is therefore injected
+        // explicitly: this test's subject is the deny MASK (C1), not where the
+        // deny list comes from (M3's unit tests pin that), and injecting keeps
+        // the scratch tree's DACLs in play instead of the real `~/.ssh`.
+        let scratch_denies: Vec<std::path::PathBuf> =
+            [".ssh", ".aws", ".azure", ".gnupg", ".saife"]
+                .iter()
+                .map(|d| home.join(d))
+                .chain(std::iter::once(local.join("saife")))
+                .collect();
+        let scratch_deny_files: Vec<std::path::PathBuf> = vec![
+            home.join(".ssh").join("id_ed25519"),
+            local.join("saife").join("provider.json"),
+        ];
+        let entries = build_allowlist_with(&sid, &home, &fs, &scratch_denies, &scratch_deny_files)
+            .expect("build the allowlist");
         let journal = DaclJournal::open(
             &base.join("journal"),
             JournalHeader {

@@ -39,7 +39,7 @@ pub const RX: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 /// `FILE_LIST_DIRECTORY`, so sibling directory contents stay hidden.
 /// Fixes KI-1.2's `lstat` failures (e.g. Node `fs.lstatSync` on the user
 /// home) without weakening sibling isolation.
-const ANCESTOR_MASK: u32 = FILE_READ_ATTRIBUTES.0 | FILE_TRAVERSE.0;
+pub(crate) const ANCESTOR_MASK: u32 = FILE_READ_ATTRIBUTES.0 | FILE_TRAVERSE.0;
 
 /// The python shim the sandbox injects via PYTHONPATH (see the module
 /// docstring in sitecustomize.py for why it must rewrite mode 0o700).
@@ -88,7 +88,7 @@ pub fn build_allowlist(
     build_allowlist_with(sid, cwd, fs, &dirs, &files)
 }
 
-fn build_allowlist_with(
+pub(crate) fn build_allowlist_with(
     sid: &str,
     cwd: &std::path::Path,
     fs: &FilesystemSlice,
@@ -232,16 +232,25 @@ fn build_allowlist_with(
         );
     }
 
-    // .sandbox: minimal RX so the owning session can traverse to reach its own
-    // subtree, without being able to read sibling subtrees (the per-session
-    // subtrees are PROTECTED so inheritance stops at their boundary).
+    // M5 residual (security review 2026-11-09): `.sandbox` itself is granted
+    // with a PROTECTED DACL carrying only traverse + read-attributes, so it
+    // inherits NOTHING from `$CWD` — a sibling session's broad `$CWD` allow
+    // used to reach this directory and let it enumerate the `<sid>` names,
+    // create entries beside them and rename another session's tree. With no
+    // FILE_LIST_DIRECTORY the sibling names are not enumerable, and without
+    // FILE_ADD_SUBDIRECTORY/FILE_DELETE_CHILD nothing can be created or
+    // renamed through it. Sibling isolation therefore rests on BOTH layers:
+    // this PROTECTED parent and the per-session PROTECTED `<sid>` DACLs below.
+    // The owner trustees keep full control on every PROTECTED DACL
+    // (see `grant_one`'s owner re-grant), so the supervisor can still create
+    // and tear down the per-session directories.
     push_entry(
         &mut entries,
         cwd.join(".sandbox"),
-        RX,
+        ANCESTOR_MASK,
         ".sandbox".into(),
         false,
-        false,
+        true,
     );
 
     // Per-session subtree: PROTECTED so it inherits nothing from $CWD/.sandbox.
@@ -1203,6 +1212,93 @@ mod tests {
         );
     }
 
+    /// M5 residual (security review 2026-11-09): `.sandbox` itself used to
+    /// inherit the broad `$CWD` RWX grant, so a second session could enumerate
+    /// sibling `<sid>` names, create entries under `.sandbox` and rename another
+    /// session's tree. The parent is now PROTECTED and granted only traverse +
+    /// read-attributes — enough for the owning session to reach its own subtree,
+    /// not enough to LIST siblings. (The per-session `<sid>` entries stay
+    /// PROTECTED as before; this is the missing second layer.)
+    #[test]
+    fn m5_sandbox_parent_is_protected_and_grants_no_list_directory() {
+        let fs = FilesystemSlice::default();
+        let entries = build_allowlist("m5-parent", std::path::Path::new(r"C:\proj"), &fs).unwrap();
+        let parent = entries
+            .iter()
+            .find(|e| e.label == ".sandbox")
+            .expect("the .sandbox parent grant must exist");
+        assert!(
+            parent.protected,
+            "`.sandbox` must be PROTECTED so a sibling session's inherited $CWD allow does \
+             not reach it: mask=0x{:x} inherit={}",
+            parent.access, parent.inherit
+        );
+        assert_eq!(
+            parent.access & FILE_LIST_DIRECTORY.0,
+            0,
+            "`.sandbox` must NOT grant FILE_LIST_DIRECTORY — sibling <sid> names would be \
+             enumerable: mask=0x{:x}",
+            parent.access
+        );
+        assert_ne!(
+            parent.access & FILE_TRAVERSE.0,
+            0,
+            "`.sandbox` must still grant FILE_TRAVERSE so the owning session reaches its \
+             own subtree: mask=0x{:x}",
+            parent.access
+        );
+    }
+
+    /// M1: the CLI modes that survive the parser reach the DACL as the
+    /// documented masks, not as "everything writable". `:read` is RX,
+    /// `:readwrite` and a bare `--allow` are RWX. (`:write`/`:execute` are
+    /// refused at the parser, profile.rs, where the mode strings live.)
+    #[test]
+    fn m1_read_and_readwrite_modes_carry_their_documented_masks() {
+        let cwd = std::path::Path::new(r"C:\proj");
+        let fs = crate::profile::merge_filesystem(
+            &FilesystemSlice::default(),
+            false,
+            &[
+                "C:/grants/rw:readwrite".into(),
+                "C:/grants/bare".into(),
+                "C:/grants/r:read".into(),
+            ],
+            &[],
+            cwd,
+        )
+        .expect("the supported modes must parse");
+        let entries = build_allowlist_with("m1-sid", cwd, &fs, &[], &[]).unwrap();
+
+        let grant = |path: &str| {
+            entries
+                .iter()
+                .find(|e| !e.deny && paths_eq_ci(&e.win32_path, std::path::Path::new(path)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no grant entry for {path}: {:?}",
+                        entries.iter().map(|e| &e.label).collect::<Vec<_>>()
+                    )
+                })
+                .access
+        };
+        assert_eq!(
+            grant(r"C:\grants\rw"),
+            RWX,
+            "`:readwrite` must grant read+write+execute"
+        );
+        assert_eq!(
+            grant(r"C:\grants\bare"),
+            RWX,
+            "a bare `--allow` is the documented readwrite default"
+        );
+        assert_eq!(
+            grant(r"C:\grants\r"),
+            RX,
+            "`:read` must grant read+execute only"
+        );
+    }
+
     /// M5 pin (partial verdict): the per-session `.sandbox\<sid>` subtree is
     /// granted with a PROTECTED DACL, so it inherits nothing from `$CWD` /
     /// `.sandbox` — session B's inherited `$CWD` allow does not reach session
@@ -1230,15 +1326,17 @@ mod tests {
                 e.label
             );
         }
-        // The `.sandbox` parent itself is the documented M5 residual: it is a
-        // plain inheritable RX grant today, and changing that is a separate
-        // fix the owner has not approved. Pin the current shape so any change
-        // there is a deliberate decision, not drift.
+        // The `.sandbox` parent is now PROTECTED too (M5 residual closed): the
+        // per-session subtrees stop inheritance at their own boundary, and the
+        // parent no longer inherits the broad `$CWD` allow either.
         let parent = entries
             .iter()
             .find(|e| e.label == ".sandbox")
             .expect("the .sandbox parent grant must exist");
-        assert!(!parent.protected, "the M5 residual is still open");
+        assert!(
+            parent.protected,
+            "the .sandbox parent must be PROTECTED as well (M5 residual)"
+        );
     }
 
     /// M2: a jvm-profile policy must carry descendant deny ACEs for the whole
@@ -1295,9 +1393,13 @@ mod tests {
         )
         .expect("the jvm profile must build an allowlist");
 
-        let home = std::path::PathBuf::from(
-            std::env::var_os("USERPROFILE").expect("USERPROFILE is needed to spell the grants"),
-        );
+        // M3: the credential-deny base is the OS-known profile root (with a
+        // USERPROFILE fallback), so the `want` list is spelled from the same
+        // source the production code asks — not from an env variable another
+        // test could be repointing under this suite's env lock.
+        let home = crate::profile::system_profile_root()
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+            .expect("the profile root is needed to spell the grants");
         let appdata = std::path::PathBuf::from(
             std::env::var_os("APPDATA").expect("APPDATA is needed to spell NuGet.Config"),
         );

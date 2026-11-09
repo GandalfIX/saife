@@ -2265,11 +2265,25 @@
             "the tool's own control plane is always denied as well: {:?}",
             fs.denied_paths
         );
-        assert!(
-            !fs.denied_paths.iter().any(|d| d.contains(".ssh")),
-            "no profile means no profile denies: {:?}",
-            fs.denied_paths
-        );
+        // M3: "no profile" no longer means "no credential denies". The builtin
+        // set is rooted at the OS-known profile directory and is pushed
+        // unconditionally, so an absent `profile_dir` (an UNSET `USERPROFILE`)
+        // still denies the real credential trees — they are the one deny no
+        // configuration, and no environment, can remove.
+        let real = crate::profile::system_profile_root()
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+            .expect("the credential-deny base exists");
+        for dir in crate::net::mxc::PROFILE_SECRET_DIRS {
+            let denied_dir = real.join(dir).display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&denied_dir)),
+                "the builtin credential denies survive an absent profile_dir: {dir} missing \
+                 from {:?}",
+                fs.denied_paths
+            );
+        }
     }
 
     /// A deny that *is* a grant sits on the boundary of "contains a grant": it can
