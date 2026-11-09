@@ -2256,12 +2256,20 @@ function Invoke-Scenario-S74 {
     $d = New-ScenarioDir 74
     $journalDir = Get-DaclJournalDir
     $beforeJournals = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $proc = Start-SandboxProcess -Arguments 'run --allow-cwd -- cmd /c ping -n 30 127.0.0.1' -WorkingDirectory $d
+    # The workload MUST outlive the supervisor kill below. It used to be
+    # `ping -n 30 127.0.0.1`, but ICMP is denied inside the AppContainer: ping
+    # exits at once, the session lived ~100ms, and its journal existed for
+    # ~76ms (measured 2026-11-09 on an unelevated host) - so the 300ms poll
+    # missed it DETERMINISTICALLY and the scenario reported "journaling not
+    # wired?". The CPU-spin hold keeps the session alive with no stdin, no
+    # network and no output, and the poll is tightened to 50ms.
+    $hold = New-HoldBatch -Dir $d
+    $proc = Start-SandboxProcess -Arguments ("run --allow-cwd -- cmd /c {0}" -f $hold) -WorkingDirectory $d
     $journal = $null
     try {
         $deadline = (Get-Date).AddSeconds(20)
         while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 300
+            Start-Sleep -Milliseconds 50
             $now = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue |
                 Where-Object { $beforeJournals.Name -notcontains $_.Name })
             if ($now.Count -gt 0) { $journal = $now[0]; break }
