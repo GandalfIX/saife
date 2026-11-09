@@ -14,8 +14,8 @@
   (documented, rejected for cost — see `fc99657`), and the M11 cross-session
   code-execution gap itself. Two follow-ups found on the way: `restore_one`
   does not strip deny ACEs (inert litter, teardown fix pending), `req_id` is
-  not yet an audit `--filter` key, and AGENTS.md's L-O note is stale
-  (protected file — owner must edit).
+  not yet an audit `--filter` key. AGENTS.md's L-O note was rewritten on
+  2026-11-09 (`4c0d3b8`) with the owner's consent.
 - **Basis:** `0a55236` (`feat/ssh-gateway-plugin`, PR #39 head), branch `security/review-20261109`.
 - **Review under test:** an external security review with 39 points (2 Critical, 5 High,
   16 Medium, 16 Low). Point ids below are that review's ids.
