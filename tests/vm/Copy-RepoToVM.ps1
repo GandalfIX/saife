@@ -164,6 +164,9 @@ try {
         (Join-Path $repoRoot 'target'),
         (Join-Path $repoRoot '.git'),
         (Join-Path $repoRoot '.sandbox'),
+        # Other branches' checkouts (git worktree), incl. their hidden `.git`
+        # pointer files - not this working tree (see Invoke-TestsInVM.ps1).
+        (Join-Path $repoRoot '.worktrees'),
         (Join-Path $repoRoot 'tests\vm\vms'),
         (Join-Path $repoRoot 'tests\vm\results'),
         (Join-Path $repoRoot 'tests\vm\templates')
