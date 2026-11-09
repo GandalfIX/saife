@@ -228,6 +228,8 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
     // facade, but a bound is still cheaper than trusting the relay.
     let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut sock)).await {
         Ok(HeadRead::Complete(head)) => String::from_utf8_lossy(&head).into_owned(),
+        // No parsed head, so no declared length to drain: this client flooded the
+        // head, and the 431 is the last thing it is owed.
         Ok(HeadRead::TooLarge) => {
             return respond(&mut sock, "431 Request Header Fields Too Large", "", "").await;
         }
@@ -262,6 +264,14 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
         })
         .unwrap_or(false);
     if !presented_ok {
+        // Drain the declared body BEFORE refusing: closing a socket that still
+        // holds unread inbound data makes Windows send a RST, and a RST can
+        // destroy the tail of THIS response before the client reads it (observed
+        // in CI as a 401 truncated inside the header block). The facade always
+        // frames its request, so a drain here reads a bounded, already-arrived
+        // body; a client that declared a body and never sent it pays at most
+        // one BODY_READ_TIMEOUT before the refusal.
+        drain_declared_body(&mut sock, &head).await;
         return respond(
             &mut sock,
             "401 Unauthorized",
@@ -366,7 +376,10 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
                 Err(e) => respond(&mut sock, "404 Not Found", "", &format!("{e:#}\n")).await,
             }
         }
-        _ => respond(&mut sock, "404 Not Found", "", "runner_operation_unknown\n").await,
+        _ => {
+            drain_declared_body(&mut sock, &head).await;
+            respond(&mut sock, "404 Not Found", "", "runner_operation_unknown\n").await
+        }
     }
 }
 
@@ -445,6 +458,38 @@ async fn read_body(sock: &mut TcpStream, head: &str) -> Vec<u8> {
     }
     body.truncate(got);
     body
+}
+
+/// Read (and discard) the body the head declares, bounded by the same cap and
+/// timeout a real read gets. Every refusal that fires BEFORE the body would be
+/// read must call this: closing the socket with unread inbound data pending
+/// makes Windows emit a RST, and a RST can destroy the tail of the response the
+/// client is still waiting for - a truncated refusal that reads like a protocol
+/// error (observed in CI on the 401 path).
+async fn drain_declared_body(sock: &mut TcpStream, head: &str) {
+    const CAP: usize = 4096;
+    let want = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+        .min(CAP);
+    if want == 0 {
+        return;
+    }
+    let mut got = 0;
+    let mut chunk = [0u8; 512];
+    while got < want {
+        match tokio::time::timeout(BODY_READ_TIMEOUT, sock.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => got += n,
+        }
+    }
 }
 
 async fn respond(sock: &mut TcpStream, status: &str, headers: &str, body: &str) -> Result<()> {
@@ -676,6 +721,28 @@ mod tests {
             resp.starts_with("HTTP/1.0 202"),
             "the real token must still be accepted: {resp}"
         );
+    }
+
+    /// CI caught a truncated 401: the refusal path answered without reading the
+    /// declared body, the close then carried a RST, and the RST destroyed the
+    /// response tail before the client read it ("WWW-A" and nothing more). The
+    /// refusal now drains the body first. A single iteration cannot prove the
+    /// race is gone, so this repeats it; with unread data still pending the tail
+    /// is lost at least once under load.
+    #[test]
+    fn the_token_refusal_leaves_no_unread_body_to_reset_the_connection() {
+        let h = harness();
+        for attempt in 0..8 {
+            let resp = post_build(h.server.port, Some("wrong-token"), GOOD);
+            assert!(
+                resp.starts_with("HTTP/1.0 401"),
+                "attempt {attempt}: got: {resp}"
+            );
+            assert!(
+                resp.contains("runner_token_invalid"),
+                "attempt {attempt}: the refusal body must arrive whole: {resp}"
+            );
+        }
     }
 
     /// A build the runner stopped at its deadline is not a build that failed: the
