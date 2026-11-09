@@ -600,9 +600,11 @@ fn flush_batch(
     }
 }
 
-/// Open `path` for a DACL write and apply `new_acl` via kernel-handle
-/// `SetSecurityInfo` (the de0b9bf Marta-hang bypass). Frees `new_acl`.
-fn apply_dacl_kernel(path_str: &str, new_acl: *mut ACL, protected: bool) -> Result<()> {
+/// Open `path` for a DACL write and apply `acl` via kernel-handle
+/// `SetSecurityInfo` (the de0b9bf Marta-hang bypass). Does NOT free `acl` —
+/// for callers that hold the buffer themselves (the restore path builds its
+/// stripped ACL in a caller-owned `Vec`, which the allocator frees).
+fn set_dacl_kernel(path_str: &str, acl: *const ACL, protected: bool) -> Result<()> {
     unsafe {
         let mut path_buf: Vec<u16> = path_str.encode_utf16().collect();
         path_buf.push(0); // ensure trailing null
@@ -615,29 +617,14 @@ fn apply_dacl_kernel(path_str: &str, new_acl: *mut ACL, protected: bool) -> Resu
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         );
-        let handle = match open_r {
-            Ok(h) => h,
-            Err(e) => {
-                LocalFree(Some(HLOCAL(new_acl as *mut _)));
-                return Err(e);
-            }
-        };
+        let handle = open_r?;
         // call SetSecurityInfo (which uses the kernel) with the handle.
         let flags = if protected {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
         } else {
             DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION
         };
-        let write_r = SetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            flags,
-            None,
-            None,
-            Some(new_acl),
-            None,
-        );
-        let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
+        let write_r = SetSecurityInfo(handle, SE_FILE_OBJECT, flags, None, None, Some(acl), None);
         let _ = CloseHandle(handle);
         if write_r.is_err() {
             return Err(HRESULT::from_win32(write_r.0).into());
@@ -646,9 +633,24 @@ fn apply_dacl_kernel(path_str: &str, new_acl: *mut ACL, protected: bool) -> Resu
     Ok(())
 }
 
-/// Revoke our trustee's ACEs and re-grant the journaled prior state for
-/// every entry in the journal (MXC teardown semantics). Applies through
-/// `apply_dacl_kernel` — never through the Marta write path.
+/// `set_dacl_kernel` for an aclapi-allocated ACL (`SetEntriesInAclW`
+/// output): takes ownership and `LocalFree`s it afterwards.
+fn apply_dacl_kernel(path_str: &str, new_acl: *mut ACL, protected: bool) -> Result<()> {
+    let r = set_dacl_kernel(path_str, new_acl, protected);
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
+    }
+    r
+}
+
+/// Strip every ACE this session installed and re-grant the journaled prior
+/// state for every entry in the journal (MXC teardown semantics). Applies
+/// through `apply_dacl_kernel` — never through the Marta write path.
+///
+/// "Every ACE" means every access mode: a `REVOKE_ACCESS` replay removed the
+/// session SID's ALLOW ACEs but left its `DENY_ACCESS` ACEs behind (probed
+/// 2026-11-09), which since C1 are real `FILE_ALL_ACCESS` denies on the six
+/// builtin-deny trees. See `dacl_without_trustee_aces`.
 ///
 /// An UNREADABLE journal is an error, never an empty inventory (M4, security
 /// review 2026-11-09): `restore_or_warn` turns that into a failed teardown and
@@ -665,7 +667,21 @@ pub fn restore_all(journal: &DaclJournal) -> Result<()> {
             ),
         )
     })?;
+    // First entry per path wins (see the comment at the loop). The set is
+    // keyed by the journal's path string verbatim.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in entries {
+        // One restore per path. The journal records an entry per grant (and
+        // per propagated descendant), and a single run can journal the same
+        // path more than once - e.g. an allow and a deny on the same tree, or
+        // two grant batches sharing the journal. The FIRST entry for a path
+        // carries the path's true pre-grant `prior_aces`; every later entry's
+        // snapshot was taken after an earlier grant had already written this
+        // session's ACEs, so replaying it would resurrect exactly the ACEs
+        // the first restore just stripped.
+        if !seen.insert(entry.path.clone()) {
+            continue;
+        }
         restore_one(&entry)?;
     }
     Ok(())
@@ -728,19 +744,14 @@ fn restore_one(e: &JournalEntry) -> Result<()> {
             return Ok(());
         }
 
-        let revoke = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: 0,
-            grfAccessMode: REVOKE_ACCESS,
-            grfInheritance: NO_INHERITANCE,
-            Trustee: TRUSTEE_W {
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_GROUP,
-                ptstrName: PWSTR(psid.0 as *mut _),
-                ..Default::default()
-            },
-        };
-
         let mut new_acl: *mut ACL = std::ptr::null_mut();
+        // When the stripped ACL is written straight back (no prior state to
+        // re-merge), it lives in `stripped` and is written with set_dacl_kernel
+        // (no LocalFree); `borrowed` carries its pointer for the write at the
+        // end. When there is prior state, SetEntriesInAclW produces an
+        // aclapi-owned `new_acl` instead and `borrowed` stays None.
+        let mut stripped: Vec<u32> = Vec::new();
+        let mut borrowed: Option<*const ACL> = None;
         let set_r = if e.protected {
             // PROTECTED dropped inheritance, so grant_one rebuilt the DACL
             // from scratch: rebuild it the same way (owner trustees + prior
@@ -759,26 +770,54 @@ fn restore_one(e: &JournalEntry) -> Result<()> {
             }
             SetEntriesInAclW(Some(&all_entries), None, &mut new_acl)
         } else {
-            let old_acl_opt = if dacl_ptr.is_null() {
+            // Drop EVERY ACE naming the session SID - allow and deny alike -
+            // then re-merge the journaled prior state. `REVOKE_ACCESS` alone
+            // removed only the ALLOW ACEs: a DENY_ACCESS ACE for the same
+            // trustee survived the replay (probed 2026-11-09 through
+            // GetExplicitEntriesFromAclW: the FILE_ALL_ACCESS deny was still
+            // listed after restore). Since C1 the session's deny ACEs carry a
+            // real FILE_ALL_ACCESS mask on the six builtin-deny trees, so a
+            // revoke-only teardown left them permanently on the user's real
+            // credential directories - inert once profile teardown deletes the
+            // SID, but litter, and it breaks "a session leaves the host as it
+            // found it".
+            //
+            // dacl_without_trustee_aces copies the raw ACEs (InitializeAcl +
+            // AddAce), so inherited ACEs and every other trustee's entries
+            // travel byte-identical; SetEntriesInAclW then merges the prior
+            // state on top. A blanket DACL write of a rebuilt-from-scratch ACL
+            // would drop the owner's entries instead.
+            let base = if dacl_ptr.is_null() {
                 None
             } else {
-                Some(dacl_ptr as *const ACL)
+                match dacl_without_trustee_aces(dacl_ptr, &psid, &mut stripped) {
+                    Ok(acl) => Some(acl),
+                    Err(err) => {
+                        let _ = LocalFree(Some(HLOCAL(psid.0 as *mut _)));
+                        let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+                        return Err(err);
+                    }
+                }
             };
-            let mut tmp: *mut ACL = std::ptr::null_mut();
-            let first = SetEntriesInAclW(Some(&[revoke]), old_acl_opt, &mut tmp);
-            if first.is_err() {
-                let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
-                let _ = LocalFree(Some(HLOCAL(psid.0 as *mut _)));
-                return Err(HRESULT::from_win32(first.0).into());
-            }
             let prior: Vec<EXPLICIT_ACCESS_W> = prior_eas(&e.prior_aces, psid);
             if prior.is_empty() {
-                new_acl = tmp;
-                WIN32_ERROR(0)
+                // `base` is always Some here: an object with no DACL carries
+                // none of our ACEs, so the early return above fires when there
+                // is also no prior state. The stripped ACL is borrowed from
+                // `stripped`, so it is written with set_dacl_kernel (which
+                // does not free it) — never apply_dacl_kernel.
+                match base {
+                    Some(acl) => {
+                        borrowed = Some(acl);
+                        WIN32_ERROR(0)
+                    }
+                    None => WIN32_ERROR(0),
+                }
             } else {
-                let second = SetEntriesInAclW(Some(&prior), Some(tmp), &mut new_acl);
-                let _ = LocalFree(Some(HLOCAL(tmp as *mut _)));
-                second
+                // aclapi copies the ACEs it reads, so a borrowed old ACL is a
+                // legal input; the merged output is LocalAlloc'd (freed by
+                // apply_dacl_kernel below).
+                SetEntriesInAclW(Some(&prior), base, &mut new_acl)
             }
         };
 
@@ -788,7 +827,89 @@ fn restore_one(e: &JournalEntry) -> Result<()> {
             return Err(HRESULT::from_win32(set_r.0).into());
         }
 
-        apply_dacl_kernel(&path_str, new_acl, e.protected)
+        match borrowed {
+            Some(acl) => set_dacl_kernel(&path_str, acl, e.protected),
+            None => apply_dacl_kernel(&path_str, new_acl, e.protected),
+        }
+    }
+}
+
+/// A standard (non-object) ACE: `ACE_HEADER` (4 bytes), `Mask` (4 bytes),
+/// then the trustee SID. `ACCESS_ALLOWED_ACE` and `ACCESS_DENIED_ACE` share
+/// this layout; object ACEs carry GUIDs after the mask and are only ever
+/// copied, never matched (this module writes standard ACEs only).
+#[repr(C)]
+struct TrusteeAce {
+    header: ACE_HEADER,
+    mask: u32,
+    sid_start: [u8; 4],
+}
+
+// ACE types with the Header/Mask/SidStart layout `TrusteeAce` reads. windows-rs
+// 0.62 does not export the ACE_*_ACE_TYPE constants.
+const ACE_TYPE_ALLOWED: u8 = 0;
+const ACE_TYPE_DENIED: u8 = 1;
+
+/// Copy `dacl` without every ACE (allow or deny, explicit or inherited) whose
+/// trustee is `ac_sid`, leaving every other ACE byte-identical. The ACL is
+/// built into `storage` (a `Vec<u32>`, so the buffer is DWORD-aligned as an
+/// ACL must be) and the returned pointer is valid while `storage` lives and is
+/// not mutated.
+///
+/// Why not `SetEntriesInAclW` with `REVOKE_ACCESS`: that removed the trustee's
+/// ALLOW ACEs only. A `DENY_ACCESS` ACE for the same SID survived the replay -
+/// probed 2026-11-09 by journaling, restoring, and enumerating the DACL with
+/// `GetExplicitEntriesFromAclW`, which still listed the deny (mode
+/// `DENY_ACCESS`, mask `FILE_ALL_ACCESS`). Since C1 the six builtin-deny
+/// trees (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.saife`,
+/// `%LOCALAPPDATA%\saife`) carry exactly such an ACE for the per-session
+/// AppContainer SID, so a revoke-only teardown left it on the host forever.
+///
+/// Copying raw ACEs with `InitializeAcl` + `AddAce` (rather than rebuilding
+/// from `GetExplicitEntriesFromAclW`, which lists explicit ACEs only) keeps
+/// inherited ACEs, their `INHERITED_ACE` flags and every other trustee's
+/// entries exactly as they were: the owner's access is never rewritten.
+fn dacl_without_trustee_aces(
+    dacl: *const ACL,
+    ac_sid: &PSID,
+    storage: &mut Vec<u32>,
+) -> Result<*const ACL> {
+    unsafe {
+        let mut info = ACL_SIZE_INFORMATION::default();
+        GetAclInformation(
+            dacl,
+            (&mut info as *mut ACL_SIZE_INFORMATION) as *mut _,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )?;
+        // Dropping ACEs never grows the ACL, so the source size is a valid
+        // allocation bound; the `.max` covers a degenerate 0-byte field
+        // (InitializeAcl requires room for the 8-byte header).
+        let bytes = (info.AclBytesInUse as usize).max(std::mem::size_of::<ACL>());
+        storage.clear();
+        storage.resize(bytes.div_ceil(4), 0);
+        let out = storage.as_mut_ptr().cast::<ACL>();
+        // The source revision (2 for plain ACEs) is what AddAce must be told;
+        // copying it keeps an ACL_REVISION_DS object's revision intact.
+        let revision = ACE_REVISION((*dacl).AclRevision as u32);
+        InitializeAcl(out, bytes as u32, revision)?;
+        let mut written: u32 = 0;
+        for index in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace).is_err() || ace.is_null() {
+                continue;
+            }
+            let a = &*(ace as *const TrusteeAce);
+            let ours = (a.header.AceType == ACE_TYPE_ALLOWED
+                || a.header.AceType == ACE_TYPE_DENIED)
+                && EqualSid(*ac_sid, PSID(a.sid_start.as_ptr() as *mut _)).is_ok();
+            if ours {
+                continue;
+            }
+            AddAce(out, revision, written, ace, a.header.AceSize as u32)?;
+            written += 1;
+        }
+        Ok(out)
     }
 }
 
@@ -1677,14 +1798,227 @@ mod propagation_tests {
             "the deny targets the AppContainer SID, not the supervisor"
         );
         assert!(restore_or_warn(&journal), "journal replay must succeed");
-        // NOTE: restore_one's REVOKE_ACCESS does not strip a DENY ACE (verified:
-        // the explicit deny with flags 0x03 survives journal replay), so teardown
-        // leaves a stale per-session deny ACE on the directory. That is a
-        // pre-existing teardown gap, not a C1 regression: pre-C1 the same litter
-        // existed with a 0-mask deny; it is now FILE_ALL_ACCESS but still names a
-        // per-session AC SID that CreateAppContainerProfile minted and teardown
-        // deletes, so no live process ever holds it again. Filed for a separate
-        // fix; not asserted here to keep this test on C1's actual claims.
+        // Teardown now strips the session SID's deny ACEs too (teardown gap
+        // found while implementing C1, closed 2026-11-09 - see
+        // teardown_strips_the_session_sids_deny_aces_and_leaves_other_trustees_alone;
+        // REVOKE_ACCESS left DENY_ACCESS ACEs behind). Asserting the outcome
+        // here as well: no deny, no allow, nothing for the dead SID.
+        assert!(
+            trustee_deny_ace_masks(&dir.to_string_lossy(), &sid).is_empty(),
+            "teardown must strip the session SID's deny ACEs"
+        );
+        assert!(
+            trustee_ace_flags(&dir.to_string_lossy(), &sid).is_empty(),
+            "teardown must leave no ACE for the session SID on {dir:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("key")).expect("the supervisor must still read its file"),
+            b"value"
+        );
+    }
+
+    /// One explicit (non-inherited) entry in a DACL as
+    /// `(access_mode, mask, inheritance_flags, trustee SID)`.
+    fn explicit_entries(path: &str) -> Vec<(i32, u32, u32, String)> {
+        unsafe {
+            let path_w = HSTRING::from(path);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let r = GetNamedSecurityInfoW(
+                &path_w,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut sd,
+            );
+            assert!(r.is_ok(), "read DACL of {path}");
+            let mut out = Vec::new();
+            if !dacl.is_null() {
+                let mut count: u32 = 0;
+                let mut ea_array: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
+                if GetExplicitEntriesFromAclW(dacl, &mut count, &mut ea_array).is_ok()
+                    && !ea_array.is_null()
+                {
+                    for i in 0..count as usize {
+                        let ea = ea_array.add(i);
+                        let trustee = if (*ea).Trustee.TrusteeForm == TRUSTEE_IS_SID {
+                            sid_to_string(PSID((*ea).Trustee.ptstrName.0 as *mut _))
+                                .unwrap_or_else(|_| "??".into())
+                        } else {
+                            "??".into()
+                        };
+                        out.push((
+                            (*ea).grfAccessMode.0,
+                            (*ea).grfAccessPermissions,
+                            (*ea).grfInheritance.0,
+                            trustee,
+                        ));
+                    }
+                    let _ = LocalFree(Some(HLOCAL(ea_array as *mut _)));
+                }
+            }
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            out
+        }
+    }
+
+    /// Add one explicit, non-inheritable FILE_ALL_ACCESS ACE for the current
+    /// user on `path`, merging into the DACL as it stands (inherited ACEs
+    /// untouched). This models an entry that is none of the session's business
+    /// and must survive teardown byte-identical.
+    fn add_explicit_owner_ace(path: &str) {
+        unsafe {
+            let owner = current_user_sid().expect("current user SID");
+            let path_w = HSTRING::from(path);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let r = GetNamedSecurityInfoW(
+                &path_w,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut sd,
+            );
+            assert!(r.is_ok(), "read DACL of {path}");
+            let ea = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: 0x1f01ff, // FILE_ALL_ACCESS
+                grfAccessMode: SET_ACCESS,
+                grfInheritance: NO_INHERITANCE,
+                Trustee: TRUSTEE_W {
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_USER,
+                    ptstrName: PWSTR(owner.0 as *mut _),
+                    ..Default::default()
+                },
+            };
+            let mut acl: *mut ACL = std::ptr::null_mut();
+            let old = if dacl.is_null() {
+                None
+            } else {
+                Some(dacl as *const ACL)
+            };
+            let set_r = SetEntriesInAclW(Some(&[ea]), old, &mut acl);
+            assert!(set_r.is_ok(), "SetEntriesInAclW: {set_r:?}");
+            let named_r = SetNamedSecurityInfoW(
+                &path_w,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(acl),
+                None,
+            );
+            assert!(named_r.is_ok(), "SetNamedSecurityInfoW: {named_r:?}");
+            let _ = LocalFree(Some(HLOCAL(acl as *mut _)));
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+        }
+    }
+
+    #[test]
+    fn teardown_strips_the_session_sids_deny_aces_and_leaves_other_trustees_alone() {
+        let sid = make_sid(TEST_SID);
+        let owner = current_user_sid().expect("current user SID");
+        let base = tmp_tag("teardown-deny");
+        let _guard = TempDir(base.clone());
+        let dir = base.join("creds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("key"), b"value").unwrap();
+
+        // An explicit owner ACE, so the trailing check can tell "the owner's
+        // entry survived" from "the owner's access happens to be inherited".
+        add_explicit_owner_ace(&dir.to_string_lossy());
+        let mut owner_before = trustee_ace_flags(&dir.to_string_lossy(), &owner);
+        owner_before.sort();
+        assert!(
+            !owner_before.is_empty(),
+            "an explicit owner ACE takes part in the test"
+        );
+
+        let journal = DaclJournal::open(
+            &base.join("journal"),
+            JournalHeader {
+                run_id: format!("teardown-deny-{}", std::process::id()),
+                owner_pid: std::process::id(),
+                owner_created: 0,
+            },
+        )
+        .unwrap();
+
+        // One journal, one scratch tree, both access modes for the same
+        // session SID: an ALLOW (the shape a workspace grant and its
+        // propagation take) and a DENY (the shape the six builtin-deny trees
+        // take - since C1 with a real FILE_ALL_ACCESS mask).
+        let allow = AllowEntry {
+            win32_path: dir.clone(),
+            access: RWX,
+            label: "workspace".into(),
+            deny: false,
+            protected: false,
+            inherit: true,
+        };
+        let deny = AllowEntry {
+            win32_path: dir.clone(),
+            access: FILE_ALL_ACCESS.0,
+            label: "builtin-deny:test".into(),
+            deny: true,
+            protected: false,
+            inherit: true,
+        };
+        grant_access(&sid, &[allow, deny], Some(&journal)).unwrap();
+
+        // Sanity: both ACEs are armed on the object and on the pre-existing
+        // descendant before teardown.
+        assert!(
+            trustee_ace_flags(&dir.to_string_lossy(), &sid)
+                .iter()
+                .any(|(mask, _)| *mask == RWX),
+            "the allow ACE must be armed before teardown"
+        );
+        assert!(
+            trustee_deny_ace_masks(&dir.to_string_lossy(), &sid).contains(&FILE_ALL_ACCESS.0),
+            "the deny ACE must be armed before teardown"
+        );
+        assert!(
+            !trustee_ace_flags(&dir.join("key").to_string_lossy(), &sid).is_empty(),
+            "the propagated descendant ACE must be armed before teardown"
+        );
+
+        assert!(restore_or_warn(&journal), "journal replay must succeed");
+
+        // PROBE: what the DACL still carries after the replay (the same
+        // GetExplicitEntriesFromAclW enumeration the fix has to reason about).
+        let explicit = explicit_entries(&dir.to_string_lossy());
+        eprintln!("[probe] explicit entries on {dir:?} after restore: {explicit:?}");
+
+        assert!(
+            trustee_ace_flags(&dir.to_string_lossy(), &sid).is_empty(),
+            "teardown must leave NO ACE for the session SID - neither the ALLOW nor \
+             the DENY may survive; DACL still carries {:?}",
+            trustee_ace_flags(&dir.to_string_lossy(), &sid)
+        );
+        assert!(
+            trustee_ace_flags(&dir.join("key").to_string_lossy(), &sid).is_empty(),
+            "teardown must leave no ACE for the session SID on the propagated \
+             descendant either"
+        );
+        // Every other trustee's ACEs are exactly as before the run.
+        let mut owner_after = trustee_ace_flags(&dir.to_string_lossy(), &owner);
+        owner_after.sort();
+        assert_eq!(
+            owner_after, owner_before,
+            "teardown must not touch the owner's ACEs"
+        );
+        // ...and the supervisor still owns its tree.
+        assert_eq!(
+            std::fs::read(dir.join("key")).expect("the supervisor must still read its file"),
+            b"value"
+        );
     }
 
     /// C1 live test (ignored by default): after arming a real AppContainer
