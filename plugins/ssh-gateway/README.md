@@ -19,6 +19,39 @@ Write your hosts to `%USERPROFILE%\.saife\ssh-gateway.json` (see
 `ssh-gateway.example.json`). The sidecar reads that file at session start; a
 missing or broken file means zero hosts, never a crash.
 
+The plugin ships an **empty** `known_hosts` beside `sidecar.py`, and every ssh
+it spawns runs with `UserKnownHostsFile=<that file>` and
+`StrictHostKeyChecking=yes` (see *Host keys* below). Seed it before the first
+session or every verb refuses with `502 host_key_unknown`.
+
+`ssh.exe` must exist: the Windows *OpenSSH Client* optional feature, or any ssh
+on `PATH`. The sidecar resolves it **once at startup** —
+`%SystemRoot%\System32\OpenSSH\ssh.exe` first, then `PATH` — and refuses to
+start with `ssh_executable_not_found` when nothing resolves, instead of spawning
+a bare name a file in the plugin directory could shadow.
+
+### Host keys: seed `known_hosts` once per host
+
+`ssh-keyscan` is the supported seeding tool. Run it on the host you trust, then
+review the line before it is trusted:
+
+```powershell
+ssh-keyscan -p 22 logs.example.invalid >> "$env:USERPROFILE\.saife\plugins\ssh-gateway\known_hosts"
+```
+
+Pin a key type when you want an exact algorithm:
+
+```powershell
+ssh-keyscan -p 22 -t ed25519 logs.example.invalid >> "$env:USERPROFILE\.saife\plugins\ssh-gateway\known_hosts"
+```
+
+A per-host `"known_hosts": "%USERPROFILE%\.saife\srv1.known_hosts"` entry in the
+gateway JSON overrides the plugin-local file for that one host.
+
+There is deliberately **no** trust-on-first-use: the sidecar never writes to the
+file and never touches `%USERPROFILE%\.ssh\known_hosts`, so an unknown key is a
+refusal (`502 host_key_unknown` naming the file to seed), not a silent accept.
+
 ## Run
 
 ```powershell
@@ -39,7 +72,7 @@ curl.exe -s -X POST -d "{\"host\":\"srv1\",\"verb\":\"version\"}" http://ssh.san
 |---|---|
 | `GET /status` | `{"ok":true,...}` — health probe, no token |
 | `GET /hosts` | declared hosts with their allowed verbs (no identity paths) |
-| `POST /exec` | body `{"host":..., "verb":..., "args":..., "stdin":...}`; `200` + remote stdout, `502` + remote stderr, `403 host_not_declared` / `403 command_not_declared`, `400` malformed |
+| `POST /exec` | body `{"host":..., "verb":..., "args":..., "stdin":...}`; `200` + remote stdout, `502` + remote stderr, `403 host_not_declared` / `403 command_not_declared`, `400` malformed or unsupported framing, `502 host_key_unknown` (seed the plugin-local `known_hosts`) |
 
 ## Security invariants
 
@@ -63,6 +96,20 @@ curl.exe -s -X POST -d "{\"host\":\"srv1\",\"verb\":\"version\"}" http://ssh.san
    `ClearAllForwardings=yes`, `ForwardAgent=no`, `PermitLocalCommand=no`, so a
    `~/.ssh/config` entry or `Match` block cannot add a `ProxyCommand`, forward the
    agent, or bind a local port behind the manifest's back.
+3c. **Host keys are pinned, never trust-on-first-use.** ssh runs with
+   `UserKnownHostsFile=<the plugin's own known_hosts>` and
+   `StrictHostKeyChecking=yes`, so an unknown host key is a refusal (a named
+   `502 host_key_unknown` carrying ssh's own error), not a silent accept — and
+   the key is never appended to the user's global
+   `%USERPROFILE%\.ssh\known_hosts`. Seed the plugin-local file with
+   `ssh-keyscan` (see *Host keys* above); a per-host `known_hosts` entry
+   overrides it for that host.
+3d. **ssh is resolved once, absolutely.** The binary is resolved at startup
+   (`%SystemRoot%\System32\OpenSSH\ssh.exe`, then `PATH`) and spawned by that
+   absolute path — CreateProcess searches the child's cwd before System32, and
+   the sidecar's cwd is the plugin directory, so a bare-name spawn could be
+   shadowed by a dropped-in `ssh.exe`. No resolution, no start (exit 2,
+   `ssh_executable_not_found`).
 4. **Keys stay host-side.** The sidecar reads identities itself; `GET /hosts`
    never echoes identity paths.
 5. **Bounded, and bounded in the right place.** `args`/`stdin` are size-capped;

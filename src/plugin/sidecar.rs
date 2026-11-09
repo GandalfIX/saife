@@ -2,8 +2,12 @@
 //!
 //! The sidecar is the supervisor's child and runs **outside** the container. It
 //! gets a free loopback port, a fresh 32-hex facade token, the mount name and the
-//! manifest's non-secret `config` entries in its environment, and nothing else —
-//! no secret value exists in the POC. Its stdout/stderr go to
+//! manifest's non-secret `config` entries in its environment — and, since the
+//! 2026-11-09 review (H3), nothing beyond a minimal startup allowlist: the
+//! supervisor's environment is cleared first (`env_clear`), then only `PATH`,
+//! `SYSTEMROOT`, `TEMP`, `TMP`, `LOCALAPPDATA`, `USERPROFILE` (the Windows
+//! essentials a Python sidecar's startup needs) and the `SIDECAR_*` values are
+//! re-added — no secret value exists in the POC. Its stdout/stderr go to
 //! `%LOCALAPPDATA%\saife\sidecar-logs\<sid>-<mount>.log` instead of the
 //! session's console, so a chatty sidecar cannot corrupt the workload's output.
 //!
@@ -90,9 +94,29 @@ impl Sidecar {
         let mut cmd = Command::new(&program);
         // No shell: argv is passed through, `current_dir` is the plugin's own
         // directory, and every setting below is an explicit name/value pair.
+        // H3: the supervisor's environment is NOT inherited wholesale — a
+        // sidecar is supervisor-privileged code, but "privileged" is not
+        // "trustworthy to see everything the supervisor happens to have set".
+        // `env_clear` drops it first, then only a minimal startup allowlist is
+        // re-added: the Windows essentials the child's runtime needs to
+        // function (`PATH`, `SYSTEMROOT`, `TEMP`, `TMP`, `LOCALAPPDATA`,
+        // `USERPROFILE`) plus the `SIDECAR_*` values the manifest defines.
         cmd.args(&manifest.command[1..])
             .current_dir(plugin_dir)
-            .env("SIDECAR_PORT", port.to_string())
+            .env_clear();
+        for key in [
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.env("SIDECAR_PORT", port.to_string())
             .env("SIDECAR_FACADE_TOKEN", &token)
             .env("SIDECAR_MOUNT", &manifest.mount)
             .stdin(Stdio::null())
@@ -624,20 +648,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// LIVE (`-- --ignored`): the sidecar's environment.
+    /// The sidecar's environment (H3, docs/design/2026-11-09-security-review-verdicts.md).
     ///
-    /// H3 (docs/design/2026-11-09-security-review-verdicts.md, verdict: partial):
-    /// `start` never calls `env_clear`, so the child inherits the supervisor's
-    /// whole environment while the module docstring promises "and nothing else".
-    /// The verdict defers the fix — a plugin is supervisor-privileged code by
-    /// design, `.saife` is denied to the workload, and repo-local plugins need an
-    /// operator `--plugin-dir`, so the inherited environment has no reachable
-    /// attacker. This test therefore stays ignored and asserts the CONTRACT, not
-    /// today's behaviour: when H3 lands it is un-ignored and must pass.
+    /// `start` used to inherit the supervisor's whole environment while the module
+    /// docstring promised "and nothing else". The fix calls `env_clear` first, then
+    /// re-adds only a minimal startup allowlist (`PATH`, `SYSTEMROOT`, `TEMP`,
+    /// `TMP`, `LOCALAPPDATA`, `USERPROFILE`) on top of the `SIDECAR_*` values the
+    /// sidecar is meant to read. This test is its regression guard: a sentinel
+    /// planted in the supervisor's environment must not reach the child, while
+    /// `PATH` and `SIDECAR_FACADE_TOKEN` must.
     ///
     /// Run: `cargo test --bin saife \
-    ///     plugin::sidecar::tests::the_sidecar_inherits_no_supervisor_environment -- --ignored`
-    #[ignore = "red until H3 lands (env_clear); docs/design/2026-11-09-security-review-verdicts.md"]
+    ///     plugin::sidecar::tests::the_sidecar_inherits_no_supervisor_environment -- --exact`
     #[test]
     fn the_sidecar_inherits_no_supervisor_environment() {
         // A fixture sidecar that dumps its own environment and answers /status.

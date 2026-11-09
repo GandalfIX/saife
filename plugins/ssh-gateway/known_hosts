@@ -1,0 +1,24 @@
+# plugin-local known_hosts for the ssh-gateway sidecar.
+#
+# Shipped EMPTY on purpose. The sidecar runs ssh with:
+#   -o UserKnownHostsFile=<this file> -o StrictHostKeyChecking=yes
+# so the FIRST contact with a host is NOT a silent trust-on-first-use that
+# would append to your real %USERPROFILE%\.ssh\known_hosts: ssh REFUSES an
+# unknown key instead of writing one, and the file it is handed is this one,
+# never the user's global known_hosts.
+#
+# To authorise a host, seed its key here with ssh-keyscan, e.g. from a host you
+# trust has already resolved the destination correctly (NOT from the sandbox):
+#
+#   ssh-keyscan -p 22 logs.example.invalid \
+#     >> "C:\path\to\plugins\ssh-gateway\known_hosts"
+#
+# or pin a specific key type:
+#
+#   ssh-keyscan -p 22 -t ed25519 logs.example.invalid \
+#     >> "C:\path\to\plugins\ssh-gateway\known_hosts"
+#
+# Review every line you add like code: a host key is the trust root for the
+# connection, and a wrong entry means an attacker-in-the-middle ssh is not
+# detected. A per-host "known_hosts" entry in the gateway JSON overrides this
+# file for that one host.

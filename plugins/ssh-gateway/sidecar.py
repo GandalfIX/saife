@@ -66,6 +66,7 @@ import json
 import os
 import re
 import select
+import shutil
 import socket
 import subprocess
 import sys
@@ -96,6 +97,34 @@ READ_CHUNK = 64 * 1024
 # the user's ~/.ssh/config (ProxyCommand, ForwardAgent, LocalForward, Match
 # blocks) cannot govern a connection the manifest is supposed to define.
 SSH_CONFIG = Path(__file__).with_name("ssh_config")
+
+# The plugin's OWN known_hosts: shipped empty, so first contact with a host is
+# NOT a silent trust-on-first-use that appends to the user's real
+# %USERPROFILE%\.ssh\known_hosts. StrictHostKeyChecking=yes (below) makes ssh
+# REFUSE an unknown key instead of writing one; operators seed this file with
+# ssh-keyscan (see README). A per-host `known_hosts` entry overrides it.
+KNOWN_HOSTS = Path(__file__).with_name("known_hosts")
+
+
+def resolve_ssh_binary(sysroot: str | None = None) -> str | None:
+    """Resolve ssh.exe once at startup, preferring the system OpenSSH then PATH.
+
+    Spawning ssh by BARE NAME lets CreateProcess search the sidecar's own cwd
+    (the plugin dir) before System32/PATH, so an `ssh.exe` dropped beside
+    `sidecar.py` wins. Resolving an absolute path once closes that: the child is
+    spawned by the resolved path, never by a name a directory listing can shadow.
+    Returns None when nothing resolves (startup then refuses to serve).
+    """
+    root = (sysroot if sysroot is not None
+            else (os.environ.get("SystemRoot") or os.environ.get("windir") or ""))
+    if root:
+        preferred = os.path.join(root, "System32", "OpenSSH", "ssh.exe")
+        if os.path.isfile(preferred):
+            return preferred
+    return shutil.which("ssh")
+
+
+SSH_BIN = resolve_ssh_binary()
 
 
 def max_exec() -> int:
@@ -251,14 +280,25 @@ def run_ssh(entry: dict, verb: str, args: str, stdin: bytes,
         meta["outcome"] = "refused:no_target"
         return 502, b"host entry has no target", meta
     port = int(entry.get("port", 22))
+    if not SSH_BIN:
+        meta["outcome"] = "ssh_not_found"
+        return 502, b"ssh_not_found: no ssh executable was resolved at startup", meta
+    # M13: host keys are pinned to the plugin's own known_hosts (or the
+    # per-host file an operator declares). StrictHostKeyChecking=yes means ssh
+    # REFUSES an unknown key instead of TOFU-appending it to a file it was
+    # handed - and the file it is handed is never the user's global one.
+    known_hosts = entry.get("known_hosts")
+    user_known_hosts = (expand_env(known_hosts) if known_hosts
+                        else str(KNOWN_HOSTS))
     cmd = [
-        "ssh",
+        SSH_BIN,
         "-F", str(SSH_CONFIG),
         "-T",
         "-p", str(port),
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={int(entry.get('connect_timeout', 15))}",
-        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={user_known_hosts}",
         "-o", "ClearAllForwardings=yes",
         "-o", "ForwardAgent=no",
         "-o", "PermitLocalCommand=no",
@@ -271,9 +311,6 @@ def run_ssh(entry: dict, verb: str, args: str, stdin: bytes,
             meta["outcome"] = "refused:identity"
             return 502, f"identity file not accessible: {path}".encode(), meta
         cmd += ["-i", path, "-o", "IdentitiesOnly=yes"]
-    known_hosts = entry.get("known_hosts")
-    if known_hosts:
-        cmd += ["-o", f"UserKnownHostsFile={expand_env(known_hosts)}"]
     cmd.append(target)
 
     remote = verb if not args else f"{verb} {args.strip()}"
@@ -358,9 +395,18 @@ def run_ssh(entry: dict, verb: str, args: str, stdin: bytes,
         returncode = proc.returncode
         meta["exit"] = returncode
         if returncode != 0:
-            meta["outcome"] = "ssh_failed"
             err_file.seek(0)
             detail = err_file.read(8192).decode("utf-8", "replace").strip()
+            # M13: an unknown host key must surface as a NAMED refusal, not a
+            # hang and not a generic failure - the operator's remedy is to seed
+            # the plugin's known_hosts, and the message has to say so.
+            lowered = detail.lower()
+            if "host key verification failed" in lowered or "no matching host key" in lowered:
+                meta["outcome"] = "host_key_unknown"
+                hint = (f"host_key_unknown: the host key is not in {user_known_hosts}; "
+                        "seed it with ssh-keyscan (see README): ")
+                return 502, (hint + detail).encode()[:8192], meta
+            meta["outcome"] = "ssh_failed"
             return 502, f"ssh exit {returncode}: {detail}".encode()[:8192], meta
         return 200, bytes(out), meta
     finally:
@@ -423,7 +469,21 @@ class Handler(BaseHTTPRequestHandler):
             self._deny(401, "facade token required")
             return
 
-        length = min(int(self.headers.get("Content-Length", "0") or 0), MAX_STDIN_BYTES + 65536)
+        # Framing is validated BEFORE any body byte is read (M16). A negative
+        # Content-Length reaches `rfile.read(-1)` - read to EOF - so the handler
+        # parks until the caller hangs up, and a non-numeric one raises out of
+        # the handler so the connection is dropped with no reply. The sidecar
+        # speaks Content-Length framing only: a chunked request is refused by
+        # name, never decoded, and never silently read as an empty body.
+        if self.headers.get("Transfer-Encoding"):
+            self._deny(400, "Transfer-Encoding is not supported; send Content-Length")
+            return
+        try:
+            length = max(0, int(self.headers.get("Content-Length", "0") or 0))
+        except ValueError:
+            self._deny(400, "Content-Length must be a non-negative integer")
+            return
+        length = min(length, MAX_STDIN_BYTES + 65536)
         raw = self.rfile.read(length) if length else b""
         try:
             req = json.loads(raw.decode("utf-8"))
@@ -490,6 +550,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    # L-M: ssh must be resolvable BEFORE the port opens - a sidecar that serves
+    # /exec and only discovers at the first exec that it cannot spawn ssh would
+    # turn a startup misconfiguration into per-request 502s.
+    if not SSH_BIN:
+        print("sidecar: ssh_executable_not_found: no ssh.exe under "
+              "%SystemRoot%\\System32\\OpenSSH and none on PATH; refusing to start",
+              file=sys.stderr)
+        return 2
     if not PORT:
         print("sidecar: SIDECAR_PORT not set", file=sys.stderr)
         return 2
