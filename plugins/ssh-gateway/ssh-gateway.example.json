@@ -1,0 +1,13 @@
+{
+    "hosts": {
+        "srv1": {
+            "target": "logs@example.invalid",
+            "port": 22,
+            "identity": "%USERPROFILE%\\.ssh\\id_ed25519",
+            "commands": ["list", "stream", "journal", "version"],
+            "connect_timeout": 15,
+            "command_timeout": 300,
+            "max_output_mb": 512
+        }
+    }
+}

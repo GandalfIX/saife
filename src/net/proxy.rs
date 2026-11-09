@@ -437,6 +437,7 @@ fn emit_facade(
     path: Option<&str>,
     disposition: &str,
     reason: Option<&str>,
+    status: Option<u16>,
 ) -> Result<()> {
     use serde_json::{Map, json};
     let mut e = Map::new();
@@ -445,6 +446,12 @@ fn emit_facade(
     e.insert("path".into(), json!(path));
     e.insert("disposition".into(), json!(disposition));
     e.insert("reason".into(), json!(reason));
+    // The sidecar's own HTTP status. `disposition: allow` means the proxy
+    // forwarded the call; a plugin refusal (403/502/503) is visible here and
+    // nowhere else in the chain - without it every plugin refusal read "allow".
+    if let Some(code) = status {
+        e.insert("status".into(), json!(code));
+    }
     writer.append(e)?;
     Ok(())
 }
@@ -2287,6 +2294,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             None,
             "deny",
             Some("facade_requires_http"),
+            None,
         );
         write_response(
             &mut sock,
@@ -2383,6 +2391,21 @@ async fn write_response(sock: &mut TcpStream, status: &str, headers: &str, body:
 /// profile; nothing legitimate comes close, and the cap keeps an unbounded body from
 /// becoming a memory amplifier in the supervisor.
 const MAX_FACADE_BODY: usize = 4096;
+/// Upper bound for buffering the sidecar's response head while the relay
+/// extracts its status for the audit leaf. A sidecar head is a few hundred
+/// bytes; 64 KiB is generous and never read past.
+const MAX_FACADE_RESPONSE_HEAD: usize = 64 * 1024;
+/// How long to wait for that head: the sidecar is local and answers quickly,
+/// but a wedged plugin must not hang the relay either.
+const RELAY_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The status code from a response head, if it is shaped like one.
+fn parse_http_status(head: &[u8]) -> Option<u16> {
+    let text = std::str::from_utf8(head).ok()?;
+    let line = text.lines().next()?;
+    let code = line.split(' ').nth(1)?;
+    code.parse::<u16>().ok()
+}
 
 /// The declared Content-Length of a request head, if present and valid.
 fn content_length(head: &str) -> Option<usize> {
@@ -3304,6 +3327,7 @@ async fn relay_facade(
                 Some(path),
                 "deny",
                 Some("facade_sidecar_unreachable"),
+                None,
             );
             write_response(
                 sock,
@@ -3315,7 +3339,6 @@ async fn relay_facade(
             return Ok(());
         }
     };
-    let _ = emit_facade(writer, mount, Some(path), "allow", None);
     // The method is the declared one, uppercased only when it already is a token
     // (facade_action refused anything else). The body is the client's, framed by the
     // supervisor: the sidecar still never sees a single client header.
@@ -3328,9 +3351,60 @@ async fn relay_facade(
     }
     request.push_str("\r\n");
     if upstream.write_all(request.as_bytes()).await.is_err() {
+        let _ = emit_facade(
+            writer,
+            mount,
+            Some(path),
+            "deny",
+            Some("facade_sidecar_write_failed"),
+            None,
+        );
         return Ok(());
     }
     if !body.is_empty() && upstream.write_all(body).await.is_err() {
+        let _ = emit_facade(
+            writer,
+            mount,
+            Some(path),
+            "deny",
+            Some("facade_sidecar_write_failed"),
+            None,
+        );
+        return Ok(());
+    }
+
+    // Read the sidecar's response HEAD before writing the leaf: the leaf's job is
+    // to say what crossed the boundary AND what came back. Emitting "allow" at
+    // connect time recorded a plugin's 403/502 as a permitted call, and a
+    // responder could not tell a refused verb from a served one.
+    let mut head: Vec<u8> = Vec::with_capacity(512);
+    let mut status: Option<u16> = None;
+    while head.len() <= MAX_FACADE_RESPONSE_HEAD {
+        let mut chunk = [0u8; 1024];
+        match tokio::time::timeout(RELAY_HEAD_TIMEOUT, upstream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => {
+                head.extend_from_slice(&chunk[..n]);
+                if let Some(idx) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                    status = parse_http_status(&head[..idx]);
+                    break;
+                }
+            }
+        }
+    }
+    if status.is_none() {
+        let _ = emit_facade(
+            writer,
+            mount,
+            Some(path),
+            "deny",
+            Some("facade_sidecar_response_unparsable"),
+            None,
+        );
+    } else {
+        let _ = emit_facade(writer, mount, Some(path), "allow", None, status);
+    }
+    if !head.is_empty() && sock.write_all(&head).await.is_err() {
         return Ok(());
     }
     let _ = tokio::io::copy(&mut upstream, sock).await;
@@ -3469,6 +3543,7 @@ async fn handle_forward(
                 Some(fwd.origin_form.as_str()),
                 "deny",
                 Some("facade_unknown_mount"),
+                None,
             );
             write_response(
                 &mut sock,
@@ -3487,6 +3562,7 @@ async fn handle_forward(
                 Some(fwd.origin_form.as_str()),
                 "deny",
                 Some("facade_method_invalid"),
+                None,
             );
             write_response(
                 &mut sock,
@@ -3505,6 +3581,7 @@ async fn handle_forward(
                 Some(fwd.origin_form.as_str()),
                 "deny",
                 Some("facade_operation_not_declared"),
+                None,
             );
             write_response(
                 &mut sock,
@@ -3526,6 +3603,7 @@ async fn handle_forward(
                     Some(fwd.origin_form.as_str()),
                     "deny",
                     Some("facade_body_too_large"),
+                    None,
                 );
                 write_response(
                     &mut sock,
