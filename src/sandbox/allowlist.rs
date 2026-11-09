@@ -108,12 +108,21 @@ fn build_allowlist_with(
         );
         collect_ancestors(p, &mut ancestor_set);
     }
-    // Built-in denies come first in the evaluation order the OS uses (explicit
-    // denies are evaluated before allows), and they are identical to the mxc
-    // backend's: credentials plus the tool's own control plane. Before AppContainer
-    // had them, `--backend appcontainer --allow $USERPROFILE` could read
-    // ~/.azure/accessTokens.json and rewrite ~/.saife/plugins, while the docs
-    // promised those directories stay denied.
+    // Built-in denies — credentials plus the tool's own control-plane trees.
+    // The AppContainer set is a SUPERSET of the mxc backend's: these six are
+    // `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.saife` and
+    // `%LOCALAPPDATA%\saife`, while mxc's `PROFILE_SECRET_DIRS` names the four
+    // credential dirs. The two `.saife` trees are denied here because they hold
+    // the plugin manifests whose `command` runs HOST-side on the next
+    // `--plugin` run, the learned policy, the audit log and the DPAPI-wrapped
+    // signing key.
+    //
+    // These denies only mean something with a real mask. Until 2026-11-09 every
+    // deny on this backend was written with `access = 0` — a no-op ACE that
+    // intersects no requested rights — so `--backend appcontainer --allow
+    // $USERPROFILE` read all six through the inherited allow (C1). The comment
+    // that used to sit here claimed the protection held; it never did on this
+    // backend.
     for deny in builtin_denies {
         for grant in fs.allow.iter().chain(fs.read_only.iter()) {
             if crate::profile::path_covers(deny, grant) {
@@ -132,12 +141,18 @@ fn build_allowlist_with(
             }
         }
     }
-    // Profile deny entries (deny ACE).
+    // Deny ACEs carry FILE_ALL_ACCESS (0x1F01FF, the mask the owner ACEs
+    // already use). A deny ACE intersects the requested rights, so the mask must
+    // be a superset of every allow mask this list can write (RWX, RX,
+    // FILE_ALL_ACCESS) or whatever it leaves out stays readable through the
+    // covering grant. The trustee is the AppContainer SID, never the user or the
+    // supervisor's own token, so this does not reduce the supervisor's access to
+    // the deny trees (it reaches its own stores as the supervisor SID).
     for p in &fs.deny {
         push_entry(
             &mut entries,
             p.clone(),
-            0,
+            FILE_ALL_ACCESS.0,
             format!("deny:{}", p.display()),
             true,
             false,
@@ -147,7 +162,7 @@ fn build_allowlist_with(
         push_entry(
             &mut entries,
             deny.clone(),
-            0,
+            FILE_ALL_ACCESS.0,
             format!("builtin-deny:{}", deny.display()),
             true,
             false,
@@ -239,7 +254,14 @@ fn build_allowlist_with(
     // documented here because it looks like a sandbox bug when it bites.
     if let Some(ac_temp) = crate::sandbox::appcontainer::ac_private_temp_path(sid) {
         let _ = std::fs::create_dir_all(&ac_temp);
-        push_entry(&mut entries, ac_temp, RWX, "ac-private-temp".into(), false, true);
+        push_entry(
+            &mut entries,
+            ac_temp,
+            RWX,
+            "ac-private-temp".into(),
+            false,
+            true,
+        );
     }
 
     // Implicit grants for any Win32 process to start (windows_common group,
@@ -756,7 +778,10 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let sid = "sid-test";
         ensure_session_dirs(&cwd, sid).unwrap();
-        let shim = cwd.join(".sandbox").join(sid).join("pyshim\\sitecustomize.py");
+        let shim = cwd
+            .join(".sandbox")
+            .join(sid)
+            .join("pyshim\\sitecustomize.py");
         let content = std::fs::read_to_string(&shim).unwrap();
         assert!(
             content.contains("_sandbox_mkdir"),
@@ -780,8 +805,7 @@ mod tests {
     #[test]
     fn allowlist_contains_python_shim_grant() {
         let fs = FilesystemSlice::default();
-        let entries =
-            build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs).unwrap();
+        let entries = build_allowlist("test-sid", std::path::Path::new("C:\\proj"), &fs).unwrap();
         let pyshim = std::path::Path::new(r"C:\proj\.sandbox\test-sid\pyshim");
         assert!(
             entries
@@ -876,7 +900,9 @@ mod tests {
         // Asking for `env::temp_dir()` here would pass locally and fail wherever the
         // host puts TEMP elsewhere (GitHub's runner uses another drive).
         assert!(
-            entries.iter().any(|e| paths_eq_ci(&e.win32_path, &temp_root)),
+            entries
+                .iter()
+                .any(|e| paths_eq_ci(&e.win32_path, &temp_root)),
             "the temp root ({temp_root:?}) must still get its traverse grant; entries: {:?}",
             entries.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
         );
@@ -893,7 +919,12 @@ mod tests {
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let err = match build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies) {
+        let err = match build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &denies,
+        ) {
             Ok(_) => panic!("a grant inside .saife must be refused"),
             Err(e) => e,
         };
@@ -926,6 +957,297 @@ mod tests {
                 let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
                 panic!(".saife must be a deny entry; entries: {labels:?}")
             });
-        assert!(hit.label.starts_with("builtin-deny:"), "label: {}", hit.label);
+        assert!(
+            hit.label.starts_with("builtin-deny:"),
+            "label: {}",
+            hit.label
+        );
+    }
+
+    /// C1 red test 1: a deny ACE with mask 0 denies nothing — it intersects no
+    /// requested rights, so every allow in the DACL still wins and the
+    /// "denied" directory stays readable through any inherited grant. Both
+    /// deny-producing loops (profile denies and builtin denies) must emit a
+    /// non-zero mask.
+    #[test]
+    fn every_deny_entry_carries_a_non_zero_mask() {
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let builtin = builtin_deny_dir_set(&home);
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from(r"C:\proj")],
+            read_only: Vec::new(),
+            deny: vec![home.join("secrets")],
+        };
+        let entries =
+            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &builtin)
+                .unwrap();
+        let denies: Vec<&AllowEntry> = entries.iter().filter(|e| e.deny).collect();
+        assert!(
+            denies.len() == builtin.len() + 1,
+            "expected one deny per builtin dir plus the profile deny; got: {:?}",
+            denies.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+        for e in &denies {
+            assert!(
+                e.access != 0,
+                "deny {:?} has a zero access mask — a zero-mask deny ACE is a \
+                 no-op, so the directory stays readable (C1)",
+                e.win32_path
+            );
+        }
+    }
+
+    /// C1 red test 1 (builtin half): the builtin deny set is exactly the six
+    /// credential/control-plane directories, each denied with a non-zero mask.
+    #[test]
+    fn the_builtin_deny_set_yields_exactly_six_non_zero_denies() {
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let local = home.join("AppData").join("Local");
+        let builtin = builtin_deny_dir_set(&home);
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from(r"C:\proj")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries =
+            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &builtin)
+                .unwrap();
+        let builtin_denies: Vec<&AllowEntry> = entries
+            .iter()
+            .filter(|e| e.deny && e.label.starts_with("builtin-deny:"))
+            .collect();
+        assert_eq!(
+            builtin_denies.len(),
+            6,
+            "the builtin deny set is six directories, not {:?}",
+            builtin_denies.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+        let want: Vec<std::path::PathBuf> = [".ssh", ".aws", ".azure", ".gnupg", ".saife"]
+            .iter()
+            .map(|d| home.join(d))
+            .chain(std::iter::once(local.join("saife")))
+            .collect();
+        for w in &want {
+            let hit = builtin_denies
+                .iter()
+                .find(|e| e.win32_path == *w)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{w:?} missing from the builtin denies: {:?}",
+                        builtin_denies
+                            .iter()
+                            .map(|e| &e.win32_path)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_ne!(
+                hit.access, 0,
+                "the deny for {w:?} must carry a non-zero mask (C1)"
+            );
+        }
+        // The set is a superset of the mxc backend's PROFILE_SECRET_DIRS
+        // (4 credential dirs): it additionally denies the two `.saife`
+        // control-plane trees.
+        assert!(want.contains(&home.join(".saife")));
+        assert!(want.contains(&local.join("saife")));
+    }
+
+    /// C1: a grant spelled the ways Win32 accepts for a denied directory must
+    /// still be refused by the pre-flight — after the mask is real, the
+    /// pre-flight is the only thing standing between a mis-spelled grant and
+    /// an allow ACE inside the deny (an explicit allow would beat the
+    /// inherited deny on the parent for the AC SID... and worse, a miss here
+    /// means the grant ships at all).
+    #[test]
+    fn the_preflight_refuses_a_grant_spelled_into_a_deny() {
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let denies = vec![home.join(".saife")];
+        for grant_spelling in [
+            r"C:\Users\test\.saife.",
+            r"C:\Users\test\.saife ",
+            r"C:\Users\test\.saife\.",
+            r"\\?\C:\Users\test\.saife",
+        ] {
+            let fs = FilesystemSlice {
+                allow: vec![std::path::PathBuf::from(grant_spelling)],
+                read_only: Vec::new(),
+                deny: Vec::new(),
+            };
+            let res =
+                build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies);
+            assert!(
+                res.is_err(),
+                "grant {grant_spelling:?} names the denied .saife (Win32 drops the \
+                 trailing dot/space/`\\.` and the `\\\\?\\` prefix) and must be refused"
+            );
+        }
+        // Control: a real sibling still passes the pre-flight.
+        let fs = FilesystemSlice {
+            allow: vec![home.join(".saife-backup")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        assert!(
+            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies)
+                .is_ok()
+        );
+    }
+
+    /// C1: the other direction — a grant that COVERS a deny (e.g.
+    /// `--allow $USERPROFILE` with the builtin `~/.ssh` deny) must pass the
+    /// pre-flight, and the deny entry must carry a real mask so the ACE (not
+    /// the pre-flight) does the work of shielding the denied subtree from the
+    /// covering grant.
+    #[test]
+    fn a_grant_covering_a_deny_ships_and_the_deny_keeps_a_real_mask() {
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let denies = vec![home.join(".ssh")];
+        let fs = FilesystemSlice {
+            allow: vec![home.clone()],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries =
+            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies)
+                .expect(
+                    "a grant that covers a deny must not be refused - the deny ACE does the work",
+                );
+        assert!(
+            entries.iter().any(|e| !e.deny && e.win32_path == home),
+            "the covering grant must stay in the allowlist"
+        );
+        let deny = entries
+            .iter()
+            .find(|e| e.deny && e.win32_path == home.join(".ssh"))
+            .expect("the deny inside the grant must stay in the allowlist");
+        assert_ne!(
+            deny.access, 0,
+            "the deny under a covering grant needs a real mask - a zero-mask \
+             deny is a no-op and the inherited $USERPROFILE allow reads ~/.ssh (C1)"
+        );
+    }
+
+    /// M5 pin (partial verdict): the per-session `.sandbox\<sid>` subtree is
+    /// granted with a PROTECTED DACL, so it inherits nothing from `$CWD` /
+    /// `.sandbox` — session B's inherited `$CWD` allow does not reach session
+    /// A's subtree. This pins the already-correct half of M5; the residual
+    /// (`.sandbox` itself inheriting RWX) is a separate, not-yet-approved fix,
+    /// which is why the parent entry is asserted NOT protected here.
+    #[test]
+    fn per_session_subtree_entries_are_protected() {
+        let fs = FilesystemSlice::default();
+        let entries = build_allowlist("m5-sid", std::path::Path::new(r"C:\proj"), &fs).unwrap();
+        let subtree: Vec<&AllowEntry> = entries
+            .iter()
+            .filter(|e| e.label.starts_with(".sandbox/"))
+            .collect();
+        assert_eq!(
+            subtree.len(),
+            4,
+            "the per-session subtree grants exactly <sid>, bin, venv, pyshim: {:?}",
+            subtree.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+        for e in &subtree {
+            assert!(
+                e.protected,
+                "{} must be PROTECTED so the subtree inherits nothing (M5)",
+                e.label
+            );
+        }
+        // The `.sandbox` parent itself is the documented M5 residual: it is a
+        // plain inheritable RX grant today, and changing that is a separate
+        // fix the owner has not approved. Pin the current shape so any change
+        // there is a deliberate decision, not drift.
+        let parent = entries
+            .iter()
+            .find(|e| e.label == ".sandbox")
+            .expect("the .sandbox parent grant must exist");
+        assert!(!parent.protected, "the M5 residual is still open");
+    }
+
+    /// M2 deferred fix: a jvm-profile policy must carry descendant deny ACEs
+    /// for `~/.gradle/gradle.properties` and `~/.m2/settings.xml` while the
+    /// `.gradle`/`.m2` directory grants stay — whole-dir denies would make
+    /// the jvm profile unlaunchable (see the verdict's fix note).
+    ///
+    /// Red until M2 lands — docs/design/2026-11-09-security-review-verdicts.md
+    #[test]
+    #[ignore = "red until M2 lands — docs/design/2026-11-09-security-review-verdicts.md"]
+    fn m2_jvm_profile_denies_gradle_properties_and_maven_settings() {
+        let _env = crate::env_lock();
+        // `jvm.json` references `$JAVA_HOME` in read_only; the variable is not
+        // needed for the deny assertions, so provide a placeholder when the
+        // host lacks one (restored on drop, even on panic).
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("JAVA_HOME", v),
+                        None => std::env::remove_var("JAVA_HOME"),
+                    }
+                }
+            }
+        }
+        let java_guard = EnvGuard(std::env::var_os("JAVA_HOME"));
+        if java_guard.0.is_none() {
+            unsafe { std::env::set_var("JAVA_HOME", r"C:\java\placeholder") }
+        }
+
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let jvm_profile = manifest.join("profiles").join("jvm.json");
+        let cwd = manifest.clone();
+        let resolved =
+            crate::profile::load_and_resolve(jvm_profile.to_string_lossy().as_ref(), &cwd)
+                .expect("the shipped jvm profile must load");
+        let entries = build_allowlist_with(
+            "m2-sid",
+            &cwd,
+            &resolved.filesystem,
+            &crate::profile::builtin_deny_dirs(),
+        )
+        .expect("the jvm profile must build an allowlist");
+
+        let denies: Vec<&AllowEntry> = entries.iter().filter(|e| e.deny).collect();
+        for (dir, file) in [(r".gradle", "gradle.properties"), (r".m2", "settings.xml")] {
+            let hit = denies.iter().find(|e| {
+                let p = &e.win32_path;
+                p.file_name().and_then(|n| n.to_str()) == Some(file)
+                    && p.parent()
+                        .and_then(|par| par.file_name().and_then(|n| n.to_str()))
+                        == Some(dir)
+            });
+            assert!(
+                hit.is_some(),
+                "the jvm policy must deny {dir}\\{file} (descendant of the granted \
+                 {dir} tree); denies today: {:?}",
+                denies.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
+            );
+        }
+        // The directory grants themselves must stay (whole-dir denies are the
+        // explicitly rejected alternative).
+        let home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE is needed to spell the grants"),
+        );
+        for dir in [".gradle", ".m2"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| !e.deny && e.win32_path == home.join(dir)),
+                "the {dir} directory grant must survive the descendant denies"
+            );
+        }
+    }
+
+    /// The six builtin deny directories (the AppContainer builtin set — a
+    /// superset of the mxc backend's four `PROFILE_SECRET_DIRS`, adding the
+    /// two `.saife` control-plane trees).
+    fn builtin_deny_dir_set(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let local = home.join("AppData").join("Local");
+        [".ssh", ".aws", ".azure", ".gnupg", ".saife"]
+            .iter()
+            .map(|d| home.join(d))
+            .chain(std::iter::once(local.join("saife")))
+            .collect()
     }
 }

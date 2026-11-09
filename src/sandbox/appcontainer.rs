@@ -1007,9 +1007,17 @@ fn is_credential_shaped_env(name: &str) -> bool {
         return true;
     }
     let upper = name.to_ascii_uppercase();
-    ["TOKEN", "API_KEY", "APIKEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"]
-        .iter()
-        .any(|needle| upper.contains(needle))
+    [
+        "TOKEN",
+        "API_KEY",
+        "APIKEY",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
 }
 
 /// Build the child environment block: parent env + `PATH` prepended with
@@ -1061,12 +1069,7 @@ pub fn build_env_block(sid: &str, cwd: &std::path::Path, proxy: Option<&ProxyEnv
         };
     // Names of the four proxy vars, in the order we post-process them.
     // Comparison is case-insensitive (Windows env vars are case-insensitive).
-    const PROXY_VARS: [&str; 4] = [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "SAIFE_PROXY_PORT",
-        "NO_PROXY",
-    ];
+    const PROXY_VARS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "SAIFE_PROXY_PORT", "NO_PROXY"];
 
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut path_overridden = false;
@@ -1442,6 +1445,264 @@ mod propagation_tests {
             .count();
         assert_eq!(with_ace, 4, "only the first 4 visited files carry the ACE");
     }
+
+    /// Masks of the DENY ACEs for `sid` on `path` (the propagation helper above
+    /// merges allow and deny; the C1 live test has to name the deny one).
+    fn trustee_deny_ace_masks(path: &str, sid: &PSID) -> Vec<u32> {
+        let with_flags: Vec<(u32, u8)> = trustee_deny_ace_entries(path, sid);
+        with_flags.into_iter().map(|(m, _)| m).collect()
+    }
+
+    /// `(mask, ace_flags)` for every DENY ACE naming `sid` on `path`.
+    fn trustee_deny_ace_entries(path: &str, sid: &PSID) -> Vec<(u32, u8)> {
+        unsafe {
+            let path_w = HSTRING::from(path);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let r = GetNamedSecurityInfoW(
+                &path_w,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut sd,
+            );
+            assert!(r.is_ok(), "read DACL of {path}");
+            let mut out = Vec::new();
+            if !dacl.is_null() {
+                let mut info = ACL_SIZE_INFORMATION::default();
+                if GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION) as *mut _,
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+                .is_ok()
+                {
+                    for i in 0..info.AceCount {
+                        let mut ace = std::mem::MaybeUninit::<*mut core::ffi::c_void>::uninit();
+                        if GetAce(dacl, i, ace.as_mut_ptr()).is_err() {
+                            continue;
+                        }
+                        let ace = ace.assume_init();
+                        if ace.is_null() {
+                            continue;
+                        }
+                        let a = &*(ace as *const StdAce);
+                        if a.header.AceType != ACE_TYPE_DENIED {
+                            continue;
+                        }
+                        let ace_sid = PSID(a.sid_start.as_ptr() as *mut _);
+                        if EqualSid(*sid, ace_sid).is_ok() {
+                            out.push((a.mask, a.header.AceFlags));
+                        }
+                    }
+                }
+            }
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            out
+        }
+    }
+
+    /// True when `path`'s DACL carries the SE_DACL_PROTECTED control bit —
+    /// i.e. it was written with PROTECTED_DACL_SECURITY_INFORMATION and no
+    /// longer inherits from its parent.
+    fn dacl_is_protected(path: &str) -> bool {
+        unsafe {
+            let path_w = HSTRING::from(path);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let r = GetNamedSecurityInfoW(
+                &path_w,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut sd,
+            );
+            assert!(r.is_ok(), "read DACL of {path}");
+            let mut control: u16 = 0;
+            let mut revision = 0u32;
+            let ok = GetSecurityDescriptorControl(sd, &mut control, &mut revision).is_ok();
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+            ok && (control & SE_DACL_PROTECTED.0) != 0
+        }
+    }
+
+    /// M5 pin: a `protected` entry is applied through
+    /// PROTECTED_DACL_SECURITY_INFORMATION (appcontainer.rs:291-311 → :626-630),
+    /// so the built DACL drops inheritance and carries only the owner trustees
+    /// plus the session SID. This is the DACL half of the per-session
+    /// `.sandbox\<sid>` isolation; the entry half is pinned in allowlist.rs.
+    #[test]
+    fn protected_entries_are_applied_with_a_protected_dacl() {
+        let sid = make_sid(TEST_SID);
+        let base = tmp_tag("m5-protected");
+        let _guard = TempDir(base.clone());
+        let dir = base.join("session");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), b"x").unwrap();
+
+        let entry = AllowEntry {
+            win32_path: dir.clone(),
+            access: RWX,
+            label: ".sandbox/<sid>".into(),
+            deny: false,
+            protected: true,
+            inherit: true,
+        };
+        grant_access(&sid, &[entry], None).unwrap();
+
+        assert!(
+            dacl_is_protected(&dir.to_string_lossy()),
+            "the per-session subtree must carry a PROTECTED DACL (M5)"
+        );
+        let aces = trustee_ace_flags(&dir.to_string_lossy(), &sid);
+        assert!(
+            aces.iter().any(|(mask, _)| *mask == RWX),
+            "the session SID must get its RWX grant on the rebuilt DACL: {aces:?}"
+        );
+    }
+
+    /// C1: the deny trustee is the AppContainer SID, never the user or the
+    /// supervisor token. Arming a real `FILE_ALL_ACCESS` deny must therefore
+    /// leave the supervisor's own read access untouched — if someone ever
+    /// switches the trustee to the owner SID, this test (and the whole
+    /// supervisor) breaks here rather than at teardown.
+    #[test]
+    fn a_deny_ace_for_the_session_sid_leaves_the_supervisors_own_access_intact() {
+        let sid = make_sid(TEST_SID);
+        let base = tmp_tag("c1-supervisor");
+        let _guard = TempDir(base.clone());
+        let dir = base.join("secret");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("key"), b"value").unwrap();
+
+        let entry = AllowEntry {
+            win32_path: dir.clone(),
+            access: FILE_ALL_ACCESS.0,
+            label: "builtin-deny:test".into(),
+            deny: true,
+            protected: false,
+            inherit: true,
+        };
+        let journal = DaclJournal::open(
+            &base.join("journal"),
+            JournalHeader {
+                run_id: format!("c1sup-{}", std::process::id()),
+                owner_pid: std::process::id(),
+                owner_created: 0,
+            },
+        )
+        .unwrap();
+        grant_access(&sid, &[entry], Some(&journal)).unwrap();
+
+        assert!(
+            trustee_deny_ace_masks(&dir.to_string_lossy(), &sid).contains(&FILE_ALL_ACCESS.0),
+            "the deny ACE must carry FILE_ALL_ACCESS for the AC SID (C1)"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("key")).expect("the supervisor must still read its own file"),
+            b"value",
+            "the deny targets the AppContainer SID, not the supervisor"
+        );
+        assert!(restore_or_warn(&journal), "journal replay must succeed");
+        // NOTE: restore_one's REVOKE_ACCESS does not strip a DENY ACE (verified:
+        // the explicit deny with flags 0x03 survives journal replay), so teardown
+        // leaves a stale per-session deny ACE on the directory. That is a
+        // pre-existing teardown gap, not a C1 regression: pre-C1 the same litter
+        // existed with a 0-mask deny; it is now FILE_ALL_ACCESS but still names a
+        // per-session AC SID that CreateAppContainerProfile minted and teardown
+        // deletes, so no live process ever holds it again. Filed for a separate
+        // fix; not asserted here to keep this test on C1's actual claims.
+    }
+
+    /// C1 live test (ignored by default): after arming a real AppContainer
+    /// session, the deny ACE on `~/.ssh` must actually deny read access.
+    ///
+    /// A true kernel `AccessCheck` needs the impersonated AppContainer token,
+    /// which only the spawned child holds; the DACL-side equivalent asserted
+    /// here is that the AC SID carries a DENY ACE whose mask intersects
+    /// `FILE_READ_DATA`. A zero-mask deny (the pre-C1 state) fails this: it is
+    /// a no-op ACE that intersects nothing. The test points `USERPROFILE` and
+    /// `LOCALAPPDATA` at a scratch tree so it arms a temp `~/.ssh`, never the
+    /// real one.
+    ///
+    /// Run: cargo test --bin saife c1_live -- --ignored --nocapture
+    #[test]
+    #[ignore = "arms a real AppContainer session (creates a profile, writes DACLs); run: cargo test --bin saife c1_live -- --ignored"]
+    fn c1_live_armed_appcontainer_denies_file_read_data_on_ssh() {
+        use crate::sandbox::allowlist::build_allowlist;
+
+        let _env = crate::env_lock();
+        let base = tmp_tag("c1-live");
+        let _base_guard = TempDir(base.clone());
+        let home = base.join("home");
+        let local = base.join("local");
+        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::fs::create_dir_all(local.join("saife")).unwrap();
+        std::fs::write(home.join(".ssh").join("id_ed25519"), b"secret").unwrap();
+
+        struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.1.take() {
+                        Some(v) => std::env::set_var(self.0, v),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+        let _home_env = EnvGuard("USERPROFILE", std::env::var_os("USERPROFILE"));
+        let _local_env = EnvGuard("LOCALAPPDATA", std::env::var_os("LOCALAPPDATA"));
+        unsafe {
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("LOCALAPPDATA", &local);
+        }
+
+        let sid = format!("c1live{}", std::process::id());
+        let session = create_session(&sid).expect("create a real AppContainer profile");
+
+        let fs = crate::profile::FilesystemSlice {
+            allow: vec![home.clone()],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries = build_allowlist(&sid, &home, &fs).expect("build the allowlist");
+        let journal = DaclJournal::open(
+            &base.join("journal"),
+            JournalHeader {
+                run_id: format!("c1-{}", std::process::id()),
+                owner_pid: std::process::id(),
+                owner_created: 0,
+            },
+        )
+        .unwrap();
+
+        grant_access(&session.ac_sid.0, &entries, Some(&journal)).expect("arm the session");
+
+        let ssh = home.join(".ssh");
+        let denies = trustee_deny_ace_masks(&ssh.to_string_lossy(), &session.ac_sid.0);
+        assert!(
+            denies
+                .iter()
+                .any(|mask| mask & FILE_READ_DATA.0 == FILE_READ_DATA.0),
+            "the AC SID must be denied FILE_READ_DATA on the armed ~/.ssh; deny ACE \
+             masks found: {denies:x?} (a zero mask here means the deny is a no-op, C1)"
+        );
+
+        // Teardown: journal replay restores the temp tree's DACLs; removing the
+        // profile keeps repeated runs clean.
+        let _ = restore_or_warn(&journal);
+        delete_profile(&ac_profile_name(&sid));
+    }
 }
 
 #[cfg(test)]
@@ -1564,8 +1825,14 @@ fn credential_shaped_env_vars_do_not_reach_the_child() {
             cur.push(c);
         }
     }
-    assert!(!names.iter().any(|n| n.contains("API_KEY")), "credential leaked: {names:?}");
-    assert!(!names.iter().any(|n| n.contains("TOKEN")), "credential leaked: {names:?}");
+    assert!(
+        !names.iter().any(|n| n.contains("API_KEY")),
+        "credential leaked: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("TOKEN")),
+        "credential leaked: {names:?}"
+    );
     assert!(
         names.iter().any(|n| n == "SAIFE_TEST_ORDINARY"),
         "ordinary variables must still pass: {names:?}"

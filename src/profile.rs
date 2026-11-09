@@ -263,16 +263,120 @@ pub fn builtin_deny_dirs() -> Vec<std::path::PathBuf> {
 /// Does `outer` contain `inner` (equal, or an ancestor)? Component-wise and
 /// case-insensitive, because Windows paths are. Used to refuse a session whose
 /// deny would swallow a grant instead of silently locking the workload out.
+///
+/// Comparison happens on [`path_key`], the same normalization the mxc backend's
+/// deny-vs-grant check uses (`crate::net::mxc::path_key`), so a deny spelled
+/// with a trailing dot/space, a `\\.`/`\\..` segment, a verbatim `\\?\` prefix
+/// or a forward-slash separator compares equal to the plain spelling — Win32
+/// treats all of these as one directory, and a pre-flight that does not is a
+/// grant that ships inside a deny. `path_key` is private to (and feature-gated
+/// behind) the mxc module, so the normalization is mirrored here; the two must
+/// stay in lock-step.
 pub fn path_covers(outer: &std::path::Path, inner: &std::path::Path) -> bool {
-    fn norm(p: &std::path::Path) -> String {
-        p.display()
-            .to_string()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase()
+    let outer = path_key(&outer.to_string_lossy());
+    let inner = path_key(&inner.to_string_lossy());
+    // An empty deny covers nothing: an empty deny is a mistake, not a wildcard.
+    !outer.is_empty()
+        && (inner == outer
+            || inner
+                .strip_prefix(&outer)
+                .is_some_and(|rest| rest.starts_with('\\')))
+}
+
+/// Normalized comparison key for a Windows path — a faithful mirror of
+/// [`crate::net::mxc::path_key`]. See that function's docs for the full list of
+/// spellings this unifies; the short version is: separators become `\\`, a
+/// verbatim/device prefix is dropped, each component loses its trailing dots
+/// and spaces (before the `.`/`..` tests), `.` is dropped and `..` collapses,
+/// and the whole key is upper-cased. Nothing here touches the filesystem.
+fn path_key(path: &str) -> String {
+    let unified = unify_path_prefix(path);
+    let (root, rest) = split_path_root(&unified);
+
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('\\') {
+        // Trailing spaces first, then the `.`/`..` tests, then the dots: Windows
+        // ignores a component's trailing dots and spaces *before* deciding what
+        // the component means, so `.. ` is the parent directory. Doing it in any
+        // other order dropped `.. ` (it trimmed to nothing).
+        let segment = segment.trim_end_matches(' ');
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            segments.pop();
+            continue;
+        }
+        let segment = trim_component(segment);
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
     }
-    let (o, i) = (norm(outer), norm(inner));
-    i == o || i.starts_with(&format!("{o}\\"))
+
+    let mut key = fold_case(&root);
+    for segment in segments {
+        if !key.is_empty() && !key.ends_with('\\') {
+            key.push('\\');
+        }
+        key.push_str(&fold_case(segment));
+    }
+    key
+}
+
+/// Separator unification plus verbatim/device-prefix removal. Mirror of
+/// `mxc::unify_path_prefix`.
+fn unify_path_prefix(path: &str) -> String {
+    let raw = path.trim().replace('/', "\\");
+    let bytes = raw.as_bytes();
+    if bytes.len() < 4
+        || !(bytes[..4].eq_ignore_ascii_case(br"\\?\")
+            || bytes[..4].eq_ignore_ascii_case(br"\\.\\"))
+    {
+        return raw;
+    }
+    let rest = &raw[4..];
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes.len() >= 4 && rest_bytes[..4].eq_ignore_ascii_case(br"UNC\") {
+        return format!("\\\\{}", &rest[4..]);
+    }
+    rest.to_string()
+}
+
+/// Split a unified path into its root (`C:`, `\\server\share`, `\`, or `""`)
+/// and the part below it. Mirror of `mxc::split_path_root`.
+fn split_path_root(path: &str) -> (String, &str) {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        let mut parts = path[2..].splitn(3, '\\');
+        let server = parts.next().unwrap_or_default();
+        let share = parts.next().unwrap_or_default();
+        let end = 2 + server.len() + usize::from(!share.is_empty()) + share.len();
+        let root = if share.is_empty() {
+            format!("\\\\{}", trim_component(server))
+        } else {
+            format!("\\\\{}\\{}", trim_component(server), trim_component(share))
+        };
+        return (root, &path[end..]);
+    }
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return (path[..2].to_string(), &path[2..]);
+    }
+    if bytes.first() == Some(&b'\\') {
+        return ("\\".to_string(), &path[1..]);
+    }
+    (String::new(), path)
+}
+
+/// One path component as Win32 compares it: trailing dots and spaces are not
+/// part of the name. Mirror of `mxc::trim_component`.
+fn trim_component(component: &str) -> &str {
+    component.trim_end_matches(['.', ' '])
+}
+
+/// Win32's case fold, as closely as `std` approximates it: Unicode uppercase.
+/// Mirror of `mxc::fold_case`.
+fn fold_case(text: &str) -> String {
+    text.to_uppercase()
 }
 
 /// Ceiling for both `limits` terms: 7 days
@@ -1428,6 +1532,66 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1 red test: the pre-flight's deny-vs-grant compare must recognize the
+    /// deny directory under every spelling Win32 itself accepts — a trailing
+    /// dot, a trailing space, a `\.` segment, a `\..` that still resolves into
+    /// the tree, and a verbatim `\\?\` prefix. These name the same directory
+    /// the plain spelling does, so a deny spelled any of these ways must still
+    /// cover a grant inside it (and a normally-spelled deny must still cover
+    /// a grant spelled these ways). Before the normalization the compare was
+    /// textual, so all of these slipped past and the grant shipped.
+    #[test]
+    fn path_covers_normalizes_the_spellings_win32_accepts() {
+        let plain = std::path::Path::new(r"C:\Users\u\.ssh");
+        let key_inside = std::path::Path::new(r"C:\Users\u\.ssh\id_ed25519");
+
+        // A weirdly-spelled deny must still cover a grant inside ~/.ssh.
+        for deny_spelling in [
+            r"C:\Users\u\.ssh.",
+            r"C:\Users\u\.ssh ",
+            r"C:\Users\u\.ssh\.",
+            r"C:\Users\u\.ssh\..",
+            r"\\?\C:\Users\u\.ssh",
+        ] {
+            assert!(
+                path_covers(std::path::Path::new(deny_spelling), key_inside),
+                "deny spelled {deny_spelling:?} must cover the grant inside ~/.ssh"
+            );
+        }
+
+        // And the mirror direction: a normally-spelled deny must cover a grant
+        // spelled the ways Win32 accepts for ~/.ssh itself.
+        for grant_spelling in [
+            r"C:\Users\u\.ssh.",
+            r"C:\Users\u\.ssh ",
+            r"C:\Users\u\.ssh\.",
+            r"\\?\C:\Users\u\.ssh",
+            r"c:/users/u/.ssh",
+        ] {
+            assert!(
+                path_covers(plain, std::path::Path::new(grant_spelling)),
+                "grant spelled {grant_spelling:?} is inside the deny and must be refused"
+            );
+        }
+
+        // Negative controls: a sibling sharing the prefix is NOT inside.
+        for sibling in [
+            r"C:\Users\u\.ssh2",
+            r"C:\Users\u\.ssh2\k",
+            r"C:\Users\u\.ss",
+        ] {
+            assert!(
+                !path_covers(plain, std::path::Path::new(sibling)),
+                "{sibling:?} is a sibling, not a descendant"
+            );
+        }
+        // `..` resolving OUT of the deny is not covered either.
+        assert!(!path_covers(
+            plain,
+            std::path::Path::new(r"C:\Users\u\.ssh\..")
+        ));
+    }
 
     #[test]
     fn expand_basic() {

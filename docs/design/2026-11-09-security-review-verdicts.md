@@ -132,6 +132,12 @@ supervisor SID. Normalize `path_covers` to the `mxc::path_key` standard
 (`mxc.rs:238-267`) so `C:\Users\u\.ssh.` or a trailing space cannot slip past the
 pre-flight after the mask is enforced.
 
+**Follow-up found while implementing (2026-11-09).** `restore_one`'s `REVOKE_ACCESS`
+does not strip a `DENY_ACCESS` ACE, so teardown leaves this session's deny ACEs on the
+six trees. They name a per-session AppContainer SID whose profile teardown deletes, so
+they are inert litter rather than a live hole; it matters only if a SID is ever reused.
+Track as a teardown fix, separate from C1.
+
 **Red tests.**
 1. `allowlist` unit: every entry with `deny == true` has `access != 0`; the builtin
    list produces exactly six non-zero denies.
