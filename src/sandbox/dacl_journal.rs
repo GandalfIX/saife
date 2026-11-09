@@ -313,4 +313,40 @@ mod tests {
         );
         assert!(!d.join("bad.jsonl").exists(), "original removed");
     }
+
+    /// L-O (verdict: partial): teardown ACE restore IS implemented through the
+    /// journal. Prove the restore path runs (the reap closure is invoked and sees
+    /// the journaled entry) and the journal is removed on success — the
+    /// `main.rs:1044-1048` teardown sequence. `.sandbox/<sid>` dir removal is a
+    /// separate, tracked gap and is deliberately not tested here.
+    #[test]
+    fn teardown_restore_runs_and_journal_is_removed_on_success() {
+        let d = tmpdir("teardown");
+        let j = DaclJournal::open(&d, header(99998)).unwrap();
+        j.record(&entry("C:\\teardown")).unwrap();
+        assert!(
+            d.join("r99998.jsonl").exists(),
+            "the journal exists before teardown"
+        );
+
+        let restore_ran = std::cell::Cell::new(false);
+        let reaped = recover_orphans(&d, &|h| h.owner_pid != 99998, &|journal| {
+            restore_ran.set(true);
+            assert_eq!(
+                journal.entries().len(),
+                1,
+                "the restore path sees the journaled ACE"
+            );
+            true
+        });
+        assert_eq!(reaped, 1, "the dead-owner journal is reaped");
+        assert!(
+            restore_ran.get(),
+            "the restore path must run before the journal is removed"
+        );
+        assert!(
+            !d.join("r99998.jsonl").exists(),
+            "the journal is removed on a successful restore"
+        );
+    }
 }

@@ -695,6 +695,21 @@ mod tests {
         assert_eq!(out.bytes, b"one\ntwo\n");
         assert_eq!(out.flushes, 2, "one flush per chunk, not one at the end");
     }
+    /// L-N (verdict: partial; fix NOT approved): a `paths` entry carrying a
+    /// control character must be refused so build output / log lines cannot be
+    /// forged through it. red until L-N lands.
+    #[test]
+    #[ignore = "red until L-N lands"]
+    fn a_paths_entry_with_a_control_character_is_refused() {
+        let err = refuse_unsafe_relative("paths entry", "a\nb", "the project")
+            .expect_err("a control character in a paths entry must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("control") || msg.contains("a\nb"),
+            "the refusal must name the control character: {msg}"
+        );
+    }
+
     /// `C:foo` is drive-relative: not absolute, no leading separator, and it resolves against
     /// the drive's working directory - so it passed both earlier checks. Refused now.
     #[test]
@@ -717,5 +732,4 @@ mod tests {
         assert!(refusal.contains("no drive"), "got: {refusal}");
         let _ = std::fs::remove_dir_all(&ws);
     }
-
 }

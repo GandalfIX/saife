@@ -759,4 +759,51 @@ mod tests {
         }
         assert!(more.contains("line 2"), "got: {more:?}");
     }
+
+    /// L-E (verdict doc: partial — real but deferred): the runner listener reads
+    /// the request head with no deadline and no connection cap, so a client
+    /// that connects and sends NOTHING parks its handler task until the
+    /// session ends. Only host-local or opt-in loopback exposure keeps this
+    /// Low; the facade frames every real request, so the silent client is not
+    /// the workload's own traffic.
+    ///
+    /// RED until L-E lands (verdict doc): once a head-read timeout exists, the
+    /// listener closes the idle connection and the client observes EOF (or a
+    /// reset) instead of parking. The 10 s deadline bounds the wait whichever
+    /// timeout the fix chooses; the failure mode pinned here is "parked", not
+    /// "closed too late".
+    #[test]
+    #[ignore = "red until L-E lands (verdict doc): the runner listener has no head-read timeout"]
+    fn a_connection_that_sends_nothing_is_closed_after_the_head_read_timeout() {
+        let h = harness();
+        let mut s = connect(h.server.port);
+        // Nothing is ever written: this is the idle client.
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        let mut buf = [0u8; 1];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match s.read(&mut buf) {
+                // EOF: the listener closed the idle connection. The red/green
+                // line — today this never happens inside the deadline.
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    return;
+                }
+                // TimedOut/WouldBlock: the connection is still parked.
+                Err(_) => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an idle connection must be closed after the head-read timeout; \
+                 it is still parked after 10s (L-E)"
+            );
+        }
+    }
 }

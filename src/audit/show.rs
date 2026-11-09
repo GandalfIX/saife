@@ -162,4 +162,69 @@ mod tests {
         let rc = run_show("nonexistent-sid-12345678", false, None);
         assert_ne!(rc, 0);
     }
+
+    /// H4 (verdict doc: partial, Medium — real but deferred). The reader joins
+    /// the raw `--sid` into the audit directory (`audit_log_path`), so
+    /// `audit show` reads an attacker-chosen `*.ndjson` outside it.
+    ///
+    /// RED until H4 lands (verdict doc): validation at this reader entry point
+    /// must make every case below return `Err` BEFORE any file is opened.
+    /// Each traversal case plants a readable log where the path resolves to,
+    /// so today the read SUCCEEDS (`Ok(0)`) and this test is red; after the
+    /// fix the planted file is never read.
+    ///
+    /// `run_show_inner`, not `run_show`: it is the reader entry point the CLI
+    /// wrapper only maps to an exit code, and it returns the `Err` the fix
+    /// will produce.
+    #[test]
+    #[ignore = "red until H4 lands (verdict doc): audit show must validate the sid before reading"]
+    fn show_refuses_a_traversal_session_id_before_reading_any_file() {
+        let pid = std::process::id();
+        // (1) Relative traversal: `..\..\x` resolves, via the OS, to a sibling
+        // of (above) the audit directory.
+        let relative = format!("..\\..\\h4-show-{pid}");
+        // (2) Absolute path: `Path::join` REPLACES the audit directory.
+        let absolute = std::env::temp_dir()
+            .join(format!("h4-show-abs-{pid}"))
+            .to_string_lossy()
+            .into_owned();
+        // (3) UNC path: no share is created, so today's answer is "no audit
+        // log". The assertion is that the refusal names the SESSION ID — i.e.
+        // it happened before any path lookup — not that a file went missing.
+        let unc = format!("\\\\h4-nonexistent\\share\\h4-show-{pid}");
+
+        let planted: Vec<(&str, std::path::PathBuf)> = vec![
+            (relative.as_str(), crate::audit::audit_log_path(&relative)),
+            (absolute.as_str(), crate::audit::audit_log_path(&absolute)),
+        ];
+        for (_, path) in &planted {
+            std::fs::write(path, "{\"op\":\"CONNECT\",\"host\":\"planted.example\"}\n")
+                .expect("plant a readable log at the traversal target");
+        }
+
+        let results = [
+            run_show_inner(&relative, false, None).map_err(|e| format!("{e:#}")),
+            run_show_inner(&absolute, false, None).map_err(|e| format!("{e:#}")),
+            run_show_inner(&unc, false, None).map_err(|e| format!("{e:#}")),
+        ];
+        for (_, path) in &planted {
+            let _ = std::fs::remove_file(path);
+        }
+
+        assert!(
+            results[0].is_err(),
+            "a relative traversal sid must be refused, got {results:?}"
+        );
+        assert!(
+            results[1].is_err(),
+            "an absolute-path sid must be refused, got {results:?}"
+        );
+        match &results[2] {
+            Err(message) => assert!(
+                message.to_ascii_lowercase().contains("session"),
+                "a UNC sid must be refused by sid validation before any path lookup: {message}"
+            ),
+            Ok(_) => panic!("a UNC sid must be refused, got {results:?}"),
+        }
+    }
 }

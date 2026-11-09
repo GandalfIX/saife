@@ -6599,3 +6599,67 @@
             started.elapsed()
         );
     }
+
+    // ---- H2 characterization: the chained-branch contract ([G-22]) ---------
+    //
+    // Verdict doc `docs/design/2026-11-09-security-review-verdicts.md`, H2:
+    // partial, Medium. The mechanism (chained dials skip local resolution and
+    // the pinned-address hard-deny) is real and DOCUMENTED/ACCEPTED for a
+    // remote upstream — the upstream proxy resolves the name and owns its own
+    // defenses ([G-22], ADR-0001 §D-1/D-2). It is unsound only for the
+    // loopback bridge this module itself recommends (`upstream.rs:26-29`:
+    // cntlm/px on 127.0.0.1, which has no rebinding defense), and that
+    // residual is deferred. This test does not assert the deferred fix; it
+    // pins today's contract so a future change to the chained branch is a
+    // deliberate one.
+    //
+    // The injected resolver answers with LOOPBACK and `permit_loopback` is
+    // `false`: if the chained branch ever resolved locally and ran
+    // `pinned_addrs_hard_denied`, the dial would be DENIED (or the counter
+    // would move). Today it returns before both legs.
+    #[tokio::test]
+    async fn chained_dial_sends_the_hostname_and_skips_local_resolution_and_pinned_hard_deny() {
+        let fake = FakeUpstream::start(200);
+        let chain = dialer(&fake.url(), &[]);
+        let resolve_calls = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::dial_upstream(
+                Some(chain.as_ref()),
+                "rebind.example",
+                443,
+                false,
+                |host, port| {
+                    resolve_calls.fetch_add(1, Ordering::SeqCst);
+                    // A poisoned answer: the shape a split-horizon/rebinding
+                    // resolver would return. Seeing it here would mean the
+                    // chained branch resolved locally, which [G-22] forbids.
+                    assert_eq!((host.as_str(), port), ("rebind.example", 443));
+                    async { Ok(vec!["127.0.0.1:443".parse::<SocketAddr>().unwrap()]) }
+                },
+            ),
+        )
+        .await
+        .expect("the chained dial must not hang");
+        // `DialFailure` is deliberately not `Debug` (it carries no printable
+        // policy detail), so match rather than `expect`.
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(_) => panic!("the chained dial must reach the fake upstream, not be refused"),
+        };
+
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            0,
+            "[G-22]: the chained branch must not resolve locally; the upstream does the DNS"
+        );
+        drop(stream);
+
+        let heads = fake.heads();
+        assert_eq!(heads.len(), 1, "exactly one upstream CONNECT: {heads:?}");
+        assert!(
+            heads[0].starts_with("CONNECT rebind.example:443 HTTP/1.1"),
+            "the hostname STRING is what chains (no pinned IP is sent): {:?}",
+            heads[0]
+        );
+    }

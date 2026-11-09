@@ -296,6 +296,44 @@ class HttpFixture:
 GOOD = {"target": "logs@example.invalid", "commands": ["list"], "command_timeout": 2}
 
 
+def status_code_of(resp: bytes) -> int:
+    """The status line's code, failing loudly when the connection was dropped."""
+    line = resp.split(b"\r\n", 1)[0] if resp else b""
+    parts = line.split()
+    assert parts and parts[0].startswith(b"HTTP/"), (
+        f"no HTTP status line - the connection was dropped: {resp[:120]!r}")
+    return int(parts[1])
+
+
+def raw_post(fx: "HttpFixture", headers: str, body: bytes = b"", timeout: float = 5) -> bytes:
+    """One raw request on a socket whose write side stays OPEN until the reply.
+
+    That is the point of using a raw socket here: a handler that blocks reading
+    a body it was never sent must fail this helper by timing out, instead of
+    passing because the client closed and turned the read into EOF.
+    """
+    sock = socket.create_connection(("127.0.0.1", fx.server.server_address[1]), timeout=timeout)
+    try:
+        sock.sendall(headers.encode("ascii") + body)
+        sock.settimeout(timeout)
+        chunks = []
+        while True:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout as exc:
+                raise AssertionError(
+                    f"the sidecar did not answer within {timeout}s - it is waiting on a "
+                    "body the client never offered to close"
+                ) from exc
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
+
 class ExecPath(unittest.TestCase):
     def test_success_replies_the_bytes_and_audits_the_call(self):
         with HttpFixture({"srv1": dict(GOOD)}) as fx:
@@ -372,6 +410,62 @@ class ExecPath(unittest.TestCase):
             rec = fx.audit[-1]
             self.assertEqual(rec["status"], 403)
             self.assertIn("command_not_declared", rec["outcome"])
+
+
+class MalformedFramingIsContained(unittest.TestCase):
+    """M16 (docs/design/2026-11-09-security-review-verdicts.md, verdict: partial).
+
+    `do_POST` trusts `int(self.headers.get("Content-Length"))`: a negative value
+    reaches `rfile.read(-1)` (read to EOF - the handler parks until the caller
+    hangs up) and a non-numeric one raises out of the handler (the connection is
+    dropped with no reply). The verdict marks this unreachable from the workload
+    - the facade re-frames every request and the token gates first - so the
+    hardening (`max(0, ...)`, `try/except ValueError -> 400`, reject
+    `Transfer-Encoding`) is deferred, and these tests stay skipped until it
+    lands. They pin the CONTRACT: a malformed frame gets a bounded, named
+    refusal and never spawns ssh or leaves an EXEC record.
+    """
+
+    def _post_raw(self, fx, extra_headers: str, body: bytes = b"") -> bytes:
+        head = (
+            "POST /exec HTTP/1.0\r\nHost: ssh\r\nX-Facade-Token: test-token\r\n"
+            f"{extra_headers}\r\n"
+        )
+        return raw_post(fx, head, body)
+
+    def _assert_contained(self, fx, resp: bytes) -> None:
+        code = status_code_of(resp)
+        self.assertGreaterEqual(code, 400, f"a malformed frame must be refused: {resp[:200]!r}")
+        self.assertLess(code, 600, f"expected an HTTP error reply: {resp[:200]!r}")
+        self.assertEqual(FakeProc.instances, [], "no ssh may be spawned for a malformed frame")
+        self.assertEqual(fx.audit, [], "no EXEC record: the request never became a call")
+
+    @unittest.skip('M16 hardening pending — docs/design/2026-11-09-security-review-verdicts.md')
+    def test_negative_content_length_is_refused_not_read_to_eof(self):
+        # The write side stays open (raw_post never closes it): today
+        # `read(-1)` waits for an EOF that only arrives when the caller gives
+        # up, so the reply must come from the reply path, not from EOF.
+        with HttpFixture({"srv1": dict(GOOD)}) as fx:
+            resp = self._post_raw(fx, "Content-Length: -1\r\n")
+            self._assert_contained(fx, resp)
+
+    @unittest.skip('M16 hardening pending — docs/design/2026-11-09-security-review-verdicts.md')
+    def test_non_numeric_content_length_gets_a_clean_reply(self):
+        # `int("abc")` raises out of the handler today: the client sees a
+        # dropped connection instead of a status line.
+        with HttpFixture({"srv1": dict(GOOD)}) as fx:
+            resp = self._post_raw(fx, "Content-Length: abc\r\n")
+            self._assert_contained(fx, resp)
+
+    @unittest.skip('M16 hardening pending — docs/design/2026-11-09-security-review-verdicts.md')
+    def test_chunked_transfer_encoding_is_rejected(self):
+        # A valid JSON body in chunked framing must not be decoded: the sidecar
+        # speaks Content-Length framing only, so the request is refused whole.
+        payload = json.dumps({"host": "srv1", "verb": "list"}).encode()
+        body = f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
+        with HttpFixture({"srv1": dict(GOOD)}) as fx:
+            resp = self._post_raw(fx, "Transfer-Encoding: chunked\r\n", body)
+            self._assert_contained(fx, resp)
 
 
 if __name__ == "__main__":

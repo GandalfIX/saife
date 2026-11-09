@@ -447,4 +447,123 @@ mod tests {
         }
         cleanup(&sid);
     }
+
+    /// Write a fully valid, signed one-leaf chain at `sid`'s path. `leaf` must
+    /// already carry whatever fields the test wants to pin; `hash`/`parent`
+    /// are recomputed here and the root is signed with the real key, so the
+    /// only thing under test is the field set.
+    fn plant_signed_chain(sid: &str, mut leaf: Map<String, Value>) {
+        leaf.insert("ts".into(), json!("2026-11-09T00:00:00Z"));
+        let hash = sha256_hex(&canonicalize(&leaf));
+        leaf.insert("hash".into(), json!(hash));
+        leaf.insert("parent".into(), json!(Value::Null));
+        let path = audit_log_path(sid);
+        std::fs::write(&path, serde_json::to_string(&leaf).unwrap() + "\n").unwrap();
+        std::fs::write(path.with_extension("root"), &hash).unwrap();
+        let key = signing::KeyMaterial::ensure().unwrap();
+        let sig = key.sign_root(&decode_hex(&hash).unwrap());
+        let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(path.with_extension("sig"), &sig_hex).unwrap();
+    }
+
+    /// One CONNECT leaf, carrying `sid`/`seq` only when asked: the missing-key
+    /// tests need a leaf that never had the key at all.
+    fn chain_leaf(sid: &str, with_sid: bool, with_seq: bool) -> Map<String, Value> {
+        let mut e = Map::new();
+        e.insert("op".into(), json!("CONNECT"));
+        e.insert("host".into(), json!("planted.example"));
+        if with_sid {
+            e.insert("sid".into(), json!(sid));
+        }
+        if with_seq {
+            e.insert("seq".into(), json!(0));
+        }
+        e
+    }
+
+    /// H4 (verdict doc: partial, Medium — real but deferred). `verify` joins
+    /// the raw `--sid` into the audit directory exactly like `show`, so a
+    /// traversal sid names a file outside it — and the chain planted below is
+    /// fully valid, so today `verify` reports **OK** for it.
+    ///
+    /// RED until H4 lands (verdict doc): sid validation at this reader entry
+    /// point must make every case return `Err` before any file is opened.
+    #[test]
+    #[ignore = "red until H4 lands (verdict doc): audit verify must validate the sid before reading"]
+    fn verify_refuses_a_traversal_session_id_before_reading_any_file() {
+        let pid = std::process::id();
+        let relative = format!("..\\..\\h4-verify-{pid}");
+        let absolute = std::env::temp_dir()
+            .join(format!("h4-verify-abs-{pid}"))
+            .to_string_lossy()
+            .into_owned();
+        let unc = format!("\\\\h4-nonexistent\\share\\h4-verify-{pid}");
+
+        // The planted chain carries the traversal sid itself, so today every
+        // check inside `verify_inner` passes and the verdict is OK.
+        plant_signed_chain(&relative, chain_leaf(&relative, true, true));
+        plant_signed_chain(&absolute, chain_leaf(&absolute, true, true));
+
+        let results = [
+            verify_inner(&relative).map_err(|e| format!("{e:#}")),
+            verify_inner(&absolute).map_err(|e| format!("{e:#}")),
+            verify_inner(&unc).map_err(|e| format!("{e:#}")),
+        ];
+        cleanup(&relative);
+        cleanup(&absolute);
+
+        assert!(
+            results[0].is_err(),
+            "a relative traversal sid must be refused, got {results:?}"
+        );
+        assert!(
+            results[1].is_err(),
+            "an absolute-path sid must be refused, got {results:?}"
+        );
+        match &results[2] {
+            Err(message) => assert!(
+                message.to_ascii_lowercase().contains("session"),
+                "a UNC sid must be refused by sid validation before any path lookup: {message}"
+            ),
+            Ok(outcome) => panic!("a UNC sid must be refused, got {outcome:?}"),
+        }
+    }
+
+    /// L-H (verdict doc: partial, Low — deferred defense-in-depth). A leaf
+    /// that STRIPPED its `sid` key must verify as Tampered, not be silently
+    /// accepted: `verify` checks the session binding only when the key is
+    /// present, so a rewritten leaf that drops it (hash recomputed, chain
+    /// re-signed — the honest forgery below) verifies OK today.
+    ///
+    /// RED until L-H lands (verdict doc): requiring `sid` on every leaf turns
+    /// this into Tampered.
+    #[test]
+    #[ignore = "red until L-H lands (verdict doc): a leaf without `sid` must be Tampered"]
+    fn a_leaf_without_the_sid_key_is_tampered() {
+        let sid = fresh_sid("lh-no-sid");
+        plant_signed_chain(&sid, chain_leaf(&sid, false, true));
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        assert!(
+            matches!(outcome, VerifyOutcome::Tampered(_)),
+            "a leaf without `sid` must be Tampered, got {outcome:?}"
+        );
+    }
+
+    /// L-H, the `seq` half: a leaf with its sequence number stripped must be
+    /// Tampered for the same reason — the check is conditional on presence.
+    ///
+    /// RED until L-H lands (verdict doc).
+    #[test]
+    #[ignore = "red until L-H lands (verdict doc): a leaf without `seq` must be Tampered"]
+    fn a_leaf_without_the_seq_key_is_tampered() {
+        let sid = fresh_sid("lh-no-seq");
+        plant_signed_chain(&sid, chain_leaf(&sid, true, false));
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        assert!(
+            matches!(outcome, VerifyOutcome::Tampered(_)),
+            "a leaf without `seq` must be Tampered, got {outcome:?}"
+        );
+    }
 }

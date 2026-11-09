@@ -622,6 +622,74 @@ mod tests {
         assert!(msg.contains(GLOBAL_ROOT_LABEL), "got: {msg}");
     }
 
+    // ---- H3's mitigations that DO exist -----------------------------------
+    // docs/design/2026-11-09-security-review-verdicts.md § H3 (verdict: partial):
+    // the missing `env_clear` is deferred because a malicious plugin is already
+    // supervisor-privileged code — and *is* out of reach, because (a) the
+    // workload cannot install one (`.saife` is a builtin deny, pinned in
+    // `net/mxc/live.rs`) and (b) plugin roots come only from the operator.
+    // These tests pin (b), the mitigation this module owns.
+
+    /// Plugin roots are exactly what the operator named plus the install root.
+    /// Nothing is discovered implicitly — no workspace, no cwd, no repo-local
+    /// `.saife/plugins` — so a cloned repository cannot gain a host-side
+    /// sidecar by being run in (the module doc's trust rule).
+    #[test]
+    fn plugin_roots_come_only_from_the_operator_or_the_install_root() {
+        let global = scratch("roots-operator-global");
+        let workspace = scratch("roots-operator-workspace");
+        install(
+            &workspace,
+            "planted",
+            &manifest_json("planted", "planted", ""),
+        );
+
+        // No `--plugin-dir` given: exactly one root, the install root. The
+        // process's cwd must not appear on its own.
+        let roots = plugin_roots_in(&global, &[]);
+        assert_eq!(
+            roots.len(),
+            1,
+            "only the install root may be searched without an operator flag: {roots:?}"
+        );
+        assert_eq!(roots[0].label, GLOBAL_ROOT_LABEL);
+        assert_eq!(roots[0].path, global);
+        let cwd = std::env::current_dir().expect("cwd");
+        assert!(
+            !roots.iter().any(|r| r.path == cwd),
+            "the cwd must never become an implicit plugin root: {roots:?}"
+        );
+
+        // A plugin planted in a workspace directory is invisible: the name is
+        // refused, and the refusal lists only the roots actually searched.
+        let err = load_plugin_from(&roots, "planted")
+            .expect_err("a workspace plugin the operator did not name must not load");
+        let msg = err.to_string();
+        assert!(msg.starts_with("plugin_not_found: planted"), "got: {msg}");
+        assert!(
+            !msg.contains(&workspace.display().to_string()),
+            "the workspace must not appear as a searched root: {msg}"
+        );
+    }
+
+    /// The install root must stay inside the tree every launch denies: if
+    /// `global_plugins_root()` ever moves out of `~/.saife`, the workload could
+    /// write a plugin that executes host-side on the next run, and the
+    /// control-plane deny tests in `net/mxc/live.rs` would no longer cover this
+    /// module. Green by construction; this is the coupling that makes H3's
+    /// "the workload cannot install one" true.
+    #[test]
+    fn the_install_root_lives_inside_the_denied_control_plane() {
+        let root = global_plugins_root().expect("USERPROFILE is set on every Windows host");
+        let denied = crate::profile::builtin_deny_dirs();
+        assert!(
+            denied.iter().any(|d| crate::profile::path_covers(d, &root)),
+            "the global plugin root {} must sit inside one of the builtin deny \
+             trees {denied:?}",
+            root.display()
+        );
+    }
+
     // ---- registry --------------------------------------------------------
 
     fn target(mount: &str, port: u16) -> FacadeTarget {

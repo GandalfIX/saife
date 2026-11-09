@@ -624,6 +624,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// LIVE (`-- --ignored`): the sidecar's environment.
+    ///
+    /// H3 (docs/design/2026-11-09-security-review-verdicts.md, verdict: partial):
+    /// `start` never calls `env_clear`, so the child inherits the supervisor's
+    /// whole environment while the module docstring promises "and nothing else".
+    /// The verdict defers the fix — a plugin is supervisor-privileged code by
+    /// design, `.saife` is denied to the workload, and repo-local plugins need an
+    /// operator `--plugin-dir`, so the inherited environment has no reachable
+    /// attacker. This test therefore stays ignored and asserts the CONTRACT, not
+    /// today's behaviour: when H3 lands it is un-ignored and must pass.
+    ///
+    /// Run: `cargo test --bin saife \
+    ///     plugin::sidecar::tests::the_sidecar_inherits_no_supervisor_environment -- --ignored`
+    #[ignore = "red until H3 lands (env_clear); docs/design/2026-11-09-security-review-verdicts.md"]
+    #[test]
+    fn the_sidecar_inherits_no_supervisor_environment() {
+        // A fixture sidecar that dumps its own environment and answers /status.
+        let dir = std::env::temp_dir().join(format!(
+            "sandbox-plugin-h3-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sidecar.py"),
+            r#"import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+with open(os.environ["SIDECAR_CFG_ENVDUMP"], "w", encoding="utf-8") as fh:
+    json.dump(dict(os.environ), fh)
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_a):
+        pass
+
+HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
+"#,
+        )
+        .unwrap();
+        let dump = dir.join("env.json");
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "name": "h3env",
+            "mount": "h3env",
+            "command": ["python", "sidecar.py"],
+            "health": {"path": "/status", "timeout_ms": 15000, "interval_ms": 100},
+            "operations": [{"method": "GET", "path": "/"}],
+            "config": {"envdump": dump.display().to_string()}
+        })
+        .to_string();
+        std::fs::write(dir.join(crate::plugin::PLUGIN_ENTRY), body).unwrap();
+        let manifest =
+            crate::plugin::read_manifest(&dir.join(crate::plugin::PLUGIN_ENTRY), "h3env")
+                .expect("the H3 fixture manifest");
+
+        // SAFETY: process-wide state, set before the spawn and removed below;
+        // the name is test-unique and the value would only matter to this test.
+        // Edition 2024 makes these calls unsafe; the sentinel is exactly what
+        // the verdict's red test plants in the supervisor's environment.
+        let sentinel = format!("SAIFE_H3_SENTINEL_{}", nanos());
+        unsafe { std::env::set_var(&sentinel, "must-not-reach-the-sidecar") };
+
+        let sidecar = Sidecar::start(&dir, &manifest, &format!("h3-env-{}", nanos()))
+            .expect("the fixture sidecar must answer its health probe");
+        drop(sidecar); // end the tree before reading what it recorded
+
+        let env: std::collections::HashMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(&dump).expect("the sidecar must dump its environment"),
+        )
+        .expect("the dump must be a JSON object of strings");
+
+        assert!(
+            !env.contains_key(&sentinel),
+            "H3: the sidecar must not inherit the supervisor's environment, \
+             but {sentinel} did"
+        );
+        assert!(
+            !env.values().any(|v| v == "must-not-reach-the-sidecar"),
+            "the sentinel value must not reach the sidecar under any name"
+        );
+        assert!(env.contains_key("PATH"), "the fix must still provide PATH");
+        assert!(
+            env.contains_key("SIDECAR_FACADE_TOKEN"),
+            "the facade token must still be present"
+        );
+
+        // SAFETY: removes the sentinel set above; the environment is as found.
+        unsafe { std::env::remove_var(&sentinel) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// LIVE (`-- --ignored`): the real `tngtech` plugin, the real proxy, the real
     /// relay, and a real kill.
     ///
