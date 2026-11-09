@@ -8,6 +8,152 @@ minor release may break the profile schema; the error message names the fix.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-09
+
+The release that adds the **ssh-gateway plugin** and the **declared-loopback session mode**, and
+that lands the independent security review of 2026-11-09: 39 findings re-tested against the code,
+29 confirmed, 12 partial, 1 wrong (a junction inside the project fails the pack instead of
+exfiltrating it). Containment is unchanged or **stricter** throughout; the two behaviour changes
+that can refuse something that used to "work" are named under Changed.
+
+### Added
+
+- **ssh-gateway plugin.** A sandboxed workload names a verb on a declared host; the sidecar runs the
+  real `ssh` on the host with keys that never enter the container, and the workload receives the
+  bytes. This is the designed way out for a tool that sshs to a server - the identity file sits
+  behind the `.ssh` deny grant and port 22 is kernel-denied by design - without weakening either.
+  Hosts and per-host verb allowlists come from a gateway file; every call is audited twice: one
+  `op=FACADE` leaf with the sidecar's own HTTP status, and one structured EXEC line on the sidecar
+  log (host, verb, argument digest, sizes, exit, duration).
+- **`--allow-host-loopback`** (ADR-0007). The mxc substrate closes loopback as a property of proxy
+  mode, not of egress policy, so a per-port allowance - the mechanism the ADR first proposed - does
+  not exist. What ships is the honest remainder: a session mode with loopback **open, unscoped and
+  unaudited**, internet egress still passing the audited decision pipeline, and the risk printed as
+  a pinned startup warning. The session-start leaf records `loopback: open-unscoped`. Gradle builds
+  still belong on `--runner`.
+- **LAN egress denied by default.** A wildcard allow-list entry resolving into `10/8`,
+  `172.16/12`, `192.168/16`, `100.64/10` or `fc00::/7` used to dial the local network and audit as
+  allowed; those ranges are now refused on the direct path (`lan_refused`). `--allow-lan` relaxes
+  the LAN leg only - loopback and link-local stay refused.
+- **Built-in credential-file denies.** The shipped profiles grant `~/.gradle` and `~/.m2` RWX, and
+  those trees hold `gradle.properties` and `settings.xml`. Where a whole-directory deny cannot work
+  (the pre-flight refuses a grant inside a deny), the files are denied individually:
+  `gradle.properties`, `.m2/settings.xml`, `.cargo/credentials.toml`, `.git-credentials`,
+  `.docker/config.json`, `.kube/config`, `.config/gh`, `%APPDATA%\NuGet\NuGet.Config`, `.pypirc`.
+  (`.npmrc` stays readable on purpose - npm needs the token; the trade-off is in `profiles/README.md`.)
+- **`req_id` on request leaves and as an audit filter key.** The admission allow and any post-dial
+  deny of the same request share an id, so `--filter req_id=17` selects exactly that request's
+  allow+deny, and `audit show` counts a host as contacted only when the terminal disposition is allow.
+
+### Security
+
+- **Deny ACEs carried a zero access mask since the MVP.** A `DENY_ACCESS` ACE with mask 0 intersects
+  no requested right, so the six builtin-deny trees and every profile deny denied **nothing**: a
+  session granted `--allow $USERPROFILE` could read `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg` and
+  both `.saife` trees through the inherited allow. The mask is now `FILE_ALL_ACCESS` with
+  propagation, and `path_covers` normalizes like the admission path so a grant spelled into a deny
+  cannot slip past the pre-flight.
+- **Runner sync-out refused junctions and link entries.** The workload owns the writable project,
+  so it could pre-create `build/libs` as a junction and have the supervisor write through it with
+  the user's rights; the tar crate's containment check canonicalizes and follows such a junction.
+  Entry kinds are pre-scanned, every existing component is checked for reparse points, and the
+  destination must resolve under the canonical project - in `sync_out` itself, because the junction
+  can be planted while the build runs.
+- **The audit chain has one writer per session id**, a lock carrying the holder's pid and creation
+  stamp (a crashed run is reaped, a recycled pid is not honoured). `.sig` is published before
+  `.root`, each through a sibling temp and `MoveFileExW(REPLACE|WRITE_THROUGH)`, so a kill in
+  between reads as INCOMPLETE instead of TAMPERED. Appends after seal are counted and printed
+  instead of vanishing, and a failed non-strict write no longer advances the chain - a degraded log
+  used to verify as TAMPERED because the next leaf named a parent that was never written.
+- **`audit verify` no longer mints a signing key.** It called `ensure()` and installed a fresh trust
+  anchor when the key was missing, turning key loss into BAD_SIGNATURE for every old session;
+  it reports `KEY_MISSING` and creates nothing. A key fingerprint (`.keyfp`) distinguishes a
+  rotation from a substitution (`KEY_CHANGED`), with the honest caveat that a per-session
+  fingerprint cannot tell them apart without a trust store.
+- **Readers refuse what the writer refuses.** Session ids are validated at both reader entry points
+  (a traversal, absolute or UNC id used to read or write outside the session directory), a
+  non-ASCII `.sig` is BAD_SIGNATURE instead of a panic, a leaf without `sid` or `seq` is Tampered,
+  and `audit show` prints "PRESENT (not verified)" instead of claiming "Sig OK" from file existence.
+- **Teardown strips the session's deny ACEs too.** `REVOKE_ACCESS` removes allow ACEs and leaves
+  deny ones behind, so the six builtin-deny trees kept a permanent `FILE_ALL_ACCESS` deny for a
+  deleted AppContainer SID. Restore rebuilds each journaled DACL without every ACE for the session
+  SID (allow, deny, explicit, inherited), merges the journaled prior ACEs back, and applies it -
+  copying raw ACEs so other trustees and inherited flags stay byte-identical. Each path is restored
+  once; a later journal entry can no longer resurrect dead ACEs.
+- **ssh-gateway hardening.** A plugin-local `known_hosts` with `StrictHostKeyChecking=yes` (first
+  contact used to be silent TOFU into the user's real `~/.ssh/known_hosts`); framed body reads
+  (negative or non-numeric `Content-Length`, `Transfer-Encoding` refused); `ssh.exe` resolved once
+  by absolute path instead of through a `PATH` that starts with the plugin directory; the child
+  environment cleared and rebuilt from an allowlist, so `AWS_*`, `GITHUB_TOKEN` and proxy variables
+  no longer reach a sidecar.
+- **Runner hardening.** Build logs are a ring with a line cap and a 4 MiB budget (a build printing
+  gigabytes used to fill the supervisor's heap, bounded only by the deadline); the container gets
+  `PidsLimit 1024`, 4 CPUs and >= 4 GiB memory (overridable via `SAIFE_RUNNER_*`); the runner token
+  compares in constant time; head and body reads have deadlines (408 on timeout); control
+  characters are refused in `project` and `paths`; `.sandbox/<sid>` is removed at teardown; and a
+  junction or file symlink inside the project is refused by name instead of producing an opaque
+  pack failure.
+- **Network honesty.** A chained dial deliberately resolves nothing locally, which voids the
+  destination hard-deny when the upstream is the loopback bridge this module recommends - dial
+  behaviour is unchanged (a local pre-check would false-deny under split-horizon DNS), but a
+  loopback upstream now prints a named warning and ADR-0001 states the guarantee's real scope.
+  `CONNECT user@host:443` no longer carries userinfo into the decision, `Proxy-Authenticate` /
+  `Proxy-Info` are stripped from every relayed head, body reads have a deadline (128 idle
+  authenticated connections used to park every permit), and the facade relays the declared path
+  while the audit leaf keeps the origin-form.
+- **`--allow <path>:write` and `:execute` are refused** with an error naming the supported modes
+  (`read`, `readwrite`). Both were parsed and then discarded: every mode except `read` became a
+  full RWX grant, while the user guide promised "write only". `:read` now yields RX, `:readwrite`
+  and a bare `--allow` yield RWX.
+- **The credential-deny base comes from `SHGetKnownFolderPath`**, not from a caller-controlled
+  `USERPROFILE`: unset, all six directory and nine file denies silently vanished; repointed, they
+  denied the wrong tree. `.sandbox` carries a PROTECTED DACL (a second session could enumerate
+  sibling SIDs, create entries and rename another session's tree), and a journal that cannot be
+  read fails closed instead of parsing as empty - which deleted the journal and left every granted
+  ACE on the host forever.
+- **Runner token refusals drain the declared body** before answering: closing a socket with unread
+  inbound data makes Windows send a RST, and the tail of the 401 was destroyed before the client
+  read it - a truncated header that looked like a protocol error.
+- **The shipped ssh-gateway manifest parses.** `"max_concurrent": 4` was a JSON number in a
+  `BTreeMap<String, String>`, so the plugin could never load (stop-ship, found by the verdict pass
+  and not by any test). Every shipped `plugin.json` is now parsed by the real loader in a test.
+
+### Changed
+
+- `audit show` counts a host as contacted only for a request whose **terminal** disposition is
+  allow; the admission allow used to be counted even when the dial was then denied.
+- `install-local.ps1`'s self-check captures `saife setup --check-only` before printing instead of
+  piping into `Select-Object -First 4`, which closed the child's stdout mid-output and made a clean
+  install end in a Rust panic (`os error 232`).
+- `release.ps1` treats an already-deleted release branch as the expected case instead of exiting
+  non-zero after a successful publish.
+- The opencode profile grants `$HOME/.local/bin` and `$APPDATA/uv` read access, so a bare `opencode`
+  resolves and a uv-managed python can spawn its interpreter - both used to report as
+  `0x80070002` or `permission denied (os error 5)`.
+
+### Docs
+
+- ADR-0007 (declared loopback reach): Accepted, with the spike measurements, the shipped
+  implementation and the standing rule that Gradle builds prefer the runner (ADR-0006).
+- `docs/design/2026-11-09-security-review-verdicts.md`: the independent verdicts, per point, with
+  severity moves and the red test that flips each fix.
+- FAQ: opencode v2 under mxc needs loopback; `0x80070002` from a missing PATH-directory grant, with
+  the uv-trampoline variant.
+- `plugins/ssh-gateway/README.md`: install, gateway-file format, the eight invariants, seeding the
+  plugin-local `known_hosts` with `ssh-keyscan`.
+
+### Notes
+
+- No profile schema change: a 0.4.x profile loads unchanged. The new refusals are defaults that were
+  previously *silent* (zero-mask denies, LAN dials) or dishonest (grant modes); the escape hatches
+  are `--allow-lan` and, for loopback, `--allow-host-loopback`.
+- The built-in credential-file denies are not configurable per profile. A workflow that must read one
+  of those files inside a session is out of scope by design - put the values in the build facade or
+  copy them into the project.
+- `--allow-host-loopback` opens **every** host loopback service to the session and audits none of
+  that traffic. It is a product decision recorded in ADR-0007, not a scoping mechanism; the
+  per-port allowance the ADR originally wanted does not exist in the substrate.
+
 ## [0.4.0] - 2026-11-04
 
 The release that adds the **build runner**, and the first one that ships an **arm64** archive.
