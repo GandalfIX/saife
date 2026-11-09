@@ -207,7 +207,7 @@ starts empty and either fails offline or has to download, and the slot has `Netw
 | scope | one global volume, shared by every session and project | what the measurements assumed; per-session means paying the 88 s first build again in every session |
 | prewarm | explicit, documented command (`saife runner prewarm`) that reports the size | the first fill needs network and a slot has none; an implicit networked build would contradict `--network none` |
 | growth | no eviction in v1; the size is reported (`saife runner status`) | silent deletion of a cache is worse than a visible large one; the operator can remove the volume |
-| trust | **shared state between sessions**, stated as a limit (§10.5) | a build in session A can poison what session B reads; acceptable while saife is single-user on one machine, and said out loud |
+| trust | **shared state between sessions**, stated as a limit (§10.5) | a build in session A can make session B's build **execute code**: an init script under `/cache/init.d` runs, a substituted dependency jar is compiled against, a rewritten Gradle distribution runs. That is code execution, not "B reads wrong bytes"; acceptable while saife is single-user on one machine, and said out loud |
 
 Per-session caching is one line away and buys isolation at the price of the 88 s download per
 session; it stays a future switch, not the default.
@@ -480,10 +480,14 @@ before S-1 starts.
 4. **The substrate is a dependency we do not control.** Docker Desktop requires a paid
    subscription for larger organisations, updates itself, and is itself a VM; Podman machine and
    a bare WSL2 distro are alternatives with different gaps.
-5. **The cache is shared trust** (§4.1). One global volume means a build in one session can leave
-   something another session's build reads — a poisoned dependency, a rewritten Gradle
-   distribution. Accepted for a single-user machine, written down here and in the ADR, and
-   reversible by switching to a per-session volume.
+5. **The cache is shared trust, and the trust is code execution** (§4.1). One global volume
+   means a build in one session can leave something another session's build **executes** — a
+   Gradle init script under `/cache/init.d`, a substituted dependency jar, a rewritten Gradle
+   distribution. That is code execution in B's build, not merely a wrong byte read, and the
+   read-only mount that sounds like the fix breaks every Gradle build (Gradle writes to its
+   home). Accepted for a single-user machine, written down here, in the ADR and at the mount
+   site (`docker.rs::slot_create_body`), and reversible only by a per-session volume seeded from
+   this one — not by a one-line mount change.
 6. **Audit stops at the facade.** Container-internal actions are invisible to saife.
 7. **A live daemon costs RAM** until the idle kill (measured 479 MB), and a leaked container is a
    stale build environment — hence the start-up sweep, which has to be right.

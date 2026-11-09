@@ -53,6 +53,20 @@ impl BuildState {
     }
 }
 
+/// One build's log window, with **absolute** line numbers.
+///
+/// `first` is the absolute index of `lines[0]`: how many lines precede the
+/// window, evicted ones included. A follower that tracks how many lines it has
+/// already written advances by `lines.len()`, so eviction can never renumber a
+/// line under it (M10). A follower whose place was evicted sees `gap == true`
+/// and is told, instead of silently receiving a shifted stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogWindow {
+    pub first: usize,
+    pub lines: Vec<String>,
+    pub gap: bool,
+}
+
 /// What an engine (Docker today, something else tomorrow) has to provide. The transport
 /// and the request validation live above this line, so a fake engine can prove the
 /// protocol without a container.
@@ -61,8 +75,12 @@ pub trait BuildEngine: Send + Sync {
     fn start(&self, req: BuildRequest) -> Result<String>;
     /// Current state of one build.
     fn state(&self, id: &str) -> Result<BuildState>;
-    /// Log lines produced after the first `from` lines already delivered.
-    fn lines(&self, id: &str, from: usize) -> Result<Vec<String>>;
+    /// Log lines from the absolute index `from` onwards.
+    ///
+    /// The returned window carries its own absolute `first`, because retention is
+    /// bounded (M10): a reader whose `from` is older than what the ring still holds
+    /// must be able to tell a real line 0 from the first *retained* line.
+    fn lines(&self, id: &str, from: usize) -> Result<LogWindow>;
     /// Release this engine's resources because its session is ending.
     ///
     /// Part of the contract rather than the wiring's business: "a slot dies with its
@@ -136,6 +154,11 @@ pub fn spawn(state: Arc<RunnerState>) -> Result<RunnerServer> {
                         accepted = listener.accept() => {
                             let Ok((sock, _)) = accepted else { continue };
                             let state = Arc::clone(&state);
+                            // No connection cap here: this listener is bound to
+                            // 127.0.0.1 and only the session's own facade relays to
+                            // it, so a cap would bound the supervisor's own traffic,
+                            // not a workload's. The head/body deadlines in `handle`
+                            // are what keep a silent connection from parking a task.
                             tokio::spawn(async move {
                                 let _ = handle(sock, state).await;
                             });
@@ -157,21 +180,61 @@ pub fn spawn(state: Arc<RunnerState>) -> Result<RunnerServer> {
     })
 }
 
-async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
-    // Head, bounded: this listener is reachable only through the facade, but a bound is
-    // still cheaper than trusting the relay.
+/// How long a connection may take to deliver a complete request head (L-E).
+///
+/// The proxy's own listener bounds the same read at 15 s; this one sits behind
+/// the facade, which frames every request it relays, so a head that dribbles in
+/// is never legitimate traffic here and the bound is shorter. Without it a client
+/// that connects and sends nothing parks its handler task for the life of the
+/// session - a slow-read vector, not a remote one (see the accept loop).
+const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound on reading a declared body (L-E; the proxy bounds its own at `BODY_READ_TIMEOUT`).
+/// The cap is 4 KiB, so this is generous for any legal request and still finite for
+/// a client that declares a body and sends nothing.
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The outcome of reading a request head, bounded by size.
+enum HeadRead {
+    Complete(Vec<u8>),
+    TooLarge,
+    /// The client closed, reset, or erred before the head was complete.
+    Closed,
+}
+
+/// Read up to the HTTP head terminator (CRLF, CRLF), one byte at a time,
+/// with a size bound.
+///
+/// One byte per read on purpose: a single `read` would consume the body that
+/// follows the head on a connection that pipelines, and this listener answers
+/// exactly one request per connection.
+async fn read_head(sock: &mut TcpStream) -> HeadRead {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
+    while !head.ends_with(&[0x0d, 0x0a, 0x0d, 0x0a]) {
         if head.len() > 16 * 1024 {
-            return respond(&mut sock, "431 Request Header Fields Too Large", "", "").await;
+            return HeadRead::TooLarge;
         }
         match sock.read(&mut byte).await {
-            Ok(0) | Err(_) => return Ok(()),
+            Ok(0) | Err(_) => return HeadRead::Closed,
             Ok(_) => head.push(byte[0]),
         }
     }
-    let head = String::from_utf8_lossy(&head).into_owned();
+    HeadRead::Complete(head)
+}
+
+async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
+    // Head, bounded in size AND time: this listener is reachable only through the
+    // facade, but a bound is still cheaper than trusting the relay.
+    let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut sock)).await {
+        Ok(HeadRead::Complete(head)) => String::from_utf8_lossy(&head).into_owned(),
+        Ok(HeadRead::TooLarge) => {
+            return respond(&mut sock, "431 Request Header Fields Too Large", "", "").await;
+        }
+        // Gone away, or still dribbling at the deadline: both are a closed connection.
+        // A response to a peer that may never read it buys nothing.
+        Ok(HeadRead::Closed) | Err(_) => return Ok(()),
+    };
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -186,7 +249,19 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
             token = Some(v.trim().to_string());
         }
     }
-    if token.as_deref() != Some(state.token.as_str()) {
+    // Constant-time compare, deliberately the same shape as
+    // `net::token::RunToken::matches` (L-D): the proxy compares its credential with a
+    // single whole-value `ct_eq`, and this listener must not be the one place in the
+    // supervisor where a length-dependent `==` survives. Equal-length wrong tokens
+    // still fail; `ct_eq` leaks only the length, which is pinned in `net/token.rs`.
+    let presented_ok = token
+        .as_deref()
+        .map(|presented| {
+            use subtle::ConstantTimeEq;
+            bool::from(presented.as_bytes().ct_eq(state.token.as_bytes()))
+        })
+        .unwrap_or(false);
+    if !presented_ok {
         return respond(
             &mut sock,
             "401 Unauthorized",
@@ -199,7 +274,22 @@ async fn handle(mut sock: TcpStream, state: Arc<RunnerState>) -> Result<()> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match (method, path) {
         ("POST", "/build") => {
-            let body = read_body(&mut sock, &head).await;
+            let body =
+                match tokio::time::timeout(BODY_READ_TIMEOUT, read_body(&mut sock, &head)).await {
+                    Ok(body) => body,
+                    // A body that never arrives is refused by name rather than read
+                    // forever: the facade frames every request, so this is a client that
+                    // stopped mid-request, and the request must not outlive it.
+                    Err(_) => {
+                        return respond(
+                            &mut sock,
+                            "408 Request Timeout",
+                            "",
+                            "runner_body_timeout\n",
+                        )
+                        .await;
+                    }
+                };
             let mut req = match BuildRequest::parse(&body, &state.workspace) {
                 Ok(req) => req,
                 Err(e) => {
@@ -294,8 +384,21 @@ async fn stream_log(
         .context("runner: write the log head")?;
     let mut from = 0usize;
     loop {
-        if let Ok(lines) = state.engine.lines(id, from) {
-            for line in lines {
+        if let Ok(window) = state.engine.lines(id, from) {
+            // A follower whose `from` fell behind the retained window (M10: the
+            // ring evicted lines it had not read yet) is TOLD, not handed a
+            // silently shifted stream. One marker at the gap, then the index the
+            // engine reported is the new absolute position.
+            if window.gap
+                && sock
+                    .write_all(crate::runner::builds::LOG_TRUNCATED_MARKER.as_bytes())
+                    .await
+                    .is_err()
+            {
+                return Ok(());
+            }
+            from = window.first;
+            for line in window.lines {
                 from += 1;
                 if sock.write_all(line.as_bytes()).await.is_err() {
                     return Ok(());
@@ -382,6 +485,10 @@ mod tests {
         /// The last request the listener handed to the engine. The copy list is decided
         /// above the engine, so this is how precedence is asserted without a container.
         last: StdMutex<Option<BuildRequest>>,
+        /// Whether the next `lines` call must report an evicted gap (M10): the
+        /// ring's eviction itself is unit-tested in builds.rs, this proves the
+        /// wire says so when it happens.
+        compacted: StdMutex<bool>,
     }
 
     impl FakeEngine {
@@ -433,12 +540,25 @@ mod tests {
                 .map(|(_, s)| s.clone())
                 .ok_or_else(|| anyhow::anyhow!("runner: unknown build `{id}`"))
         }
-        fn lines(&self, id: &str, from: usize) -> Result<Vec<String>> {
+        fn lines(&self, id: &str, from: usize) -> Result<LogWindow> {
             let map = self.builds.lock().unwrap();
             let (lines, _) = map
                 .get(id)
                 .ok_or_else(|| anyhow::anyhow!("runner: unknown build `{id}`"))?;
-            Ok(lines.iter().skip(from).cloned().collect())
+            if *self.compacted.lock().unwrap() {
+                *self.compacted.lock().unwrap() = false;
+                let first = from + 1;
+                return Ok(LogWindow {
+                    first,
+                    gap: true,
+                    lines: lines.iter().skip(first).cloned().collect(),
+                });
+            }
+            Ok(LogWindow {
+                first: from,
+                gap: false,
+                lines: lines.iter().skip(from).cloned().collect(),
+            })
         }
     }
 
@@ -537,6 +657,25 @@ mod tests {
         // own token shape: the two credentials are not interchangeable.
         let resp = post_build(h.server.port, Some("not-the-token"), GOOD);
         assert!(resp.starts_with("HTTP/1.0 401"), "got: {resp}");
+
+        // L-D: the comparison is a single constant-time `ct_eq` over the whole value
+        // (the shape `net/token.rs` pins for the proxy), so a token that is the SAME
+        // LENGTH as the real one is still refused, and the real one still works.
+        // Equality of outcomes is all a test can see - the timing property rests on
+        // review, as `net/token.rs` says of its own comparison.
+        let mut same_length = TOKEN.to_string();
+        same_length.pop();
+        same_length.push('e');
+        assert_eq!(same_length.len(), TOKEN.len());
+        assert_ne!(same_length, TOKEN);
+        let resp = post_build(h.server.port, Some(&same_length), GOOD);
+        assert!(resp.starts_with("HTTP/1.0 401"), "got: {resp}");
+
+        let resp = post_build(h.server.port, Some(TOKEN), GOOD);
+        assert!(
+            resp.starts_with("HTTP/1.0 202"),
+            "the real token must still be accepted: {resp}"
+        );
     }
 
     /// A build the runner stopped at its deadline is not a build that failed: the
@@ -760,20 +899,52 @@ mod tests {
         assert!(more.contains("line 2"), "got: {more:?}");
     }
 
-    /// L-E (verdict doc: partial — real but deferred): the runner listener reads
-    /// the request head with no deadline and no connection cap, so a client
-    /// that connects and sends NOTHING parks its handler task until the
-    /// session ends. Only host-local or opt-in loopback exposure keeps this
-    /// Low; the facade frames every real request, so the silent client is not
-    /// the workload's own traffic.
+    /// M10 (reader contract, on the wire): a `follow=1` reader whose place was
+    /// evicted by the ring is TOLD with the truncation marker, and the evicted
+    /// line is never handed to it. The engine's own ring is unit-tested in
+    /// builds.rs; this proves the listener turns `gap` into a real line.
+    #[test]
+    fn a_follower_whose_place_was_evicted_is_told_on_the_wire() {
+        let h = harness();
+        let resp = post_build(h.server.port, Some(TOKEN), GOOD);
+        assert!(resp.contains("\"b1\""), "got: {resp}");
+        h.engine.push_line("b1", "old\n");
+        h.engine.push_line("b1", "kept\n");
+        h.engine.finish("b1", BuildState::Succeeded(0));
+        // The first poll will report that line 0 ("old") was evicted.
+        *h.engine.compacted.lock().unwrap() = true;
+
+        let body = send(
+            h.server.port,
+            &format!("GET /build?id=b1&follow=1 HTTP/1.0{CRLF}X-Facade-Token: {TOKEN}{CRLF}{CRLF}"),
+        );
+        assert!(
+            body.contains("[saife] log truncated"),
+            "the follower must be told about the gap: {body}"
+        );
+        assert!(
+            body.contains("kept"),
+            "the retained line still reaches it: {body}"
+        );
+        assert!(
+            !body.contains("old\n"),
+            "the evicted line is never claimed: {body}"
+        );
+    }
+
+    /// L-E (verdict: partial - real, now fixed): the runner listener used to
+    /// read the request head with no deadline, so a client that connected and
+    /// sent NOTHING parked its handler task until the session ended. Only
+    /// host-local or opt-in loopback exposure kept this Low; the facade frames
+    /// every real request, so the silent client is never the workload's own
+    /// traffic.
     ///
-    /// RED until L-E lands (verdict doc): once a head-read timeout exists, the
+    /// Regression guard (now GREEN): once a head-read timeout exists, the
     /// listener closes the idle connection and the client observes EOF (or a
     /// reset) instead of parking. The 10 s deadline bounds the wait whichever
-    /// timeout the fix chooses; the failure mode pinned here is "parked", not
+    /// timeout the fix chose; the failure mode pinned here is "parked", not
     /// "closed too late".
     #[test]
-    #[ignore = "red until L-E lands (verdict doc): the runner listener has no head-read timeout"]
     fn a_connection_that_sends_nothing_is_closed_after_the_head_read_timeout() {
         let h = harness();
         let mut s = connect(h.server.port);

@@ -372,10 +372,71 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>> {
 /// would pay the download again every session. The cost is that sessions share state -
 /// acceptable while saife is single-user on one machine, and written down as a limit
 /// rather than discovered later (see `docs/USER-GUIDE.md`, "Building in the sandbox").
+///
+/// **M11: what "shared state" actually means is CODE EXECUTION.** A write under
+/// `/cache/init.d` is a Gradle init script that session B's build RUNS; a substituted
+/// distribution or plugin jar is loaded by B's compiler. See [`slot_create_body`] for
+/// the mount site and why the read-only fix is refused.
+///
 /// How long any engine request may take before it is treated as stuck.
 pub const ENGINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub const CACHE_VOLUME: &str = "saife-runner-cache";
+
+// ---------------------------------------------------------------------------
+// Resource limits for a build slot (M12)
+// ---------------------------------------------------------------------------
+
+/// Ceiling on tasks (threads *and* processes - the kernel's `pids` cgroup counts
+/// both) inside a slot. A build that forks without bound is a host-wide DoS, and the
+/// ceiling is high enough for Gradle's worker pool plus the Kotlin daemon.
+pub const SLOT_PIDS_LIMIT: i64 = 1_024;
+
+/// Four CPUs, in the engine's `NanoCpus` unit (1e-9 of a CPU). A build is CPU-hungry
+/// but must not be able to starve the supervisor it is supposed to be isolated from.
+pub const SLOT_NANO_CPUS: i64 = 4_000_000_000;
+
+/// The **floor** for a slot's memory, in bytes: 4 GiB.
+///
+/// Not a tight default on purpose - a Kotlin/Gradle build needs 2-4 GiB for the daemons
+/// alone, and a limit that fails a legitimate build is worse than no limit (operators
+/// would raise it once, by hand, and never lower it again). This is the number the
+/// code and the docs agree on; [`slot_memory_bytes`] can be raised without a rebuild.
+pub const SLOT_MEMORY_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// A positive integer from the environment, or `None` when unset/invalid.
+///
+/// The override exists because the right ceiling depends on the machine: a 64 GiB
+/// workstation can afford more than a 16 GiB laptop, and rebuilding saife to change a
+/// number would push operators to remove the limit instead.
+fn limit_override(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0)
+}
+
+/// Bytes of memory a slot may use: [`SLOT_MEMORY_FLOOR_BYTES`], or
+/// `SAIFE_RUNNER_MEMORY_BYTES`.
+pub fn slot_memory_bytes() -> u64 {
+    limit_override("SAIFE_RUNNER_MEMORY_BYTES").unwrap_or(SLOT_MEMORY_FLOOR_BYTES)
+}
+
+/// CPU ceiling in `NanoCpus` units: [`SLOT_NANO_CPUS`], or `SAIFE_RUNNER_NANOCPUS`.
+pub fn slot_nano_cpus() -> i64 {
+    limit_override("SAIFE_RUNNER_NANOCPUS")
+        .map(|v| v.min(i64::MAX as u64) as i64)
+        .unwrap_or(SLOT_NANO_CPUS)
+}
+
+/// Task ceiling: [`SLOT_PIDS_LIMIT`], or `SAIFE_RUNNER_PIDS`.
+pub fn slot_pids_limit() -> i64 {
+    limit_override("SAIFE_RUNNER_PIDS")
+        .map(|v| v.min(i64::MAX as u64) as i64)
+        .unwrap_or(SLOT_PIDS_LIMIT)
+}
 
 pub const RUNNER_IMAGE: &str =
     "eclipse-temurin@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507";
@@ -986,7 +1047,34 @@ impl Engine {
 }
 
 /// The create body for a slot, as JSON. Extracted so the properties that matter - no
-/// network, the cache volume, the session label - are asserted without an engine.
+/// network, the cache volume, the session label, the resource limits - are asserted
+/// without an engine.
+///
+/// # The cache mount is a code-execution boundary (M11 residual)
+///
+/// Every slot mounts the same [`CACHE_VOLUME`] read-write, because an `--offline`
+/// build needs one warm Gradle home. Session A can therefore write under
+/// `/cache/init.d` (a Gradle **init script**, which B's build executes),
+/// `/cache/caches/modules-2` (a substituted dependency jar, which B's compiler
+/// loads), or the distribution itself. That is cross-session **code execution**,
+/// not merely "B reads wrong bytes" - the plan's §4.1/§10.5 wording was corrected
+/// to say so.
+///
+/// Read-only at `/cache` is NOT the fix: Gradle writes to its home (daemon logs,
+/// `.lock`, caches) and the build fails. The honest fix is a per-session volume
+/// seeded from this one, which is not a one-liner here: seeding ~900 MB needs a
+/// helper container mounting both volumes and a copy per session, and `prewarm`,
+/// the idle sweep and `status` all key on ONE volume name. Until that lands the
+/// gap is documented here rather than papered over.
+///
+/// # Non-root `User`: out of scope (M12)
+///
+/// `HostConfig.User` is deliberately unset, so the build runs as root *inside the
+/// container*. Setting it would need an ownership plan for `/src` and `/cache`
+/// first: the tree arrives as an archive PUT (root-owned), the cache volume is
+/// shared with a root-written prewarm, and a non-root user cannot read either
+/// without a chown step per build. The container is unprivileged on the host and
+/// `NetworkMode: none` by default; this is the remaining half of M12.
 fn slot_create_body(spec: &SlotSpec) -> serde_json::Value {
     serde_json::json!({
         "Image": spec.image,
@@ -1007,6 +1095,14 @@ fn slot_create_body(spec: &SlotSpec) -> serde_json::Value {
         "HostConfig": {
             "NetworkMode": if spec.allow_network { "bridge" } else { "none" },
             "AutoRemove": false,
+            // M12 (verdict: confirmed): a build is untrusted code by construction, so it
+            // gets a PID, CPU and memory ceiling of its own. Without them a runaway build
+            // (or a fork bomb in a Gradle plugin) takes the host down with it - the
+            // supervisor included. Memory is a floor, not a tight default; see
+            // `SLOT_MEMORY_FLOOR_BYTES` and the `SAIFE_RUNNER_*` overrides.
+            "PidsLimit": slot_pids_limit(),
+            "NanoCpus": slot_nano_cpus(),
+            "Memory": slot_memory_bytes(),
             "Mounts": [{
                 "Type": "volume",
                 "Source": CACHE_VOLUME,
@@ -1169,6 +1265,66 @@ mod tests {
         );
     }
 
+    /// M12 (verdict: confirmed): a slot carries a PID, CPU and memory ceiling.
+    /// Memory is at least the documented floor - Gradle/Kotlin daemons need
+    /// GiBs, and a limit that fails a legitimate build would be raised once, by
+    /// hand, and never lowered again. Generous by default, configurable without
+    /// a rebuild through the `SAIFE_RUNNER_*` variables.
+    #[test]
+    fn a_slot_is_created_with_cpu_memory_and_pid_limits() {
+        let _guard = crate::env_lock();
+        // SAFETY: serialised by `env_lock`, and every variable is restored before
+        // this test returns - the defaults below must not depend on the suite.
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "SAIFE_RUNNER_MEMORY_BYTES",
+            "SAIFE_RUNNER_NANOCPUS",
+            "SAIFE_RUNNER_PIDS",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        for (k, _) in &saved {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        let body = slot_create_body(&SlotSpec::new("limits"));
+        let hc = &body["HostConfig"];
+        let pids = hc["PidsLimit"].as_i64().expect("PidsLimit");
+        let nanos = hc["NanoCpus"].as_i64().expect("NanoCpus");
+        let memory = hc["Memory"].as_u64().expect("Memory is a byte count");
+        assert!(
+            (512..=1024).contains(&pids),
+            "a fork bomb must hit a ceiling in the documented range: {pids}"
+        );
+        assert!(
+            nanos > 0 && nanos <= 8 * 1_000_000_000,
+            "a build must not take the whole host by default: {nanos}"
+        );
+        assert!(
+            memory >= SLOT_MEMORY_FLOOR_BYTES,
+            "the floor is the documented one (Gradle needs GiBs): {memory}"
+        );
+
+        // ... and the override changes the emitted body, not a copy of it.
+        // SAFETY: as above.
+        unsafe { std::env::set_var("SAIFE_RUNNER_MEMORY_BYTES", "8589934592") };
+        unsafe { std::env::set_var("SAIFE_RUNNER_NANOCPUS", "2000000000") };
+        unsafe { std::env::set_var("SAIFE_RUNNER_PIDS", "512") };
+        let hc = &slot_create_body(&SlotSpec::new("limits"))["HostConfig"];
+        assert_eq!(hc["Memory"], 8_589_934_592u64);
+        assert_eq!(hc["NanoCpus"], 2_000_000_000i64);
+        assert_eq!(hc["PidsLimit"], 512i64);
+
+        // SAFETY: as above; the saved values go back so a parallel test's
+        // view of the environment is what it saved.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
     /// A slot that removes itself even when the test panics: the first failing runs of these
     /// legs left containers behind, which is exactly the leak the start-up sweep exists to
     /// clean up - the tests should not be the thing that creates the mess.
@@ -1225,6 +1381,20 @@ mod tests {
             inspect["HostConfig"]["NetworkMode"].as_str(),
             Some("none"),
             "a slot is created with no network: {inspect}"
+        );
+        // M12, proved against the engine rather than the body we sent: the
+        // limits are on the RUNNING container, not only in the create request.
+        assert!(
+            inspect["HostConfig"]["Memory"].as_u64().unwrap_or(0) >= SLOT_MEMORY_FLOOR_BYTES,
+            "the engine must report the memory ceiling: {inspect}"
+        );
+        assert!(
+            inspect["HostConfig"]["NanoCpus"].as_i64().unwrap_or(0) > 0,
+            "the engine must report the CPU ceiling: {inspect}"
+        );
+        assert!(
+            inspect["HostConfig"]["PidsLimit"].as_i64().unwrap_or(0) > 0,
+            "the engine must report the PID ceiling: {inspect}"
         );
     }
     /// LIVE (`-- --ignored`): a project goes in through the archive API, a command sees it,

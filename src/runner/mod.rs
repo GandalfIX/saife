@@ -149,14 +149,26 @@ fn refuse_unsafe_relative(label: &str, value: &str, container: &str) -> Result<(
              (no `..`, no drive, no root)"
         );
     }
+    // L-N (verdict: partial - fixed): a control character never belongs in a path entry.
+    // Win32 forbids newlines in file names, but the entry is also interpolated into the
+    // build log's header line, and this is the one check that keeps a value from forging
+    // it. Refused for `project` too, because both go through here - and the value is
+    // shown ESCAPED (`{value:?}`), so the refusal cannot smuggle one in itself.
+    if value.chars().any(char::is_control) {
+        bail!(
+            "runner: {label} {value:?} must not contain control characters - a path entry \
+             is copied and logged verbatim, so one would forge a build-log line"
+        );
+    }
     Ok(())
 }
 
 /// Whether this directory entry is a link, a junction or another reparse point.
 ///
 /// Windows gives a junction a real path and a real directory attribute, so only the
-/// attribute tells it apart from the directory it names.
-fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+/// attribute tells it apart from the directory it names. `pub(crate)` because the
+/// packer (`sync`) refuses reparse points by the same rule (H1 residual).
+pub(crate) fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -695,11 +707,10 @@ mod tests {
         assert_eq!(out.bytes, b"one\ntwo\n");
         assert_eq!(out.flushes, 2, "one flush per chunk, not one at the end");
     }
-    /// L-N (verdict: partial; fix NOT approved): a `paths` entry carrying a
-    /// control character must be refused so build output / log lines cannot be
-    /// forged through it. red until L-N lands.
+    /// L-N (verdict: partial - fixed): a `paths` entry carrying a control character
+    /// is refused, so build output / log lines cannot be forged through it. The
+    /// disk half (a project directory) goes through the same function.
     #[test]
-    #[ignore = "red until L-N lands"]
     fn a_paths_entry_with_a_control_character_is_refused() {
         let err = refuse_unsafe_relative("paths entry", "a\nb", "the project")
             .expect_err("a control character in a paths entry must be refused");

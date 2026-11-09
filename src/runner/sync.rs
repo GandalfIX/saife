@@ -5,7 +5,7 @@
 //! project is copied, not mounted - which makes these two functions the hot path of every
 //! build, and makes their semantics (what is copied, what is dropped) part of the feature.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 /// Pack a directory into a tar archive, paths relative to `root`.
@@ -49,10 +49,20 @@ pub fn pack_paths(root: &Path, paths: &[String], skip: &[&str]) -> Result<Vec<u8
             continue;
         }
         let source = root.join(&rel);
-        if std::fs::metadata(&source)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
+        // H1 residual (verdict: H1 itself WRONG, this residual is real): the old
+        // `std::fs::metadata` FOLLOWS a link, so a listed symlink had its TARGET
+        // classified - a symlink-to-file was read and packed, a symlink-to-dir was
+        // walked into. The refusal is on the entry itself, before anything is read.
+        let meta = std::fs::symlink_metadata(&source)
+            .with_context(|| format!("runner: inspect {}", source.display()))?;
+        if super::is_reparse_point(&meta) {
+            bail!(
+                "runner: {} is a reparse point (a link or junction); the copy allow-list \
+                 names real paths only - remove it or name the real path instead",
+                source.display()
+            );
+        }
+        if meta.is_dir() {
             builder
                 .append_dir(&rel, &source)
                 .with_context(|| format!("runner: pack {}", source.display()))?;
@@ -65,6 +75,12 @@ pub fn pack_paths(root: &Path, paths: &[String], skip: &[&str]) -> Result<Vec<u8
 }
 
 /// One file into the archive, with the mode every packed file gets.
+///
+/// Callers must already have refused reparse points (H1 residual): [`pack_paths`]
+/// checks its listed entries and [`walk`] checks every directory entry, so a
+/// reparse point never reaches this function. `File::open` would FOLLOW a
+/// symlink-to-file (there is no `OPEN_REPARSE_POINT` here), which is exactly the
+/// behaviour the two call-site checks exist to prevent.
 fn append_file(builder: &mut tar::Builder<Vec<u8>>, path: &Path, rel: &Path) -> Result<()> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("runner: open {}", path.display()))?;
@@ -102,7 +118,23 @@ fn walk(builder: &mut tar::Builder<Vec<u8>>, root: &Path, rel: &Path, skip: &[&s
         }
         let path = entry.path();
         let rel_path = rel.join(&name);
-        if entry.file_type()?.is_dir() {
+        // H1 residual (verdict: H1 itself WRONG, the refusal is still right): a
+        // junction inside the project used to reach `append_file` and fail there
+        // with an opaque ERROR_ACCESS_DENIED from `File::open` - the pack failed,
+        // but said nothing about WHY. A symlink-to-FILE was worse: it was followed
+        // and its target's contents were packed. One named refusal covers both
+        // shapes, `symlink_metadata` so the link itself is inspected, not the
+        // target it names.
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("runner: inspect {}", path.display()))?;
+        if super::is_reparse_point(&meta) {
+            bail!(
+                "runner: {} is a reparse point (a link or junction); a build packs real \
+                 project files only - remove it or name the real path instead",
+                path.display()
+            );
+        }
+        if meta.is_dir() {
             builder
                 .append_dir(&rel_path, &path)
                 .with_context(|| format!("runner: pack {}", path.display()))?;
@@ -525,5 +557,153 @@ mod tests {
                 || n.starts_with("build/")),
             "nested outputs must not travel: {names:?}"
         );
+    }
+
+    // ---- H1 residual: reparse points are refused BY NAME --------------------
+
+    /// Removes a scratch tree on the way out, including on a panic: a test that
+    /// creates links must not leave them behind for the next run to trip over.
+    struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // `remove_dir_all` removes a junction without recursing into its
+            // target on Windows (it detects the reparse point), and a symlink
+            // with `remove_file`, so this is safe against the links below.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// H1 residual (verdict: H1 itself was WRONG - `is_dir()` is false for a
+    /// junction, so it was never recursed into). What remained was the failure
+    /// MODE: the junction reached `append_file`, whose `File::open` failed with
+    /// an opaque ERROR_ACCESS_DENIED, so the build never started and the refusal
+    /// said nothing about why. It must be a NAMED refusal now, and no external
+    /// content may travel either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_inside_the_project_is_refused_by_name() {
+        let root = scratch("h1-named");
+        let _root_guard = Guard(root.clone());
+        std::fs::write(root.join("real.txt"), b"kept").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("saife-sync-h1-named-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        let _outside_guard = Guard(outside.clone());
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"exfil").unwrap();
+
+        let link = root.join("linked");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .expect("mklink runs");
+        assert!(
+            status.success(),
+            "the junction must be created for this test"
+        );
+
+        let err = pack_dir(&root, &[])
+            .expect_err("a junction inside the project must be refused, not packed through");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reparse point"),
+            "the refusal must name a reparse point: {msg}"
+        );
+        assert!(
+            msg.contains("linked"),
+            "the refusal must name the offending path: {msg}"
+        );
+        // Refusal, not partial pack: there is no archive at all, so the
+        // junction target's contents cannot have travelled.
+        assert!(!msg.contains("exfil"), "no external content: {msg}");
+    }
+
+    /// H1 residual: the symlink-to-FILE case was the real exfiltration variant -
+    /// `File::open` FOLLOWS such a link (there is no `OPEN_REPARSE_POINT`), so a
+    /// `loot -> ~/.ssh/id_rsa` inside the project was packed. Refused now. Needs
+    /// symlink-creation privilege (Developer Mode or the token); if the host
+    /// denies it, the junction test above still covers the unprivileged vector.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlink_to_a_file_inside_the_project_is_refused_not_followed() {
+        let root = scratch("h1-filelink");
+        let _root_guard = Guard(root.clone());
+        std::fs::write(root.join("real.txt"), b"kept").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("saife-sync-h1-filelink-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        let _outside_guard = Guard(outside.clone());
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"exfil").unwrap();
+
+        let link = root.join("loot");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink"])
+            .arg(&link)
+            .arg(outside.join("secret.txt"))
+            .status()
+            .expect("mklink runs");
+        if !status.success() {
+            eprintln!(
+                "SKIP: this host refuses symlink creation without privilege \
+                 (the junction test covers the unprivileged vector)"
+            );
+            return;
+        }
+
+        let err = pack_dir(&root, &[])
+            .expect_err("a symlink-to-file inside the project must be refused, not followed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reparse point"),
+            "the refusal must name a reparse point: {msg}"
+        );
+        assert!(
+            msg.contains("loot"),
+            "the refusal must name the offending path: {msg}"
+        );
+        assert!(!msg.contains("exfil"), "no external content: {msg}");
+    }
+
+    /// ... and the same refusal for a LISTED entry, which does not go through
+    /// `walk`: `pack_paths` used `std::fs::metadata`, which follows the link, so
+    /// a listed symlink had its target classified - a symlink-to-file was read
+    /// and packed. The allow-list names real paths only.
+    #[cfg(windows)]
+    #[test]
+    fn a_listed_entry_that_is_a_reparse_point_is_refused() {
+        let root = scratch("h1-listed");
+        let _root_guard = Guard(root.clone());
+        std::fs::write(root.join("real.txt"), b"kept").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("saife-sync-h1-listed-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        let _outside_guard = Guard(outside.clone());
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"exfil").unwrap();
+
+        let link = root.join("loot");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .expect("mklink runs");
+        assert!(
+            status.success(),
+            "the junction must be created for this test"
+        );
+
+        let err = pack_paths(&root, &["loot".to_string()], &[])
+            .expect_err("a listed reparse point must be refused, not followed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reparse point"),
+            "the refusal must name a reparse point: {msg}"
+        );
+        assert!(msg.contains("loot"), "the refusal names the entry: {msg}");
+        assert!(!msg.contains("exfil"), "no external content: {msg}");
     }
 }

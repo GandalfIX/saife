@@ -7,7 +7,7 @@
 use crate::runner::BuildRequest;
 use crate::runner::docker::{Engine, Slot, SlotSpec};
 use crate::runner::lifecycle;
-use crate::runner::server::{BuildEngine, BuildState};
+use crate::runner::server::{BuildEngine, BuildState, LogWindow};
 use crate::runner::sync;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -43,9 +43,161 @@ pub const IMAGE_JAVA_HOME: &str = "/opt/java/openjdk";
 /// one warm cache every slot shares (the 88 s first build is paid once per machine).
 const CACHE_IN_SLOT: &str = "/cache";
 
+/// M10 (verdict: confirmed): how much of a build's log the supervisor retains.
+///
+/// A build that prints gigabytes must not fill the supervisor's heap, and the
+/// build deadline is not a bound on bytes (a build can print faster than it
+/// builds). Two budgets, whichever trips first: [`LOG_LINE_CAP`] lines, or
+/// [`LOG_BYTE_BUDGET`] bytes of line text. [`LOG_PARTIAL_CAP`] bounds the line
+/// still being assembled, because a stream with no newline at all is unbounded
+/// output too.
+pub(crate) const LOG_LINE_CAP: usize = 8_192;
+pub(crate) const LOG_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+pub(crate) const LOG_PARTIAL_CAP: usize = 64 * 1024;
+
+/// What a reader sees when lines were dropped before its place (M10). Spelled
+/// as a line so a `follow=1` reader can tell a gap from a build that was simply
+/// quiet: one marker, emitted where the reader notices, never renumbered.
+pub(crate) const LOG_TRUNCATED_MARKER: &str = "[saife] log truncated\n";
+
+/// One build's retained log, addressed by ABSOLUTE line number.
+///
+/// `total` counts every line ever appended, evicted ones included. A reader's
+/// `from` index is an absolute line number, so eviction can never shift a line
+/// under a follower or hand it one twice (M10). Both budgets apply, whichever
+/// trips first: [`LOG_LINE_CAP`] lines, or [`LOG_BYTE_BUDGET`] bytes.
+struct BoundedLog {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+    total: usize,
+}
+
+impl BoundedLog {
+    fn new() -> Self {
+        BoundedLog {
+            lines: std::collections::VecDeque::new(),
+            bytes: 0,
+            total: 0,
+        }
+    }
+
+    /// Append one line, then evict the OLDEST lines while the window is over
+    /// either budget. Eviction is from the front only: the absolute numbering
+    /// (`total - len` is the first retained index) stays stable no matter how
+    /// many lines a burst drops.
+    fn push(&mut self, line: String) {
+        self.bytes += line.len();
+        self.total += 1;
+        self.lines.push_back(line);
+        // Never evict below one line: the splitter caps every line at
+        // [`LOG_PARTIAL_CAP`], far under the byte budget, so this only guards a
+        // direct push of a monster line - and then ONE line is retained even
+        // though it alone busts the budget.
+        while (self.lines.len() > LOG_LINE_CAP || self.bytes > LOG_BYTE_BUDGET)
+            && self.lines.len() > 1
+        {
+            match self.lines.pop_front() {
+                Some(dropped) => self.bytes -= dropped.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// The lines from absolute index `from` onwards.
+    ///
+    /// `first` is the ABSOLUTE index of the first line returned: a follower
+    /// whose place was evicted learns it here (`gap == true`) instead of being
+    /// handed a window that silently repeats or skips lines.
+    fn window(&self, from: usize) -> LogWindow {
+        let base = self.total - self.lines.len();
+        let skip = from.saturating_sub(base);
+        LogWindow {
+            first: base + skip,
+            gap: from < base,
+            lines: self.lines.iter().skip(skip).cloned().collect(),
+        }
+    }
+}
+
+/// Turns the exec stream's arbitrary chunks into lines, bounding the line that
+/// is still being assembled.
+///
+/// The supervisor splits the stream itself because the engine hands it chunks
+/// that end wherever the container flushed: the partial line between chunks is
+/// the one buffer nothing else here bounds (M10). A line longer than
+/// [`LOG_PARTIAL_CAP`] is cut there and marked, so the log never looks like the
+/// build simply printed a short line.
+struct LineSplitter {
+    partial: String,
+    capped: bool,
+}
+
+impl LineSplitter {
+    fn new() -> Self {
+        LineSplitter {
+            partial: String::new(),
+            capped: false,
+        }
+    }
+
+    /// Feed one chunk; `sink` receives every complete line (and the marker
+    /// ahead of any line that had to be cut).
+    fn feed(&mut self, chunk: &[u8], sink: &mut dyn FnMut(String)) {
+        self.partial.push_str(&String::from_utf8_lossy(chunk));
+        loop {
+            if let Some(pos) = self.partial.find('\n') {
+                let mut line: String = self.partial.drain(..=pos).collect();
+                if line.len() > LOG_PARTIAL_CAP {
+                    truncate_on_char_boundary(&mut line, LOG_PARTIAL_CAP);
+                    self.capped = true;
+                }
+                if self.capped {
+                    self.capped = false;
+                    sink(LOG_TRUNCATED_MARKER.to_string());
+                }
+                sink(line);
+                continue;
+            }
+            if self.partial.len() > LOG_PARTIAL_CAP {
+                // Keep the head, drop the tail, and mark it: the cut becomes
+                // visible when the line finally ends (or the stream does).
+                self.capped = true;
+                truncate_on_char_boundary(&mut self.partial, LOG_PARTIAL_CAP);
+            }
+            break;
+        }
+    }
+
+    /// End of stream: a cut is marked, whatever is left is the last line.
+    fn finish(&mut self, sink: &mut dyn FnMut(String)) {
+        if self.capped {
+            self.capped = false;
+            sink(LOG_TRUNCATED_MARKER.to_string());
+        }
+        if !self.partial.is_empty() {
+            let tail = std::mem::take(&mut self.partial);
+            sink(tail);
+        }
+    }
+}
+
+/// Truncate a `String` to at most `cap` bytes, on a char boundary - `String::truncate`
+/// panics on a boundary split, and a multi-byte character at the cut is the tail we
+/// are dropping anyway.
+fn truncate_on_char_boundary(s: &mut String, cap: usize) {
+    if s.len() <= cap {
+        return;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 struct BuildRecord {
     state: BuildState,
-    lines: Vec<String>,
+    lines: BoundedLog,
 }
 
 struct Inner {
@@ -207,12 +359,16 @@ impl BuildEngine for DockerBuilds {
             id.clone(),
             BuildRecord {
                 state: BuildState::Running,
-                lines: vec![format!(
-                    "[saife] {} {}{}\n",
-                    req.task,
-                    shown,
-                    copy_scope(&req.paths)
-                )],
+                lines: {
+                    let mut log = BoundedLog::new();
+                    log.push(format!(
+                        "[saife] {} {}{}\n",
+                        req.task,
+                        shown,
+                        copy_scope(&req.paths)
+                    ));
+                    log
+                },
             },
         );
 
@@ -235,18 +391,12 @@ impl BuildEngine for DockerBuilds {
                     std::thread::Builder::new()
                         .name(format!("saife-build-log-{id_stream}"))
                         .spawn(move || {
-                            let mut partial = String::new();
+                            let mut splitter = LineSplitter::new();
                             let streamed = inner.engine.exec_stream(&exec_id, |chunk| {
-                                partial.push_str(&String::from_utf8_lossy(chunk));
-                                while let Some(pos) = partial.find('\n') {
-                                    let line = partial[..=pos].to_string();
-                                    partial.drain(..=pos);
-                                    append_line(&inner, &id_stream, line);
-                                }
+                                splitter
+                                    .feed(chunk, &mut |line| append_line(&inner, &id_stream, line));
                             });
-                            if !partial.is_empty() {
-                                append_line(&inner, &id_stream, partial);
-                            }
+                            splitter.finish(&mut |line| append_line(&inner, &id_stream, line));
                             let _ = done_tx.send(streamed);
                         })
                 };
@@ -325,12 +475,12 @@ impl BuildEngine for DockerBuilds {
             .ok_or_else(|| anyhow::anyhow!("runner: unknown build `{id}`"))
     }
 
-    fn lines(&self, id: &str, from: usize) -> Result<Vec<String>> {
+    fn lines(&self, id: &str, from: usize) -> Result<LogWindow> {
         let builds = self.inner.builds.lock().unwrap();
         let rec = builds
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("runner: unknown build `{id}`"))?;
-        Ok(rec.lines.iter().skip(from).cloned().collect())
+        Ok(rec.lines.window(from))
     }
 
     /// Stop this runner's slot when the session ends (invariant 4: a slot is a container,
@@ -714,6 +864,146 @@ mod tests {
         assert!(SKIP_IN_PROJECT.contains(&".gradle"));
         assert!(SKIP_IN_PROJECT.contains(&".git"));
     }
+
+    // ---- M10: bounded log retention -----------------------------------------
+
+    /// M10 (verdict: confirmed): a build printing ten times the budget must leave a
+    /// bounded record. The deadline does not bound bytes - a build prints faster than
+    /// it builds - so a `Vec<String>` that only the clock stops is a heap exhaustion
+    /// vector that looks like a normal build.
+    #[test]
+    fn log_retention_is_bounded_by_a_line_cap_and_a_byte_budget() {
+        let mut log = BoundedLog::new();
+        let attempts = LOG_LINE_CAP * 10;
+        for i in 0..attempts {
+            log.push(format!("line {i}\n"));
+        }
+        assert!(
+            log.lines.len() <= LOG_LINE_CAP,
+            "retained {} lines, cap is {LOG_LINE_CAP}",
+            log.lines.len()
+        );
+        assert!(
+            log.bytes <= LOG_BYTE_BUDGET,
+            "retained {} bytes, budget is {LOG_BYTE_BUDGET}",
+            log.bytes
+        );
+        assert_eq!(
+            log.total, attempts,
+            "every line is still counted: the absolute numbering is what a follower tracks"
+        );
+        assert!(
+            log.window(attempts).lines.is_empty(),
+            "a reader at the end has nothing left to read"
+        );
+    }
+
+    /// ... and the byte budget is its own trip: many large lines must bound bytes
+    /// before the line count reaches its cap, or a 64 KiB-per-line build fills 4 MiB
+    /// in 64 lines and the line cap never fires.
+    #[test]
+    fn the_byte_budget_trips_before_the_line_cap() {
+        let mut log = BoundedLog::new();
+        let line = format!("{}\n", "x".repeat(8 * 1024));
+        for _ in 0..(LOG_BYTE_BUDGET / line.len() * 3) {
+            log.push(line.clone());
+        }
+        assert!(
+            log.lines.len() < LOG_LINE_CAP,
+            "the byte budget must trip first: {} lines retained",
+            log.lines.len()
+        );
+        assert!(log.bytes <= LOG_BYTE_BUDGET, "{} bytes", log.bytes);
+    }
+
+    /// The reader contract M10 is really about: `follow=1` reads with an absolute
+    /// `from` index, so eviction must not renumber a line. A follower that keeps up
+    /// receives every line exactly once; one that fell behind is TOLD (gap), instead
+    /// of being handed a shifted window that silently repeats or skips lines.
+    #[test]
+    fn a_following_reader_neither_skips_nor_duplicates_lines() {
+        let mut log = BoundedLog::new();
+        let mut from = 0usize;
+        let mut seen: Vec<String> = Vec::new();
+        for i in 0..(LOG_LINE_CAP * 2) {
+            log.push(format!("line {i}\n"));
+            let w = log.window(from);
+            assert!(
+                !w.gap,
+                "a poller that keeps up never sees a gap (at line {i})"
+            );
+            assert_eq!(w.first, from, "the window starts where the reader asked");
+            from += w.lines.len();
+            seen.extend(w.lines);
+        }
+        assert_eq!(seen.len(), LOG_LINE_CAP * 2, "no skip and no duplicate");
+        assert_eq!(seen.first().map(String::as_str), Some("line 0\n"));
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some(format!("line {}\n", LOG_LINE_CAP * 2 - 1).as_str())
+        );
+
+        // Now poll late enough that the reader's place is gone: the window must say
+        // so, and the index it reports must be the real first retained line.
+        let late = log.window(0);
+        assert!(
+            late.gap,
+            "a reader whose place was evicted must be told, not silently shifted"
+        );
+        assert_eq!(late.first, log.total - log.lines.len());
+        assert!(!late.lines.is_empty());
+
+        // Continuing from the window's own end delivers the next line and nothing else.
+        let next_from = late.first + late.lines.len();
+        log.push("late\n".to_string());
+        let w = log.window(next_from);
+        assert!(!w.gap, "the follower caught up");
+        assert_eq!(
+            w.lines,
+            vec!["late\n".to_string()],
+            "neither a repeat nor a skip after the gap"
+        );
+    }
+
+    /// A chunk boundary is not a line boundary, and a stream that never emits a
+    /// newline is unbounded output: the partial line has its own cap, and the cut is
+    /// marked so the log does not look like the build simply printed a short line.
+    #[test]
+    fn a_partial_line_is_capped_and_marked() {
+        let mut splitter = LineSplitter::new();
+        let mut out: Vec<String> = Vec::new();
+        splitter.feed(&vec![b'x'; LOG_PARTIAL_CAP * 10], &mut |l| out.push(l));
+        splitter.finish(&mut |l| out.push(l));
+
+        assert!(
+            out.iter().all(|l| l.len() <= LOG_PARTIAL_CAP + 1),
+            "no emitted line may exceed the partial cap: {:?}",
+            out.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert!(
+            out.iter().any(|l| l == LOG_TRUNCATED_MARKER),
+            "the cut must be marked: {:?}",
+            out.iter().map(|l| l.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            out.iter().map(String::len).sum::<usize>() <= LOG_PARTIAL_CAP * 2,
+            "ten times the cap must not be retained: {} bytes",
+            out.iter().map(String::len).sum::<usize>()
+        );
+    }
+
+    /// The ordinary case still works: chunk boundaries do not split lines, and the
+    /// tail without a newline is flushed when the stream ends.
+    #[test]
+    fn chunk_boundaries_do_not_split_lines_and_the_tail_is_flushed() {
+        let mut splitter = LineSplitter::new();
+        let mut out: Vec<String> = Vec::new();
+        splitter.feed(b"one\ntw", &mut |l| out.push(l));
+        splitter.feed(b"o\nthr", &mut |l| out.push(l));
+        splitter.finish(&mut |l| out.push(l));
+        assert_eq!(out, vec!["one\n", "two\n", "thr"]);
+    }
+
     /// LIVE (`-- --ignored`): a real project, a real container, a real Gradle build.
     ///
     /// Needs a prewarmed cache (`saife runner prewarm <project>`) - the slot has no network
@@ -769,7 +1059,7 @@ mod tests {
         loop {
             let state = builds.state(&id).expect("state");
             if !matches!(state, BuildState::Running) {
-                let lines = builds.lines(&id, 0).expect("lines");
+                let lines = builds.lines(&id, 0).expect("lines").lines;
                 eprintln!("live: {} lines, final state {state:?}", lines.len());
                 for l in lines.iter().rev().take(12).rev() {
                     eprint!("  {l}");
@@ -865,7 +1155,7 @@ mod tests {
             BuildState::TimedOut,
             "a build past its deadline must be stopped, not reported as a build failure"
         );
-        let lines = builds.lines(&id, 0).expect("lines");
+        let lines = builds.lines(&id, 0).expect("lines").lines;
         assert!(
             lines
                 .iter()

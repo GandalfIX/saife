@@ -1113,7 +1113,32 @@ fn run_inner(
     }
     sandbox::appcontainer::delete_profile(&session.ac_name);
 
+    // L-O (verdict: partial): the ACE half was already implemented by the DACL
+    // journal above; the per-session `.sandbox/<sid>` DIRECTORY was never
+    // removed, so every run left one behind. Best-effort on purpose: the tree is
+    // litter once its ACEs are restored, and a workload may still hold a file in
+    // it - a finished run must not fail over that.
+    let _ = remove_session_sandbox_dir(&cwd, &sid);
+
     Ok(exit_code as i32)
+}
+
+/// Remove this session's `.sandbox/<sid>` tree at teardown (L-O).
+///
+/// Called AFTER the DACL restore, because a tree removed while its ACEs are
+/// still journaled would leave the journal pointing at paths that no longer
+/// exist (the restore tolerates that, but the order costs nothing).
+///
+/// `.sandbox` itself is left alone: it is the parent every session shares, and
+/// removing it would race another session's teardown. `NotFound` is success -
+/// a run that never created the tree, or a second teardown, must not be an
+/// error.
+fn remove_session_sandbox_dir(cwd: &std::path::Path, sid: &str) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(cwd.join(".sandbox").join(sid)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,6 +2129,49 @@ fn join_cmdline(tokens: &[String]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// L-O teardown tests: the per-session `.sandbox/<sid>` tree must not survive
+/// the run that created it.
+///
+/// Inline rather than in [`tests`] because it pins a function that only the
+/// teardown path calls, and because `tests.rs` is not this slice's file.
+#[cfg(test)]
+mod session_teardown_tests {
+    use super::*;
+
+    /// L-O (verdict: partial - the ACE half was implemented, this half was not):
+    /// teardown removes this session's `.sandbox/<sid>` tree, leaves a sibling
+    /// session's tree alone, and a second teardown is not an error.
+    #[test]
+    fn teardown_removes_the_session_sandbox_dir() {
+        let cwd = std::env::temp_dir().join(format!(
+            "saife-teardown-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(cwd.join(".sandbox").join("sid1").join("bin")).unwrap();
+        std::fs::write(cwd.join(".sandbox/sid1/bin/tool.exe"), b"x").unwrap();
+        std::fs::write(cwd.join(".sandbox/sid1/pyshim.py"), b"x").unwrap();
+        std::fs::create_dir_all(cwd.join(".sandbox").join("sid2")).unwrap();
+
+        remove_session_sandbox_dir(&cwd, "sid1").expect("teardown removes the session dir");
+
+        assert!(
+            !cwd.join(".sandbox").join("sid1").exists(),
+            "the session's .sandbox/<sid> tree must not survive teardown"
+        );
+        assert!(
+            cwd.join(".sandbox").join("sid2").exists(),
+            "another session's tree must not be touched"
+        );
+        // Idempotent: a run that never created the tree (or a second teardown)
+        // is success, not an error at the end of an otherwise clean run.
+        remove_session_sandbox_dir(&cwd, "sid1").expect("a second teardown is not an error");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+}
 
 /// Regression tests for the audit commit path (H5b/H5c).
 ///
