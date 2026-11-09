@@ -260,6 +260,59 @@ pub fn builtin_deny_dirs() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Credential FILES denied for EVERY launch, on both backends, whatever the
+/// profile says (M2: security-review 2026-11-09, verdict "partial").
+///
+/// `~/.gradle` and `~/.m2` are RWX in the shipped `jvm.json` because Gradle
+/// and Maven cannot run without their trees, and the credentials inside those
+/// trees (`gradle.properties`, `settings.xml`) must not ship with the grant.
+/// The same reasoning covers cargo's registry token, git's credential store,
+/// docker/kube client configs, the GitHub CLI's hosts file and the PyPI
+/// upload token. A whole-directory deny is the explicitly rejected
+/// alternative: the deny contains a grant, and both backends refuse such a
+/// session rather than silently narrowing it — `jvm.json` would become
+/// unlaunchable. Denying the descendant FILE keeps the directory grant
+/// working while the credential inside it stays unreadable.
+///
+/// **`~/.npmrc` is deliberately NOT on this list.** It is the credential —
+/// and also the configuration: npm must read it to find the registry and the
+/// token, so denying it breaks every authenticated npm install. The trade-off
+/// is documented in `profiles/README.md` instead of being "fixed" with a deny
+/// the workload would route around anyway (an unauthenticated registry reads
+/// everything else the token names).
+///
+/// Derived from the same bases [`builtin_deny_dirs`] uses — `%USERPROFILE%`
+/// and the known-folder env vars, not a caller-supplied profile — until M3
+/// (SHGetKnownFolderPath) lands, so the two deny sets can never disagree
+/// about whose tree they deny. If the base is unset the corresponding files
+/// are simply absent from the list (the same posture as the dir denies).
+pub fn builtin_deny_files() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
+        for (dir, file) in [
+            (Some(".gradle"), "gradle.properties"),
+            (Some(".m2"), "settings.xml"),
+            (Some(".cargo"), "credentials.toml"),
+            (None, ".git-credentials"),
+            (Some(".docker"), "config.json"),
+            (Some(".kube"), "config"),
+            // The gh CLI's config dir (`hosts.yml` holds the OAuth token);
+            // denied as the tree it is, which no shipped profile grants.
+            (Some(".config"), "gh"),
+            (None, ".pypirc"),
+        ] {
+            out.push(match dir {
+                Some(dir) => home.join(dir).join(file),
+                None => home.join(file),
+            });
+        }
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").map(std::path::PathBuf::from) {
+        out.push(appdata.join("NuGet").join("NuGet.Config"));
+    }
+    out
+}
+
 /// Does `outer` contain `inner` (equal, or an ancestor)? Component-wise and
 /// case-insensitive, because Windows paths are. Used to refuse a session whose
 /// deny would swallow a grant instead of silently locking the workload out.

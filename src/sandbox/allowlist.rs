@@ -72,7 +72,20 @@ pub fn build_allowlist(
     // The built-in deny set is read from the environment here, once, so the body
     // below is a pure function of its arguments and can be tested without mutating
     // process state (the suite has tests that do).
-    build_allowlist_with(sid, cwd, fs, &crate::profile::builtin_deny_dirs())
+    //
+    // The credential FILES are filtered by existence, unlike the directories: a
+    // missing file usually means the tool is not installed (`~/.m2/settings.xml`
+    // on a machine without Maven), and `grant_one` fails on a missing path, with
+    // `grant_access` failing the SESSION on any deny that cannot be applied. A
+    // file that does not exist needs no deny. The mxc backend keeps the full
+    // list — its `denied_paths` are policy entries, not filesystem objects, so a
+    // missing path is inert there.
+    let dirs = crate::profile::builtin_deny_dirs();
+    let files: Vec<std::path::PathBuf> = crate::profile::builtin_deny_files()
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    build_allowlist_with(sid, cwd, fs, &dirs, &files)
 }
 
 fn build_allowlist_with(
@@ -80,6 +93,7 @@ fn build_allowlist_with(
     cwd: &std::path::Path,
     fs: &FilesystemSlice,
     builtin_denies: &[std::path::PathBuf],
+    builtin_deny_files: &[std::path::PathBuf],
 ) -> Result<Vec<AllowEntry>> {
     let mut entries = Vec::new();
     let mut ancestor_set: Vec<std::path::PathBuf> = Vec::new();
@@ -123,7 +137,13 @@ fn build_allowlist_with(
     // $USERPROFILE` read all six through the inherited allow (C1). The comment
     // that used to sit here claimed the protection held; it never did on this
     // backend.
-    for deny in builtin_denies {
+    // The pre-flight refuses a session whose grant is INSIDE a deny — for the
+    // credential FILES below exactly as for the directories above. That is
+    // what makes the file denies safe to add without touching the shipped
+    // profile JSONs: a grant of `~/.gradle` (the directory) passes, because
+    // the deny names `~/.gradle/gradle.properties` (a descendant), while a
+    // grant of the credential file itself is refused by name.
+    for deny in builtin_denies.iter().chain(builtin_deny_files.iter()) {
         for grant in fs.allow.iter().chain(fs.read_only.iter()) {
             if crate::profile::path_covers(deny, grant) {
                 // windows::core::Result is this module's error type; the message is
@@ -167,6 +187,32 @@ fn build_allowlist_with(
             true,
             false,
         );
+    }
+    // M2: builtin credential FILE denies (`gradle.properties`, `settings.xml`,
+    // `credentials.toml`, `.git-credentials`, docker/kube configs, the gh
+    // config tree, `NuGet.Config`, `.pypirc` — the list lives in
+    // `crate::profile::builtin_deny_files`, beside `builtin_deny_dirs`). The
+    // shipped `jvm.json` grants `~/.gradle` and `~/.m2` RWX because Gradle and
+    // Maven cannot run without those trees; the credentials inside them must
+    // not ship with the grant. Whole-dir denies are the explicitly rejected
+    // alternative: the deny would contain the grant and the pre-flight above
+    // would refuse the session — `jvm.json` would become unlaunchable.
+    //
+    // Same FILE_ALL_ACCESS mask as the dir denies (a zero-mask deny is a no-op
+    // ACE, C1), but NON-INHERITABLE: a file has no children to shield, so an
+    // inheritable flag only invites a pointless `should_propagate` walk. The
+    // deny applies to the file itself, where the RWX allow on the covering
+    // directory would otherwise reach it — an explicit deny beats the
+    // inherited allow in the DACL evaluation order.
+    for file in builtin_deny_files {
+        entries.push(AllowEntry {
+            win32_path: file.clone(),
+            access: FILE_ALL_ACCESS.0,
+            label: format!("builtin-deny-file:{}", file.display()),
+            deny: true,
+            protected: false,
+            inherit: false,
+        });
     }
     // Ancestor traverse grants (KI-1.2 fix): for every allowed/RO path, grant
     // the AppContainer SID `FILE_READ_ATTRIBUTES | FILE_TRAVERSE` on each
@@ -924,6 +970,7 @@ mod tests {
             std::path::Path::new(r"C:\proj"),
             &fs,
             &denies,
+            &[],
         ) {
             Ok(_) => panic!("a grant inside .saife must be refused"),
             Err(e) => e,
@@ -946,9 +993,14 @@ mod tests {
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let entries =
-            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies)
-                .unwrap();
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &denies,
+            &[],
+        )
+        .unwrap();
         let want = home.join(".saife");
         let hit = entries
             .iter()
@@ -978,9 +1030,14 @@ mod tests {
             read_only: Vec::new(),
             deny: vec![home.join("secrets")],
         };
-        let entries =
-            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &builtin)
-                .unwrap();
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &builtin,
+            &[],
+        )
+        .unwrap();
         let denies: Vec<&AllowEntry> = entries.iter().filter(|e| e.deny).collect();
         assert!(
             denies.len() == builtin.len() + 1,
@@ -1009,9 +1066,14 @@ mod tests {
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let entries =
-            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &builtin)
-                .unwrap();
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &builtin,
+            &[],
+        )
+        .unwrap();
         let builtin_denies: Vec<&AllowEntry> = entries
             .iter()
             .filter(|e| e.deny && e.label.starts_with("builtin-deny:"))
@@ -1073,8 +1135,13 @@ mod tests {
                 read_only: Vec::new(),
                 deny: Vec::new(),
             };
-            let res =
-                build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies);
+            let res = build_allowlist_with(
+                "test-sid",
+                std::path::Path::new(r"C:\proj"),
+                &fs,
+                &denies,
+                &[],
+            );
             assert!(
                 res.is_err(),
                 "grant {grant_spelling:?} names the denied .saife (Win32 drops the \
@@ -1088,8 +1155,14 @@ mod tests {
             deny: Vec::new(),
         };
         assert!(
-            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies)
-                .is_ok()
+            build_allowlist_with(
+                "test-sid",
+                std::path::Path::new(r"C:\proj"),
+                &fs,
+                &denies,
+                &[],
+            )
+            .is_ok()
         );
     }
 
@@ -1107,11 +1180,14 @@ mod tests {
             read_only: Vec::new(),
             deny: Vec::new(),
         };
-        let entries =
-            build_allowlist_with("test-sid", std::path::Path::new(r"C:\proj"), &fs, &denies)
-                .expect(
-                    "a grant that covers a deny must not be refused - the deny ACE does the work",
-                );
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &denies,
+            &[],
+        )
+        .expect("a grant that covers a deny must not be refused - the deny ACE does the work");
         assert!(
             entries.iter().any(|e| !e.deny && e.win32_path == home),
             "the covering grant must stay in the allowlist"
@@ -1165,14 +1241,24 @@ mod tests {
         assert!(!parent.protected, "the M5 residual is still open");
     }
 
-    /// M2 deferred fix: a jvm-profile policy must carry descendant deny ACEs
-    /// for `~/.gradle/gradle.properties` and `~/.m2/settings.xml` while the
-    /// `.gradle`/`.m2` directory grants stay — whole-dir denies would make
-    /// the jvm profile unlaunchable (see the verdict's fix note).
+    /// M2: a jvm-profile policy must carry descendant deny ACEs for the whole
+    /// builtin credential-file set — `~/.gradle/gradle.properties`,
+    /// `~/.m2/settings.xml`, `~/.cargo/credentials.toml`,
+    /// `~/.git-credentials`, `~/.docker/config.json`, `~/.kube/config`,
+    /// `~/.config/gh`, `%APPDATA%\NuGet\NuGet.Config` and `~/.pypirc` — while
+    /// the `.gradle`/`.m2` directory grants stay. Whole-dir denies would make
+    /// the jvm profile unlaunchable: the deny contains the grant, and the
+    /// pre-flight refuses such a session (see the verdict's fix note).
     ///
-    /// Red until M2 lands — docs/design/2026-11-09-security-review-verdicts.md
+    /// `~/.npmrc` is deliberately NOT denied — npm must read it to
+    /// authenticate at all (trade-off documented in `profiles/README.md`) — so
+    /// it is asserted ABSENT from the deny set, not merely left out.
+    ///
+    /// This drives `build_allowlist_with` with the unfiltered builtin file
+    /// set so the assertions pin the policy's shape rather than which
+    /// credential files happen to exist on this host (`build_allowlist`
+    /// skips missing files at apply time; see its comment).
     #[test]
-    #[ignore = "red until M2 lands — docs/design/2026-11-09-security-review-verdicts.md"]
     fn m2_jvm_profile_denies_gradle_properties_and_maven_settings() {
         let _env = crate::env_lock();
         // `jvm.json` references `$JAVA_HOME` in read_only; the variable is not
@@ -1205,30 +1291,81 @@ mod tests {
             &cwd,
             &resolved.filesystem,
             &crate::profile::builtin_deny_dirs(),
+            &crate::profile::builtin_deny_files(),
         )
         .expect("the jvm profile must build an allowlist");
 
-        let denies: Vec<&AllowEntry> = entries.iter().filter(|e| e.deny).collect();
-        for (dir, file) in [(r".gradle", "gradle.properties"), (r".m2", "settings.xml")] {
-            let hit = denies.iter().find(|e| {
-                let p = &e.win32_path;
-                p.file_name().and_then(|n| n.to_str()) == Some(file)
-                    && p.parent()
-                        .and_then(|par| par.file_name().and_then(|n| n.to_str()))
-                        == Some(dir)
-            });
-            assert!(
-                hit.is_some(),
-                "the jvm policy must deny {dir}\\{file} (descendant of the granted \
-                 {dir} tree); denies today: {:?}",
-                denies.iter().map(|e| &e.win32_path).collect::<Vec<_>>()
-            );
-        }
-        // The directory grants themselves must stay (whole-dir denies are the
-        // explicitly rejected alternative).
         let home = std::path::PathBuf::from(
             std::env::var_os("USERPROFILE").expect("USERPROFILE is needed to spell the grants"),
         );
+        let appdata = std::path::PathBuf::from(
+            std::env::var_os("APPDATA").expect("APPDATA is needed to spell NuGet.Config"),
+        );
+        // The full M2 set, spelled independently of `builtin_deny_files` so a
+        // silent deletion from that list fails HERE instead of shipping.
+        let want = [
+            home.join(".gradle").join("gradle.properties"),
+            home.join(".m2").join("settings.xml"),
+            home.join(".cargo").join("credentials.toml"),
+            home.join(".git-credentials"),
+            home.join(".docker").join("config.json"),
+            home.join(".kube").join("config"),
+            home.join(".config").join("gh"),
+            home.join(".pypirc"),
+            appdata.join("NuGet").join("NuGet.Config"),
+        ];
+        let file_denies: Vec<&AllowEntry> = entries
+            .iter()
+            .filter(|e| e.deny && e.label.starts_with("builtin-deny-file:"))
+            .collect();
+        assert_eq!(
+            file_denies.len(),
+            want.len(),
+            "every builtin credential file must be denied exactly once (and nothing else may \
+             join the set); denies: {:?}",
+            file_denies
+                .iter()
+                .map(|e| &e.win32_path)
+                .collect::<Vec<_>>()
+        );
+        for file in &want {
+            let hit = file_denies
+                .iter()
+                .find(|e| paths_eq_ci(&e.win32_path, file))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the jvm policy must deny {file:?} (a credential file inside a granted \
+                         tree); file denies: {:?}",
+                        file_denies
+                            .iter()
+                            .map(|e| &e.win32_path)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_ne!(
+                hit.access, 0,
+                "the file deny for {file:?} must carry a real mask — a zero-mask deny ACE \
+                 denies nothing (C1, applied to files)"
+            );
+            assert!(
+                !hit.inherit,
+                "the deny for {file:?} must be non-inheritable: a file has no children to \
+                 shield, and an inheritable ACE only invites a pointless propagation walk"
+            );
+        }
+        // The deliberately-undenied credential: ~/.npmrc stays readable because
+        // npm needs the token in it to reach any registry at all.
+        let npmrc = home.join(".npmrc");
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.deny || !paths_eq_ci(&e.win32_path, &npmrc)),
+            "~/.npmrc must NOT be denied: npm reads the token from it to authenticate, and \
+             denying it breaks every authenticated install (the trade-off is documented in \
+             profiles/README.md, not fixed by a deny)"
+        );
+        // The directory grants themselves must stay (whole-dir denies are the
+        // explicitly rejected alternative).
         for dir in [".gradle", ".m2"] {
             assert!(
                 entries
@@ -1237,6 +1374,70 @@ mod tests {
                 "the {dir} directory grant must survive the descendant denies"
             );
         }
+    }
+
+    /// M2 pre-flight half: the builtin file denies take part in the same
+    /// deny-covers-grant refusal the directory denies use. A grant of the
+    /// credential FILE is refused (the operator asked for a credential),
+    /// while a grant of the PARENT DIRECTORY passes — the deny applies to
+    /// the file, not the tree that holds it. That asymmetry is the whole
+    /// point: it is what keeps `jvm.json` launchable with `.gradle`/`.m2`
+    /// granted RWX.
+    #[test]
+    fn m2_a_credential_file_grant_is_refused_but_the_parent_dir_passes() {
+        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let file = home.join(".gradle").join("gradle.properties");
+        // (a) Granting the file itself, ON TOP OF the legitimate directory
+        // grant: the pre-flight refuses the session because one grant names a
+        // credential file. The directory grant does not rescue it.
+        let fs = FilesystemSlice {
+            allow: vec![home.join(".gradle"), file.clone()],
+            ..Default::default()
+        };
+        let err = match build_allowlist_with(
+            "m2-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &[],
+            std::slice::from_ref(&file),
+        ) {
+            Ok(_) => panic!("a grant of the credential file must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message().contains("deny covers grant"),
+            "the refusal must be the pre-flight's named error, not an accident: {}",
+            err.message()
+        );
+        // (b) Granting the parent directory: allowed, and the file deny ships
+        // beside it with a real mask.
+        let fs = FilesystemSlice {
+            allow: vec![home.join(".gradle")],
+            ..Default::default()
+        };
+        let entries = build_allowlist_with(
+            "m2-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &[],
+            std::slice::from_ref(&file),
+        )
+        .expect("the parent directory grant must pass - the deny applies to the file, not the dir");
+        assert!(
+            entries
+                .iter()
+                .any(|e| !e.deny && e.win32_path == home.join(".gradle")),
+            "the .gradle directory grant must stay in the allowlist"
+        );
+        let deny = entries
+            .iter()
+            .find(|e| e.deny && e.win32_path == file)
+            .expect("the credential-file deny must ship with the parent grant");
+        assert_ne!(
+            deny.access, 0,
+            "the file deny needs a real mask - a zero-mask deny is a no-op and the inherited \
+             .gradle allow reads gradle.properties (C1's lesson, applied to files)"
+        );
     }
 
     /// The six builtin deny directories (the AppContainer builtin set — a

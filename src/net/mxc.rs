@@ -840,6 +840,30 @@ pub fn filesystem_policy(
             &grants,
         )?;
     }
+    // M2: credential FILES, denied for every launch as DESCENDANTS of the
+    // directories the shipped profiles grant RWX (`jvm.json` grants `~/.gradle`
+    // and `~/.m2` — Gradle and Maven cannot run without those trees — and
+    // `opencode.json` inherits both, so it inherits these denies too). The
+    // same list the AppContainer backend denies, defined once in
+    // `crate::profile::builtin_deny_files`.
+    //
+    // Whole-directory denies are the wrong tool here: MXC filesystem policy is
+    // additive grants, so a deny of `~/.gradle` contains the `~/.gradle` grant
+    // and [`RequestError::DenyCoversGrant`] refuses the session — the jvm
+    // profile would be unlaunchable. A deny of the file inside the granted
+    // tree is the expressible case (see the docstring above) and is kept.
+    //
+    // Not filtered by existence, unlike the AppContainer path: these are policy
+    // entries handed to the container, not filesystem objects this process
+    // writes a DACL onto, so a credential file that is not installed is an
+    // inert deny rather than a failed launch.
+    for file in crate::profile::builtin_deny_files() {
+        push_deny(
+            &mut filesystem.denied_paths,
+            &file.display().to_string(),
+            &grants,
+        )?;
+    }
     for candidate in configured_denies {
         push_deny(&mut filesystem.denied_paths, candidate, &grants)?;
     }
@@ -3087,3 +3111,72 @@ mod tests;
 /// scratch directory removes itself.
 #[cfg(test)]
 mod live;
+
+// ---------------------------------------------------------------------------
+// M2: credential-file denies on the mxc contract (security review 2026-11-09)
+// ---------------------------------------------------------------------------
+
+/// M2's mxc half: [`filesystem_policy`] must deny the same credential FILES
+/// the AppContainer backend denies ([`crate::profile::builtin_deny_files`]),
+/// as *descendants* of the directories the shipped profiles grant RWX
+/// (`jvm.json` grants `~/.gradle` and `~/.m2`; `opencode.json` inherits
+/// both, so it inherits the denies too).
+///
+/// The test lives beside the function rather than in `mxc/tests.rs` so the
+/// assertion is about this module's own contract: adding a credential file to
+/// `builtin_deny_files` without pushing it here is invisible to
+/// `denied_paths` and would ship a readable credential.
+#[cfg(test)]
+mod m2_credential_file_denies {
+    use super::*;
+
+    #[test]
+    fn the_mxc_policy_denies_the_builtin_credential_files() {
+        // `builtin_deny_files()` reads USERPROFILE/APPDATA and other tests in
+        // this suite repoint USERPROFILE, so hold the same lock they do.
+        let _env = crate::env_lock();
+        let home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE must be set"),
+        );
+        // The jvm profile's grant, in the shape main.rs passes it: writable
+        // extras beside the workspace.
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[home.join(".gradle"), home.join(".m2")],
+            &[],
+            &[],
+            Some(&home),
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+        )
+        .expect("a file deny is a descendant of a grant, never an ancestor");
+
+        for file in crate::profile::builtin_deny_files() {
+            let spelled = file.display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|deny| path_key(deny) == path_key(&spelled)),
+                "the mxc contract must deny the credential file {spelled}: {:?}",
+                fs.denied_paths
+            );
+        }
+        // ~/.npmrc is the deliberate exception: npm must read the token.
+        let npmrc = home.join(".npmrc").display().to_string();
+        assert!(
+            fs.denied_paths
+                .iter()
+                .all(|deny| path_key(deny) != path_key(&npmrc)),
+            "~/.npmrc must NOT be denied on the mxc path either: {:?}",
+            fs.denied_paths
+        );
+        // The directory grants stay: the deny names the file, not the tree.
+        for dir in [".gradle", ".m2"] {
+            let spelled = home.join(dir).display().to_string();
+            assert!(
+                fs.readwrite_paths.contains(&spelled),
+                "the {dir} grant must survive the file denies: {:?}",
+                fs.readwrite_paths
+            );
+        }
+    }
+}

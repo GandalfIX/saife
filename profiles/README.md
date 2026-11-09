@@ -84,6 +84,40 @@ carries the paths, but it is unverified until Maven is. Create the directory
 first (`mkdir %USERPROFILE%\.m2`) — an allow entry cannot create the root it
 grants.
 
+## Default credential-file denies
+
+Several shipped profiles grant a tree RWX because the tool that owns it cannot
+run otherwise — `jvm.json` grants `~/.gradle` and `~/.m2`, `node.json` grants
+`$APPDATA\npm`, and `opencode.json` (which extends both) inherits all of it.
+Those trees also hold credentials. Rather than remove the grants (which would
+make the profiles unlaunchable), the sandbox denies the credential FILES
+themselves as descendants of the granted directories, on **both backends** and
+for **every** profile, whatever the operator grants:
+
+- `~/.gradle/gradle.properties`
+- `~/.m2/settings.xml`
+- `~/.cargo/credentials.toml`
+- `~/.git-credentials`
+- `~/.docker/config.json`
+- `~/.kube/config`
+- `~/.config/gh`
+- `%APPDATA%\NuGet\NuGet.Config`
+- `~/.pypirc`
+
+A missing file is skipped silently on the AppContainer backend (the tool is
+not installed); the mxc backend lists it as an inert policy entry. A grant of
+one of these files *itself* is refused at session start (the deny names the
+file), while a grant of its parent directory still passes — that asymmetry is
+what keeps `jvm.json` launchable.
+
+**`~/.npmrc` is deliberately NOT denied.** `node.json` grants it read-only, and
+npm must read it to find both the registry URL and the auth token: denying it
+breaks every authenticated install. The token in `.npmrc` is therefore a
+documented residual — if it must not be reachable, run the session without the
+`node`/`opencode` profile or rotate the token out of `.npmrc` (an
+unauthenticated registry read is the threat, and a denied `.npmrc` does not
+remove the token from the machine).
+
 ## `gradle-runner.json` — a session that builds through the runner
 
 **Not in a released build.** The runner lives on `feat/gradle-build-runner`; the
