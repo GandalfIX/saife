@@ -900,6 +900,13 @@ fn dacl_without_trustee_aces(
                 continue;
             }
             let a = &*(ace as *const TrusteeAce);
+            // Bound every read by the ACE's own size: a well-formed
+            // ACCESS_ALLOWED/DENIED ACE is at least header(4) + mask(4) +
+            // sid_start(4), so anything smaller is corrupt, cannot name our
+            // trustee, and is skipped instead of read.
+            if (a.header.AceSize as usize) < std::mem::size_of::<TrusteeAce>() {
+                continue;
+            }
             let ours = (a.header.AceType == ACE_TYPE_ALLOWED
                 || a.header.AceType == ACE_TYPE_DENIED)
                 && EqualSid(*ac_sid, PSID(a.sid_start.as_ptr() as *mut _)).is_ok();
