@@ -149,11 +149,19 @@ on `AppData\Local`, causing `saife run --block-net` to deadlock in
 `grant_access` / `build_allowlist`) MUST clean up the ACEs it created
 afterwards. Two complementary mechanisms:
 
-1. **Per-session cleanup (Rust):** `saife run` should remove the ACEs it
+1. **Per-session cleanup (Rust):** `saife run` removes the allow ACEs it
    added to the CWD ancestor directories on exit (after the child process
-   returns, before the supervisor exits). The per-session `.sandbox\<sid>`
-   directory is also removed. This is the primary defense — it runs
-   automatically. *(Not yet implemented; tracked as a follow-up.)*
+   returns, before the supervisor exits), and removes the per-session
+   `.sandbox\<sid>` directory. This is the primary defense — it runs
+   automatically. The DACL journal (`src/sandbox/dacl_journal.rs`) records
+   every grant before it is applied and teardown replays it with
+   `REVOKE_ACCESS`; a run that was killed is recovered at the next start
+   (`recover_orphans`). Since 2026-11-09 an unreadable journal is retained
+   and restore fails closed instead of reporting success (M4).
+   **Known gap:** `REVOKE_ACCESS` does not strip `DENY_ACCESS` ACEs, so the
+   six builtin-deny trees keep a per-session deny ACE after teardown. It
+   names the AC SID whose profile is deleted, so it grants nothing — inert
+   litter, tracked as a teardown follow-up.
 2. **Test harness cleanup (PowerShell):** `tests/run-tests.ps1` must, after the
    suite completes (on success OR failure), remove any `S-1-15-2-*`
    (AppContainer) ACEs that the run added to `$env:TEMP`, `AppData\Local`, and
