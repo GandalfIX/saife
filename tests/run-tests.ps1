@@ -72,7 +72,17 @@
   only pass for the wrong reason. The number is reserved out of the run (it is not a
   skipping scenario); the property is pinned meanwhile by the ignored live leg
   `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful` in
-  src/net/mxc.rs. Suite total: 93 scenarios in 1..=94 with 93 reserved.
+  src/net/mxc.rs.
+  S-96..S-98 (teardown postconditions; prep for the POSIX-backend work) pin
+  what a finished session must NOT leave behind: S-96 the AppContainer profile
+  (Packages dir + HKCU Storage key), S-97 the per-session <cwd>\.sandbox\<sid>
+  install tree (observably created by --print-sid, removed by a real run's
+  teardown, shared .sandbox parent kept), S-98 the DACL journal file (written
+  during the session, deleted on success). Each scenario proves the observable
+  EXISTED mid-session, so "gone after" cannot pass vacuously. All three are
+  AppContainer-only: the mxc path creates no profile, no install tree and no
+  journal.
+  Suite total: 96 scenarios in 1..=98 with 93 reserved.
 
   BACKEND SELECTION (P3.1 harness plumbing): -Backend appcontainer|mxc
   (default appcontainer) is passed to EVERY `run` invocation as
@@ -3295,6 +3305,130 @@ function Invoke-Scenario-S94 {
 }
 
 # ---------------------------------------------------------------------------
+# S-96..S-98: teardown postconditions (prep for the POSIX-backend work).
+#
+# Each pins a state a finished run must NOT leave behind, and each proves the
+# observable EXISTED during the session first, so a "gone after" pass cannot be
+# vacuous: the AppContainer profile is polled for mid-run (S-96), the
+# install tree is observable by construction after --print-sid (S-97), and the
+# journal file is polled for mid-run (S-98). All three are AppContainer-only:
+# the mxc path creates no profile, no install tree and no journal.
+# ---------------------------------------------------------------------------
+
+# Poll for a path's appearance within $Seconds. Returns $true when the path
+# was seen at least once. The counterpart of a teardown postcondition is
+# only proven if it was observed to exist; a test that only checks absence
+# after the fact would also pass if the mechanism were never created.
+function Wait-PathAppears { param([string]$Path, [int]$Seconds = 20, [int]$IntervalMs = 50)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $Path) { return $true }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    return (Test-Path -LiteralPath $Path)
+}
+
+# Write the hold batch the S-96/S-98 sessions run as their workload. It is a
+# pure CPU spin - no stdin (which `timeout` needs and loses under a redirected
+# harness), no network, no output - that keeps the session alive for the
+# seconds the poll above needs. `ver` is a cmd builtin, so the loop spawns no
+# process and `>NUL` silences it. One run of the loop is roughly a second on
+# the VM guest; 40000 gives the poll a multi-second window on a slow host.
+function New-HoldBatch { param([string]$Dir)
+    $path = Join-Path $Dir 'hold.cmd'
+    Set-Content -LiteralPath $path -Value "@echo off`r`nfor /l %%i in (1,1,40000) do @ver>NUL`r`n" -Encoding ASCII
+    return 'hold.cmd'
+}
+
+# S-96: teardown deletes the AppContainer PROFILE. The footprint is the
+# %LOCALAPPDATA%\Packages\<ac> directory plus the HKCU AppContainer Storage
+# key, both created by CreateAppContainerProfile and both removed by
+# DeleteAppContainerProfile. A profile that leaked would make every later
+# session re-derive instead of create - silent until the store filled with
+# per-session profiles. The session id is scenario-unique, so a leftover from
+# any earlier run cannot fake the mid-run observation (the scenario starts
+# from a clean baseline for ITS OWN name).
+function Invoke-Scenario-S96 {
+    $d = New-ScenarioDir 96
+    $sid = 'S96-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $pkg = Join-Path $env:LOCALAPPDATA "Packages\sandbox.$sid.ac"
+    $storage = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\sandbox.' + $sid + '.ac'
+    $hold = New-HoldBatch -Dir $d
+    $proc = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sid, $hold) -WorkingDirectory $d
+    $seen = Wait-PathAppears -Path $pkg -Seconds 20
+    $exited = $proc.WaitForExit(90000)
+    $exitCode = if ($exited) { $proc.ExitCode } else { -2 }
+    if (-not $exited) { try { $proc.Kill() } catch { } }
+    $stderr = $proc.StandardError.ReadToEnd()
+    $null = $proc.StandardOutput.ReadToEnd()
+    $proc.Close()
+    $pkgAfter = Test-Path -LiteralPath $pkg
+    $storageAfter = Test-Path -LiteralPath $storage
+    $passed = $seen -and $exited -and ($exitCode -eq 0) -and (-not $pkgAfter) -and (-not $storageAfter)
+    return @{ Num=96; Name='S-96 (teardown deletes the AppContainer profile)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'profile Packages dir + HKCU Storage key existed mid-run, both gone after teardown' }
+                 else { "seen=$seen exited=$exited exitCode=$exitCode pkgAfter=$pkgAfter storageAfter=$storageAfter stderr=$(Get-LineHead -Lines @($stderr) -Max 200)" } }
+}
+
+# S-97: teardown removes the per-session <cwd>\.sandbox\<sid> install tree
+# while the shared .sandbox parent stays (removing the parent would race a
+# concurrent session's teardown). The tree is observable WITHOUT a poll:
+# --print-sid returns before the child spawns but after ensure_session_dirs,
+# so the tree is on disk the moment that run prints the id. The follow-up run
+# with the same --sid is the real session whose teardown must remove it.
+# (Pinning the print-sid residue is intentional: it documents the early
+# return's litter and is exactly what makes the "existed" proof free.)
+function Invoke-Scenario-S97 {
+    $d = New-ScenarioDir 97
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) {
+        return @{ Num=97; Name='S-97 (teardown removes the session tree)'; Passed=$false; Skipped=$false
+            Detail = "print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" }
+    }
+    $sid = (($psid.Stdout | Where-Object { $_ -match '^\d{8}-\d{6}-\d{5}$' }) -join '').Trim()
+    if (-not $sid) {
+        return @{ Num=97; Name='S-97 (teardown removes the session tree)'; Passed=$false; Skipped=$false
+            Detail = 'print-sid produced no session id' }
+    }
+    $tree = Join-Path $d ".sandbox\$sid"
+    $before = Test-Path -LiteralPath (Join-Path $tree 'bin')
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','echo','S97-MARKER') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $after = Test-Path -LiteralPath $tree
+    $parentKept = Test-Path -LiteralPath (Join-Path $d '.sandbox')
+    $passed = $before -and ($r.ExitCode -eq 0) -and ($out -match 'S97-MARKER') -and (-not $after) -and $parentKept
+    return @{ Num=97; Name='S-97 (teardown removes the session tree)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "tree $sid existed after --print-sid and is gone after the run; .sandbox parent kept" }
+                 else { "before=$before exit=$($r.ExitCode) marker=$($out -match 'S97-MARKER') after=$after parentKept=$parentKept out=$(Get-LineHead -Lines @($out) -Max 160) err=$(Get-LineHead -Lines $r.Stderr -Max 160)" } }
+}
+
+# S-98: teardown deletes the DACL journal file on success. The journal is
+# the crash-recovery record (S-74 reaps orphans from it), so a journal left
+# behind after a CLEAN run is not a crash record - it is a restore that
+# reported failure, or a removal that never ran. The file is polled for
+# mid-run so the absence assertion cannot pass while journaling is silently
+# unwired (a run that opened no journal would otherwise pass vacuously).
+function Invoke-Scenario-S98 {
+    $d = New-ScenarioDir 98
+    $sid = 'S98-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $journal = Join-Path (Get-DaclJournalDir) "$sid.jsonl"
+    $hold = New-HoldBatch -Dir $d
+    $proc = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sid, $hold) -WorkingDirectory $d
+    $seen = Wait-PathAppears -Path $journal -Seconds 20
+    $exited = $proc.WaitForExit(90000)
+    $exitCode = if ($exited) { $proc.ExitCode } else { -2 }
+    if (-not $exited) { try { $proc.Kill() } catch { } }
+    $stderr = $proc.StandardError.ReadToEnd()
+    $null = $proc.StandardOutput.ReadToEnd()
+    $proc.Close()
+    $after = Test-Path -LiteralPath $journal
+    $passed = $seen -and $exited -and ($exitCode -eq 0) -and (-not $after)
+    return @{ Num=98; Name='S-98 (teardown deletes the DACL journal on success)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'journal file existed mid-run and is gone after the clean run' }
+                 else { "seen=$seen exited=$exited exitCode=$exitCode journalAfter=$after stderr=$(Get-LineHead -Lines @($stderr) -Max 200)" } }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -3327,7 +3461,7 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 95
+$script:MaxScenario = 98
 # S-93 is RESERVED, and deliberately not registered at all (P2.4).
 #
 # It is the harness form of guardrail 1's NEGATIVE case (ADR-0004: a session must
@@ -3392,6 +3526,9 @@ $script:AppContainerOnlyScenarios = @{
     42 = 'regression guard on the same drive-root ACE (the grant must not weaken an unrelated denial)'
     73 = 'asserts DACL-journal teardown restore; the mxc path writes no ACLs, so there is no journal and no restore to observe'
     74 = 'asserts DACL-journal crash recovery (orphan reap); no ACLs and no journal on the mxc path'
+    96 = 'asserts the AppContainer PROFILE footprint (Packages dir + HKCU Storage key); the mxc path creates no named AppContainer profile'
+    97 = 'asserts the per-session <cwd>\.sandbox\<sid> install tree, which the mxc path does not create'
+    98 = 'asserts DACL-journal file lifetime; the mxc path writes no ACLs, so it keeps no journal'
 }
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
@@ -3417,6 +3554,9 @@ $script:ScenarioFunctions = @{
     92 = { Invoke-Scenario-S92 }
     94 = { Invoke-Scenario-S94 }
     95 = { Invoke-Scenario-S95 }
+    96 = { Invoke-Scenario-S96 }
+    97 = { Invoke-Scenario-S97 }
+    98 = { Invoke-Scenario-S98 }
 }
 
 
