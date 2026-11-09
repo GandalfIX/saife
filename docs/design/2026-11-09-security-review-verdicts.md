@@ -1,22 +1,22 @@
 # Security review 2026-11-09 — independent verdicts
 
 - **Status:** verdicts complete. Implemented (red→green, tests retained) on
-  `security/review-20261109`, local only: **C1** (`59a2331`), **C2** (`22afba7`),
-  **M14** (`a348ced`), **H5d** (`d5ff395`), **M2** (`0d8640a`),
-  **H5a/b/c + M6** (`8edae53`), **H4/L-F/L-G/L-H/L-I/M7/L-L** (`87dfa35`),
-  **M1/M3/M5/M4** (`a9b3dba`), **H2/M8/M9/M15/L-A/L-B/L-C** (`3145ef3`),
-  **M13/M16/L-M/H3** (`db92c83`), **M10/M11/M12/L-D/L-E/L-N/L-O/H1-res**
-  (`fc99657`). The 12 non-confirmed points carry pinned or `#[ignore]`d
-  regression tests (`e9b5010`). Still open by decision: **L-P** (unsigned
+  `security/review-20261109`, local only: **C1** (`8282bfb`), **C2** (`e2b38f4`),
+  **M14** (`f86a6a7`), **H5d** (`721ff16`), **M2** (`2f61315`),
+  **H5a/b/c + M6** (`b3d3f2e`), **H4/L-F/L-G/L-H/L-I/M7/L-L** (`b74867f`),
+  **M1/M3/M5/M4** (`1316be6`), **H2/M8/M9/M15/L-A/L-B/L-C** (`2316ff6`),
+  **M13/M16/L-M/H3** (`9292db6`), **M10/M11/M12/L-D/L-E/L-N/L-O/H1-res**
+  (`649f034`). The 12 non-confirmed points carry pinned or `#[ignore]`d
+  regression tests (`131ecd2`). Still open by decision: **L-P** (unsigned
   releases — the documented D2 deferral; cheapest step is a pinned minisign
   key), **L-J/L-K** (no code change per verdict), M7's DACL (claim removed
-  instead of implemented — see `87dfa35`), M11's per-session volume
-  (documented, rejected for cost — see `fc99657`), and the M11 cross-session
+  instead of implemented — see `b74867f`), M11's per-session volume
+  (documented, rejected for cost — see `649f034`), and the M11 cross-session
   code-execution gap itself. Two follow-ups found on the way: `restore_one`
   does not strip deny ACEs (inert litter, teardown fix pending), `req_id` is
   not yet an audit `--filter` key. AGENTS.md's L-O note was rewritten on
-  2026-11-09 (`4c0d3b8`) with the owner's consent.
-- **Basis:** `0a55236` (`feat/ssh-gateway-plugin`, PR #39 head), branch `security/review-20261109`.
+  2026-11-09 (`0fa74dd`) with the owner's consent.
+- **Basis:** `0a55236` (the PR #39 head, squash-merged to main as `98b77fd`), branch `security/review-20261109`.
 - **Review under test:** an external security review with 39 points (2 Critical, 5 High,
   16 Medium, 16 Low). Point ids below are that review's ids.
 - **Method:** 18 independent reviewers, each read-only, each told to falsify its point
