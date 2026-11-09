@@ -230,22 +230,48 @@ impl AuditWriter {
             eprint!("[proxy] {line}");
         }
 
+        let pre_len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         let file_result = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(&self.path);
-        if self.strict {
+        let written = if self.strict {
             let mut f = file_result
                 .with_context(|| format!("strict audit: open {:?} for append", self.path.display()))?;
             f.write_all(line.as_bytes())
                 .with_context(|| format!("strict audit: write {:?} failed", self.path.display()))?;
+            true
         } else if let Ok(mut f) = file_result {
-            let _ = f.write_all(line.as_bytes());
-        }
+            // Best-effort: the error is swallowed (the documented contract) but
+            // must not be mistaken for success. A `write_all` that failed partway
+            // can leave a partial line; truncate it away so the next append starts
+            // on a clean line boundary. A terminal partial line would also make
+            // `scan_existing` refuse to extend the log after a restart, turning a
+            // transient failure into a dead file.
+            match f.write_all(line.as_bytes()) {
+                Ok(()) => true,
+                Err(_) => {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&self.path)
+                        .and_then(|t| t.set_len(pre_len));
+                    false
+                }
+            }
+        } else {
+            // The open itself failed (e.g. the log turned read-only): nothing was
+            // written, so there is nothing to truncate.
+            false
+        };
         // Commit last: a failed write must not advance the chain, or the next
-        // leaf would name a parent that is not in the file.
-        chain.seq = seq + 1;
-        chain.last = Some(hash);
+        // leaf would name a parent that is not in the file. In non-strict mode
+        // this turns an honest transient failure into a visible gap (a dropped
+        // leaf), not a phantom parent that `verify` calls TAMPERED. Strict mode
+        // already returned `Err` above.
+        if written {
+            chain.seq = seq + 1;
+            chain.last = Some(hash);
+        }
         Ok(())
     }
 
@@ -787,5 +813,100 @@ mod tests {
             "the sealed chain must not verify as tampered"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// H5d (verdict: confirmed, understated). A non-strict write failure is
+    /// swallowed, but the chain still advanced — so the next successful leaf
+    /// named a parent that was never written to the file, and `verify`
+    /// reported TAMPERED on an honestly degraded log. The fix: on a non-strict
+    /// write failure, do not advance seq/last (honour the existing comment at
+    /// the commit point). Best-effort still returns `Ok(())`.
+    #[test]
+    fn a_failed_nonstrict_write_does_not_advance_the_chain() {
+        use crate::audit::verify::{VerifyOutcome, verify_inner};
+
+        let sid = format!(
+            "test-h5d-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+
+        // Leaf A — writes successfully.
+        let writer = AuditWriter::open(&sid, false).unwrap();
+        let mut ea = Map::new();
+        ea.insert("op".into(), serde_json::json!("CONNECT"));
+        ea.insert("host".into(), serde_json::json!("a.example"));
+        writer.append(ea).unwrap();
+
+        // Capture A's hash for the parent assertion later.
+        let content_a = std::fs::read_to_string(&path).unwrap();
+        let leaf_a: Value = serde_json::from_str(content_a.lines().next().unwrap()).unwrap();
+        let hash_a = leaf_a["hash"].as_str().unwrap().to_string();
+
+        // Force the next append to fail WITHOUT changing code paths: make the
+        // log file read-only so OpenOptions::append fails. On Windows the
+        // readonly attribute denies FILE_APPEND_DATA; on Unix a 0o444 mode
+        // denies write. The original permissions are restored afterwards
+        // (rather than calling `set_readonly(false)`, which would make the file
+        // world-writable on Unix and trips clippy::permissions_set_readonly_false).
+        let original_perms = std::fs::metadata(&path).unwrap().permissions();
+        let mut ro_perms = original_perms.clone();
+        ro_perms.set_readonly(true);
+        std::fs::set_permissions(&path, ro_perms).unwrap();
+
+        // Leaf B — non-strict append must return Ok (best-effort contract)
+        // even though the write failed.
+        let mut eb = Map::new();
+        eb.insert("op".into(), serde_json::json!("CONNECT"));
+        eb.insert("host".into(), serde_json::json!("b.example"));
+        let res_b = writer.append(eb);
+        assert!(
+            res_b.is_ok(),
+            "non-strict append must swallow the write error (best-effort contract)"
+        );
+
+        // Restore the original permissions so writes succeed again.
+        std::fs::set_permissions(&path, original_perms).unwrap();
+
+        // Leaf C — writes successfully. Its parent must be hash(A), not
+        // hash(B): B was never written to the file, so naming B as parent
+        // would manufacture a TAMPERED verdict on an honest log.
+        let mut ec = Map::new();
+        ec.insert("op".into(), serde_json::json!("CONNECT"));
+        ec.insert("host".into(), serde_json::json!("c.example"));
+        writer.append(ec).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = content.trim().lines().collect();
+        // Only A and C should be in the file — B was never written.
+        assert_eq!(
+            lines.len(),
+            2,
+            "only the two successful leaves should be in the file"
+        );
+
+        let leaf_c: Value = serde_json::from_str(lines[1]).unwrap();
+        let parent_c = leaf_c["parent"].as_str().unwrap();
+        assert_eq!(
+            parent_c, hash_a,
+            "C's parent must be hash(A) — B was never written, so naming B \
+             would manufacture a phantom parent"
+        );
+
+        // The chain must not verify as tampered: it is an honest two-leaf
+        // log. (No root/sig committed, so verify reports Incomplete, not
+        // Tampered.)
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Incomplete(_) => {} // expected: no committed root
+            VerifyOutcome::Tampered(m) => {
+                panic!("an honestly degraded log must not verify as tampered: {m}")
+            }
+            other => panic!("expected Incomplete (no root), got {other:?}"),
+        }
     }
 }
