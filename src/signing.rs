@@ -2,15 +2,25 @@
 //!
 //! The secret key is stored at `%LOCALAPPDATA%\saife\signing\ed25519-key`,
 //! DPAPI-encrypted (`CryptProtectData`, user scope — not LOCAL_MACHINE, so only
-//! the same user on the same machine can decrypt). The 32-byte secret is
-//! encrypted to a variable-length blob and written with a restrictive DACL
-//! (owner + SYSTEM only — best-effort; DPAPI is the primary protection).
+//! the same user on the same machine can decrypt). The file inherits the
+//! user's `%LOCALAPPDATA%` ACL; there is deliberately **no** extra restrictive
+//! DACL on it (M7): a previous doc comment claimed owner+SYSTEM-only and the
+//! code never applied one. User-scope DPAPI is the primary and sufficient
+//! protection for the threat this key faces — another process running as the
+//! same user cannot decrypt the blob even though it can read the file, and
+//! anything running as another user or SYSTEM is already outside the model.
+//! No DPAPI entropy is used: a constant embedded in the binary is not a
+//! secret, and machine-unique entropy would break moving a key between
+//! installs. Which key signed a session is recorded as a fingerprint
+//! (`fingerprint_of`, M7) so `audit verify` can report KEY_CHANGED.
 //!
 //! Public key is derived from the secret on demand; we don't store it.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 use windows::Win32::Foundation::LocalFree;
 use windows::Win32::Foundation::HLOCAL;
 use windows::Win32::Security::Cryptography::{
@@ -44,8 +54,10 @@ impl KeyMaterial {
         let path = key_path()?;
         if !path.exists() {
             let signing = generate_signing_key()?;
-            let secret = signing.to_bytes();
-            let encrypted = dpapi_protect(&secret)?;
+            // L-L: the raw 32-byte secret exists exactly once in memory, in
+            // this buffer, before it is DPAPI-encrypted - wipe it on drop.
+            let secret = Zeroizing::new(signing.to_bytes());
+            let encrypted = dpapi_protect(&secret[..])?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -102,8 +114,12 @@ impl KeyMaterial {
                 path.display()
             )
         })?;
-        let secret = dpapi_unprotect(&bytes)
-            .with_context(|| format!("signing key at {} cannot be decrypted", path.display()))?;
+        // L-L: the decrypted plaintext only lives in zeroized wrappers from
+        // here to the SigningKey.
+        let secret = Zeroizing::new(
+            dpapi_unprotect(&bytes)
+                .with_context(|| format!("signing key at {} cannot be decrypted", path.display()))?,
+        );
         if secret.len() != 32 {
             bail!(
                 "signing key at {} is {} bytes, expected 32 (decrypted)",
@@ -111,7 +127,7 @@ impl KeyMaterial {
                 secret.len()
             );
         }
-        let mut arr = [0u8; 32];
+        let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&secret);
         Ok(Self {
             signing: SigningKey::from_bytes(&arr),
@@ -124,6 +140,28 @@ impl KeyMaterial {
         use ed25519_dalek::Signer;
         self.signing.sign(root_bytes).to_bytes()
     }
+
+    /// Fingerprint of this key's public half (M7). Recorded with a committed
+    /// root; see [`fingerprint_of`].
+    pub fn fingerprint(&self) -> String {
+        fingerprint_of(&self.signing)
+    }
+}
+
+/// Fingerprint of the verifying key (M7): SHA-256 over the 32-byte public key,
+/// lowercase hex.
+///
+/// This is an identifier, not a trust anchor. Recording it beside the root lets
+/// `audit verify` say `KEY_CHANGED` ("the current key cannot check this
+/// signature") instead of `BAD_SIGNATURE` ("this is a forgery") after a
+/// rotation. Without a pinned/stored trust root it cannot prove which key
+/// *should* have signed, so it cannot distinguish rotation from substitution;
+/// the verdict text says exactly that.
+pub fn fingerprint_of(secret: &SigningKey) -> String {
+    let public = VerifyingKey::from(secret);
+    let mut h = Sha256::new();
+    h.update(public.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Verify a root signature against the public key derived from a secret key.
@@ -164,11 +202,12 @@ pub fn key_exists() -> bool {
 fn generate_signing_key() -> Result<SigningKey> {
     use windows::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG;
     use windows::Win32::Security::Cryptography::BCryptGenRandom;
-    let mut secret = [0u8; 32];
+    // L-L: wiped on drop.
+    let mut secret = Zeroizing::new([0u8; 32]);
     // SAFETY: see `src/net/token.rs:12`. Same pattern: system-preferred RNG,
     // no algorithm handle, valid `&mut [u8]` of length 32.
     unsafe {
-        BCryptGenRandom(None, &mut secret, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+        BCryptGenRandom(None, &mut *secret, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
             .ok()
             .context("BCryptGenRandom failed")?;
     }
@@ -213,7 +252,12 @@ fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
         if r.is_err() {
             bail!("CryptUnprotectData failed: {:?}", r);
         }
+        // L-L: zero the plaintext in the DPAPI-allocated buffer before it is
+        // freed. `LocalFree` does not scrub, and the buffer held the decrypted
+        // secret. Safe: `out_blob` came from a successful CryptUnprotectData and
+        // names `cbData` valid bytes at `pbData`.
         let out = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        std::ptr::write_bytes(out_blob.pbData, 0, out_blob.cbData as usize);
         let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut _)));
         Ok(out)
     }
@@ -222,6 +266,19 @@ fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-L (verdict doc: confirmed, understated). `Cargo.toml` built
+    /// ed25519-dalek with `default-features = false`, which switched the
+    /// crate's `zeroize` feature off - so even its own `Drop` did not scrub
+    /// the key. This bound is the compile-time guard: if the feature is ever
+    /// dropped again, the crate stops compiling. (The wipe of the
+    /// DPAPI-unprotected plaintext buffer is a `write_bytes` before `LocalFree`
+    /// - not observable from a unit test, so this bound is the guard.)
+    #[test]
+    fn the_signing_key_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SigningKey>();
+    }
 
     #[test]
     fn sign_and_verify_roundtrip() {

@@ -68,6 +68,21 @@ pub fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a session id and return it normalized (L-F): lower-cased.
+///
+/// Every intake point - the writer ([`AuditWriter::open`]), both readers
+/// (`show`/`verify`) and the commit - goes through this, so the on-disk file
+/// name and the leaf's `sid` field always agree byte for byte. NTFS resolves
+/// `ABC.ndjson` and `abc.ndjson` to the same file, and a case-sensitive
+/// comparison then turned a tool-created id (`ABC`) verified case-insensitively
+/// (`abc`) into a self-inflicted `TAMPERED`. Legacy logs written with a
+/// mixed-case leaf are still accepted: the leaf comparison is
+/// case-insensitive (H4/L-F fix in `verify`).
+pub fn normalize_session_id(session_id: &str) -> anyhow::Result<String> {
+    validate_session_id(session_id)?;
+    Ok(session_id.to_ascii_lowercase())
+}
+
 pub fn audit_log_path(session_id: &str) -> PathBuf {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -330,8 +345,8 @@ impl AuditWriter {
     /// is false, degrades gracefully (best-effort logging, never returns
     /// `Err`).
     pub fn open(session_id: &str, strict: bool) -> Result<Self> {
-        validate_session_id(session_id)?;
-        let path = audit_log_path(session_id);
+        let session_id = normalize_session_id(session_id)?;
+        let path = audit_log_path(&session_id);
         Self::open_at(path, strict)
     }
 
@@ -1024,6 +1039,38 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         assert!(err.contains("session id"), "the refusal must say why: {err}");
+    }
+
+    /// L-F (verdict doc: confirmed, Low). The id becomes a file name, and NTFS
+    /// resolves `ABC` and `abc` to the same file; a leaf stamped with the raw
+    /// casing made `verify` call the tool's own untouched log TAMPERED. Intake
+    /// lowercases, so the name and the leaf always agree.
+    #[test]
+    fn a_session_id_is_lower_cased_at_intake() {
+        let sid = format!(
+            "TEST-CASE-INTAKE-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lower = sid.to_ascii_lowercase();
+        {
+            let w = AuditWriter::open(&sid, false).unwrap();
+            let mut e = Map::new();
+            e.insert("op".into(), serde_json::json!("CONNECT"));
+            e.insert("host".into(), serde_json::json!("case.example"));
+            w.append(e).unwrap();
+        }
+        let path = audit_log_path(&lower);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let leaf: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            leaf["sid"], lower,
+            "the leaf must stamp the normalized id, not the raw casing"
+        );
     }
 
     /// Sealing is a state, not a sleep. Once sealed, a late append must not reach the

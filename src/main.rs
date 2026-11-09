@@ -556,12 +556,15 @@ fn publish_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
+    // H4: defensive validation at this door too - the writer is not the only
+    // way a sid reaches `audit_log_path`. Done before touching the key.
+    let sid = audit::normalize_session_id(sid)?;
     let key = signing::KeyMaterial::ensure()?;
     let root_bytes =
         decode_hex_vec(root).ok_or_else(|| anyhow::anyhow!("root is not valid hex: {root}"))?;
     let sig = key.sign_root(&root_bytes);
     let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
-    let log_path = audit::audit_log_path(sid);
+    let log_path = audit::audit_log_path(&sid);
     // H5b: signature FIRST, root second, each an atomic replace.
     //
     // Order is the whole point. Every state a kill can leave behind is now one
@@ -572,6 +575,11 @@ fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
     // older session's signature), which verify reported as BAD_SIGNATURE/TAMPERED
     // - blaming the operator for a crash.
     publish_atomically(&log_path.with_extension("sig"), sig_hex.as_bytes())?;
+    // M7: the key fingerprint is a sidecar recorded with the commit, so a later
+    // verify can say KEY_CHANGED instead of BAD_SIGNATURE after a rotation. It is
+    // written before the root: if the run is killed here, no committed root means
+    // verify reports INCOMPLETE and never reads it.
+    publish_atomically(&log_path.with_extension("keyfp"), key.fingerprint().as_bytes())?;
     publish_atomically(&log_path.with_extension("root"), root.as_bytes())?;
     Ok(())
 }
@@ -2102,12 +2110,58 @@ mod audit_commit_tests {
     fn cleanup(sid: &str) {
         let log = audit::audit_log_path(sid);
         let _ = std::fs::remove_file(&log);
-        for ext in ["root", "sig"] {
+        for ext in ["root", "sig", "keyfp"] {
             let p = log.with_extension(ext);
             let _ = std::fs::remove_file(&p);
             let _ = std::fs::remove_dir_all(&p);
         }
         let _ = std::fs::remove_file(audit::lock_path(&log));
+    }
+
+    /// H4 (verdict doc): the commit is the third way a sid reaches the
+    /// filesystem, so it must validate at its own door - before the key is
+    /// loaded and before anything is published.
+    #[test]
+    fn commit_audit_root_refuses_a_traversal_sid_and_writes_nothing() {
+        let pid = std::process::id();
+        let bad = format!("..\\..\\h4-commit-{pid}");
+        let log = audit::audit_log_path(&bad);
+        let root = log.with_extension("root");
+        let sig = log.with_extension("sig");
+        let keyfp = log.with_extension("keyfp");
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_file(&sig);
+        let _ = std::fs::remove_file(&keyfp);
+
+        let err = commit_audit_root(&bad, &"0".repeat(64))
+            .expect_err("a traversal sid must be refused before anything is written");
+        let text = format!("{err:#}");
+        assert!(
+            text.to_ascii_lowercase().contains("session id"),
+            "the refusal must name the session id, not a file error: {text}"
+        );
+        assert!(
+            !root.exists() && !sig.exists() && !keyfp.exists(),
+            "the refusal must write nothing"
+        );
+    }
+
+    /// M7 (verdict doc: confirmed). The commit must record the fingerprint of
+    /// the key that signed, so a later verify can report KEY_CHANGED instead of
+    /// silently calling every pre-rotation session a forgery.
+    #[test]
+    fn commit_audit_root_records_the_signing_key_fingerprint() {
+        let sid = fresh_sid("m7-keyfp");
+        let root = one_leaf_chain(&sid);
+
+        commit_audit_root(&sid, &root).expect("the commit succeeds");
+
+        let log = audit::audit_log_path(&sid);
+        let fp = std::fs::read_to_string(log.with_extension("keyfp")).unwrap();
+        let key = signing::KeyMaterial::load_existing().unwrap();
+        assert_eq!(fp, key.fingerprint(), "the recorded fingerprint must be the signer's");
+        assert_eq!(fp.len(), 64, "the fingerprint is a 32-byte SHA-256 in hex");
+        cleanup(&sid);
     }
 
     /// H5b (verdict doc: confirmed). The pair used to be written root-then-sig with

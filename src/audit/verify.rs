@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{canonicalize, sha256_hex, audit_log_path};
+use super::{audit_log_path, canonicalize, normalize_session_id, sha256_hex};
 use crate::signing;
 
 pub fn run_verify(session_id: &str) -> i32 {
@@ -32,6 +32,10 @@ pub fn run_verify(session_id: &str) -> i32 {
             println!("KEY_MISSING: {reason}");
             1
         }
+        Ok(VerifyOutcome::KeyChanged(reason)) => {
+            println!("KEY_CHANGED: {reason}");
+            1
+        }
         Err(e) => {
             eprintln!("[saife] audit verify: {e:#}");
             1
@@ -47,6 +51,13 @@ pub fn run_verify(session_id: &str) -> i32 {
 /// `KeyMissing` is its own verdict (M6): verifying must never mint a key, so a
 /// missing key is reported distinctly rather than collapsed into `BadSignature`
 /// - and must not be reported as `Tampered`, which would blame the operator.
+///
+/// `KeyChanged` (M7) is the rotation-vs-tamper verdict: the committed root
+/// records the fingerprint of the key that signed it, and a mismatch with the
+/// current key cannot be checked with the current key. Without a trust store
+/// a per-session fingerprint cannot distinguish a legitimate rotation from a
+/// substituted signature, so the verdict says so rather than inventing a weak
+/// signal or calling a different key a forgery.
 #[derive(Debug)]
 pub(crate) enum VerifyOutcome {
     Ok,
@@ -54,10 +65,17 @@ pub(crate) enum VerifyOutcome {
     Tampered(String),
     BadSignature(String),
     KeyMissing(String),
+    KeyChanged(String),
 }
 
 pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
-    verify_with_key_source(session_id, signing::KeyMaterial::load_existing)
+    // H4: validate before any file is opened. `audit_log_path` joins the raw id,
+    // so a traversal/absolute/UNC sid reached an attacker-chosen file. The UNC
+    // case has no file to find, so without this guard it reported a missing-file
+    // error instead of the session-id refusal - which is why the test asserts the
+    // word "session".
+    let session_id = normalize_session_id(session_id)?;
+    verify_with_key_source(&session_id, signing::KeyMaterial::load_existing)
 }
 
 /// Verify with an injected key loader (M6). The production path loads the
@@ -108,16 +126,33 @@ fn verify_with_key_source(
         // numbers must be the line order. Both were unchecked, so copying a clean
         // session's .ndjson/.root/.sig over another session's names verified OK -
         // a substitution that needs no key at all.
-        if let Some(leaf_sid) = obj.get("sid").and_then(|x| x.as_str())
-            && leaf_sid != session_id
-        {
+        //
+        // L-H: `sid` and `seq` are required on every leaf, not checked only when
+        // present. Stripping them (and recomputing the hash) used to verify OK.
+        // L-F: the compare is case-insensitive, so a legacy log whose leaf carries
+        // a mixed-case id still verifies after intake lowercased the lookup.
+        let leaf_sid = match obj.get("sid").and_then(|x| x.as_str()) {
+            Some(s) => s,
+            None => {
+                return Ok(VerifyOutcome::Tampered(format!(
+                    "leaf {i}: missing or non-string `sid` field"
+                )));
+            }
+        };
+        if !leaf_sid.eq_ignore_ascii_case(session_id) {
             return Ok(VerifyOutcome::Tampered(format!(
                 "leaf {i}: belongs to session {leaf_sid}, not {session_id}"
             )));
         }
-        if let Some(seq) = obj.get("seq").and_then(|x| x.as_u64())
-            && seq != leaf_count as u64 - 1
-        {
+        let seq = match obj.get("seq").and_then(|x| x.as_u64()) {
+            Some(s) => s,
+            None => {
+                return Ok(VerifyOutcome::Tampered(format!(
+                    "leaf {i}: missing or non-numeric `seq` field"
+                )));
+            }
+        };
+        if seq != leaf_count as u64 - 1 {
             return Ok(VerifyOutcome::Tampered(format!(
                 "leaf {i}: seq {seq} does not match its position in the log"
             )));
@@ -215,6 +250,37 @@ fn verify_with_key_source(
             )));
         }
     };
+
+    // M6: load, never mint. `ensure()` here meant a missing key both reported
+    // `BAD_SIGNATURE` for every old session (indistinguishable from tampering)
+    // and installed a fresh trust anchor as a side effect of verifying.
+    let key = match load_key() {
+        Ok(k) => k,
+        Err(e) => return Ok(VerifyOutcome::KeyMissing(format!("{e:#}"))),
+    };
+
+    // M7: the commit records the fingerprint of the key that signed this
+    // session (`<sid>.keyfp`). A mismatch means the current key cannot check
+    // this signature - rotation, another host, or a substitution - and saying
+    // BAD_SIGNATURE would call the operator's own history a forgery. A
+    // per-session fingerprint without a trust store cannot tell rotation from
+    // tampering, so the verdict names both possibilities; re-verify on the
+    // signing host to settle it. Absent file = a session committed before
+    // fingerprints existed: no signal, check the signature as before.
+    let current_fp = key.fingerprint();
+    if let Ok(recorded) = std::fs::read_to_string(log_path.with_extension("keyfp")) {
+        let recorded = recorded.trim();
+        if !recorded.is_empty() && !recorded.eq_ignore_ascii_case(&current_fp) {
+            return Ok(VerifyOutcome::KeyChanged(format!(
+                "recorded signing key {recorded} differs from the current key {current_fp}; \
+                 the signature cannot be checked with the current key. This is either key \
+                 rotation (or a session signed on another machine/user) or a substituted \
+                 signature - a per-session fingerprint cannot tell them apart without a \
+                 trust store; re-verify on the host that signed this session"
+            )));
+        }
+    }
+
     let sig_bytes = match decode_hex(&sig_hex) {
         Some(b) => b,
         None => return Ok(VerifyOutcome::BadSignature("signature is not valid hex".to_string())),
@@ -224,13 +290,6 @@ fn verify_with_key_source(
         None => return Ok(VerifyOutcome::BadSignature("computed root is not valid hex".to_string())),
     };
 
-    // M6: load, never mint. `ensure()` here meant a missing key both reported
-    // `BAD_SIGNATURE` for every old session (indistinguishable from tampering)
-    // and installed a fresh trust anchor as a side effect of verifying.
-    let key = match load_key() {
-        Ok(k) => k,
-        Err(e) => return Ok(VerifyOutcome::KeyMissing(format!("{e:#}"))),
-    };
     if !signing::verify_with_secret(&key.signing, &root_bytes, &sig_bytes) {
         return Ok(VerifyOutcome::BadSignature("signature does not verify".to_string()));
     }
@@ -238,14 +297,29 @@ fn verify_with_key_source(
     Ok(VerifyOutcome::Ok)
 }
 
+/// Hex-decode by bytes (L-G). The previous version byte-sliced a `&str`, so an
+/// even-length non-ASCII input ("a€": 4 bytes) sliced inside a char boundary
+/// and panicked (exit 101) instead of producing a verdict. Byte-wise nibble
+/// parsing returns `None` for any non-hex byte, ASCII or not.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) { return None; }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect()
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    bytes
+        .chunks(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use serde_json::{json, Map};
     use crate::audit::{AuditWriter, audit_log_path};
 
@@ -259,6 +333,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("root"));
         let _ = std::fs::remove_file(p.with_extension("sig"));
+        let _ = std::fs::remove_file(p.with_extension("keyfp"));
     }
 
     #[test]
@@ -662,11 +737,155 @@ mod tests {
         cleanup(&sid);
     }
 
+    /// L-F (verdict doc: confirmed, Low). NTFS is case-insensitive, so a log
+    /// created with `--sid ABC` is found by `audit verify abc` — but the leaf
+    /// carries `ABC` and the comparison was exact, so the tool called its own
+    /// untouched log TAMPERED. Intake must lowercase the id so the on-disk name
+    /// and the leaf value always agree.
+    #[test]
+    fn a_session_created_in_upper_case_verifies_in_lower_case() {
+        let upper = format!("TEST-CASE-INTAKE-{}", std::process::id());
+        let lower = upper.to_ascii_lowercase();
+        let root;
+        {
+            let w = AuditWriter::open(&upper, false).unwrap();
+            let mut e = Map::new();
+            e.insert("op".into(), json!("CONNECT"));
+            e.insert("host".into(), json!("case.example"));
+            w.append(e).unwrap();
+            root = w.current_root().unwrap();
+        }
+        // Commit exactly as a clean session would.
+        let key = signing::KeyMaterial::ensure().unwrap();
+        let root_bytes = decode_hex(&root).unwrap();
+        let sig = key.sign_root(&root_bytes);
+        std::fs::write(audit_log_path(&upper).with_extension("root"), &root).unwrap();
+        let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(audit_log_path(&upper).with_extension("sig"), &sig_hex).unwrap();
+
+        let outcome = verify_inner(&lower).unwrap();
+        cleanup(&upper);
+        assert!(
+            matches!(outcome, VerifyOutcome::Ok),
+            "`--sid ABC` then `verify abc` must verify, got {outcome:?}"
+        );
+    }
+
+    /// L-F, the legacy half: a log written before intake lowercased ids has a
+    /// mixed-case leaf `sid` on disk (and NTFS finds the file regardless).
+    /// Verify must accept a case-insensitive match of the stored value rather
+    /// than turning a pre-existing mixed-case log into TAMPERED.
+    #[test]
+    fn a_legacy_mixed_case_leaf_still_verifies() {
+        let upper = format!("TEST-CASE-LEGACY-{}", std::process::id());
+        plant_signed_chain(&upper, chain_leaf(&upper, true, true));
+        let outcome = verify_inner(&upper.to_ascii_lowercase()).unwrap();
+        cleanup(&upper);
+        assert!(
+            matches!(outcome, VerifyOutcome::Ok),
+            "a legacy mixed-case sid must still verify, got {outcome:?}"
+        );
+    }
+
+    /// L-G (verdict doc: confirmed, Low). `decode_hex` byte-sliced a `&str`, so
+    /// a valid-UTF-8 non-ASCII `.sig` (here `"a€"`: 4 bytes, 2 chars — even
+    /// length, so the length check let it through) hit a slice off a char
+    /// boundary and `audit verify` panicked with exit 101 instead of printing
+    /// a verdict. A non-hex `.sig` is a bad signature, never a crash.
+    #[test]
+    fn a_non_ascii_signature_is_a_verdict_not_a_panic() {
+        let sid = fresh_sid("lg-nonascii-sig");
+        plant_signed_chain(&sid, chain_leaf(&sid, true, true));
+        std::fs::write(audit_log_path(&sid).with_extension("sig"), "a\u{20ac}").unwrap();
+
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        assert!(
+            matches!(outcome, VerifyOutcome::BadSignature(_)),
+            "a non-hex .sig must be BAD_SIGNATURE, got {outcome:?}"
+        );
+    }
+
+    /// M7 (verdict doc: confirmed). The committed root did not record which key
+    /// signed it, so after a rotation every older session verified under the new
+    /// key, failed, and was reported BAD_SIGNATURE - the tool calling its own
+    /// history a forgery. The commit now records the signer's fingerprint, and
+    /// a mismatch is its own verdict.
+    #[test]
+    fn a_session_signed_with_a_different_key_is_key_changed() {
+        let older = fresh_sid("m7-older");
+        let newer = fresh_sid("m7-newer");
+        // Deterministic test keys: the point is that they differ, not that they
+        // came from the RNG.
+        let old_key = SigningKey::from_bytes(&[0x11; 32]);
+        let new_key = SigningKey::from_bytes(&[0x22; 32]);
+
+        plant_signed_chain_with_key(&older, chain_leaf(&older, true, true), &old_key);
+        plant_signed_chain_with_key(&newer, chain_leaf(&newer, true, true), &new_key);
+
+        // A rotation happened: the current key is `new_key`.
+        let older_outcome =
+            verify_with_key_source(&older, || Ok(signing::KeyMaterial { signing: new_key.clone() }))
+                .unwrap();
+        let newer_outcome =
+            verify_with_key_source(&newer, || Ok(signing::KeyMaterial { signing: new_key.clone() }))
+                .unwrap();
+
+        cleanup(&older);
+        cleanup(&newer);
+
+        match older_outcome {
+            VerifyOutcome::KeyChanged(m) => assert!(
+                m.to_ascii_lowercase().contains("key"),
+                "the verdict must say which key changed: {m}"
+            ),
+            VerifyOutcome::BadSignature(m) => panic!(
+                "a key rotation must not be reported as a forgery (BAD_SIGNATURE): {m}"
+            ),
+            other => panic!("a different signing key must be KeyChanged, got {other:?}"),
+        }
+        assert!(
+            matches!(newer_outcome, VerifyOutcome::Ok),
+            "the session signed with the current key must still verify, got {newer_outcome:?}"
+        );
+    }
+
+    /// M7, the guard against over-claiming: a matching fingerprint must not
+    /// short-circuit the signature check. A forged signature under the same key
+    /// is still BAD_SIGNATURE.
+    #[test]
+    fn a_matching_fingerprint_does_not_excuse_a_forged_signature() {
+        let sid = fresh_sid("m7-same-key-bad-sig");
+        let key = signing::KeyMaterial::ensure().unwrap();
+        plant_signed_chain_with_key(&sid, chain_leaf(&sid, true, true), &key.signing);
+        // Corrupt the signature; the fingerprint still matches the key.
+        let sig_path = audit_log_path(&sid).with_extension("sig");
+        let sig = std::fs::read_to_string(&sig_path).unwrap();
+        let flipped = if sig.starts_with("00") { "ff" } else { "00" };
+        let corrupt = format!("{flipped}{}", &sig[2..]);
+        std::fs::write(&sig_path, corrupt).unwrap();
+
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        assert!(
+            matches!(outcome, VerifyOutcome::BadSignature(_)),
+            "a forged signature must stay BAD_SIGNATURE, got {outcome:?}"
+        );
+    }
+
     /// Write a fully valid, signed one-leaf chain at `sid`'s path. `leaf` must
     /// already carry whatever fields the test wants to pin; `hash`/`parent`
     /// are recomputed here and the root is signed with the real key, so the
     /// only thing under test is the field set.
-    fn plant_signed_chain(sid: &str, mut leaf: Map<String, Value>) {
+    fn plant_signed_chain(sid: &str, leaf: Map<String, Value>) {
+        let key = signing::KeyMaterial::ensure().unwrap();
+        plant_signed_chain_with_key(sid, leaf, &key.signing);
+    }
+
+    /// M7 variant: sign with an explicit key and record its fingerprint with the
+    /// commit, exactly as `commit_audit_root` now does. Lets a test model a key
+    /// rotation without touching the user's real key.
+    fn plant_signed_chain_with_key(sid: &str, mut leaf: Map<String, Value>, key: &SigningKey) {
         leaf.insert("ts".into(), json!("2026-11-09T00:00:00Z"));
         let hash = sha256_hex(&canonicalize(&leaf));
         leaf.insert("hash".into(), json!(hash));
@@ -674,10 +893,14 @@ mod tests {
         let path = audit_log_path(sid);
         std::fs::write(&path, serde_json::to_string(&leaf).unwrap() + "\n").unwrap();
         std::fs::write(path.with_extension("root"), &hash).unwrap();
-        let key = signing::KeyMaterial::ensure().unwrap();
-        let sig = key.sign_root(&decode_hex(&hash).unwrap());
+        let hash_bytes = decode_hex(&hash).unwrap();
+        let sig = {
+            use ed25519_dalek::Signer;
+            key.sign(&hash_bytes).to_bytes()
+        };
         let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
         std::fs::write(path.with_extension("sig"), &sig_hex).unwrap();
+        std::fs::write(path.with_extension("keyfp"), signing::fingerprint_of(key)).unwrap();
     }
 
     /// One CONNECT leaf, carrying `sid`/`seq` only when asked: the missing-key
@@ -703,7 +926,6 @@ mod tests {
     /// RED until H4 lands (verdict doc): sid validation at this reader entry
     /// point must make every case return `Err` before any file is opened.
     #[test]
-    #[ignore = "red until H4 lands (verdict doc): audit verify must validate the sid before reading"]
     fn verify_refuses_a_traversal_session_id_before_reading_any_file() {
         let pid = std::process::id();
         let relative = format!("..\\..\\h4-verify-{pid}");
@@ -752,7 +974,6 @@ mod tests {
     /// RED until L-H lands (verdict doc): requiring `sid` on every leaf turns
     /// this into Tampered.
     #[test]
-    #[ignore = "red until L-H lands (verdict doc): a leaf without `sid` must be Tampered"]
     fn a_leaf_without_the_sid_key_is_tampered() {
         let sid = fresh_sid("lh-no-sid");
         plant_signed_chain(&sid, chain_leaf(&sid, false, true));
@@ -769,7 +990,6 @@ mod tests {
     ///
     /// RED until L-H lands (verdict doc).
     #[test]
-    #[ignore = "red until L-H lands (verdict doc): a leaf without `seq` must be Tampered"]
     fn a_leaf_without_the_seq_key_is_tampered() {
         let sid = fresh_sid("lh-no-seq");
         plant_signed_chain(&sid, chain_leaf(&sid, true, false));
