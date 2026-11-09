@@ -467,6 +467,102 @@ mod tests {
         assert_eq!(m.operations[0].path, "/");
     }
 
+    // ---- M14: every shipped manifest must load ----------------------------
+
+    /// One `config` key to the env var `sidecar.rs` exports it as
+    /// (`SIDECAR_CFG_<UPPER_SNAKE>`; `env_key`: uppercase, non-alphanumeric
+    /// → `_`). A mirror for tests in this module — the mapping itself is
+    /// pinned in `sidecar::tests::config_keys_become_upper_snake_env_names`.
+    fn sidecar_cfg_env(key: &str) -> String {
+        let suffix: String = key
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("SIDECAR_CFG_{suffix}")
+    }
+
+    /// Every manifest under the repo's `plugins/` must survive the real
+    /// loader. The parser's only shipped-manifest fixture used to be
+    /// `plugins/tngtech`, so a manifest the whole supervisor could not even
+    /// read (`ssh-gateway`, M14) shipped unnoticed.
+    #[test]
+    fn every_shipped_plugin_manifest_parses_and_validates() {
+        let plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&plugins)
+            .unwrap_or_else(|e| panic!("the crate ships plugins/ next to Cargo.toml: {e}"))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        assert!(
+            dirs.len() >= 2,
+            "expected the shipped plugins under {}, found {}",
+            plugins.display(),
+            dirs.len()
+        );
+        for dir in &dirs {
+            let manifest_path = dir.join(PLUGIN_ENTRY);
+            assert!(
+                manifest_path.is_file(),
+                "a plugin directory without a {}: {}",
+                PLUGIN_ENTRY,
+                dir.display()
+            );
+            let name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_else(|| panic!("plugin dir name is not UTF-8: {}", dir.display()));
+            read_manifest(&manifest_path, name).unwrap_or_else(|e| {
+                panic!("{}: {e}", manifest_path.display());
+            });
+        }
+    }
+
+    /// M14: `config` is `BTreeMap<String, String>`, so a JSON *number* in a
+    /// shipped manifest is a parse refusal (`plugin_manifest_invalid`), never
+    /// a value. Pin that the shipped `ssh-gateway` config parses, that each
+    /// entry reaches the sidecar under the env name its Python actually
+    /// reads, and that `max_concurrent` is a positive integer string (the
+    /// sidecar's `int()` fallback would silently mask a typo as 4).
+    #[test]
+    fn the_shipped_ssh_gateway_config_reaches_the_sidecar_as_strings() {
+        let json = include_str!("../../plugins/ssh-gateway/plugin.json");
+        let m: PluginManifest = serde_json::from_str(json).unwrap_or_else(|e| {
+            panic!(
+                "plugins/ssh-gateway/plugin.json must parse: \
+                 every `config` value is a string (M14): {e}"
+            );
+        });
+        assert!(!m.config.is_empty(), "ssh-gateway declares config entries");
+        let sidecar = include_str!("../../plugins/ssh-gateway/sidecar.py");
+        for (key, value) in &m.config {
+            let env_name = sidecar_cfg_env(key);
+            assert!(
+                sidecar.contains(&env_name),
+                "the sidecar never reads {env_name} (config key {key:?}): \
+                 every shipped config entry must reach the sidecar"
+            );
+            assert!(
+                !value.trim().is_empty(),
+                "config key {key:?} must not ship an empty value"
+            );
+        }
+        let raw = m
+            .config
+            .get("max_concurrent")
+            .expect("ssh-gateway declares `max_concurrent`");
+        let parsed: u32 = raw.parse().unwrap_or_else(|_| {
+            panic!("`max_concurrent` must be a positive integer string, got {raw:?}")
+        });
+        assert!(parsed > 0);
+    }
+
     // ---- validation matrix -----------------------------------------------
 
     #[test]
