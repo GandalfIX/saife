@@ -395,6 +395,22 @@
     /// real generator produces (hex).
     const LIVE_TOKEN: &str = "live-session-token-0123456789abcdef";
 
+    /// A tag unique per fixture start, even when two parallel tests call this in
+    /// the same SystemTime tick. The stamp alone was the bug: SystemTime's tick
+    /// is coarser than two concurrent starts, and one shared tag means one
+    /// audit session id - the second writer correctly refused the chain (H5a's
+    /// one-writer lock) and the fixture panicked instead of testing. The
+    /// counter makes equality structurally impossible; the stamp stays in the
+    /// name so an audit directory still reads as a point in time.
+    fn unique_tag() -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            stamp()
+        )
+    }
+
     fn stamp() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -612,6 +628,25 @@
     ///
     /// Not `#[ignore]`d: no container is involved — this is the real listener,
     /// the real counters and the real gate.
+    /// The fixture's session id must never repeat within a run: two parallel
+    /// starts that share an id share one audit chain, and H5a's one-writer lock
+    /// correctly refuses the second - which is how the 0.5.0 CI lane failed
+    /// (`... is locked by running process <self>`). The stamp alone was the
+    /// bug; the counter makes equality structurally impossible. This test pins
+    /// that with no dependence on how coarse the host timer is - the red
+    /// evidence is the CI failure itself, since a deterministic in-process red
+    /// would have to fake the system clock.
+    #[test]
+    fn two_fixture_tags_are_never_equal() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100_000 {
+            assert!(
+                seen.insert(unique_tag()),
+                "a fixture tag repeated: two parallel starts would share one audit chain"
+            );
+        }
+    }
+
     #[test]
     fn a_session_whose_only_listener_contact_used_a_foreign_credential_is_refused() {
         let proxy = LiveProxy::start(&[]);
@@ -1530,10 +1565,15 @@
             prompt_enabled: bool,
             dialog: DialogFn,
         ) -> Self {
+            // One tag per start: pid for cross-run clarity, a process counter for
+            // uniqueness within this run, the stamp for the human reading the
+            // audit directory. See unique_tag for why the stamp alone is not
+            // enough.
+            let tag = unique_tag();
             let learned_base = std::env::temp_dir().join(format!(
                 "sandbox-mxc-live-learned-{}-{}",
                 std::process::id(),
-                stamp()
+                tag
             ));
             std::fs::create_dir_all(&learned_base).expect("learned base");
             let learned = Arc::new(Mutex::new(
@@ -1550,7 +1590,7 @@
                 intent,
                 learned,
             };
-            let sid = format!("test-mxc-live-{}-{}", std::process::id(), stamp());
+            let sid = format!("test-mxc-live-{}-{}", std::process::id(), tag);
             let writer =
                 Arc::new(crate::audit::AuditWriter::open(&sid, false).expect("audit writer"));
             let handle = crate::net::proxy::spawn(crate::net::proxy::ProxyConfig {
