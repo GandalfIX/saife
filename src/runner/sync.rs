@@ -120,7 +120,7 @@ fn walk(builder: &mut tar::Builder<Vec<u8>>, root: &Path, rel: &Path, skip: &[&s
 /// true: syncing a whole tree back would overwrite the agent's edits with snapshot content.
 #[allow(dead_code)] // the production path always knows whether to strip; the tests use both
 pub fn unpack_into(tar: &[u8], dest: &Path, keep: &dyn Fn(&Path) -> bool) -> Result<usize> {
-    unpack_into_at(tar, dest, false, keep)
+    unpack_filtered(tar, dest, false, &|p, _| keep(p))
 }
 
 /// The same, with the option to drop the archive's first path component.
@@ -128,11 +128,37 @@ pub fn unpack_into(tar: &[u8], dest: &Path, keep: &dyn Fn(&Path) -> bool) -> Res
 /// The engine's `/archive` answers are relative to the **parent** of the requested path, so
 /// `GET …?path=/src/out` yields `out/art.txt`. Sync-out strips that component; sync-in does
 /// not, because `pack_dir` already produces paths relative to the project root.
+#[allow(dead_code)] // used by the engine round-trip test and the sync tests; the guarded
+// production sync-out path uses `unpack_into_at_typed` for its kind-aware keeper
 pub fn unpack_into_at(
     tar: &[u8],
     dest: &Path,
     strip_top: bool,
     keep: &dyn Fn(&Path) -> bool,
+) -> Result<usize> {
+    unpack_filtered(tar, dest, strip_top, &|p, _| keep(p))
+}
+
+/// `unpack_into_at` with a type-aware keeper: the closure sees each entry's
+/// [`tar::EntryType`] as well as its path, so sync-out can refuse a link entry by
+/// KIND rather than by name. C2: the path-based keeper above stays as it is for
+/// the engine's own round-trip (`docker.rs`); this is the one the guarded
+/// sync-out path uses.
+pub fn unpack_into_at_typed(
+    tar: &[u8],
+    dest: &Path,
+    strip_top: bool,
+    keep: &dyn Fn(&Path, tar::EntryType) -> bool,
+) -> Result<usize> {
+    unpack_filtered(tar, dest, strip_top, keep)
+}
+
+/// The shared unpack loop behind the three wrappers above.
+fn unpack_filtered(
+    tar: &[u8],
+    dest: &Path,
+    strip_top: bool,
+    keep: &dyn Fn(&Path, tar::EntryType) -> bool,
 ) -> Result<usize> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
     let mut written = 0usize;
@@ -142,6 +168,7 @@ pub fn unpack_into_at(
             .path()
             .context("runner: read an entry path")?
             .to_path_buf();
+        let kind = entry.header().entry_type();
         // Paths are packed relative to the root, so they are already what belongs under
         // `dest` - but an archive is untrusted input, so absolute paths, `..` and Windows
         // prefixes are dropped rather than joined (tar-slip).
@@ -159,7 +186,7 @@ pub fn unpack_into_at(
                         | std::path::Component::Prefix(_)
                 )
             });
-        if escapes || relative.as_os_str().is_empty() || !keep(&relative) {
+        if escapes || relative.as_os_str().is_empty() || !keep(&relative, kind) {
             continue;
         }
         let target = dest.join(&relative);
@@ -407,9 +434,67 @@ mod tests {
         );
     }
 
+    /// H1 (verdict: WRONG — pin the corrected behavior): a project containing a
+    /// junction to an outside directory must NOT have the junction target's
+    /// contents in the packed tar. `walk` recurses on `FileType::is_dir()`, which
+    /// is false for a junction (it classifies as a symlink), so the junction is
+    /// not recursed into and the pack fails cleanly instead of exfiltrating.
+    /// See docs/design/2026-11-09-security-review-verdicts.md §H1.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_inside_the_project_is_not_packed_into_the_tar() {
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = scratch("h1-junction");
+        let _root_guard = Guard(root.clone());
+        std::fs::write(root.join("real.txt"), b"kept").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("saife-sync-h1-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        let _outside_guard = Guard(outside.clone());
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"exfil").unwrap();
+
+        let link = root.join("linked");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .expect("mklink runs");
+        assert!(
+            status.success(),
+            "the junction must be created for this test"
+        );
+
+        // Either the pack fails cleanly (the observed behavior: `File::open` on a
+        // junction is ACCESS_DENIED) or it succeeds without the target's contents.
+        match pack_dir(&root, &[]) {
+            Ok(tar) => {
+                let names = names(&tar);
+                assert!(
+                    !names.iter().any(|n| n.contains("secret")),
+                    "the junction target's contents must never be in the tar: {names:?}"
+                );
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("secret"),
+                    "a pack failure must not carry the target's contents: {msg}"
+                );
+            }
+        }
+    }
+
     /// A composite build has its own `build/` and `.gradle/` one level down. Skipping only the
-    /// root copied 4.1 MB where 304 KB of sources exist, and made "the build sees a snapshot of
-    /// the sources" false for every subproject.
+    /// root copied 4.1 MB where 304 KB of sources exist, and made "the build sees a snapshot
+    /// of the sources" false for every subproject.
     #[test]
     fn nested_outputs_and_caches_are_skipped_too() {
         let root = scratch("nested");

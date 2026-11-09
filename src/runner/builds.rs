@@ -9,7 +9,7 @@ use crate::runner::docker::{Engine, Slot, SlotSpec};
 use crate::runner::lifecycle;
 use crate::runner::server::{BuildEngine, BuildState};
 use crate::runner::sync;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -354,13 +354,7 @@ fn sync_out(inner: &Inner, project: &std::path::Path, id: &str) {
     {
         Ok(tar) if !tar.is_empty() => {
             let dest = project.join("build").join("libs");
-            if let Err(e) = std::fs::create_dir_all(&dest) {
-                append_line(
-                    inner,
-                    id,
-                    format!("[saife] could not create {}: {e}\n", dest.display()),
-                );
-            } else if let Err(e) = sync::unpack_into_at(&tar, &dest, true, &|_| true) {
+            if let Err(e) = sync_out_unpack(&tar, project, &dest) {
                 append_line(inner, id, format!("[saife] sync out failed: {e:#}\n"));
             } else {
                 append_line(
@@ -376,6 +370,114 @@ fn sync_out(inner: &Inner, project: &std::path::Path, id: &str) {
             "[saife] no artifacts in build/libs\n".to_string(),
         ),
         Err(e) => append_line(inner, id, format!("[saife] sync out failed: {e:#}\n")),
+    }
+}
+
+/// Validate and unpack the sync-out tar into `dest` under `project`.
+///
+/// Split from [`sync_out`] so the C2 guards are testable without a container
+/// engine. The guards live HERE, not at build start, because the workload can
+/// plant a junction under `build/` while the build runs. C2 (verdict: confirmed,
+/// Critical): the tar crate's `validate_inside_dst` canonicalizes THROUGH a
+/// junction, so without them a `build/libs` junction would land the artifacts in
+/// the junction's target with supervisor rights. Three layers:
+///
+/// 1. entry kinds: only Regular/Directory entries may travel - a link entry is
+///    a named refusal, not a silent drop;
+/// 2. reparse points: every existing component of `project -> dest` must be a
+///    real path, checked before AND after `create_dir_all` so a pre-existing
+///    junction is never written through even to create the destination;
+/// 3. containment: `dest` must canonicalize under the canonical project, which
+///    a junction does not.
+fn sync_out_unpack(tar: &[u8], project: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    // (1) Entry kinds first, before anything is created: the archive is untrusted
+    // input, and a link entry is the in-container half of the C2 escape.
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
+    for entry in archive.entries().context("runner: read the sync-out tar")? {
+        let entry = entry.context("runner: read a sync-out tar entry")?;
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            bail!(
+                "runner: sync-out refuses a {} tar entry ({}); \
+                 only regular files and directories travel",
+                kind_name(kind),
+                entry.path().unwrap_or_default().display()
+            );
+        }
+    }
+    // (2) Reparse points on the project -> dest chain, BEFORE `create_dir_all`:
+    // creating `build/libs` through a junction at `build` would already be a
+    // write into the target.
+    refuse_reparse_in_descendant_chain(project, dest, "the sync-out destination")?;
+    std::fs::create_dir_all(dest).with_context(|| format!("runner: create {}", dest.display()))?;
+    // And again after: the check the verdict doc asks for, and a second window
+    // a junction could appear in.
+    refuse_reparse_in_descendant_chain(project, dest, "the sync-out destination")?;
+    // (3) Containment on canonical paths: a junction canonicalizes to its
+    // target, so the lexical `dest` alone proves nothing.
+    let canonical_project = std::fs::canonicalize(project)
+        .with_context(|| format!("runner: canonicalize {}", project.display()))?;
+    let canonical_dest = std::fs::canonicalize(dest)
+        .with_context(|| format!("runner: canonicalize {}", dest.display()))?;
+    if !canonical_dest.starts_with(&canonical_project) {
+        bail!(
+            "runner: sync-out destination {} resolves to {}, which is outside \
+             the project {}",
+            dest.display(),
+            canonical_dest.display(),
+            canonical_project.display()
+        );
+    }
+    // Defense-in-depth: the keeper is type-aware too, so a path that bypasses
+    // the pre-scan above still cannot unpack a link entry.
+    sync::unpack_into_at_typed(tar, dest, true, &|_, kind| kind.is_file() || kind.is_dir())
+        .context("runner: unpack sync-out artifacts")?;
+    Ok(())
+}
+
+/// Every EXISTING component of `dest` below `base` must be a real path, not a
+/// link or junction.
+///
+/// The ancestor walker `refuse_reparse_in_chain` (runner/mod.rs) stops at the
+/// first missing component, which is right for its caller but wrong here: this
+/// walks the DESCENDANT chain from `base` toward `dest` so a junction planted at
+/// any intermediate level (`build/`, `build/libs`) is caught even when deeper
+/// levels do not exist yet. Missing components are skipped, not fatal - they are
+/// about to be created as real directories.
+fn refuse_reparse_in_descendant_chain(
+    base: &std::path::Path,
+    dest: &std::path::Path,
+    what: &str,
+) -> Result<()> {
+    let Ok(rel) = dest.strip_prefix(base) else {
+        return Ok(());
+    };
+    let mut cursor = base.to_path_buf();
+    for component in rel.components() {
+        cursor.push(component);
+        if let Ok(meta) = std::fs::symlink_metadata(&cursor)
+            && super::is_reparse_point(&meta)
+        {
+            bail!(
+                "runner: {} is a link or junction; {what} must be a real path",
+                cursor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The name a refused entry kind gets in the refusal: `symlink` tells an operator
+/// what to look for in the tar; `non-regular` covers the kinds this runner never
+/// expects to see and cannot usefully name.
+fn kind_name(kind: tar::EntryType) -> &'static str {
+    match kind {
+        tar::EntryType::Symlink => "symlink",
+        tar::EntryType::Link => "hardlink",
+        tar::EntryType::Char => "character-device",
+        tar::EntryType::Block => "block-device",
+        tar::EntryType::Fifo => "fifo",
+        _ => "non-regular",
     }
 }
 
@@ -784,6 +886,138 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "a cancelled build must not leave its slot behind: {leftover:?}"
+        );
+    }
+
+    // ---- C2: sync-out reparse-point / entry-kind guards ---------------------
+
+    /// Removes every scratch tree on the way out, including when an assertion
+    /// fails: a test that creates junctions must not leave them behind.
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                // `remove_dir_all` removes a junction without recursing into its
+                // target on Windows (it detects the reparse point), so this is
+                // safe against the junction tests below.
+                let _ = std::fs::remove_dir_all(p);
+            }
+        }
+    }
+
+    fn scratch_builds_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("saife-builds-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Create a junction (`mklink /J`): no privilege required, and it is the
+    /// exact reparse-point shape C2 is about.
+    #[cfg(windows)]
+    fn make_junction(link: &std::path::Path, target: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("mklink runs");
+        assert!(
+            status.success(),
+            "the junction {link:?} -> {target:?} must be created for this test"
+        );
+    }
+
+    fn regular_tar(name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(contents.len() as u64);
+        hdr.set_mode(0o755);
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_cksum();
+        b.append_data(&mut hdr, name, &mut &contents[..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    fn symlink_tar(name: &str, target: &str) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Symlink);
+        hdr.set_link_name(target).unwrap();
+        hdr.set_mode(0o777);
+        hdr.set_size(0);
+        hdr.set_cksum();
+        b.append_data(&mut hdr, name, &mut std::io::empty())
+            .unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// C2 (verdict: confirmed, Critical): a workload can plant a junction at
+    /// `build/libs` while the build runs; sync-out must refuse it and write
+    /// nothing through it into the junction's target.
+    #[cfg(windows)]
+    #[test]
+    fn sync_out_refuses_a_junction_at_build_libs() {
+        let ws = scratch_builds_dir("c2-junction");
+        let target = ws.join("target");
+        let project = ws.join("proj");
+        std::fs::create_dir_all(project.join("build")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let libs = project.join("build").join("libs");
+        make_junction(&libs, &target);
+        let _cleanup = Cleanup(vec![ws.clone()]);
+
+        let tar = regular_tar("libs/payload.bat", b"pwned");
+        let err = sync_out_unpack(&tar, &project, &libs)
+            .expect_err("a junction at build/libs must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("link") || msg.contains("junction") || msg.contains("reparse"),
+            "the refusal must name a reparse point: {msg}"
+        );
+        assert!(
+            !target.join("payload.bat").exists(),
+            "nothing may be written through the junction into {}",
+            target.display()
+        );
+    }
+
+    /// C2: a tar carrying a non-Regular/Directory entry (here a symlink) is
+    /// refused for sync-out, not silently unpacked.
+    #[test]
+    fn sync_out_refuses_a_symlink_tar_entry() {
+        let ws = scratch_builds_dir("c2-symlink");
+        let project = ws.join("proj");
+        let libs = project.join("build").join("libs");
+        std::fs::create_dir_all(&libs).unwrap();
+        let _cleanup = Cleanup(vec![ws.clone()]);
+
+        let tar = symlink_tar("libs/evil", "../secret");
+        let err = sync_out_unpack(&tar, &project, &libs)
+            .expect_err("a symlink tar entry must be refused for sync-out");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("only regular files and directories"),
+            "the refusal must name the entry-kind policy, not an OS symlink error: {msg}"
+        );
+        assert!(!libs.join("evil").exists(), "no link may be created");
+    }
+
+    /// C2 negative control: a normal project (real `build/libs`) syncs out
+    /// unchanged. Must stay green in both the red and green states.
+    #[test]
+    fn sync_out_unpacks_into_a_real_build_libs() {
+        let ws = scratch_builds_dir("c2-real");
+        let project = ws.join("proj");
+        let libs = project.join("build").join("libs");
+        std::fs::create_dir_all(&libs).unwrap();
+        let _cleanup = Cleanup(vec![ws.clone()]);
+
+        let tar = regular_tar("libs/app.jar", b"jar");
+        sync_out_unpack(&tar, &project, &libs).expect("a real dir syncs out");
+        assert!(
+            libs.join("app.jar").exists(),
+            "the artifact must land in build/libs"
         );
     }
 }
