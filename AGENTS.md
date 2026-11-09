@@ -35,7 +35,7 @@ holds the rules; that one holds the map.
 
 Two containment backends, selected with `--backend`:
 
-- **`mxc`** (the DEFAULT in every build since 2026-10-22; `mxc-backend` is a default feature) - the
+- **`mxc`** (the DEFAULT; `mxc-backend` is a default feature) - the
   MXC `processcontainer` backend. **Network sessions run UNELEVATED**: the proxy
   is this process's own listener and the SDK gives the container no other route
   out. Guardrail 1 proves the child reached that listener before the session is
@@ -62,8 +62,8 @@ stderr for every successful session so the evidence is auditable.
 
 Session deadlines are supervisor arithmetic, not a caller value:
 `promptTimeoutSecs + workloadTimeoutSecs + slack` (profile top-level `limits`
-section; defaults 60 s + 30 min + 2 min). Moved 2026-10-25: both keys used to be
-`network.*`, and that location is now REFUSED. A workload that legitimately runs
+section; defaults 60 s + 30 min + 2 min). The keys live in `limits`, and a
+`network.*` deadline is REFUSED. A workload that legitimately runs
 longer must raise `limits.workloadTimeoutSecs` - there is no "no deadline" mode.
 
 ## Branching
@@ -109,7 +109,7 @@ Must follow: If a test needs to change anything on the host system, like setting
 before the change is performed a "rollback script" needs to be written. 
 So in case the test is killed and the cleanup cannot be performed the user is able to clean up manually.
 
-**VM-first rule (2026-10-04):** Tests that change anything on the host (ACLs,
+**VM-first rule:** Tests that change anything on the host (ACLs,
 permissions, AppContainer profiles, network configuration) must be written to
 run inside the disposable test VM via `tests/vm/Invoke-TestsInVM.ps1` — see
 `docs/plans/2026-10-04-vm-test-infrastructure.md`. For VM-run
@@ -122,9 +122,8 @@ physical host, the rollback-script rule above remains mandatory.
   scenario (default `appcontainer`, so the recorded AC baseline stays
   reproducible). AppContainer-only scenarios SKIP with a named reason under
   `mxc`; they are listed in `$script:AppContainerOnlyScenarios`.
-- The suite verdict is "any failure fails" - it does NOT consult a scenario
-  allow-list any more (that list printed `PASS` over seven failures on
-  2026-10-22).
+- The suite verdict is "any failure fails" - every scenario counts; there is
+  no allow-list of known-failing scenarios.
 - A VM session always runs with the GUEST's token, which is elevated. The VM
   therefore proves product logic, **not** elevation. The unelevated claim is
   carried by host live legs. The standard-user lane that would close this is
@@ -138,30 +137,26 @@ physical host, the rollback-script rule above remains mandatory.
 
 The sandbox grants the per-session AppContainer SID access on the CWD and its
 ancestor directories (e.g. `$env:TEMP`, `AppData\Local`) via
-`SetNamedSecurityInfoW`. These ACEs **persist on the host** after the sandbox
-exits — they are never removed automatically. Over many test runs they
-accumulate until the ACL on the ancestor directory becomes so large that
-`SetNamedSecurityInfoW` / `GetNamedSecurityInfoW` hangs (observed at ~40+ ACEs
-on `AppData\Local`, causing `saife run --block-net` to deadlock in
-`grant_access`).
+`SetNamedSecurityInfoW`. Left uncleaned, such ACEs accumulate until the ACL on
+the ancestor directory becomes so large that `SetNamedSecurityInfoW` /
+`GetNamedSecurityInfoW` hangs (observable at ~40+ ACEs on `AppData\Local`,
+deadlocking `saife run --block-net` in `grant_access`).
 
 **Rule:** every test run that exercises `saife run` (or anything that calls
 `grant_access` / `build_allowlist`) MUST clean up the ACEs it created
 afterwards. Two complementary mechanisms:
 
-1. **Per-session cleanup (Rust):** `saife run` removes the allow ACEs it
-   added to the CWD ancestor directories on exit (after the child process
-   returns, before the supervisor exits), and removes the per-session
-   `.sandbox\<sid>` directory. This is the primary defense — it runs
-   automatically. The DACL journal (`src/sandbox/dacl_journal.rs`) records
-   every grant before it is applied and teardown replays it with
-   `REVOKE_ACCESS`; a run that was killed is recovered at the next start
-   (`recover_orphans`). Since 2026-11-09 an unreadable journal is retained
-   and restore fails closed instead of reporting success (M4).
-   **Known gap:** `REVOKE_ACCESS` does not strip `DENY_ACCESS` ACEs, so the
-   six builtin-deny trees keep a per-session deny ACE after teardown. It
-   names the AC SID whose profile is deleted, so it grants nothing — inert
-   litter, tracked as a teardown follow-up.
+1. **Per-session cleanup (Rust):** `saife run` revokes every ACE the session
+   created — allow and deny, on the CWD ancestors, the granted trees and the
+   six builtin-deny trees — and removes the per-session `.sandbox\<sid>`
+   directory, after the child process returns and before the supervisor exits.
+   This is the primary defense — it runs automatically. The DACL journal
+   (`src/sandbox/dacl_journal.rs`) records every grant before it is applied;
+   teardown rebuilds each journaled DACL without any ACE whose trustee is the
+   session SID, leaving every other trustee's entry byte-identical. A run that
+   was killed without teardown is recovered by the next start
+   (`recover_orphans`); an unreadable journal is retained and restore fails
+   closed.
 2. **Test harness cleanup (PowerShell):** `tests/run-tests.ps1` must, after the
    suite completes (on success OR failure), remove any `S-1-15-2-*`
    (AppContainer) ACEs that the run added to `$env:TEMP`, `AppData\Local`, and
