@@ -1,6 +1,10 @@
 # Security review 2026-11-09 — independent verdicts
 
-- **Status:** verdicts complete; fixes not started.
+- **Status:** verdicts complete. Implemented (red→green, tests retained): **C1**
+  (`59a2331`), **C2** (`22afba7`), **M14** (`a348ced`), **H5d** (`d5ff395`),
+  **M2** (`0d8640a`) on `security/review-20261109`, local only. The 12
+  non-confirmed points carry pinned or `#[ignore]`d regression tests (`e9b5010`).
+  Everything else is still open, in the order of the § Implementation plan.
 - **Basis:** `0a55236` (`feat/ssh-gateway-plugin`, PR #39 head), branch `security/review-20261109`.
 - **Review under test:** an external security review with 39 points (2 Critical, 5 High,
   16 Medium, 16 Low). Point ids below are that review's ids.
