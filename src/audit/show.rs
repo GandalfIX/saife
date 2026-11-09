@@ -361,6 +361,47 @@ mod tests {
             "the raw line must be truncated, not echoed whole"
         );
     }
+
+    /// M8 follow-up (2026-11-09 verdict doc): `req_id` is now a filter key,
+    /// so `audit show --filter 'req_id=17'` selects exactly the two leaves of
+    /// request 17 (the admission allow and the post-dial deny) and neither
+    /// leaf of request 18. This is `run_show_inner`'s pipeline — parse the
+    /// filter, apply it to every leaf, render — exercised on the same leaf
+    /// chain the M8 counting test uses, so the filter and the terminal-
+    /// disposition counting are proven to compose: request 17's terminal leaf
+    /// is `deny`, so it still counts as no contact under the filter.
+    #[test]
+    fn show_filter_req_id_selects_one_requests_leaves() {
+        let events: Vec<serde_json::Value> = vec![
+            // Request 17: admitted, then refused at the dial.
+            serde_json::json!({"op":"CONNECT","host":"10.0.0.1","port":443,
+                               "disposition":"allow","req_id":17,"seq":0}),
+            serde_json::json!({"op":"CONNECT","host":"10.0.0.1","port":443,
+                               "disposition":"deny","reason":"lan_refused",
+                               "req_id":17,"seq":1}),
+            // Request 18: served, and filtered out.
+            serde_json::json!({"op":"CONNECT","host":"api.example.com","port":443,
+                               "disposition":"allow","req_id":18,"seq":2}),
+        ];
+        let filter = super::super::filter::Filter::parse("req_id=17").unwrap();
+        let filtered: Vec<&serde_json::Value> =
+            events.iter().filter(|v| filter.matches(v)).collect();
+        assert_eq!(filtered.len(), 2, "exactly request 17's two leaves");
+        let out = render_summary("reqid-filter", &filtered);
+
+        assert!(
+            !out.contains("api.example.com"),
+            "request 18 is filtered out: {out}"
+        );
+        assert!(
+            out.contains("lan_refused"),
+            "request 17's post-dial deny is shown: {out}"
+        );
+        assert!(
+            !out.contains("10.0.0.1:443  x"),
+            "request 17's terminal leaf is deny, so it is no contact: {out}"
+        );
+    }
 }
 
     /// M8 (verdict: confirmed, Medium). `show` counted every `allow` leaf as a
