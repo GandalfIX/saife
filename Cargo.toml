@@ -68,8 +68,15 @@ tokio-util = "0.7"
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
 sha2 = "0.10"
+# L-L: used directly to wrap intermediate key bytes in `Zeroizing`. The
+# ed25519-dalek `zeroize` feature (pinned above) keeps the crate's own
+# ZeroizeOnDrop for the signing key. Note: in the currently resolved
+# ed25519-dalek 2.2.0 the feature is also activated transitively
+# (std -> alloc -> zeroize/alloc), but that is a resolution quirk, not a
+# guarantee - the explicit feature line is the guard.
+zeroize = "1"
 subtle = "2"
 base64 = "0.22"
 # ADR-0004 Option A: the ProcessContainer containment backend. Optional and

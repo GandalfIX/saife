@@ -162,8 +162,13 @@ mod tests {
         fn state(&self, _id: &str) -> Result<BuildState> {
             Ok(BuildState::Running)
         }
-        fn lines(&self, _id: &str, _from: usize) -> Result<Vec<String>> {
-            Ok(Vec::new())
+        fn lines(&self, _id: &str, from: usize) -> Result<crate::runner::server::LogWindow> {
+            // M10: the fake keeps no log, so the window is empty and there is no
+            // gap - it satisfies the trait without pretending to retain anything.
+            Ok(crate::runner::server::LogWindow {
+                first: from,
+                ..Default::default()
+            })
         }
         fn shutdown(&self) {
             self.shut_down.store(true, Ordering::SeqCst);

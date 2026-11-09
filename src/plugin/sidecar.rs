@@ -2,8 +2,12 @@
 //!
 //! The sidecar is the supervisor's child and runs **outside** the container. It
 //! gets a free loopback port, a fresh 32-hex facade token, the mount name and the
-//! manifest's non-secret `config` entries in its environment, and nothing else —
-//! no secret value exists in the POC. Its stdout/stderr go to
+//! manifest's non-secret `config` entries in its environment — and, since the
+//! 2026-11-09 review (H3), nothing beyond a minimal startup allowlist: the
+//! supervisor's environment is cleared first (`env_clear`), then only `PATH`,
+//! `SYSTEMROOT`, `TEMP`, `TMP`, `LOCALAPPDATA`, `USERPROFILE` (the Windows
+//! essentials a Python sidecar's startup needs) and the `SIDECAR_*` values are
+//! re-added — no secret value exists in the POC. Its stdout/stderr go to
 //! `%LOCALAPPDATA%\saife\sidecar-logs\<sid>-<mount>.log` instead of the
 //! session's console, so a chatty sidecar cannot corrupt the workload's output.
 //!
@@ -90,9 +94,29 @@ impl Sidecar {
         let mut cmd = Command::new(&program);
         // No shell: argv is passed through, `current_dir` is the plugin's own
         // directory, and every setting below is an explicit name/value pair.
+        // H3: the supervisor's environment is NOT inherited wholesale — a
+        // sidecar is supervisor-privileged code, but "privileged" is not
+        // "trustworthy to see everything the supervisor happens to have set".
+        // `env_clear` drops it first, then only a minimal startup allowlist is
+        // re-added: the Windows essentials the child's runtime needs to
+        // function (`PATH`, `SYSTEMROOT`, `TEMP`, `TMP`, `LOCALAPPDATA`,
+        // `USERPROFILE`) plus the `SIDECAR_*` values the manifest defines.
         cmd.args(&manifest.command[1..])
             .current_dir(plugin_dir)
-            .env("SIDECAR_PORT", port.to_string())
+            .env_clear();
+        for key in [
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.env("SIDECAR_PORT", port.to_string())
             .env("SIDECAR_FACADE_TOKEN", &token)
             .env("SIDECAR_MOUNT", &manifest.mount)
             .stdin(Stdio::null())
@@ -624,6 +648,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The sidecar's environment (H3, docs/design/2026-11-09-security-review-verdicts.md).
+    ///
+    /// `start` used to inherit the supervisor's whole environment while the module
+    /// docstring promised "and nothing else". The fix calls `env_clear` first, then
+    /// re-adds only a minimal startup allowlist (`PATH`, `SYSTEMROOT`, `TEMP`,
+    /// `TMP`, `LOCALAPPDATA`, `USERPROFILE`) on top of the `SIDECAR_*` values the
+    /// sidecar is meant to read. This test is its regression guard: a sentinel
+    /// planted in the supervisor's environment must not reach the child, while
+    /// `PATH` and `SIDECAR_FACADE_TOKEN` must.
+    ///
+    /// Run: `cargo test --bin saife \
+    ///     plugin::sidecar::tests::the_sidecar_inherits_no_supervisor_environment -- --exact`
+    #[test]
+    fn the_sidecar_inherits_no_supervisor_environment() {
+        // A fixture sidecar that dumps its own environment and answers /status.
+        let dir = std::env::temp_dir().join(format!(
+            "sandbox-plugin-h3-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sidecar.py"),
+            r#"import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+with open(os.environ["SIDECAR_CFG_ENVDUMP"], "w", encoding="utf-8") as fh:
+    json.dump(dict(os.environ), fh)
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_a):
+        pass
+
+HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
+"#,
+        )
+        .unwrap();
+        let dump = dir.join("env.json");
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "name": "h3env",
+            "mount": "h3env",
+            "command": ["python", "sidecar.py"],
+            "health": {"path": "/status", "timeout_ms": 15000, "interval_ms": 100},
+            "operations": [{"method": "GET", "path": "/"}],
+            "config": {"envdump": dump.display().to_string()}
+        })
+        .to_string();
+        std::fs::write(dir.join(crate::plugin::PLUGIN_ENTRY), body).unwrap();
+        let manifest =
+            crate::plugin::read_manifest(&dir.join(crate::plugin::PLUGIN_ENTRY), "h3env")
+                .expect("the H3 fixture manifest");
+
+        // SAFETY: process-wide state, set before the spawn and removed below;
+        // the name is test-unique and the value would only matter to this test.
+        // Edition 2024 makes these calls unsafe; the sentinel is exactly what
+        // the verdict's red test plants in the supervisor's environment.
+        let sentinel = format!("SAIFE_H3_SENTINEL_{}", nanos());
+        unsafe { std::env::set_var(&sentinel, "must-not-reach-the-sidecar") };
+
+        let sidecar = Sidecar::start(&dir, &manifest, &format!("h3-env-{}", nanos()))
+            .expect("the fixture sidecar must answer its health probe");
+        drop(sidecar); // end the tree before reading what it recorded
+
+        let env: std::collections::HashMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(&dump).expect("the sidecar must dump its environment"),
+        )
+        .expect("the dump must be a JSON object of strings");
+
+        assert!(
+            !env.contains_key(&sentinel),
+            "H3: the sidecar must not inherit the supervisor's environment, \
+             but {sentinel} did"
+        );
+        assert!(
+            !env.values().any(|v| v == "must-not-reach-the-sidecar"),
+            "the sentinel value must not reach the sidecar under any name"
+        );
+        assert!(env.contains_key("PATH"), "the fix must still provide PATH");
+        assert!(
+            env.contains_key("SIDECAR_FACADE_TOKEN"),
+            "the facade token must still be present"
+        );
+
+        // SAFETY: removes the sentinel set above; the environment is as found.
+        unsafe { std::env::remove_var(&sentinel) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// LIVE (`-- --ignored`): the real `tngtech` plugin, the real proxy, the real
     /// relay, and a real kill.
     ///
@@ -694,6 +812,8 @@ mod tests {
             deny_domain: Vec::new(),
             blocked: false,
             upstream: None,
+            // Test fixture stand-ins are local listeners; nothing here pins the LAN deny.
+            allow_lan: true,
             writer,
             prompt,
             facade: Arc::clone(&registry),
@@ -841,6 +961,8 @@ mod tests {
             deny_domain: Vec::new(),
             blocked: false,
             upstream: None,
+            // Test fixture stand-ins are local listeners; nothing here pins the LAN deny.
+            allow_lan: true,
             writer,
             prompt,
             facade: Arc::clone(&registry),

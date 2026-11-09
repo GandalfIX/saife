@@ -16,7 +16,11 @@ Stdlib only (unittest), so it runs on the same Python that runs the sidecar.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -94,7 +98,8 @@ class SinkBuildsAnArgvList(unittest.TestCase):
         proc = FakeProc.instances[-1]
         argv = proc.argv
         self.assertIsInstance(argv, list, "argv list, never a shell line")
-        self.assertEqual(argv[0], "ssh")
+        self.assertTrue(os.path.isabs(argv[0]), f"ssh is spawned by absolute path: {argv[0]}")
+        self.assertEqual(argv[0], sidecar.SSH_BIN, "the binary is resolved once at startup")
         self.assertEqual(argv[-1], "list all", "verb + args is ONE element")
         target_at = argv.index(DECLARED["target"])
         self.assertEqual(target_at, len(argv) - 2, "the remote command follows the target")
@@ -102,6 +107,136 @@ class SinkBuildsAnArgvList(unittest.TestCase):
         for opt in ("ClearAllForwardings=yes", "ForwardAgent=no", "PermitLocalCommand=no"):
             self.assertIn(opt, argv)
         self.assertIsNotNone(proc.stdin, "stdin is piped so the sidecar feeds the child")
+
+
+def no_popen(test: unittest.TestCase):
+    """Patch Popen so a request that must be refused fails if it spawns anything."""
+
+    def boom(*_a, **_k):  # pragma: no cover - only reached on a regression
+        test.fail("refused request spawned a process")
+
+    return mock.patch.object(sidecar.subprocess, "Popen", boom)
+
+
+class HostKeysArePinned(unittest.TestCase):
+    """M13 (docs/design/2026-11-09-security-review-verdicts.md, verdict: confirmed).
+
+    `StrictHostKeyChecking=accept-new` with NO `UserKnownHostsFile` made the first
+    contact with any host a TOFU decision, and ssh then appended that key to the
+    user's real `%USERPROFILE%\\.ssh\\known_hosts` - a file this plugin does not
+    own and every later session trusts. The fix: a plugin-local `known_hosts`,
+    `StrictHostKeyChecking=yes`, and an unknown key is a named 502 rather than a
+    hang or a silent accept.
+    """
+
+    def _run(self, entry=None):
+        FakeProc.mode = "ok"
+        with mock.patch.object(sidecar.subprocess, "Popen", FakeProc):
+            code, body, meta = sidecar.run_ssh(entry or dict(DECLARED), "list", "", b"")
+        return code, body, meta, FakeProc.instances[-1].argv
+
+    def test_the_shipped_known_hosts_is_plugin_local_and_holds_no_keys(self):
+        self.assertEqual(sidecar.KNOWN_HOSTS.name, "known_hosts")
+        self.assertEqual(sidecar.KNOWN_HOSTS.parent, Path(sidecar.__file__).resolve().parent,
+                         "the file must live beside the sidecar, never in ~/.ssh")
+        self.assertTrue(sidecar.KNOWN_HOSTS.is_file(), "the plugin must ship the file")
+        keys = [line for line in sidecar.KNOWN_HOSTS.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(keys, [], "the shipped file starts empty: nothing is trusted by default")
+
+    def test_argv_pins_the_plugin_local_file_and_strict_checking(self):
+        code, _body, _meta, argv = self._run()
+        self.assertEqual(code, 200, "a declared verb with a pinned file proceeds")
+        self.assertIn(f"UserKnownHostsFile={sidecar.KNOWN_HOSTS}", argv)
+        self.assertIn("StrictHostKeyChecking=yes", argv)
+        self.assertNotIn("StrictHostKeyChecking=accept-new", argv,
+                         "accept-new is TOFU and writes into whatever file it is handed")
+
+    def test_a_per_host_known_hosts_overrides_the_default(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".known_hosts", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write("pinned.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA\n")
+            seeded = fh.name
+        try:
+            code, _body, _meta, argv = self._run(dict(DECLARED, known_hosts=seeded))
+        finally:
+            Path(seeded).unlink(missing_ok=True)
+        self.assertEqual(code, 200)
+        self.assertIn(f"UserKnownHostsFile={seeded}", argv)
+        self.assertNotIn(f"UserKnownHostsFile={sidecar.KNOWN_HOSTS}", argv)
+
+    def test_an_unknown_host_key_is_a_named_502(self):
+        FakeProc.mode = "hostkey"
+        with mock.patch.object(sidecar.subprocess, "Popen", FakeProc):
+            code, body, meta = sidecar.run_ssh(dict(DECLARED), "list", "", b"")
+        self.assertEqual(code, 502)
+        self.assertEqual(meta["outcome"], "host_key_unknown")
+        self.assertIn(b"host_key_unknown", body, "the refusal must name the reason")
+        self.assertIn(b"Host key verification failed", body,
+                      "the ssh error is surfaced, not swallowed")
+        self.assertNotEqual(body, b"ok", "no ssh output is trusted for an unknown host key")
+
+
+class SshBinaryIsResolvedAtStartup(unittest.TestCase):
+    """L-M (docs/design/2026-11-09-security-review-verdicts.md, verdict: confirmed).
+
+    `ssh` was spawned by BARE NAME from the plugin directory as the child's cwd,
+    and CreateProcess searches the parent's cwd before System32/PATH - so a file
+    dropped next to `sidecar.py` wins. The fix resolves ssh ONCE at startup
+    (System32\\OpenSSH first, then PATH), refuses to start without it, and spawns
+    by absolute path.
+    """
+
+    def _sysroot(self, with_ssh: bool) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="saife-sshroot-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        if with_ssh:
+            exe = root / "System32" / "OpenSSH" / "ssh.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"")
+        return root
+
+    def test_the_system_openssh_is_preferred(self):
+        root = self._sysroot(with_ssh=True)
+        resolved = sidecar.resolve_ssh_binary(str(root))
+        self.assertEqual(resolved, str(root / "System32" / "OpenSSH" / "ssh.exe"))
+        self.assertTrue(os.path.isabs(resolved))
+
+    def test_a_host_without_the_system_openssh_falls_back_to_path(self):
+        root = self._sysroot(with_ssh=False)
+        with mock.patch.object(sidecar.shutil, "which", lambda _name: "C:/tools/ssh.exe"):
+            self.assertEqual(sidecar.resolve_ssh_binary(str(root)), "C:/tools/ssh.exe")
+
+    def test_nothing_resolves_to_none_rather_than_a_guess(self):
+        root = self._sysroot(with_ssh=False)
+        with mock.patch.object(sidecar.shutil, "which", lambda _name: None):
+            self.assertIsNone(sidecar.resolve_ssh_binary(str(root)))
+
+    def test_main_refuses_to_start_without_an_ssh_binary(self):
+        err = io.StringIO()
+        with mock.patch.object(sidecar, "SSH_BIN", None), contextlib.redirect_stderr(err):
+            self.assertEqual(sidecar.main(), 2, "a sidecar that cannot spawn ssh must not serve")
+        self.assertIn("ssh", err.getvalue())
+        self.assertIn("ssh_executable_not_found", err.getvalue(),
+                    "the refusal must be a NAMED startup error, not a generic one")
+
+    def test_the_spawn_uses_the_resolved_absolute_binary(self):
+        absolute = "C:/Windows/System32/OpenSSH/ssh.exe"
+        FakeProc.mode = "ok"
+        with mock.patch.object(sidecar, "SSH_BIN", absolute), \
+                mock.patch.object(sidecar.subprocess, "Popen", FakeProc):
+            code, _body, _meta = sidecar.run_ssh(dict(DECLARED), "list", "", b"")
+        self.assertEqual(code, 200)
+        argv = FakeProc.instances[-1].argv
+        self.assertEqual(argv[0], absolute, "argv[0] is the resolved path, not a bare name")
+        self.assertTrue(os.path.isabs(argv[0]), "an absolute path cannot be shadowed by cwd")
+
+    def test_a_missing_binary_is_refused_at_the_sink(self):
+        with mock.patch.object(sidecar, "SSH_BIN", None), no_popen(self):
+            code, body, meta = sidecar.run_ssh(dict(DECLARED), "list", "", b"")
+        self.assertEqual(code, 502)
+        self.assertIn(b"ssh_not_found", body)
+        self.assertEqual(meta["outcome"], "ssh_not_found")
 
 
 class VerbCharset(unittest.TestCase):
@@ -230,6 +365,12 @@ class FakeProc:
         self.killed_event = threading.Event()
         self.returncode = 0
         self.stderr_text = b""
+        if self.mode == "hostkey":
+            # ssh with StrictHostKeyChecking=yes and no entry in the pinned
+            # known_hosts: exits 255, says so on stderr, and produces NO stdout.
+            self.returncode = 255
+            self.stderr.write(b"Host key verification failed.\r\n")
+            self.stderr.flush()
         FakeProc.instances.append(self)
 
     def kill(self):
@@ -294,6 +435,44 @@ class HttpFixture:
 
 
 GOOD = {"target": "logs@example.invalid", "commands": ["list"], "command_timeout": 2}
+
+
+def status_code_of(resp: bytes) -> int:
+    """The status line's code, failing loudly when the connection was dropped."""
+    line = resp.split(b"\r\n", 1)[0] if resp else b""
+    parts = line.split()
+    assert parts and parts[0].startswith(b"HTTP/"), (
+        f"no HTTP status line - the connection was dropped: {resp[:120]!r}")
+    return int(parts[1])
+
+
+def raw_post(fx: "HttpFixture", headers: str, body: bytes = b"", timeout: float = 5) -> bytes:
+    """One raw request on a socket whose write side stays OPEN until the reply.
+
+    That is the point of using a raw socket here: a handler that blocks reading
+    a body it was never sent must fail this helper by timing out, instead of
+    passing because the client closed and turned the read into EOF.
+    """
+    sock = socket.create_connection(("127.0.0.1", fx.server.server_address[1]), timeout=timeout)
+    try:
+        sock.sendall(headers.encode("ascii") + body)
+        sock.settimeout(timeout)
+        chunks = []
+        while True:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout as exc:
+                raise AssertionError(
+                    f"the sidecar did not answer within {timeout}s - it is waiting on a "
+                    "body the client never offered to close"
+                ) from exc
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
 
 
 class ExecPath(unittest.TestCase):
@@ -372,6 +551,62 @@ class ExecPath(unittest.TestCase):
             rec = fx.audit[-1]
             self.assertEqual(rec["status"], 403)
             self.assertIn("command_not_declared", rec["outcome"])
+
+
+class MalformedFramingIsContained(unittest.TestCase):
+    """M16 (docs/design/2026-11-09-security-review-verdicts.md).
+
+    `do_POST` used to trust `int(self.headers.get("Content-Length"))`: a negative
+    value reached `rfile.read(-1)` (read to EOF - the handler parked until the
+    caller hung up) and a non-numeric one raised out of the handler (the
+    connection was dropped with no reply). The hardening (`max(0, ...)`,
+    `try/except ValueError -> 400`, reject `Transfer-Encoding`) landed on
+    2026-11-09; these tests are its regression guard. They pin the CONTRACT: a
+    malformed frame gets a bounded, named refusal and never spawns ssh or
+    leaves an EXEC record.
+    """
+
+    def _post_raw(self, fx, extra_headers: str, body: bytes = b"") -> bytes:
+        head = (
+            "POST /exec HTTP/1.0\r\nHost: ssh\r\nX-Facade-Token: test-token\r\n"
+            f"{extra_headers}\r\n"
+        )
+        return raw_post(fx, head, body)
+
+    def _assert_contained(self, fx, resp: bytes) -> None:
+        code = status_code_of(resp)
+        self.assertGreaterEqual(code, 400, f"a malformed frame must be refused: {resp[:200]!r}")
+        self.assertLess(code, 600, f"expected an HTTP error reply: {resp[:200]!r}")
+        self.assertEqual(FakeProc.instances, [], "no ssh may be spawned for a malformed frame")
+        self.assertEqual(fx.audit, [], "no EXEC record: the request never became a call")
+
+    def test_negative_content_length_is_refused_not_read_to_eof(self):
+        # The write side stays open (raw_post never closes it): today
+        # `read(-1)` waits for an EOF that only arrives when the caller gives
+        # up, so the reply must come from the reply path, not from EOF.
+        with HttpFixture({"srv1": dict(GOOD)}) as fx:
+            resp = self._post_raw(fx, "Content-Length: -1\r\n")
+            self._assert_contained(fx, resp)
+
+    def test_non_numeric_content_length_gets_a_clean_reply(self):
+        # `int("abc")` raises out of the handler today: the client sees a
+        # dropped connection instead of a status line.
+        with HttpFixture({"srv1": dict(GOOD)}) as fx:
+            resp = self._post_raw(fx, "Content-Length: abc\r\n")
+            self._assert_contained(fx, resp)
+
+    def test_chunked_transfer_encoding_is_rejected(self):
+        # A valid JSON body in chunked framing must not be decoded: the sidecar
+        # speaks Content-Length framing only, so the request is refused whole.
+        payload = json.dumps({"host": "srv1", "verb": "list"}).encode()
+        body = f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
+        with HttpFixture({"srv1": dict(GOOD)}) as fx:
+            resp = self._post_raw(fx, "Transfer-Encoding: chunked\r\n", body)
+            self._assert_contained(fx, resp)
+            # The refusal must NAME the framing it will not speak - a bare
+            # "body must be JSON" (what an empty Content-Length produces) would
+            # leave the operator guessing why a valid body was rejected.
+            self.assertIn(b"transfer-encoding", resp.lower())
 
 
 if __name__ == "__main__":

@@ -829,14 +829,43 @@ pub fn filesystem_policy(
     // sibling `%LOCALAPPDATA%\saife` holds the audit log and the signing key. A
     // profile that grants `$HOME` would otherwise let the workload rewrite a plugin
     // that executes outside the sandbox on the next run.
+    //
+    // M3 (security review 2026-11-09): `builtin_deny_dirs()` is rooted at the
+    // OS-known profile directory, not at `profile_dir` (which the caller passes
+    // from the caller-controlled `USERPROFILE`). Pushing them UNCONDITIONALLY —
+    // deduplicated by path, not skipped by name — is what keeps the real
+    // credential trees denied when `USERPROFILE` is repointed at a throwaway
+    // directory or unset entirely. The old name-based `continue` skipped a real
+    // `~/.ssh` whenever a (possibly different) `profile_dir\.ssh` had already been
+    // pushed, so a repointed env removed the deny on BOTH backends.
     for dir in crate::profile::builtin_deny_dirs() {
-        let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-        if PROFILE_SECRET_DIRS.contains(&name) {
-            continue; // already denied above
-        }
         push_deny(
             &mut filesystem.denied_paths,
             &dir.display().to_string(),
+            &grants,
+        )?;
+    }
+    // M2: credential FILES, denied for every launch as DESCENDANTS of the
+    // directories the shipped profiles grant RWX (`jvm.json` grants `~/.gradle`
+    // and `~/.m2` — Gradle and Maven cannot run without those trees — and
+    // `opencode.json` inherits both, so it inherits these denies too). The
+    // same list the AppContainer backend denies, defined once in
+    // `crate::profile::builtin_deny_files`.
+    //
+    // Whole-directory denies are the wrong tool here: MXC filesystem policy is
+    // additive grants, so a deny of `~/.gradle` contains the `~/.gradle` grant
+    // and [`RequestError::DenyCoversGrant`] refuses the session — the jvm
+    // profile would be unlaunchable. A deny of the file inside the granted
+    // tree is the expressible case (see the docstring above) and is kept.
+    //
+    // Not filtered by existence, unlike the AppContainer path: these are policy
+    // entries handed to the container, not filesystem objects this process
+    // writes a DACL onto, so a credential file that is not installed is an
+    // inert deny rather than a failed launch.
+    for file in crate::profile::builtin_deny_files() {
+        push_deny(
+            &mut filesystem.denied_paths,
+            &file.display().to_string(),
             &grants,
         )?;
     }
@@ -886,6 +915,106 @@ fn push_deny(
     }
     denied.push(candidate.to_string());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M3: the credential denies are rooted at the OS profile, not USERPROFILE
+// ---------------------------------------------------------------------------
+
+/// M3's mxc half (security review 2026-11-09, confirmed): the four
+/// [`PROFILE_SECRET_DIRS`] used to be joined onto the caller-supplied
+/// `profile_dir` — which `main.rs` reads from `USERPROFILE` — and the builtin
+/// dirs were then SKIPPED BY NAME because they had "already been denied". With
+/// `USERPROFILE` unset every credential deny vanished; repointed, they denied a
+/// throwaway tree and the real `~/.ssh` was skipped. The builtin set is now
+/// pushed unconditionally (path-deduplicated), so the real tree is denied
+/// whatever the env says.
+#[cfg(test)]
+mod m3_credential_deny_base {
+    use super::*;
+
+    #[test]
+    fn m3_a_repointed_profile_dir_cannot_remove_the_real_credential_denies() {
+        let Some(real) = crate::profile::system_profile_root() else {
+            eprintln!(
+                "[test] SHGetKnownFolderPath(FOLDERID_Profile) unavailable; M3 mxc test skipped"
+            );
+            return;
+        };
+        let fake = Path::new(r"C:\Users\throwaway-m3");
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[],
+            &[],
+            &[],
+            Some(fake),
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+        )
+        .expect("neither tree contains a grant");
+
+        for dir in PROFILE_SECRET_DIRS {
+            let faked = fake.join(dir).display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| path_key(d) == path_key(&faked)),
+                "the caller's profile_dir deny is kept as declared: {faked} missing from {:?}",
+                fs.denied_paths
+            );
+            let actual = real.join(dir).display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| path_key(d) == path_key(&actual)),
+                "the REAL credential tree must stay denied when profile_dir is repointed: \
+                 {actual} missing from {:?}",
+                fs.denied_paths
+            );
+        }
+        // And the control plane / file denies follow the real root too.
+        for want in crate::profile::builtin_deny_files() {
+            let spelled = want.display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| path_key(d) == path_key(&spelled)),
+                "the credential file {spelled} must stay denied: {:?}",
+                fs.denied_paths
+            );
+        }
+    }
+
+    /// With no `profile_dir` at all (an UNSET `USERPROFILE`), the credential
+    /// dirs must still be denied — they come from the OS known folder.
+    #[test]
+    fn m3_an_absent_profile_dir_still_denies_every_credential_tree() {
+        let Some(real) = crate::profile::system_profile_root() else {
+            eprintln!(
+                "[test] SHGetKnownFolderPath(FOLDERID_Profile) unavailable; M3 mxc test skipped"
+            );
+            return;
+        };
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[],
+            &[],
+            &[],
+            None,
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+        )
+        .expect("no deny contains a grant");
+
+        for dir in PROFILE_SECRET_DIRS {
+            let actual = real.join(dir).display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|d| path_key(d) == path_key(&actual)),
+                "an absent profile_dir must not remove the deny on {actual}: {:?}",
+                fs.denied_paths
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3087,3 +3216,72 @@ mod tests;
 /// scratch directory removes itself.
 #[cfg(test)]
 mod live;
+
+// ---------------------------------------------------------------------------
+// M2: credential-file denies on the mxc contract (security review 2026-11-09)
+// ---------------------------------------------------------------------------
+
+/// M2's mxc half: [`filesystem_policy`] must deny the same credential FILES
+/// the AppContainer backend denies ([`crate::profile::builtin_deny_files`]),
+/// as *descendants* of the directories the shipped profiles grant RWX
+/// (`jvm.json` grants `~/.gradle` and `~/.m2`; `opencode.json` inherits
+/// both, so it inherits the denies too).
+///
+/// The test lives beside the function rather than in `mxc/tests.rs` so the
+/// assertion is about this module's own contract: adding a credential file to
+/// `builtin_deny_files` without pushing it here is invisible to
+/// `denied_paths` and would ship a readable credential.
+#[cfg(test)]
+mod m2_credential_file_denies {
+    use super::*;
+
+    #[test]
+    fn the_mxc_policy_denies_the_builtin_credential_files() {
+        // `builtin_deny_files()` reads USERPROFILE/APPDATA and other tests in
+        // this suite repoint USERPROFILE, so hold the same lock they do.
+        let _env = crate::env_lock();
+        let home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE must be set"),
+        );
+        // The jvm profile's grant, in the shape main.rs passes it: writable
+        // extras beside the workspace.
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[home.join(".gradle"), home.join(".m2")],
+            &[],
+            &[],
+            Some(&home),
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+        )
+        .expect("a file deny is a descendant of a grant, never an ancestor");
+
+        for file in crate::profile::builtin_deny_files() {
+            let spelled = file.display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|deny| path_key(deny) == path_key(&spelled)),
+                "the mxc contract must deny the credential file {spelled}: {:?}",
+                fs.denied_paths
+            );
+        }
+        // ~/.npmrc is the deliberate exception: npm must read the token.
+        let npmrc = home.join(".npmrc").display().to_string();
+        assert!(
+            fs.denied_paths
+                .iter()
+                .all(|deny| path_key(deny) != path_key(&npmrc)),
+            "~/.npmrc must NOT be denied on the mxc path either: {:?}",
+            fs.denied_paths
+        );
+        // The directory grants stay: the deny names the file, not the tree.
+        for dir in [".gradle", ".m2"] {
+            let spelled = home.join(dir).display().to_string();
+            assert!(
+                fs.readwrite_paths.contains(&spelled),
+                "the {dir} grant must survive the file denies: {:?}",
+                fs.readwrite_paths
+            );
+        }
+    }
+}

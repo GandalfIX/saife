@@ -74,6 +74,7 @@ fn main() {
             plugin_dir,
             runner,
             allow_host_loopback,
+            allow_lan,
             cmd,
         } => run_cmd(
             backend,
@@ -94,6 +95,7 @@ fn main() {
             plugin_dir,
             runner,
             allow_host_loopback,
+            allow_lan,
             cmd,
         ),
         Cmd::Ps { json, .. } => ps_cmd(json),
@@ -517,15 +519,70 @@ fn learned_load_failure(e: anyhow::Error) -> (i32, String, String) {
     )
 }
 
+/// Publish `bytes` at `path` as one atomic replace (H5b).
+///
+/// A sibling temp file plus `MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+/// MOVEFILE_WRITE_THROUGH)`: the windows crate is already a dependency (the key
+/// publish in `signing.rs` uses the same call), it replaces an existing
+/// destination, and it does not return until the rename is in the directory - so a
+/// kill either leaves the old file or the new one, never a torn one. The temp is a
+/// sibling, so the rename is same-volume by construction and cannot degrade into a
+/// non-atomic copy.
+fn publish_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use windows::Win32::Storage::FileSystem::{
+        MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::HSTRING;
+
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {:?}", tmp.display()))?;
+    let published = unsafe {
+        MoveFileExW(
+            &HSTRING::from(tmp.as_os_str()),
+            &HSTRING::from(path.as_os_str()),
+            MOVE_FILE_FLAGS(MOVEFILE_REPLACE_EXISTING.0 | MOVEFILE_WRITE_THROUGH.0),
+        )
+    };
+    if let Err(e) = published {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("publish audit file {:?}", path.display()));
+    }
+    Ok(())
+}
+
 fn commit_audit_root(sid: &str, root: &str) -> Result<()> {
+    // H4: defensive validation at this door too - the writer is not the only
+    // way a sid reaches `audit_log_path`. Done before touching the key.
+    let sid = audit::normalize_session_id(sid)?;
     let key = signing::KeyMaterial::ensure()?;
     let root_bytes =
         decode_hex_vec(root).ok_or_else(|| anyhow::anyhow!("root is not valid hex: {root}"))?;
     let sig = key.sign_root(&root_bytes);
-    let sig_hex: String = sig.iter().map(|b| format!("{:02x}", b)).collect();
-    let log_path = audit::audit_log_path(sid);
-    std::fs::write(log_path.with_extension("root"), root)?;
-    std::fs::write(log_path.with_extension("sig"), &sig_hex)?;
+    let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+    let log_path = audit::audit_log_path(&sid);
+    // H5b: signature FIRST, root second, each an atomic replace.
+    //
+    // Order is the whole point. Every state a kill can leave behind is now one
+    // `verify` reads as an interrupted commit, never as an edit:
+    //   sig published, root missing  -> INCOMPLETE (no committed root)
+    //   root published              -> both halves present and consistent
+    // The old root-then-sig order left a committed root with no signature (or an
+    // older session's signature), which verify reported as BAD_SIGNATURE/TAMPERED
+    // - blaming the operator for a crash.
+    publish_atomically(&log_path.with_extension("sig"), sig_hex.as_bytes())?;
+    // M7: the key fingerprint is a sidecar recorded with the commit, so a later
+    // verify can say KEY_CHANGED instead of BAD_SIGNATURE after a rotation. It is
+    // written before the root: if the run is killed here, no committed root means
+    // verify reports INCOMPLETE and never reads it.
+    publish_atomically(&log_path.with_extension("keyfp"), key.fingerprint().as_bytes())?;
+    publish_atomically(&log_path.with_extension("root"), root.as_bytes())?;
     Ok(())
 }
 
@@ -709,6 +766,8 @@ fn run_cmd(
     runner: bool,
     // `--allow-host-loopback`: ADR-0007's session mode.
     allow_host_loopback: bool,
+    // M9: `--allow-lan`, the explicit escape hatch for the private/LAN deny.
+    allow_lan: bool,
     cmd: Vec<String>,
 ) -> i32 {
     // Backend selection is refused before anything is spawned or created. The
@@ -768,6 +827,7 @@ fn run_cmd(
         &plugin_dir,
         runner,
         allow_host_loopback,
+        allow_lan,
         &cmd,
     ) {
         Ok(code) => code,
@@ -810,6 +870,8 @@ fn run_inner(
     enable_runner: bool,
     // `--allow-host-loopback`: ADR-0007's session mode, threaded to the MXC path.
     allow_host_loopback: bool,
+    // M9: `--allow-lan`, threaded to the listener the MXC path starts.
+    allow_lan: bool,
     cmd: &[String],
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
@@ -873,6 +935,7 @@ fn run_inner(
                 plugin_dirs,
                 enable_runner,
                 allow_host_loopback,
+                allow_lan,
                 cmd,
             );
         }
@@ -998,6 +1061,7 @@ fn run_inner(
         // Unchanged: this backend refuses `--plugin` and `--runner` by name
         // above, so it never has a mount that would need a listener.
         false,
+        allow_lan,
     )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
 
@@ -1049,7 +1113,32 @@ fn run_inner(
     }
     sandbox::appcontainer::delete_profile(&session.ac_name);
 
+    // L-O (verdict: partial): the ACE half was already implemented by the DACL
+    // journal above; the per-session `.sandbox/<sid>` DIRECTORY was never
+    // removed, so every run left one behind. Best-effort on purpose: the tree is
+    // litter once its ACEs are restored, and a workload may still hold a file in
+    // it - a finished run must not fail over that.
+    let _ = remove_session_sandbox_dir(&cwd, &sid);
+
     Ok(exit_code as i32)
+}
+
+/// Remove this session's `.sandbox/<sid>` tree at teardown (L-O).
+///
+/// Called AFTER the DACL restore, because a tree removed while its ACEs are
+/// still journaled would leave the journal pointing at paths that no longer
+/// exist (the restore tolerates that, but the order costs nothing).
+///
+/// `.sandbox` itself is left alone: it is the parent every session shares, and
+/// removing it would race another session's teardown. `NotFound` is success -
+/// a run that never created the tree, or a second teardown, must not be an
+/// error.
+fn remove_session_sandbox_dir(cwd: &std::path::Path, sid: &str) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(cwd.join(".sandbox").join(sid)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1229,8 @@ fn run_mxc_session(
     // `--runner`: start the build runner and publish its facade mount.
     enable_runner: bool,
     allow_host_loopback: bool,
+    // M9: `--allow-lan`, threaded to the listener this path starts.
+    allow_lan: bool,
     cmd: &[String],
 ) -> Result<i32> {
     // Decision 7: `--print-sid` yields the id and returns, exactly as the
@@ -1248,6 +1339,7 @@ fn run_mxc_session(
         audit_writer.clone(),
         std::sync::Arc::clone(&facade),
         enable_runner || !plugins.is_empty(),
+        allow_lan,
     )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
     let token = proxy.as_ref().map(|(_, env)| env.token.value());
@@ -1705,6 +1797,8 @@ fn start_session_proxy(
     // session asked for a facade mount (`--runner`, `--plugin`) and the
     // facade route exists only in the proxy.
     serve_without_egress: bool,
+    // M9: `--allow-lan`, the explicit escape hatch for the private/LAN deny.
+    allow_lan: bool,
 ) -> Result<Option<(net::proxy::ProxyHandle, net::ProxyEnv)>> {
     // The listener MUST outlive the child: the caller holds the handle until the
     // child has exited (see `seal_audit`).
@@ -1731,6 +1825,8 @@ fn start_session_proxy(
                     // No chaining: there is no origin to reach, so an upstream
                     // dialer would be a second way out wired up for nothing.
                     upstream: None,
+                    // Nothing it can reach has a destination to relax.
+                    allow_lan: false,
                     writer,
                     // Nothing to ask: the answer is the session's posture, not a
                     // per-host choice, so the dialog is constructed disabled.
@@ -1808,6 +1904,17 @@ fn start_session_proxy(
                 },
                 None => None,
             };
+            // H2 (security review 2026-11-09: partial → Medium). Under chaining
+            // saife does not resolve the destination, so its destination
+            // hard-deny never runs ([G-22]) and [G-44]'s "no tunnel to host
+            // services" holds only as far as the upstream enforces it. A remote
+            // corporate proxy is trusted to; the loopback bridge this module
+            // recommends (cntlm/px on 127.0.0.1) is not, so say so at startup.
+            // Not SAIFE_DIAG-gated: a silently weaker destination policy is
+            // exactly the class of fact an operator must not have to ask for.
+            if let Some(w) = upstream.as_ref().and_then(|d| d.loopback_bridge_warning()) {
+                eprintln!("[saife] warning: {w}");
+            }
             Some(spawn_session_listener(
                 net::proxy::ProxyConfig {
                     session_id: sid.to_string(),
@@ -1816,6 +1923,7 @@ fn start_session_proxy(
                     deny_domain: deny_domain.clone(),
                     blocked: false,
                     upstream,
+                    allow_lan,
                     writer: writer.clone(),
                     prompt,
                     facade,
@@ -1887,6 +1995,17 @@ fn spawn_session_listener(
     Ok((handle, proxy_env))
 }
 
+/// H5c: the session-end report for leaves that arrived after the seal.
+///
+/// Sealing is what lets a committed root be trusted, and the proxy's `Drop`-time
+/// trailing refusal aggregate *always* arrives after it - so those leaves are
+/// dropped by design. But "dropped by design" and "lost silently" read the same to
+/// an operator comparing the audit totals with what the proxy claims it accounted.
+/// `None` for a clean session so the normal case prints nothing.
+fn sealed_drop_line(dropped: u64) -> Option<String> {
+    (dropped > 0).then(|| format!("{dropped} audit leaf(s) dropped after seal"))
+}
+
 /// Commit this run's audit root + signature and release the writer (US-4a).
 ///
 /// Extracted from [`run_inner`] in P3.0 so **both** session paths seal the chain
@@ -1920,8 +2039,11 @@ fn seal_audit(
     let captured_root = writer.seal();
 
     // The proxy can still be winding down; its late appends are now dropped by the
-    // sealed writer instead of racing the file.
+    // sealed writer instead of racing the file. H5c: that drop is where the
+    // trailing refusal aggregate goes, so the count is read *after* this drop (the
+    // flush) and *before* the writer goes away.
     drop(proxy);
+    let dropped_after_seal = writer.dropped_after_seal();
 
     // Drop our Arc<AuditWriter>. The proxy thread's Arc may still be alive (it
     // was detached), but `AuditWriter::append` holds the file open with
@@ -1935,6 +2057,13 @@ fn seal_audit(
     {
         eprintln!("[saife] warning: failed to commit audit root: {e:#}");
         // The log is still readable; verify will report INCOMPLETE.
+    }
+
+    // H5c: the session is over, so this is the last chance to say that the chain is
+    // shorter than what the process tried to record. Silence here meant the proxy's
+    // "sums to the true total" invariant was already broken with no trace.
+    if let Some(line) = sealed_drop_line(dropped_after_seal) {
+        eprintln!("[saife] warning: {line}");
     }
 }
 
@@ -2000,3 +2129,233 @@ fn join_cmdline(tokens: &[String]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// L-O teardown tests: the per-session `.sandbox/<sid>` tree must not survive
+/// the run that created it.
+///
+/// Inline rather than in [`tests`] because it pins a function that only the
+/// teardown path calls, and because `tests.rs` is not this slice's file.
+#[cfg(test)]
+mod session_teardown_tests {
+    use super::*;
+
+    /// L-O (verdict: partial - the ACE half was implemented, this half was not):
+    /// teardown removes this session's `.sandbox/<sid>` tree, leaves a sibling
+    /// session's tree alone, and a second teardown is not an error.
+    #[test]
+    fn teardown_removes_the_session_sandbox_dir() {
+        let cwd = std::env::temp_dir().join(format!(
+            "saife-teardown-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(cwd.join(".sandbox").join("sid1").join("bin")).unwrap();
+        std::fs::write(cwd.join(".sandbox/sid1/bin/tool.exe"), b"x").unwrap();
+        std::fs::write(cwd.join(".sandbox/sid1/pyshim.py"), b"x").unwrap();
+        std::fs::create_dir_all(cwd.join(".sandbox").join("sid2")).unwrap();
+
+        remove_session_sandbox_dir(&cwd, "sid1").expect("teardown removes the session dir");
+
+        assert!(
+            !cwd.join(".sandbox").join("sid1").exists(),
+            "the session's .sandbox/<sid> tree must not survive teardown"
+        );
+        assert!(
+            cwd.join(".sandbox").join("sid2").exists(),
+            "another session's tree must not be touched"
+        );
+        // Idempotent: a run that never created the tree (or a second teardown)
+        // is success, not an error at the end of an otherwise clean run.
+        remove_session_sandbox_dir(&cwd, "sid1").expect("a second teardown is not an error");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+}
+
+/// Regression tests for the audit commit path (H5b/H5c).
+///
+/// They live here rather than in [`tests`] because they pin the ordering inside
+/// [`commit_audit_root`] and [`seal_audit`] - the two functions whose *sequence* of
+/// side effects is the safety property.
+#[cfg(test)]
+mod audit_commit_tests {
+    use super::*;
+
+    fn fresh_sid(label: &str) -> String {
+        format!(
+            "test-commit-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// One leaf in the log, returning its hash (the root that would be committed).
+    fn one_leaf_chain(sid: &str) -> String {
+        let writer = audit::AuditWriter::open(sid, false).unwrap();
+        let mut e = serde_json::Map::new();
+        e.insert("op".into(), serde_json::json!("CONNECT"));
+        e.insert("host".into(), serde_json::json!("commit.example"));
+        writer.append(e).unwrap();
+        writer.seal().expect("one leaf has a root")
+    }
+
+    fn cleanup(sid: &str) {
+        let log = audit::audit_log_path(sid);
+        let _ = std::fs::remove_file(&log);
+        for ext in ["root", "sig", "keyfp"] {
+            let p = log.with_extension(ext);
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_dir_all(&p);
+        }
+        let _ = std::fs::remove_file(audit::lock_path(&log));
+    }
+
+    /// H4 (verdict doc): the commit is the third way a sid reaches the
+    /// filesystem, so it must validate at its own door - before the key is
+    /// loaded and before anything is published.
+    #[test]
+    fn commit_audit_root_refuses_a_traversal_sid_and_writes_nothing() {
+        let pid = std::process::id();
+        let bad = format!("..\\..\\h4-commit-{pid}");
+        let log = audit::audit_log_path(&bad);
+        let root = log.with_extension("root");
+        let sig = log.with_extension("sig");
+        let keyfp = log.with_extension("keyfp");
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_file(&sig);
+        let _ = std::fs::remove_file(&keyfp);
+
+        let err = commit_audit_root(&bad, &"0".repeat(64))
+            .expect_err("a traversal sid must be refused before anything is written");
+        let text = format!("{err:#}");
+        assert!(
+            text.to_ascii_lowercase().contains("session id"),
+            "the refusal must name the session id, not a file error: {text}"
+        );
+        assert!(
+            !root.exists() && !sig.exists() && !keyfp.exists(),
+            "the refusal must write nothing"
+        );
+    }
+
+    /// M7 (verdict doc: confirmed). The commit must record the fingerprint of
+    /// the key that signed, so a later verify can report KEY_CHANGED instead of
+    /// silently calling every pre-rotation session a forgery.
+    #[test]
+    fn commit_audit_root_records_the_signing_key_fingerprint() {
+        let sid = fresh_sid("m7-keyfp");
+        let root = one_leaf_chain(&sid);
+
+        commit_audit_root(&sid, &root).expect("the commit succeeds");
+
+        let log = audit::audit_log_path(&sid);
+        let fp = std::fs::read_to_string(log.with_extension("keyfp")).unwrap();
+        let key = signing::KeyMaterial::load_existing().unwrap();
+        assert_eq!(fp, key.fingerprint(), "the recorded fingerprint must be the signer's");
+        assert_eq!(fp.len(), 64, "the fingerprint is a 32-byte SHA-256 in hex");
+        cleanup(&sid);
+    }
+
+    /// H5b (verdict doc: confirmed). The pair used to be written root-then-sig with
+    /// two `fs::write`s, so a kill in between left a new root with no (or an old)
+    /// signature - a state `verify` reported as `BAD_SIGNATURE`/`TAMPERED`, i.e. it
+    /// blamed the operator for a crash.
+    ///
+    /// The signature is now published first. This test blocks the root's
+    /// destination (a directory cannot be replaced by a file rename), so the commit
+    /// must fail *after* the signature landed and *before* the root did: exactly the
+    /// crash window, and the one `verify` reports as `INCOMPLETE`.
+    #[test]
+    fn commit_audit_root_publishes_the_signature_before_the_root() {
+        let sid = fresh_sid("order");
+        let root = one_leaf_chain(&sid);
+        let log = audit::audit_log_path(&sid);
+        let root_path = log.with_extension("root");
+        let sig_path = log.with_extension("sig");
+        std::fs::create_dir_all(&root_path).unwrap();
+
+        let err = commit_audit_root(&sid, &root)
+            .expect_err("a root that cannot be published must be reported, not swallowed");
+        assert!(
+            format!("{err:#}").to_ascii_lowercase().contains("root"),
+            "the error must name what failed: {err:#}"
+        );
+        assert!(
+            sig_path.exists(),
+            "the signature must be published before the root: a crash here leaves sig-only"
+        );
+        assert!(
+            std::fs::metadata(&root_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false),
+            "the root destination must be untouched"
+        );
+
+        cleanup(&sid);
+    }
+
+    /// The commit is a replace, not an append: a session that is re-run must not
+    /// leave the previous pair's bytes behind, and no temp sibling may survive.
+    #[test]
+    fn commit_audit_root_replaces_a_stale_pair_without_leaving_temporaries() {
+        let sid = fresh_sid("replace");
+        let root = one_leaf_chain(&sid);
+        let log = audit::audit_log_path(&sid);
+        std::fs::write(log.with_extension("root"), "0".repeat(64)).unwrap();
+        std::fs::write(log.with_extension("sig"), "0".repeat(128)).unwrap();
+
+        commit_audit_root(&sid, &root).expect("the commit replaces the stale pair");
+
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("root")).unwrap(),
+            root
+        );
+        let sig = std::fs::read_to_string(log.with_extension("sig")).unwrap();
+        assert_eq!(sig.len(), 128, "the stale signature was replaced");
+        assert!(
+            !matches!(
+                audit::verify::verify_inner(&sid).unwrap(),
+                audit::verify::VerifyOutcome::Tampered(_)
+            ),
+            "a committed pair must never verify as tampered"
+        );
+
+        let dir = log.parent().unwrap();
+        let prefix = log.file_name().unwrap().to_string_lossy().into_owned();
+        let leftovers: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix) && n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic publishes must not leave temp files behind: {leftovers:?}"
+        );
+
+        cleanup(&sid);
+    }
+
+    /// H5c (verdict doc: confirmed). `seal_audit` seals, then drops the proxy -
+    /// whose `Drop` flushes the trailing refusal aggregate into an already-sealed
+    /// chain. Those leaves are dropped so the file cannot grow past its root, but
+    /// the drop used to be silent, so the "sums to the true total" invariant broke
+    /// with nothing in the output to say so. The session-end line is that report.
+    #[test]
+    fn the_session_end_line_names_the_dropped_leaf_count() {
+        let line = sealed_drop_line(3).expect("a non-zero count must be reported");
+        assert_eq!(line, "3 audit leaf(s) dropped after seal");
+        assert!(
+            line.contains('3'),
+            "the line must name the count, got {line:?}"
+        );
+        assert!(
+            sealed_drop_line(0).is_none(),
+            "a clean session must not print a drop line"
+        );
+    }
+}

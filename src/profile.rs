@@ -239,6 +239,31 @@ pub const DEFAULT_PROMPT_TIMEOUT_SECS: u32 = crate::net::prompt::DEFAULT_PROMPT_
 /// default.
 pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = crate::net::DEFAULT_WORKLOAD_TIMEOUT_SECS;
 
+/// The current user's profile directory as the OS records it, via
+/// `SHGetKnownFolderPath(FOLDERID_Profile)` — deliberately NOT the
+/// `USERPROFILE` environment variable, which is caller-controlled (the
+/// integration harness repoints it at a throwaway directory). The credential
+/// denies below are rooted here so an env mismatch cannot move them off the
+/// real profile tree (M3, security review 2026-11-09).
+///
+/// `None` only if the known-folder lookup genuinely fails (no profile, or a
+/// broken shell install); callers fall back to `USERPROFILE` and warn then.
+pub(crate) fn system_profile_root() -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DEFAULT, None).ok()?;
+        if raw.is_null() {
+            return None;
+        }
+        // Lossy on purpose (see allowlist::known_folder_path_from_wide): an
+        // unpaired surrogate must not disable the credential denies.
+        let path = PathBuf::from(String::from_utf16_lossy(raw.as_wide()));
+        CoTaskMemFree(Some(raw.0 as *const _));
+        Some(path).filter(|p| p.is_absolute())
+    }
+}
+
 /// Directories denied for EVERY launch, on both backends, whatever the profile says.
 ///
 /// `.ssh`/`.aws`/`.azure`/`.gnupg` are credentials. `.saife` holds the plugin
@@ -247,32 +272,247 @@ pub const DEFAULT_WORKLOAD_TIMEOUT_SECS: u32 = crate::net::DEFAULT_WORKLOAD_TIME
 /// signing key in `%LOCALAPPDATA%\saife`. A profile that grants `$HOME` would
 /// otherwise let the workload rewrite a plugin that later runs outside the sandbox -
 /// a full escape, which is why this is a deny and not a documentation note.
+///
+/// **Rooted at the OS profile directory, not `USERPROFILE`** (M3, security review
+/// 2026-11-09): `USERPROFILE` is caller-controlled (the integration harness
+/// repoints it at a throwaway directory), so deriving the denies from it let a
+/// repointed value deny the wrong tree and an unset value remove every deny on
+/// BOTH backends. The base now comes from `SHGetKnownFolderPath(FOLDERID_Profile)`
+/// via [`system_profile_root`]; `USERPROFILE` is only a fallback when that lookup
+/// fails, and a warning is printed then so the degradation is visible. The `%LOCALAPPDATA%`
+/// part keeps its env-derived behaviour (the known-folder equivalent is not in
+/// this module yet).
 pub fn builtin_deny_dirs() -> Vec<std::path::PathBuf> {
+    builtin_deny_dirs_with(
+        credential_deny_base().as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+    )
+}
+
+/// Injectable form of [`builtin_deny_dirs`]: builds the six denies from `home`
+/// (the profile root) and the `%LOCALAPPDATA%\saife` control-plane tree from
+/// `local_appdata`. Both are `Option` so tests can pin the base without mutating
+/// the process environment (the suite has tests that repoint `USERPROFILE`, and a
+/// global env mutation would race them).
+pub(crate) fn builtin_deny_dirs_with(
+    home: Option<&std::path::Path>,
+    local_appdata: Option<&std::ffi::OsStr>,
+) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
+    if let Some(home) = home {
         for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
             out.push(home.join(dir));
         }
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
+    if let Some(local) = local_appdata.map(std::path::PathBuf::from) {
         out.push(local.join("saife"));
     }
     out
 }
 
+/// Credential FILES denied for EVERY launch, on both backends, whatever the
+/// profile says (M2: security-review 2026-11-09, verdict "partial").
+///
+/// `~/.gradle` and `~/.m2` are RWX in the shipped `jvm.json` because Gradle
+/// and Maven cannot run without their trees, and the credentials inside those
+/// trees (`gradle.properties`, `settings.xml`) must not ship with the grant.
+/// The same reasoning covers cargo's registry token, git's credential store,
+/// docker/kube client configs, the GitHub CLI's hosts file and the PyPI
+/// upload token. A whole-directory deny is the explicitly rejected
+/// alternative: the deny contains a grant, and both backends refuse such a
+/// session rather than silently narrowing it — `jvm.json` would become
+/// unlaunchable. Denying the descendant FILE keeps the directory grant
+/// working while the credential inside it stays unreadable.
+///
+/// **`~/.npmrc` is deliberately NOT on this list.** It is the credential —
+/// and also the configuration: npm must read it to find the registry and the
+/// token, so denying it breaks every authenticated npm install. The trade-off
+/// is documented in `profiles/README.md` instead of being "fixed" with a deny
+/// the workload would route around anyway (an unauthenticated registry reads
+/// everything else the token names).
+///
+/// Derived from the same OS-known profile root [`builtin_deny_dirs`] uses (M3),
+/// so the two deny sets can never disagree about whose tree they deny; `%APPDATA%`
+/// for `NuGet.Config` keeps its env-derived behaviour. If the base is `None`
+/// (the known-folder lookup failed AND `USERPROFILE` is unset) the
+/// home-rooted files are simply absent — the `%APPDATA%\NuGet` deny still ships.
+pub fn builtin_deny_files() -> Vec<std::path::PathBuf> {
+    builtin_deny_files_with(
+        credential_deny_base().as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+    )
+}
+
+/// Injectable form of [`builtin_deny_files`]: the home-rooted credential
+/// files under `home`, plus the `%APPDATA%\NuGet\NuGet.Config` deny under
+/// `appdata`. See [`builtin_deny_dirs_with`] for why the seam exists.
+pub(crate) fn builtin_deny_files_with(
+    home: Option<&std::path::Path>,
+    appdata: Option<&std::ffi::OsStr>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = home {
+        for (dir, file) in [
+            (Some(".gradle"), "gradle.properties"),
+            (Some(".m2"), "settings.xml"),
+            (Some(".cargo"), "credentials.toml"),
+            (None, ".git-credentials"),
+            (Some(".docker"), "config.json"),
+            (Some(".kube"), "config"),
+            // The gh CLI's config dir (`hosts.yml` holds the OAuth token);
+            // denied as the tree it is, which no shipped profile grants.
+            (Some(".config"), "gh"),
+            (None, ".pypirc"),
+        ] {
+            out.push(match dir {
+                Some(dir) => home.join(dir).join(file),
+                None => home.join(file),
+            });
+        }
+    }
+    if let Some(appdata) = appdata.map(std::path::PathBuf::from) {
+        out.push(appdata.join("NuGet").join("NuGet.Config"));
+    }
+    out
+}
+
+/// The base the credential denies are rooted at: the OS-known profile
+/// directory, falling back to `USERPROFILE` only if the known-folder lookup
+/// genuinely fails (and warning then, so the degradation is visible rather
+/// than silently re-opening the M3 hole).
+fn credential_deny_base() -> Option<std::path::PathBuf> {
+    if let Some(root) = system_profile_root() {
+        return Some(root);
+    }
+    let env = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+    if env.is_some() {
+        eprintln!(
+            "[saife] warning: SHGetKnownFolderPath(FOLDERID_Profile) failed; \
+             deriving the credential-deny base from %USERPROFILE% instead. \
+             A repointed or unset USERPROFILE will move the credential denies \
+             off the real profile tree (M3)."
+        );
+    }
+    env
+}
+
 /// Does `outer` contain `inner` (equal, or an ancestor)? Component-wise and
 /// case-insensitive, because Windows paths are. Used to refuse a session whose
 /// deny would swallow a grant instead of silently locking the workload out.
+///
+/// Comparison happens on [`path_key`], the same normalization the mxc backend's
+/// deny-vs-grant check uses (`crate::net::mxc::path_key`), so a deny spelled
+/// with a trailing dot/space, a `\\.`/`\\..` segment, a verbatim `\\?\` prefix
+/// or a forward-slash separator compares equal to the plain spelling — Win32
+/// treats all of these as one directory, and a pre-flight that does not is a
+/// grant that ships inside a deny. `path_key` is private to (and feature-gated
+/// behind) the mxc module, so the normalization is mirrored here; the two must
+/// stay in lock-step.
 pub fn path_covers(outer: &std::path::Path, inner: &std::path::Path) -> bool {
-    fn norm(p: &std::path::Path) -> String {
-        p.display()
-            .to_string()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase()
+    let outer = path_key(&outer.to_string_lossy());
+    let inner = path_key(&inner.to_string_lossy());
+    // An empty deny covers nothing: an empty deny is a mistake, not a wildcard.
+    !outer.is_empty()
+        && (inner == outer
+            || inner
+                .strip_prefix(&outer)
+                .is_some_and(|rest| rest.starts_with('\\')))
+}
+
+/// Normalized comparison key for a Windows path — a faithful mirror of
+/// [`crate::net::mxc::path_key`]. See that function's docs for the full list of
+/// spellings this unifies; the short version is: separators become `\\`, a
+/// verbatim/device prefix is dropped, each component loses its trailing dots
+/// and spaces (before the `.`/`..` tests), `.` is dropped and `..` collapses,
+/// and the whole key is upper-cased. Nothing here touches the filesystem.
+fn path_key(path: &str) -> String {
+    let unified = unify_path_prefix(path);
+    let (root, rest) = split_path_root(&unified);
+
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('\\') {
+        // Trailing spaces first, then the `.`/`..` tests, then the dots: Windows
+        // ignores a component's trailing dots and spaces *before* deciding what
+        // the component means, so `.. ` is the parent directory. Doing it in any
+        // other order dropped `.. ` (it trimmed to nothing).
+        let segment = segment.trim_end_matches(' ');
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            segments.pop();
+            continue;
+        }
+        let segment = trim_component(segment);
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
     }
-    let (o, i) = (norm(outer), norm(inner));
-    i == o || i.starts_with(&format!("{o}\\"))
+
+    let mut key = fold_case(&root);
+    for segment in segments {
+        if !key.is_empty() && !key.ends_with('\\') {
+            key.push('\\');
+        }
+        key.push_str(&fold_case(segment));
+    }
+    key
+}
+
+/// Separator unification plus verbatim/device-prefix removal. Mirror of
+/// `mxc::unify_path_prefix`.
+fn unify_path_prefix(path: &str) -> String {
+    let raw = path.trim().replace('/', "\\");
+    let bytes = raw.as_bytes();
+    if bytes.len() < 4
+        || !(bytes[..4].eq_ignore_ascii_case(br"\\?\")
+            || bytes[..4].eq_ignore_ascii_case(br"\\.\\"))
+    {
+        return raw;
+    }
+    let rest = &raw[4..];
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes.len() >= 4 && rest_bytes[..4].eq_ignore_ascii_case(br"UNC\") {
+        return format!("\\\\{}", &rest[4..]);
+    }
+    rest.to_string()
+}
+
+/// Split a unified path into its root (`C:`, `\\server\share`, `\`, or `""`)
+/// and the part below it. Mirror of `mxc::split_path_root`.
+fn split_path_root(path: &str) -> (String, &str) {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        let mut parts = path[2..].splitn(3, '\\');
+        let server = parts.next().unwrap_or_default();
+        let share = parts.next().unwrap_or_default();
+        let end = 2 + server.len() + usize::from(!share.is_empty()) + share.len();
+        let root = if share.is_empty() {
+            format!("\\\\{}", trim_component(server))
+        } else {
+            format!("\\\\{}\\{}", trim_component(server), trim_component(share))
+        };
+        return (root, &path[end..]);
+    }
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return (path[..2].to_string(), &path[2..]);
+    }
+    if bytes.first() == Some(&b'\\') {
+        return ("\\".to_string(), &path[1..]);
+    }
+    (String::new(), path)
+}
+
+/// One path component as Win32 compares it: trailing dots and spaces are not
+/// part of the name. Mirror of `mxc::trim_component`.
+fn trim_component(component: &str) -> &str {
+    component.trim_end_matches(['.', ' '])
+}
+
+/// Win32's case fold, as closely as `std` approximates it: Unicode uppercase.
+/// Mirror of `mxc::fold_case`.
+fn fold_case(text: &str) -> String {
+    text.to_uppercase()
 }
 
 /// Ceiling for both `limits` terms: 7 days
@@ -1390,9 +1630,17 @@ pub fn merge_filesystem(
     })
 }
 
-/// Parse `--allow path[:mode]`. Mode is one of read|write|readwrite|execute;
+/// Parse `--allow path[:mode]`. Mode is one of read|readonly|readwrite;
 /// default is readwrite (which grants RWX). The leading `C:` drive-letter
 /// colon is NOT treated as a separator.
+///
+/// `write` and `execute` are recognized and REFUSED by name (M1, security
+/// review 2026-11-09): this backend grants a path as ONE DACL mask, and a
+/// write-only or execute-only mask is not expressible safely on Windows —
+/// write-only still needs read to open what it wrote, and a loader needs
+/// read to map an image at all. Widening either to RWX (the old behaviour)
+/// silently granted read on a path the operator asked to keep unread, so
+/// the honest minimal option is the refusal, pointing at `:readwrite`.
 fn parse_allow_entry(entry: &str) -> Result<(String, String)> {
     // Find a colon that is not the drive-letter colon at index 1.
     let mode_colon = entry.rfind(':').filter(|&i| i != 1);
@@ -1401,10 +1649,21 @@ fn parse_allow_entry(entry: &str) -> Result<(String, String)> {
             let path = &entry[..i];
             let mode = entry[i + 1..].to_ascii_lowercase();
             match mode.as_str() {
-                "read" | "readonly" | "write" | "readwrite" | "execute" => {
-                    Ok((path.to_string(), mode))
-                }
-                _ => bail!("unknown --allow mode `{mode}` in `{entry}`"),
+                "read" | "readonly" | "readwrite" => Ok((path.to_string(), mode)),
+                "write" | "execute" => bail!(
+                    "mode `{mode}` in `{entry}` is not supported: on Windows a \
+                     write-only or execute-only mask cannot be granted safely \
+                     (a grant is one mask per path, and writing still needs \
+                     read to open what it wrote), so `:write` and `:execute` \
+                     would silently widen to full access; the supported modes \
+                     are `read` (read+execute) and `readwrite` (read+write+execute, \
+                     also the default for a bare `--allow <path>`)"
+                ),
+                _ => bail!(
+                    "unknown --allow mode `{mode}` in `{entry}`: the supported \
+                     modes are `read` (read+execute) and `readwrite` \
+                     (read+write+execute)"
+                ),
             }
         }
         None => Ok((entry.to_string(), "readwrite".to_string())),
@@ -1428,6 +1687,160 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1 red test: the pre-flight's deny-vs-grant compare must recognize the
+    /// deny directory under every spelling Win32 itself accepts — a trailing
+    /// dot, a trailing space, a `\.` segment, a `\..` that still resolves into
+    /// the tree, and a verbatim `\\?\` prefix. These name the same directory
+    /// the plain spelling does, so a deny spelled any of these ways must still
+    /// cover a grant inside it (and a normally-spelled deny must still cover
+    /// a grant spelled these ways). Before the normalization the compare was
+    /// textual, so all of these slipped past and the grant shipped.
+    #[test]
+    fn path_covers_normalizes_the_spellings_win32_accepts() {
+        let plain = std::path::Path::new(r"C:\Users\u\.ssh");
+        let key_inside = std::path::Path::new(r"C:\Users\u\.ssh\id_ed25519");
+
+        // A weirdly-spelled deny must still cover a grant inside ~/.ssh.
+        for deny_spelling in [
+            r"C:\Users\u\.ssh.",
+            r"C:\Users\u\.ssh ",
+            r"C:\Users\u\.ssh\.",
+            r"C:\Users\u\.ssh\..",
+            r"\\?\C:\Users\u\.ssh",
+        ] {
+            assert!(
+                path_covers(std::path::Path::new(deny_spelling), key_inside),
+                "deny spelled {deny_spelling:?} must cover the grant inside ~/.ssh"
+            );
+        }
+
+        // And the mirror direction: a normally-spelled deny must cover a grant
+        // spelled the ways Win32 accepts for ~/.ssh itself.
+        for grant_spelling in [
+            r"C:\Users\u\.ssh.",
+            r"C:\Users\u\.ssh ",
+            r"C:\Users\u\.ssh\.",
+            r"\\?\C:\Users\u\.ssh",
+            r"c:/users/u/.ssh",
+        ] {
+            assert!(
+                path_covers(plain, std::path::Path::new(grant_spelling)),
+                "grant spelled {grant_spelling:?} is inside the deny and must be refused"
+            );
+        }
+
+        // Negative controls: a sibling sharing the prefix is NOT inside.
+        for sibling in [
+            r"C:\Users\u\.ssh2",
+            r"C:\Users\u\.ssh2\k",
+            r"C:\Users\u\.ss",
+        ] {
+            assert!(
+                !path_covers(plain, std::path::Path::new(sibling)),
+                "{sibling:?} is a sibling, not a descendant"
+            );
+        }
+        // `..` resolving OUT of the deny is not covered either.
+        assert!(!path_covers(
+            plain,
+            std::path::Path::new(r"C:\Users\u\.ssh\..")
+        ));
+    }
+
+    /// M3: a repointed `USERPROFILE` must not move the credential denies.
+    /// The base is the OS-known profile directory, so the denies follow the
+    /// REAL tree whether `USERPROFILE` points elsewhere or is unset. Exercised
+    /// through the injectable seam so the test never mutates the process
+    /// environment (the suite has tests that repoint `USERPROFILE`, and a
+    /// global mutation would race them). The fake tree is explicitly asserted
+    /// ABSENT so the pre-fix "follows the env" behaviour cannot regress.
+    #[test]
+    fn m3_credential_denies_follow_the_os_profile_not_userprofile() {
+        let Some(real) = super::system_profile_root() else {
+            // SHGetKnownFolderPath is expected to work on every Windows host
+            // this crate runs on; if it ever does not, the fallback path has
+            // its own warning, and this test is moot. Skip loudly rather than
+            // pass vacuously.
+            eprintln!(
+                "[test] SHGetKnownFolderPath(FOLDERID_Profile) unavailable on this host; M3 seam test skipped"
+            );
+            return;
+        };
+        let fake = std::path::PathBuf::from(r"C:\Users\does-not-exist-fake-m3");
+
+        let real_dirs = builtin_deny_dirs_with(Some(&real), None);
+        let fake_dirs = builtin_deny_dirs_with(Some(&fake), None);
+        let none_dirs = builtin_deny_dirs_with(None, None);
+
+        assert_eq!(
+            real_dirs.len(),
+            5,
+            "the five home-rooted dir denies (.ssh/.aws/.azure/.gnupg/.saife): {real_dirs:?}"
+        );
+        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
+            assert!(
+                real_dirs.iter().any(|d| d == &real.join(dir)),
+                "the real profile must deny ~/{dir}: {real_dirs:?}"
+            );
+        }
+        assert_eq!(
+            fake_dirs.len(),
+            5,
+            "the fake root denies a different tree: {fake_dirs:?}"
+        );
+        assert!(
+            !fake_dirs.iter().any(|d| d.starts_with(&real)),
+            "the fake tree must not shadow the real denies: {fake_dirs:?}"
+        );
+        assert!(
+            none_dirs.is_empty(),
+            "a None base yields no home-rooted denies"
+        );
+
+        // The seam is env-independent by construction; the public entry point
+        // is the wiring proof. After M3 it derives the base from the OS known
+        // folder (== `real`) and never reads USERPROFILE, so a concurrent test
+        // repointing USERPROFILE cannot race this call.
+        let dirs = builtin_deny_dirs();
+        assert!(
+            dirs.iter().any(|d| d == &real.join(".ssh")),
+            "builtin_deny_dirs() must root at the OS profile, not USERPROFILE: {dirs:?}"
+        );
+        let files = builtin_deny_files();
+        assert!(
+            files
+                .iter()
+                .any(|f| f == &real.join(".gradle").join("gradle.properties")),
+            "builtin_deny_files() must root at the OS profile too: {files:?}"
+        );
+    }
+
+    /// M3: an UNSET `USERPROFILE` must not remove the credential denies. The
+    /// seam, with both bases supplied directly, yields the full deny set with
+    /// no dependency on any environment variable — proving the denies survive
+    /// a missing USERPROFILE without mutating the process env.
+    #[test]
+    fn m3_credential_denies_survive_an_unset_userprofile() {
+        let Some(real) = super::system_profile_root() else {
+            eprintln!(
+                "[test] SHGetKnownFolderPath(FOLDERID_Profile) unavailable on this host; M3 seam test skipped"
+            );
+            return;
+        };
+        let dirs = builtin_deny_dirs_with(Some(&real), std::env::var_os("LOCALAPPDATA").as_deref());
+        assert!(
+            dirs.iter().any(|d| d == &real.join(".ssh")),
+            "the credential dir denies must be present with no env input: {dirs:?}"
+        );
+        let files = builtin_deny_files_with(Some(&real), std::env::var_os("APPDATA").as_deref());
+        assert!(
+            files
+                .iter()
+                .any(|f| f == &real.join(".gradle").join("gradle.properties")),
+            "the credential file denies must be present with no env input: {files:?}"
+        );
+    }
 
     #[test]
     fn expand_basic() {
@@ -1605,6 +2018,84 @@ mod tests {
     #[test]
     fn parse_allow_bad_mode() {
         assert!(parse_allow_entry("C:/foo:bad").is_err());
+    }
+
+    /// M1 (security review 2026-11-09, confirmed): `--allow <path>:write` and
+    /// `:execute` were parsed and then folded into the RWX list, while
+    /// `docs/USER-GUIDE.md` promised "write only". Neither mask is expressible
+    /// safely here — a DACL grant is one mask per path, write-only still needs
+    /// read to open what it wrote, and execute-without-read cannot load an
+    /// image on Windows — so they are REFUSED by name instead of silently
+    /// widened to RWX.
+    #[test]
+    fn parse_allow_refuses_write_and_execute_with_the_supported_modes() {
+        for mode in ["write", "execute"] {
+            let err = parse_allow_entry(&format!("C:/foo:{mode}"))
+                .expect_err("a write-only/execute-only mode must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("`{mode}`")) && msg.contains("not supported"),
+                "the refusal must name the mode it rejected: {msg}"
+            );
+            assert!(
+                msg.contains("readwrite") && msg.contains("read"),
+                "the refusal must name the supported modes (read, readwrite): {msg}"
+            );
+            assert!(
+                msg.contains("Windows"),
+                "the refusal must say WHY it cannot be honoured: {msg}"
+            );
+            assert!(
+                msg.contains("C:/foo"),
+                "the refusal must quote the entry it rejected: {msg}"
+            );
+        }
+    }
+
+    /// The supported spellings still parse, and they keep their documented
+    /// meaning: `:read`/`:readonly` land on the read-only list (RX),
+    /// `:readwrite` and a bare `--allow` land on the writable list (RWX).
+    #[test]
+    fn allow_modes_map_to_the_documented_grant_lists() {
+        let fs = merge_filesystem(
+            &FilesystemSlice::default(),
+            false,
+            &[
+                "C:/rw:readwrite".into(),
+                "C:/r:read".into(),
+                "C:/ro:readonly".into(),
+                "C:/bare".into(),
+            ],
+            &[],
+            Path::new("C:/proj"),
+        )
+        .expect("the supported modes must parse");
+        let allow: Vec<String> = fs.allow.iter().map(|p| p.display().to_string()).collect();
+        let ro: Vec<String> = fs
+            .read_only
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(allow, vec![r"C:\rw".to_string(), r"C:\bare".to_string()]);
+        assert_eq!(ro, vec![r"C:\r".to_string(), r"C:\ro".to_string()]);
+    }
+
+    /// `merge_filesystem` is the CLI boundary, so the refusal must happen
+    /// there too — not only in the parser's own unit test.
+    #[test]
+    fn merge_filesystem_refuses_a_write_only_allow() {
+        let err = merge_filesystem(
+            &FilesystemSlice::default(),
+            false,
+            &["C:/foo:write".into()],
+            &[],
+            Path::new("C:/proj"),
+        )
+        .expect_err("a write-only --allow must be refused at the CLI boundary");
+        assert!(
+            format!("{err:#}").contains("not supported"),
+            "the refusal must be the named one: {err:#}"
+        );
     }
 
     #[test]

@@ -18,6 +18,6 @@
     "secrets": [],
     "config": {
         "gateway_file": "%USERPROFILE%\\.saife\\ssh-gateway.json",
-        "max_concurrent": 4
+        "max_concurrent": "4"
     }
 }

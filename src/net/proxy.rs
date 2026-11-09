@@ -146,6 +146,12 @@ pub struct ProxyConfig {
     /// only. Parsed once by the supervisor at startup and shared by
     /// every handler through the `Arc`.
     pub upstream: Option<Arc<UpstreamDialer>>,
+    /// M9: allow private/LAN destinations on the DIRECT path (`--allow-lan`).
+    /// Default `false`: an allow-listed name resolving to RFC 1918, CGNAT or
+    /// ULA is denied. Set only by an operator who needs LAN reach (a bridge to
+    /// `host.docker.internal`, a dev server on the LAN); loopback and
+    /// link-local stay refused regardless.
+    pub allow_lan: bool,
     pub writer: Arc<AuditWriter>,
     /// Prompt/intent/learned wiring (Task 3.6). Built by the supervisor
     /// before `spawn`; see [`PromptGate`].
@@ -196,6 +202,12 @@ struct ConnCtx {
     blocked: bool,
     writer: Arc<AuditWriter>,
     upstream: Option<Arc<UpstreamDialer>>,
+    /// M9: relaxed LAN deny on the direct path (`--allow-lan`).
+    allow_lan: bool,
+    /// M8: a per-listener counter that issues a unique id for every request.
+    /// Each connection's leaves share the id so a reader can tell a request's
+    /// terminal disposition from a pair that records both `allow` and `deny`.
+    next_request_id: AtomicU64,
     prompt: PromptGate,
     /// Per-launch attribution counters (ADR-0004 guardrail 1). Shared with the
     /// handle, so the launch path reads exactly what this listener counted.
@@ -354,6 +366,12 @@ impl RefusalBudget {
 }
 
 impl ConnCtx {
+    /// The next unique request id (M8). Monotonic per listener; ids are unique
+    /// within one audit log, which is the only scope a reader groups them in.
+    fn next_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// Write the trailing aggregate of every spent refusal budget.
     ///
     /// Best effort, like every other append on this listener: the writer is
@@ -375,6 +393,8 @@ impl ConnCtx {
                     None,
                     false,
                     Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
+                    // A trailing aggregate is not one request (M8).
+                    None,
                 );
             }
         }
@@ -400,6 +420,13 @@ fn emit_connect(
     scope: Option<&str>,
     persisted: bool,
     suppressed: Option<u32>,
+    // M8 (security review 2026-11-09): the request this leaf belongs to. Every
+    // leaf one connection produces carries the same id, so a reader can tell a
+    // request's TERMINAL disposition from a pair that says both (an admission
+    // `allow` followed by a post-dial `deny`). `None` for a leaf that is not a
+    // single request (the credential-less refusal budgets, a trailing
+    // aggregate).
+    req_id: Option<u64>,
 ) -> Result<()> {
     use serde_json::{Map, json};
     let mut e = Map::new();
@@ -421,6 +448,9 @@ fn emit_connect(
     // that trade: the leaf was always open-shaped (a reader takes the fields it
     // knows), and the alternative is a field whose meaning depends on `reason`.
     e.insert("suppressed".into(), json!(suppressed));
+    // M8: the request this leaf belongs to; `null` for a leaf that is not one
+    // request. A first-class integer, never packed into `scope`.
+    e.insert("req_id".into(), json!(req_id));
     writer.append(e)?;
     Ok(())
 }
@@ -438,6 +468,10 @@ fn emit_facade(
     disposition: &str,
     reason: Option<&str>,
     status: Option<u16>,
+    // M8: the request this leaf belongs to, exactly as the CONNECT leaves carry
+    // it - one facade request is one connection, so the id groups a pair the
+    // same way.
+    req_id: Option<u64>,
 ) -> Result<()> {
     use serde_json::{Map, json};
     let mut e = Map::new();
@@ -446,6 +480,7 @@ fn emit_facade(
     e.insert("path".into(), json!(path));
     e.insert("disposition".into(), json!(disposition));
     e.insert("reason".into(), json!(reason));
+    e.insert("req_id".into(), json!(req_id));
     // The sidecar's own HTTP status. `disposition: allow` means the proxy
     // forwarded the call; a plugin refusal (403/502/503) is visible here and
     // nowhere else in the chain - without it every plugin refusal read "allow".
@@ -1022,6 +1057,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         blocked,
         writer,
         upstream,
+        allow_lan,
         prompt,
         facade,
     } = cfg;
@@ -1044,6 +1080,8 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         blocked,
         writer,
         upstream,
+        allow_lan,
+        next_request_id: AtomicU64::new(0),
         prompt,
         counters: Arc::clone(&counters),
         no_token: RefusalBudget::new(),
@@ -1474,7 +1512,11 @@ fn denied_by(reason: DenyReason) -> Decision {
 
 /// Best-effort audit emission for one decision (D-5.2 kept the wrapper
 /// non-fatal: an audit I/O error must not change the policy answer).
-fn emit_decision(writer: &AuditWriter, host: &str, port: u16, d: &Decision) {
+///
+/// M8: `req_id` correlates the leaves one request produces - the admission
+/// `allow` and a later post-dial `deny` share it, so `audit show` can report
+/// the request's TERMINAL disposition instead of counting both.
+fn emit_decision(writer: &AuditWriter, host: &str, port: u16, d: &Decision, req_id: Option<u64>) {
     let _ = emit_connect(
         writer,
         host,
@@ -1486,6 +1528,7 @@ fn emit_decision(writer: &AuditWriter, host: &str, port: u16, d: &Decision) {
         d.persisted,
         // A decision is one request: nothing is suppressed about it.
         None,
+        req_id,
     );
 }
 
@@ -1871,7 +1914,11 @@ fn parse_host_ip(host: &str) -> Option<IpAddr> {
 ///
 /// Pure over `&[SocketAddr]`, so the leg is testable with any address list
 /// (no resolver seam needed) and the production dial path calls exactly this.
-fn pinned_addrs_hard_denied(addrs: &[SocketAddr], permit_loopback: bool) -> Option<Decision> {
+fn pinned_addrs_hard_denied(
+    addrs: &[SocketAddr],
+    permit_loopback: bool,
+    permit_lan: bool,
+) -> Option<Decision> {
     // [G-44]: the proxy must not become a tunnel to host services, and a host-STRING
     // check cannot enforce that - `localtest.me` and `127.0.0.1.nip.io` are public
     // DNS names that resolve to 127.0.0.1, so the operator is shown a harmless name
@@ -1890,6 +1937,18 @@ fn pinned_addrs_hard_denied(addrs: &[SocketAddr], permit_loopback: bool) -> Opti
     }
     if pinned_addrs_contain_hard_denied(addrs) {
         return Some(denied_by(DenyReason::DeniedCidr));
+    }
+    // M9 (security review 2026-11-09): private/LAN ranges (RFC 1918, CGNAT,
+    // ULA) are denied on RESOLVED addresses by default, on the DIRECT path
+    // only. An allow-listed wildcard name resolving here would otherwise reach
+    // the LAN as allow/allowlist. This is a separate predicate from the
+    // hard-deny set so the escape hatch (`--allow-lan`) can relax exactly this
+    // leg: loopback and link-local stay refused regardless. The reason token is
+    // distinct so an operator can tell the two apart in the chain.
+    if !permit_lan && addrs.iter().any(|sa| matcher::is_lan_range_ip(sa.ip())) {
+        let mut d = denied_by(DenyReason::DeniedCidr);
+        d.reason = Some("lan_refused".into());
+        return Some(d);
     }
     None
 }
@@ -1922,6 +1981,20 @@ const MAX_INFLIGHT_CONNECTIONS: usize = 32;
 /// silent client parks a task forever - the same local DoS by a slower route.
 const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Bound on reading a declared request body (L-C, security review 2026-11-09).
+/// A client that declares a body and sends nothing would otherwise park every
+/// permit for the session (self-DoS): 128 authenticated connections declaring
+/// `Content-Length` and idling pin the whole inflight budget. Consistent with
+/// [`HEAD_READ_TIMEOUT`] - a body is the same kind of slow-read vector a head
+/// is, and the cap sits far above the largest legal intent/facade body.
+#[cfg(not(test))]
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Test builds use a small cap so the refusal is observable without waiting
+/// 15 s; the read path is identical, only the constant differs (same pattern
+/// as [`MAX_INFLIGHT_CONNECTIONS`]).
+#[cfg(test)]
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Offset just past the first `\r\n\r\n` in `buf`, if the head is complete.
 fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
@@ -1938,6 +2011,15 @@ fn parse_connect_target(target: &str) -> Option<(String, u16)> {
         Some((h, p)) => (h, p),
         None => (target, "443"),
     };
+    // L-A (security review 2026-11-09): reject userinfo. `CONNECT user@host:443`
+    // keeps the `user@` prefix into `decide()` and the resolver; it dies there
+    // today, but "the admitted string == the dialed string" should be explicit,
+    // not a resolver accident. The absolute-form parser already strips userinfo,
+    // so this keeps the two paths consistent. `rsplit_once(':')` puts the whole
+    // `user@host` in `host`, so a single `@` check covers it.
+    if host.contains('@') {
+        return None;
+    }
     let bracketed = host.starts_with('[') && host.ends_with(']');
     if host.is_empty() || (host.contains(':') && !bracketed) {
         return None;
@@ -2000,6 +2082,10 @@ async fn dial_upstream<F, Fut>(
     // dial-mechanics tests pass `true` because their only upstream is a local
     // stand-in server; that is a property of the test fixture, not of the product.
     permit_loopback: bool,
+    // M9: `false` unless the operator passed `--allow-lan`. Same pattern as
+    // `permit_loopback` - the test fixtures dial stand-in servers on the host's
+    // own LAN address, which is a property of the fixture, not of the product.
+    permit_lan: bool,
     lookup: F,
 ) -> Result<TcpStream, DialFailure>
 where
@@ -2043,7 +2129,7 @@ where
     // The pinned IP set gets the hard-deny check too: a hostname that resolves
     // into a hard-denied range is refused before any dial (fail-closed
     // [G-12, G-45]).
-    if let Some(d) = pinned_addrs_hard_denied(&addrs, permit_loopback) {
+    if let Some(d) = pinned_addrs_hard_denied(&addrs, permit_loopback, permit_lan) {
         return Err(DialFailure::Denied(d));
     }
 
@@ -2171,6 +2257,8 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         None,
                         false,
                         None,
+                        // A credential-less refusal is not one request (M8).
+                        None,
                     );
                 }
                 RefusalLeaf::Aggregate { suppressed } => {
@@ -2196,6 +2284,8 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         None,
                         false,
                         Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
+                        // An aggregate is not one request (M8).
+                        None,
                     );
                 }
                 RefusalLeaf::Nothing => {}
@@ -2242,6 +2332,8 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         None,
                         false,
                         None,
+                        // A credential-less refusal is not one request (M8).
+                        None,
                     );
                 }
                 RefusalLeaf::Aggregate { suppressed } => {
@@ -2255,6 +2347,8 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         None,
                         false,
                         Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
+                        // An aggregate is not one request (M8).
+                        None,
                     );
                 }
                 RefusalLeaf::Nothing => {}
@@ -2263,6 +2357,12 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             return Ok(());
         }
     }
+
+    // M8: one id per authenticated connection. Every leaf this request
+    // produces (the admission decision and any post-dial denial) carries it, so
+    // a reader can tell a request's terminal disposition from a pair that says
+    // both. Refusal-budget leaves above are not one request and carry none.
+    let req_id = ctx.next_request_id();
 
     if method != "CONNECT" {
         return handle_non_connect(sock, ctx, method, target, head, leftover).await;
@@ -2295,6 +2395,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             "deny",
             Some("facade_requires_http"),
             None,
+            Some(req_id),
         );
         write_response(
             &mut sock,
@@ -2320,19 +2421,27 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
         // Audit BEFORE responding: the append is synchronous, so whoever
         // observes the 403 also observes the event (no flush ordering to
         // guess).
-        emit_decision(&ctx.writer, &host, port, &decision);
+        emit_decision(&ctx.writer, &host, port, &decision, Some(req_id));
         respond_deny(&mut sock, &host, port, &decision).await?;
         return Ok(());
     }
-    emit_decision(&ctx.writer, &host, port, &decision);
+    emit_decision(&ctx.writer, &host, port, &decision, Some(req_id));
 
     // Admission done — dial (Step 2): chained through the upstream
     // proxy, or DNS-pinned + Happy Eyeballs on the direct path.
-    let dialed = dial_upstream(ctx.upstream.as_deref(), &host, port, false, system_lookup).await;
+    let dialed = dial_upstream(
+        ctx.upstream.as_deref(),
+        &host,
+        port,
+        false,
+        ctx.allow_lan,
+        system_lookup,
+    )
+    .await;
     let mut upstream_stream = match dialed {
         Ok(s) => s,
         Err(DialFailure::Denied(d)) => {
-            emit_decision(&ctx.writer, &host, port, &d);
+            emit_decision(&ctx.writer, &host, port, &d, Some(req_id));
             respond_deny(&mut sock, &host, port, &d).await?;
             return Ok(());
         }
@@ -2354,7 +2463,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             // admission leaf — consumers must not assume the pair is
             // universal.
             eprintln!("[proxy] upstream chaining to {host}:{port} via {endpoint} failed: {error}");
-            emit_decision(&ctx.writer, &host, port, &upstream_error_decision());
+            emit_decision(&ctx.writer, &host, port, &upstream_error_decision(), Some(req_id));
             respond_upstream_error(&mut sock, &body).await;
             return Ok(());
         }
@@ -2463,18 +2572,30 @@ fn url_query_param(query: &str, key: &str) -> Option<String> {
 /// terminator, plus the remainder from the socket, bounded by the
 /// declared Content-Length. The cap sits far above the largest legal
 /// intent body; anything past it fails JSON parsing with a 400 anyway.
+///
+/// L-C (security review 2026-11-09): the read is bounded by
+/// [`BODY_READ_TIMEOUT`]. A client that declares a body and sends nothing
+/// would otherwise park every permit for the session - 128 such connections
+/// pin the whole inflight budget with no bytes on the wire. On expiry the
+/// empty body is returned and the caller proceeds to close the connection, so
+/// a stalled body is closed, not parked.
 async fn read_body(sock: &mut TcpStream, head: &str, leftover: &[u8]) -> Vec<u8> {
     const BODY_CAP: usize = 4096;
     let want = content_length(head).unwrap_or(0).min(BODY_CAP);
-    let mut body = leftover[..leftover.len().min(want)].to_vec();
-    while body.len() < want {
-        let mut chunk = vec![0u8; (want - body.len()).min(1024)];
-        match sock.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => body.extend_from_slice(&chunk[..n]),
+    let seeded = leftover[..leftover.len().min(want)].to_vec();
+    tokio::time::timeout(BODY_READ_TIMEOUT, async {
+        let mut body = seeded;
+        while body.len() < want {
+            let mut chunk = vec![0u8; (want - body.len()).min(1024)];
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
         }
-    }
-    body
+        body
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// POST /sandbox/intent: the agent (re-)declares its intent for a
@@ -3178,7 +3299,18 @@ fn relayed_response_head(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(head.len() + 19 + rest.len());
     for (index, line) in head_lines(head).into_iter().enumerate() {
         // Index 0 is the status line, which is always relayed as it arrived.
-        if index > 0 && (line.is_empty() || response_field_named(line, b"connection")) {
+        // L-B: `Proxy-Authenticate` / `Proxy-Authentication-Info` are proxy-hop
+        // fields, not origin fields. They were relayed on every status except
+        // exactly 407, so an origin could answer 200/401 with a challenge and
+        // make an honest client replay this session's token to it. Stripped
+        // from every relayed head; the 407 rewrite is unchanged, it just no
+        // longer needs to be the only guard.
+        if index > 0
+            && (line.is_empty()
+                || response_field_named(line, b"connection")
+                || response_field_named(line, b"proxy-authenticate")
+                || response_field_named(line, b"proxy-authentication-info"))
+        {
             continue;
         }
         out.extend_from_slice(line);
@@ -3308,6 +3440,10 @@ fn facade_action(
 /// the deputy. `tokio::io::copy` streams the response instead of buffering it: a
 /// 60 KB page is one pass-through, and a later SSE body would arrive as it is
 /// produced rather than at the end.
+// The positional signature mirrors `emit_connect`'s (sock, writer, mount, target,
+// method, wire path, body, req id, audit path): folding it into a struct would
+// put eight loosely-typed strings into one bag, so the lint is suppressed here.
+#[allow(clippy::too_many_arguments)]
 async fn relay_facade(
     sock: &mut TcpStream,
     writer: &AuditWriter,
@@ -3316,6 +3452,11 @@ async fn relay_facade(
     method: &str,
     path: &str,
     body: &[u8],
+    req_id: Option<u64>,
+    // M15: what the AUDIT leaf records - the origin-form the workload sent,
+    // not the query-stripped path the sidecar receives. The chain answers
+    // "what was asked for"; the wire carries what the manifest declared.
+    audit_path: &str,
 ) -> Result<()> {
     let mut upstream = match TcpStream::connect(("127.0.0.1", target.port)).await {
         Ok(stream) => stream,
@@ -3324,10 +3465,11 @@ async fn relay_facade(
             let _ = emit_facade(
                 writer,
                 mount,
-                Some(path),
+                Some(audit_path),
                 "deny",
                 Some("facade_sidecar_unreachable"),
                 None,
+                req_id,
             );
             write_response(
                 sock,
@@ -3354,10 +3496,11 @@ async fn relay_facade(
         let _ = emit_facade(
             writer,
             mount,
-            Some(path),
+            Some(audit_path),
             "deny",
             Some("facade_sidecar_write_failed"),
             None,
+            req_id,
         );
         return Ok(());
     }
@@ -3365,10 +3508,11 @@ async fn relay_facade(
         let _ = emit_facade(
             writer,
             mount,
-            Some(path),
+            Some(audit_path),
             "deny",
             Some("facade_sidecar_write_failed"),
             None,
+            req_id,
         );
         return Ok(());
     }
@@ -3396,13 +3540,22 @@ async fn relay_facade(
         let _ = emit_facade(
             writer,
             mount,
-            Some(path),
+            Some(audit_path),
             "deny",
             Some("facade_sidecar_response_unparsable"),
             None,
+            req_id,
         );
     } else {
-        let _ = emit_facade(writer, mount, Some(path), "allow", None, status);
+        let _ = emit_facade(
+            writer,
+            mount,
+            Some(audit_path),
+            "allow",
+            None,
+            status,
+            req_id,
+        );
     }
     if !head.is_empty() && sock.write_all(&head).await.is_err() {
         return Ok(());
@@ -3419,6 +3572,9 @@ async fn handle_forward(
     head: &str,
     leftover: &[u8],
 ) -> Result<()> {
+    // M8: one id per connection, exactly as the CONNECT leg issues one. The
+    // facade denial leaves and the decision leaves for this request share it.
+    let req_id = ctx.next_request_id();
     let fwd = match parse_absolute_target(target) {
         AbsoluteTarget::Forward(fwd) => fwd,
         AbsoluteTarget::HttpsNeedsConnect => {
@@ -3544,6 +3700,7 @@ async fn handle_forward(
                 "deny",
                 Some("facade_unknown_mount"),
                 None,
+                Some(req_id),
             );
             write_response(
                 &mut sock,
@@ -3563,6 +3720,7 @@ async fn handle_forward(
                 "deny",
                 Some("facade_method_invalid"),
                 None,
+                Some(req_id),
             );
             write_response(
                 &mut sock,
@@ -3582,6 +3740,7 @@ async fn handle_forward(
                 "deny",
                 Some("facade_operation_not_declared"),
                 None,
+                Some(req_id),
             );
             write_response(
                 &mut sock,
@@ -3604,6 +3763,7 @@ async fn handle_forward(
                     "deny",
                     Some("facade_body_too_large"),
                     None,
+                    Some(req_id),
                 );
                 write_response(
                     &mut sock,
@@ -3615,14 +3775,27 @@ async fn handle_forward(
                 return Ok(());
             }
             let body = read_body(&mut sock, head, leftover).await;
+            // M15 (security review 2026-11-09): relay the exact path that
+            // matched - the query-stripped one. The declaration was consulted
+            // on `facade_action`'s stripped path ("a manifest declares paths,
+            // not queries"), so forwarding the full origin-form would send the
+            // sidecar a request the manifest never declared (and the shipped
+            // sidecars 404 on any query).
+            let matched_path = fwd
+                .origin_form
+                .split('?')
+                .next()
+                .unwrap_or(&fwd.origin_form);
             relay_facade(
                 &mut sock,
                 &ctx.writer,
                 &mount,
                 &target,
                 method,
-                fwd.origin_form.as_str(),
+                matched_path,
                 &body,
+                Some(req_id),
+                fwd.origin_form.as_str(),
             )
             .await?;
             return Ok(());
@@ -3636,24 +3809,25 @@ async fn handle_forward(
 
     let decision = decide(&ctx, &fwd.host, fwd.port).await;
     if !decision.allowed {
-        emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision);
+        emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision, Some(req_id));
         respond_deny(&mut sock, &fwd.host, fwd.port, &decision).await?;
         return Ok(());
     }
-    emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision);
+    emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision, Some(req_id));
 
     let mut upstream = match dial_upstream(
         ctx.upstream.as_deref(),
         &fwd.host,
         fwd.port,
         false,
+        ctx.allow_lan,
         system_lookup,
     )
     .await
     {
         Ok(stream) => stream,
         Err(DialFailure::Denied(d)) => {
-            emit_decision(&ctx.writer, &fwd.host, fwd.port, &d);
+            emit_decision(&ctx.writer, &fwd.host, fwd.port, &d, Some(req_id));
             respond_deny(&mut sock, &fwd.host, fwd.port, &d).await?;
             return Ok(());
         }
@@ -3674,7 +3848,7 @@ async fn handle_forward(
                 "[proxy] upstream chaining to {}:{} via {endpoint} failed: {error}",
                 fwd.host, fwd.port
             );
-            emit_decision(&ctx.writer, &fwd.host, fwd.port, &upstream_error_decision());
+            emit_decision(&ctx.writer, &fwd.host, fwd.port, &upstream_error_decision(), Some(req_id));
             respond_upstream_error(&mut sock, &body).await;
             return Ok(());
         }

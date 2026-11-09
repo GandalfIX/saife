@@ -516,6 +516,45 @@ impl UpstreamDialer {
         self.proxy_url.endpoint()
     }
 
+    /// Is the configured upstream a loopback endpoint (`localhost`, a
+    /// `127.0.0.0/8` or `::1` address, or the unspecified address)?
+    ///
+    /// H2 (security review 2026-11-09): under chaining the destination
+    /// hard-deny never runs on saife's side — the upstream resolves the name
+    /// ([G-22]) — so the "no tunnel to host services" guarantee ([G-44]) is
+    /// only as strong as the proxy's own policy. For a remote corporate proxy
+    /// that is a defensible division of labour. For the loopback bridge this
+    /// module itself recommends (`cntlm`/`px` on `127.0.0.1`, which has no
+    /// rebinding defence) it is not, and the caller must warn so the operator
+    /// knows the bridge owns the destination policy.
+    pub fn is_loopback_endpoint(&self) -> bool {
+        self.proxy_url.host.eq_ignore_ascii_case("localhost")
+            || self
+                .proxy_url
+                .host
+                .parse::<std::net::IpAddr>()
+                .map(crate::net::matcher::is_loopback_or_unspecified)
+                .unwrap_or(false)
+    }
+
+    /// The startup warning for a loopback upstream bridge (H2), or `None` for
+    /// a remote upstream. Named in diagnostics so an operator can grep for it;
+    /// the wording states exactly what is NOT enforced by saife and who owns
+    /// the destination policy instead.
+    pub fn loopback_bridge_warning(&self) -> Option<String> {
+        if !self.is_loopback_endpoint() {
+            return None;
+        }
+        Some(format!(
+            "upstream proxy {} is a loopback bridge: chained dials resolve the \
+             destination at the bridge, so saife's destination hard-deny \
+             (no-tunnel-to-host-services, link-local, LAN ranges) is NOT \
+             applied to them - the bridge must enforce that policy itself. \
+             A remote upstream proxy is trusted to do the same.",
+            self.proxy_endpoint()
+        ))
+    }
+
     /// Dial `host:port`.
     ///
     /// `pinned_addrs` is used **only** on the `NO_PROXY` (direct) path.
@@ -1451,3 +1490,60 @@ mod tests {
         assert!(!shown.contains("proxy"), "message blames a proxy: {shown}");
     }
 }
+
+    // ------------------------------------------------------------------
+    // H2 (security review 2026-11-09): the loopback-bridge warning.
+    // ------------------------------------------------------------------
+
+    /// H2: for a REMOTE upstream, [G-22]'s division of labour is defensible
+    /// (the proxy resolves the name and owns the destination policy), so no
+    /// warning is due. For the loopback bridge this module itself recommends
+    /// (`cntlm`/`px` on 127.0.0.1, which has no rebinding defence), [G-44]'s
+    /// "no tunnel to host services" holds only if the bridge enforces it — and
+    /// the operator must be told at startup, by name.
+    #[test]
+    fn a_loopback_bridge_warns_that_it_must_enforce_the_destination_policy() {
+        for url in [
+            "http://127.0.0.1:3128",
+            "http://localhost:8080",
+            "http://[::1]:3128",
+            "http://user:pass@127.0.0.1:3128",
+        ] {
+            let d = UpstreamDialer::from_url(url, vec![]).expect("url parses");
+            assert!(d.is_loopback_endpoint(), "{url} is a loopback endpoint");
+            let w = d
+                .loopback_bridge_warning()
+                .unwrap_or_else(|| panic!("{url} must warn"));
+            assert!(
+                w.contains(d.proxy_endpoint().as_str()),
+                "the warning names the endpoint as host:port: {w}"
+            );
+            assert!(
+                w.contains("hard-deny"),
+                "it must name what is not applied: {w}"
+            );
+            assert!(
+                w.to_ascii_lowercase().contains("bridge must enforce"),
+                "it must say who owns the policy: {w}"
+            );
+            // [G-30]: never the userinfo.
+            assert!(!w.contains("pass"), "the warning must not echo credentials: {w}");
+        }
+    }
+
+    #[test]
+    fn a_remote_upstream_does_not_warn() {
+        // The same loopback-looking labels must not match a remote name.
+        for url in [
+            "http://proxy.corp:3128",
+            "http://10.20.30.40:8080",
+            "http://[2001:db8::9]:3128",
+        ] {
+            let d = UpstreamDialer::from_url(url, vec![]).expect("url parses");
+            assert!(!d.is_loopback_endpoint(), "{url} is not loopback");
+            assert!(
+                d.loopback_bridge_warning().is_none(),
+                "{url} must not carry the loopback-bridge warning"
+            );
+        }
+    }

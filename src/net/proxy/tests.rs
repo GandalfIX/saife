@@ -127,6 +127,7 @@
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -162,6 +163,7 @@
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -188,6 +190,7 @@
             "allowlist",
             Some("session-42"),
             true,
+            None,
             None,
         )
         .unwrap();
@@ -225,6 +228,7 @@
             None,
             false,
             Some(12),
+            None,
         )
         .unwrap();
         emit_connect(
@@ -236,6 +240,7 @@
             "default",
             None,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -416,7 +421,7 @@
         ];
         for (addr, denied) in cases {
             let addrs = [public, addr.parse::<SocketAddr>().unwrap()];
-            let verdict = super::pinned_addrs_hard_denied(&addrs, false);
+            let verdict = super::pinned_addrs_hard_denied(&addrs, false, false);
             assert_eq!(
                 verdict.is_some(),
                 denied,
@@ -446,7 +451,7 @@
         ];
         for (addr, denied) in cases {
             let addrs = [public, addr.parse::<SocketAddr>().unwrap()];
-            let verdict = super::pinned_addrs_hard_denied(&addrs, false);
+            let verdict = super::pinned_addrs_hard_denied(&addrs, false, false);
             assert_eq!(
                 verdict.is_some(),
                 denied,
@@ -467,8 +472,8 @@
             "203.0.113.9:443".parse::<SocketAddr>().unwrap(),
             "[2001:db8::9]:443".parse::<SocketAddr>().unwrap(),
         ];
-        assert!(super::pinned_addrs_hard_denied(&addrs, false).is_none());
-        assert!(super::pinned_addrs_hard_denied(&[], false).is_none());
+        assert!(super::pinned_addrs_hard_denied(&addrs, false, false).is_none());
+        assert!(super::pinned_addrs_hard_denied(&[], false, false).is_none());
     }
 
     /// The gap Task 5.1 recorded: the pinned-IP hard-deny leg had no test.
@@ -486,7 +491,7 @@
     async fn dial_upstream_denies_a_pinned_link_local_v4_literal() {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            super::dial_upstream(None, "169.254.31.7", 80, false, super::system_lookup),
+            super::dial_upstream(None, "169.254.31.7", 80, false, false, super::system_lookup),
         )
         .await
         {
@@ -504,7 +509,7 @@
     async fn dial_upstream_denies_a_pinned_link_local_v6_literal() {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            super::dial_upstream(None, "[fe80::1]", 80, false, super::system_lookup),
+            super::dial_upstream(None, "[fe80::1]", 80, false, false, super::system_lookup),
         )
         .await
         {
@@ -526,7 +531,7 @@
         let calls = AtomicUsize::new(0);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            super::dial_upstream(None, "metadata.evil.example", 80, false, |host, port| {
+            super::dial_upstream(None, "metadata.evil.example", 80, false, false, |host, port| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!((host.as_str(), port), ("metadata.evil.example", 80));
                 async { Ok(vec!["169.254.31.7:80".parse::<SocketAddr>().unwrap()]) }
@@ -553,7 +558,7 @@
     async fn dial_upstream_resolves_once_and_dials_only_that_answer() {
         let (_l, live) = local_listener().await;
         let calls = AtomicUsize::new(0);
-        let s = match super::dial_upstream(None, "pinned.example", live.port(), true, |host, port| {
+        let s = match super::dial_upstream(None, "pinned.example", live.port(), true, true, |host, port| {
             // `true`: dial mechanics, not policy - the stand-in upstream is a local listener
             calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!((host.as_str(), port), ("pinned.example", live.port()));
@@ -1280,7 +1285,7 @@
         token: RunToken,
     ) -> T36 {
         try_t36_token_cfg(
-            label, allow, deny, dialog, enabled, timeout, policy, upstream, token, false,
+            label, allow, deny, dialog, enabled, timeout, policy, upstream, token, false, true,
         )
         .expect("spawn test proxy")
     }
@@ -1301,6 +1306,11 @@
         upstream: Option<Arc<UpstreamDialer>>,
         token: RunToken,
         blocked: bool,
+        // M9: `true` in every existing fixture (their stand-in origins and
+        // upstreams are local listeners on the host's own LAN address - a
+        // property of the fixture, not of the product). The tests that pin the
+        // production LAN denial pass `false`.
+        allow_lan: bool,
     ) -> Result<T36> {
         let token_value = token.value().to_string();
         let learned_base = std::env::temp_dir().join(format!(
@@ -1338,6 +1348,7 @@
             allow_domain: allow.iter().map(|s| s.to_string()).collect(),
             deny_domain: deny.iter().map(|s| s.to_string()).collect(),
             upstream,
+            allow_lan,
             writer,
             prompt: gate,
             facade,
@@ -1394,8 +1405,34 @@
             None,
             unique_test_token(),
             true,
+            // No LAN reach is granted by the blocked posture; the fixture value
+            // is irrelevant here and `true` keeps it out of the assertion.
+            true,
         )
         .expect("spawn blocked test proxy")
+    }
+
+    /// A listener with the PRODUCTION default for the M9 LAN deny:
+    /// `allow_lan: false`. Every other fixture sets it to `true`, because their
+    /// stand-in origins and upstreams are local listeners on the host's own LAN
+    /// address - a property of the fixture, not of the product. The tests that
+    /// pin the LAN refusal need the default policy instead.
+    fn t36_setup_lan_denied(label: &str, allow: &[&str]) -> T36 {
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        try_t36_token_cfg(
+            label,
+            allow,
+            &[],
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+            unique_test_token(),
+            false,
+            false,
+        )
+        .expect("spawn lan-denied test proxy")
     }
 
     /// One blocking request/response round-trip against the test proxy.
@@ -3841,6 +3878,7 @@
             None,
             token.clone(),
             false,
+            true,
         )
         .err()
         .expect("a duplicate live credential must be refused");
@@ -3969,6 +4007,7 @@
             None,
             token.clone(),
             false,
+            true,
         )
         .err()
         .expect("a clone of a live token must still be refused");
@@ -5813,6 +5852,8 @@
             blocked: false,
             writer,
             upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
+            allow_lan: true,
+            next_request_id: std::sync::atomic::AtomicU64::new(0),
             prompt,
             counters: LaunchCounters::new(),
             no_token: super::RefusalBudget::new(),
@@ -6237,9 +6278,17 @@
             .first()
             .cloned()
             .expect("the sidecar must have been called");
+        // M15 (security review 2026-11-09): the declaration matched the
+        // query-stripped path, so the relay sends that path - "a manifest
+        // declares paths, not queries" (this assertion pinned the old
+        // full-origin-form behaviour).
         assert!(
-            head.starts_with("GET /page?q=1 HTTP/1.0\r\n"),
-            "origin-form with the query: {head}"
+            head.starts_with("GET /page HTTP/1.0\r\n"),
+            "the matched (query-stripped) path is what the sidecar sees: {head}"
+        );
+        assert!(
+            !head.contains("?q=1"),
+            "the query must not cross the facade: {head}"
         );
         assert!(head.contains("Host: fake\r\n"), "{head}");
         assert!(head.contains("X-Facade-Token: facadetoken\r\n"), "{head}");
@@ -6538,7 +6587,7 @@
         ] {
             let sa: SocketAddr = s.parse().unwrap();
             assert!(
-                super::pinned_addrs_hard_denied(&[sa], false).is_some(),
+                super::pinned_addrs_hard_denied(&[sa], false, false).is_some(),
                 "{s} resolves to loopback/unspecified and must be refused before dialling"
             );
             // The bare address predicate stays loopback-agnostic on purpose (the
@@ -6548,7 +6597,7 @@
         }
         // A public address is still allowed: the check must not swallow the world.
         let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        assert!(super::pinned_addrs_hard_denied(&[public], false).is_none());
+        assert!(super::pinned_addrs_hard_denied(&[public], false, false).is_none());
     }
 
     /// A CONNECT target whose port is not a number used to be silently retried on
@@ -6597,5 +6646,527 @@
              elapsed={:?}); the head deadline is not a substitute",
             socks.len(),
             started.elapsed()
+        );
+    }
+
+    // ---- H2 characterization: the chained-branch contract ([G-22]) ---------
+    //
+    // Verdict doc `docs/design/2026-11-09-security-review-verdicts.md`, H2:
+    // partial, Medium. The mechanism (chained dials skip local resolution and
+    // the pinned-address hard-deny) is real and DOCUMENTED/ACCEPTED for a
+    // remote upstream — the upstream proxy resolves the name and owns its own
+    // defenses ([G-22], ADR-0001 §D-1/D-2). It is unsound only for the
+    // loopback bridge this module itself recommends (`upstream.rs:26-29`:
+    // cntlm/px on 127.0.0.1, which has no rebinding defense), and that
+    // residual is deferred. This test does not assert the deferred fix; it
+    // pins today's contract so a future change to the chained branch is a
+    // deliberate one.
+    //
+    // The injected resolver answers with LOOPBACK and `permit_loopback` is
+    // `false`: if the chained branch ever resolved locally and ran
+    // `pinned_addrs_hard_denied`, the dial would be DENIED (or the counter
+    // would move). Today it returns before both legs.
+    #[tokio::test]
+    async fn chained_dial_sends_the_hostname_and_skips_local_resolution_and_pinned_hard_deny() {
+        let fake = FakeUpstream::start(200);
+        let chain = dialer(&fake.url(), &[]);
+        let resolve_calls = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::dial_upstream(
+                Some(chain.as_ref()),
+                "rebind.example",
+                443,
+                false,
+                false,
+                |host, port| {
+                    resolve_calls.fetch_add(1, Ordering::SeqCst);
+                    // A poisoned answer: the shape a split-horizon/rebinding
+                    // resolver would return. Seeing it here would mean the
+                    // chained branch resolved locally, which [G-22] forbids.
+                    assert_eq!((host.as_str(), port), ("rebind.example", 443));
+                    async { Ok(vec!["127.0.0.1:443".parse::<SocketAddr>().unwrap()]) }
+                },
+            ),
+        )
+        .await
+        .expect("the chained dial must not hang");
+        // `DialFailure` is deliberately not `Debug` (it carries no printable
+        // policy detail), so match rather than `expect`.
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(_) => panic!("the chained dial must reach the fake upstream, not be refused"),
+        };
+
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            0,
+            "[G-22]: the chained branch must not resolve locally; the upstream does the DNS"
+        );
+        drop(stream);
+
+        let heads = fake.heads();
+        assert_eq!(heads.len(), 1, "exactly one upstream CONNECT: {heads:?}");
+        assert!(
+            heads[0].starts_with("CONNECT rebind.example:443 HTTP/1.1"),
+            "the hostname STRING is what chains (no pinned IP is sent): {:?}",
+            heads[0]
+        );
+    }
+
+    // =====================================================================
+    // Security review 2026-11-09 — H2, M8, M9, M15, L-A, L-B, L-C
+    // =====================================================================
+
+    // ---- L-A: userinfo in a CONNECT target is refused -------------------
+
+    /// L-A (verdict: confirmed, Low). `CONNECT user@host:443` kept the userinfo
+    /// into `decide()` and the resolver; it died there today, but "the admitted
+    /// string == the dialed string" must be explicit, not a resolver accident.
+    /// The absolute-form parser already strips userinfo, so the two paths agree.
+    #[test]
+    fn connect_target_with_userinfo_is_refused() {
+        assert_eq!(super::parse_connect_target("user@host:443"), None);
+        assert_eq!(super::parse_connect_target("user@host"), None);
+        assert_eq!(
+            super::parse_connect_target("alice:p%40ss@internal.corp:8443"),
+            None,
+            "a password containing the separator still leaves an @ in the host"
+        );
+        // Normal hosts (and a bracketed IPv6 literal) are unaffected.
+        assert_eq!(
+            super::parse_connect_target("api.example.com:443"),
+            Some(("api.example.com".into(), 443))
+        );
+        assert_eq!(
+            super::parse_connect_target("api.example.com"),
+            Some(("api.example.com".into(), 443))
+        );
+        assert_eq!(
+            super::parse_connect_target("[2001:db8::9]:443"),
+            Some(("[2001:db8::9]".into(), 443))
+        );
+    }
+
+    // ---- L-B: proxy challenge fields are stripped from relayed heads ----
+
+    /// L-B (verdict: confirmed, Low). `Proxy-Authenticate` was relayed on every
+    /// status except exactly 407, so an origin could answer 200/401 with a
+    /// challenge and make an honest client replay this session's token to it.
+    /// Both proxy-hop fields are stripped from every relayed head; origin
+    /// fields (WWW-Authenticate) are untouched.
+    #[test]
+    fn a_relayed_response_strips_the_proxy_challenge_fields() {
+        for (status, head) in [
+            (
+                "401",
+                concat!(
+                    "HTTP/1.1 401 Unauthorized\r\n",
+                    "Proxy-Authenticate: Basic realm=\"origin\"\r\n",
+                    "Proxy-Authentication-Info: challenge\r\n",
+                    "WWW-Authenticate: Basic realm=\"user\"\r\n",
+                    "Content-Length: 0\r\n\r\n",
+                ),
+            ),
+            (
+                "200",
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Proxy-Authenticate: Basic realm=\"origin\"\r\n",
+                    "Content-Length: 2\r\n\r\nok",
+                ),
+            ),
+        ] {
+            let origin = FakeOrigin::start(head);
+            let (dialog, _c) = recording_dialog(Ok(allow_once()));
+            let t = t36_setup("lb-challenge", &[origin.host.as_str()], &[], dialog);
+            let resp = exchange(
+                t.port,
+                &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
+            );
+            assert!(
+                resp.starts_with(&format!("HTTP/1.1 {status}")),
+                "the origin's own status is relayed: {resp}"
+            );
+            assert!(
+                !resp.contains("Proxy-Authenticate"),
+                "a {status} must not carry the proxy challenge: {resp}"
+            );
+            assert!(
+                !resp.contains("Proxy-Authentication-Info"),
+                "a {status} must not carry the challenge info field: {resp}"
+            );
+            assert!(
+                !resp.contains("realm=\"origin\""),
+                "no byte of the proxy challenge may reach the client: {resp}"
+            );
+            if status == "401" {
+                assert!(
+                    resp.contains("WWW-Authenticate: Basic realm=\"user\""),
+                    "an origin field the client asked about is relayed verbatim: {resp}"
+                );
+            }
+        }
+    }
+
+    // ---- M15: the sidecar receives the path the manifest declared -------
+
+    /// M15 (verdict: confirmed, Medium). The declaration matched the
+    /// query-stripped path but the relay forwarded the full origin-form, so a
+    /// declared `GET /status` arrived at the sidecar as `GET /status?x=1` —
+    /// a request the manifest never declared (and the shipped sidecars 404
+    /// on any query).
+    #[test]
+    fn a_declared_facade_path_reaches_the_sidecar_query_stripped() {
+        const BODY: &str = "sidecar body";
+        let (sidecar_port, seen) = fake_sidecar(BODY);
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-query", &[], &[], dialog);
+        let mut target = facade_target("ssh", sidecar_port, "facadetoken");
+        target
+            .operations
+            .push(crate::plugin::Operation { method: "GET".into(), path: "/status".into() });
+        t.handle.ctx.facade.insert(target).unwrap();
+
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://ssh.sandbox.invalid/status?x=1 HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.0 200"),
+            "a declared path with a query must be relayed: {resp}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one sidecar request");
+        assert!(
+            seen[0].starts_with("GET /status HTTP/1.0"),
+            "the sidecar must receive the MATCHED (query-stripped) path: {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[0].contains("?x=1"),
+            "the query must not reach the sidecar: {:?}",
+            seen[0]
+        );
+    }
+
+    /// The counterpart: a query does not make an undeclared path declared.
+    #[test]
+    fn a_query_cannot_sneak_an_undeclared_facade_path_past_the_declaration() {
+        const BODY: &str = "should not be reached";
+        let (sidecar_port, seen) = fake_sidecar(BODY);
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("facade-query-undeclared", &[], &[], dialog);
+        t.handle
+            .ctx
+            .facade
+            .insert(facade_target("ssh", sidecar_port, "facadetoken"))
+            .unwrap();
+
+        let resp = exchange(
+            t.port,
+            &format!(
+                "GET http://ssh.sandbox.invalid/status?x=1 HTTP/1.1\r\n{}\r\n",
+                auth_header()
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "an undeclared path must be refused whatever the query: {resp}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the sidecar must never see an undeclared request"
+        );
+    }
+
+    // ---- L-C: a declared body that never arrives cannot park a permit ---
+
+    /// L-C (verdict: confirmed, Low). `read_body` had no timeout, so 128
+    /// authenticated connections declaring a body and sending nothing parked
+    /// every permit for the session (self-DoS). The read is bounded by
+    /// `BODY_READ_TIMEOUT` (750 ms in test builds, 15 s in production — the
+    /// same cap a head gets).
+    #[test]
+    fn a_declared_body_that_never_arrives_is_closed_not_parked() {
+        use std::io::{Read, Write};
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("lc-body-timeout", &[], &[], dialog);
+
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", t.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Declare a body the client never sends, and keep the socket open.
+        // The credential must be this listener's own, or the 407 comes before
+        // the body is ever read and the test would prove nothing.
+        let head = format!(
+            "POST /sandbox/intent HTTP/1.1\r\n{}Content-Length: 4096\r\n\r\n",
+            auth_header()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+
+        let started = std::time::Instant::now();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf); // ends at the handler's EOF
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the handler must close a stalled declared body within the 750 ms \
+             body timeout (took {elapsed:?}); the permit stayed parked"
+        );
+    }
+
+    // ---- M9: private/LAN ranges denied by default on the direct path ---
+
+    /// M9 (verdict: confirmed, Medium). The hard-deny set covered only
+    /// 169.254/16, fe80::/10, three literals and three metadata names, so an
+    /// allow-listed name resolving into RFC 1918, CGNAT or ULA reached the LAN
+    /// as allow/allowlist. Resolved (pinned) addresses in those ranges are now
+    /// denied on the direct path, default ON.
+    #[test]
+    fn pinned_lan_addresses_are_denied_by_default() {
+        let public: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        for (s, denied) in [
+            ("10.0.0.1:443", true),
+            ("10.255.255.255:443", true),
+            ("172.16.0.1:443", true),
+            ("172.31.255.255:443", true),
+            ("192.168.1.5:443", true),
+            ("100.64.0.7:443", true),   // CGNAT RFC 6598 (100.64.0.0/10)
+            ("100.127.255.255:443", true), // last address of the /10
+            ("[fd00::1]:443", true),    // ULA fc00::/7
+            ("[fc00::1]:443", true),
+            ("[::ffff:10.0.0.1]:443", true), // IPv4-mapped is unmapped first
+            // Just outside each range: no off-by-one.
+            ("9.255.255.255:443", false),
+            ("11.0.0.1:443", false),
+            ("172.32.0.1:443", false),
+            ("192.169.0.1:443", false),
+            ("100.128.0.1:443", false), // one past the /10
+            ("[fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:443", true), // last address of the /7
+            ("[fe00::1]:443", false), // one past the /7
+            ("8.8.8.8:443", false),
+        ] {
+            let sa: SocketAddr = s.parse().unwrap();
+            let verdict = super::pinned_addrs_hard_denied(&[public, sa], false, false);
+            assert_eq!(
+                verdict.is_some(),
+                denied,
+                "{s} must {}be denied by the default LAN policy",
+                if denied { "" } else { "NOT " }
+            );
+            if let Some(d) = verdict
+                && (s.contains("10.0.0.1")
+                    || s.contains("192.168")
+                    || s.contains("100.64")
+                    || s.contains("fd00")
+                    || s.contains("172.16"))
+            {
+                assert_eq!(
+                    d.reason.as_deref(),
+                    Some("lan_refused"),
+                    "the LAN refusal names itself so an operator can tell it from \
+                     the hard-deny CIDR set: {s}"
+                );
+            }
+        }
+    }
+
+    /// The escape hatch relaxes exactly the LAN leg: with `permit_lan` the
+    /// private ranges dial, while loopback ([G-44]) and the hard-deny set
+    /// ([G-45]) stay refused whatever the flag says.
+    #[test]
+    fn the_lan_escape_hatch_relaxes_only_the_lan_leg() {
+        for s in [
+            "10.0.0.1:443",
+            "192.168.1.5:443",
+            "100.64.0.7:443",
+            "[fd00::1]:443",
+        ] {
+            let sa: SocketAddr = s.parse().unwrap();
+            assert!(
+                super::pinned_addrs_hard_denied(&[sa], false, true).is_none(),
+                "--allow-lan must admit {s}"
+            );
+        }
+        for s in ["127.0.0.1:443", "[::1]:443", "0.0.0.0:443"] {
+            let sa: SocketAddr = s.parse().unwrap();
+            assert!(
+                super::pinned_addrs_hard_denied(&[sa], false, true).is_some(),
+                "loopback is the [G-44] policy refusal and stays: {s}"
+            );
+        }
+        for s in ["169.254.169.254:443", "[fe80::1]:443"] {
+            let sa: SocketAddr = s.parse().unwrap();
+            assert!(
+                super::pinned_addrs_hard_denied(&[sa], false, true).is_some(),
+                "link-local is the hard-deny set and stays: {s}"
+            );
+        }
+    }
+
+    /// The leg at the real call site: a hostname whose resolver answer is a
+    /// LAN address is refused before any dial, exactly like the link-local
+    /// case above it. 2 s bound keeps the failure fast-red (a real dial
+    /// attempt would take the OS SYN timeout).
+    #[tokio::test]
+    async fn dial_upstream_denies_a_hostname_that_resolves_to_a_lan_range() {
+        let calls = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::dial_upstream(None, "lan.evil.example", 80, false, false, |host, port| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!((host.as_str(), port), ("lan.evil.example", 80));
+                async { Ok(vec!["10.0.0.1:80".parse::<SocketAddr>().unwrap()]) }
+            }),
+        )
+        .await
+        .expect("the deny must be decided before any dial is awaited");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        match result {
+            Err(super::DialFailure::Denied(d)) => {
+                assert_eq!(d.source, "hard-deny");
+                assert_eq!(d.reason.as_deref(), Some("lan_refused"));
+            }
+            Err(_) => panic!("expected a Denied dial failure, not a dial attempt"),
+            Ok(_) => panic!("a hostname resolving into a LAN range must never be dialed"),
+        }
+    }
+
+    /// End to end through the listener: an allow-listed literal in a LAN range
+    /// is admitted by `decide()` (the string checks cannot see the address) and
+    /// denied at the pinned-address leg. Default policy, `--allow-lan` unset.
+    #[test]
+    fn an_allowlisted_lan_literal_is_refused_at_the_dial() {
+        let (_dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup_lan_denied("m9-e2e", &["10.0.0.1"]);
+        let resp = exchange(t.port, &connect_req("10.0.0.1:443"));
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "a LAN destination must be refused: {resp}"
+        );
+        let evs = connect_events(&t.sid);
+        assert_eq!(
+            evs.last().unwrap()["reason"],
+            "lan_refused",
+            "the refusal names the LAN policy: {evs:?}"
+        );
+    }
+
+    /// The `NO_PROXY` CIDR behaviour is unchanged (M9 scope): entries are
+    /// literal hostnames — `10.0.0.0/8` never matches `10.0.0.1` as a host —
+    /// and the LAN deny lives on the direct path either way.
+    #[test]
+    fn no_proxy_cidr_entries_stay_literal_under_the_lan_deny() {
+        assert!(!crate::net::upstream::host_matches_no_proxy(
+            "10.0.0.1",
+            &["10.0.0.0/8".to_string()]
+        ));
+        let d = super::UpstreamDialer::from_url(
+            "http://proxy.corp:3128",
+            vec!["10.0.0.0/8".to_string()],
+        )
+        .unwrap();
+        assert!(
+            d.chains_host("10.0.0.1"),
+            "a CIDR NO_PROXY entry is a literal hostname that matches nothing: \
+             the host still chains"
+        );
+    }
+
+    // ---- M8: one request id per request; show reads the terminal leaf ----
+
+    /// M8 (verdict: confirmed, Medium). An allow leaf was emitted before the
+    /// dial that can deny the same request, with no correlation id, and
+    /// `audit show` counted every allow leaf as a contacted host. Now the
+    /// leaves of one request share `req_id`, and show counts a host only when
+    /// the request's TERMINAL leaf is allow.
+    #[test]
+    fn an_allowed_host_whose_dial_is_refused_records_one_request_id_and_no_contact() {
+        // `[::]` passes the string checks in `decide()` (it is not a loopback
+        // NAME) and is on the allow list, so the admission leaf is `allow`;
+        // the pinned-address leg then refuses the unspecified address. This is
+        // the allow-then-deny pair M8 is about, with no upstream involved.
+        let (_dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup_lan_denied("m8-loopback-refused", &["[::]"]);
+        let resp = exchange(t.port, &connect_req("[::]:443"));
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "the dial refusal answers 403: {resp}"
+        );
+
+        let evs = connect_events(&t.sid);
+        assert_eq!(
+            evs.len(),
+            2,
+            "exactly the admission leaf and the dial denial: {evs:?}"
+        );
+        assert_eq!(evs[0]["disposition"], "allow");
+        assert_eq!(evs[1]["disposition"], "deny");
+        let id0 = evs[0]["req_id"].as_u64();
+        let id1 = evs[1]["req_id"].as_u64();
+        assert!(id0.is_some(), "the leaves carry a request id: {evs:?}");
+        assert_eq!(
+            id0, id1,
+            "the allow and the deny for ONE request share the id"
+        );
+
+        // And the summary must not claim a contact that never happened.
+        let text = std::fs::read_to_string(crate::audit::audit_log_path(&t.sid)).unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+        let refs: Vec<&serde_json::Value> = events.iter().collect();
+        let out = crate::audit::show::render_summary(&t.sid, &refs);
+        assert!(
+            !out.contains("Hosts contacted"),
+            "a request whose terminal disposition is deny is not a contacted \
+             host: {out}"
+        );
+        assert!(
+            out.contains("1 allowed, 1 denied"),
+            "the event table still reports both leaves honestly: {out}"
+        );
+    }
+
+    /// The honest counterpart: a request that was actually served counts once.
+    #[test]
+    fn a_served_request_counts_its_host_once_in_show() {
+        let fake = FakeUpstream::start(200);
+        let t = t42_setup(
+            "m8-counted-once",
+            &["allowed.example"],
+            Some(dialer(&fake.url(), &[])),
+        );
+        let (head, echo) = tunnel(t.port, "allowed.example:443", b"ping");
+        assert!(head.starts_with("HTTP/1.1 200"), "tunnel established: {head}");
+        assert_eq!(echo, "ping");
+
+        let evs = connect_events(&t.sid);
+        assert_eq!(evs.len(), 1, "one served request, one leaf: {evs:?}");
+        assert_eq!(evs[0]["disposition"], "allow");
+        assert!(
+            evs[0]["req_id"].as_u64().is_some(),
+            "a single-request leaf still carries the id"
+        );
+
+        let text = std::fs::read_to_string(crate::audit::audit_log_path(&t.sid)).unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+        let refs: Vec<&serde_json::Value> = events.iter().collect();
+        let out = crate::audit::show::render_summary(&t.sid, &refs);
+        assert!(
+            out.contains("Hosts contacted (allowed):"),
+            "a served request is a contact: {out}"
+        );
+        assert!(
+            out.contains("allowed.example:443  x1"),
+            "counted exactly once: {out}"
         );
     }
