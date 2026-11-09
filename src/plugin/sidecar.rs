@@ -790,6 +790,8 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
             deny_domain: Vec::new(),
             blocked: false,
             upstream: None,
+            // Test fixture stand-ins are local listeners; nothing here pins the LAN deny.
+            allow_lan: true,
             writer,
             prompt,
             facade: Arc::clone(&registry),
@@ -937,6 +939,8 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
             deny_domain: Vec::new(),
             blocked: false,
             upstream: None,
+            // Test fixture stand-ins are local listeners; nothing here pins the LAN deny.
+            allow_lan: true,
             writer,
             prompt,
             facade: Arc::clone(&registry),

@@ -15,6 +15,39 @@ pub const ALWAYS_DENIED_V6_CIDRS: &[(Ipv6Addr, u8)] =
     // passed `0xfe80` as the 7th segment, silently encoding `::fe80:0/10`
     // instead; caught by the Task 3.6 pipeline tests.
     &[(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10)];
+/// Private/LAN IPv4 ranges denied by default on the direct path (M9, security
+/// review 2026-11-09): an allow-listed name resolving here would otherwise
+/// reach the LAN as allow/allowlist. Loopback is handled separately (it is a
+/// policy refusal [G-44], not an address property) and link-local is a
+/// hard-deny ([G-45]); neither is in this set.
+pub const LAN_DENIED_V4_CIDRS: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(10, 0, 0, 0), 8),     // RFC 1918
+    (Ipv4Addr::new(172, 16, 0, 0), 12),  // RFC 1918
+    (Ipv4Addr::new(192, 168, 0, 0), 16), // RFC 1918
+    (Ipv4Addr::new(100, 64, 0, 0), 10),  // CGNAT RFC 6598
+];
+/// Unique-local IPv6 (`fc00::/7`).
+pub const LAN_DENIED_V6_CIDRS: &[(Ipv6Addr, u8)] =
+    &[(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7)];
+
+/// Is `ip` in a private/LAN range (RFC 1918, CGNAT, ULA)? IPv4-mapped IPv6 is
+/// unmapped first. Loopback and link-local are NOT covered here — loopback is
+/// a policy refusal ([G-44]) applied by the proxy's decision leg, and
+/// link-local is a hard-deny ([G-45]) in [`is_hard_denied_ip`]. This predicate
+/// feeds the direct-path pinned-address check (M9): default-on, configurable
+/// off via the `--allow-lan` escape hatch.
+pub fn is_lan_range_ip(ip: IpAddr) -> bool {
+    let ip = unmap_ipv4_mapped(ip);
+    match ip {
+        IpAddr::V4(v) => LAN_DENIED_V4_CIDRS
+            .iter()
+            .any(|(n, p)| in_v4_cidr(v, *n, *p)),
+        IpAddr::V6(v) => LAN_DENIED_V6_CIDRS
+            .iter()
+            .any(|(n, p)| in_v6_cidr(v, *n, *p)),
+    }
+}
+
 /// Always-denied DNS names (checked pre-resolution, AC-3.7).
 pub const ALWAYS_DENIED_DNS: &[&str] = &[
     "metadata.google.internal",

@@ -341,6 +341,19 @@ pub enum Cmd {
         #[arg(long)]
         allow_host_loopback: bool,
 
+        /// Allow private/LAN destinations (RFC 1918, CGNAT 100.64/10, ULA
+        /// fc00::/7) on the direct-dial path for this session.
+        ///
+        /// ESCAPE HATCH for the M9 deny (security review 2026-11-09), default
+        /// off. The proxy denies an allow-listed name whose RESOLVED address
+        /// lands in those ranges, so a wildcard allow entry cannot bridge the
+        /// workload onto the LAN. Set this only when a component genuinely
+        /// needs LAN reach (a `host.docker.internal` bridge, or a dev server
+        /// your machine reaches over the LAN); loopback and link-local are
+        /// refused even with this flag set.
+        #[arg(long)]
+        allow_lan: bool,
+
         /// Reuse an existing session id (re-derive its profile + ACLs).
         #[arg(long, value_name = "SID", hide = true)]
         sid: Option<String>,
@@ -1029,3 +1042,28 @@ mod tests {
         }
     }
 }
+
+    /// M9: the escape hatch is opt-in. `--allow-lan` parses and defaults off,
+    /// so a session that never asks for it keeps the private/LAN deny.
+    #[test]
+    fn allow_lan_defaults_off_and_parses_when_asked_for() {
+        let cli = Cli::parse_from(["saife", "run", "--", "cmd"]);
+        let Cmd::Run { allow_lan, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        assert!(
+            !allow_lan,
+            "the private/LAN deny must be ON unless the operator asks"
+        );
+
+        let cli = Cli::parse_from(["saife", "run", "--allow-lan", "--", "cmd"]);
+        let Cmd::Run { allow_lan, cmd, .. } = cli.cmd else {
+            panic!("expected Cmd::Run");
+        };
+        assert!(allow_lan, "--allow-lan enables the escape hatch");
+        assert_eq!(
+            cmd,
+            vec!["cmd".to_string()],
+            "the flag must not swallow the workload"
+        );
+    }

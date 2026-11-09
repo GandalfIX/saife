@@ -59,6 +59,25 @@ Adopt five omac-derived patterns plus a keystone fix (task zero), each scoped to
 
 **CONNECT to loopback refused:** the proxy refuses `CONNECT` to any loopback host (`127.0.0.1`, `::1`, `localhost`, `*.localhost`) with `403` + `X-Sandbox: denied` header. The child reaches the intent endpoints (D-4) via non-CONNECT HTTP (covered by `NO_PROXY`), not via CONNECT. Prevents the proxy from becoming a tunnel to host services. **[G-44]**
 
+> **Amended 2026-11-09 (security review, H2 — partial → Medium).** The [G-44]
+> "no tunnel to host services" guarantee and the post-resolution hard-deny
+> (link-local `169.254/16`, `fe80::/10`; private/LAN ranges, M9) hold **for
+> remote upstream proxies only**. Under chaining ([G-22]) saife sends the
+> hostname to the upstream and resolves nothing locally, so those checks cannot
+> run on saife's side; the upstream proxy's destination policy is the only
+> defense. That division of labour is the point of [G-22] for a *remote*
+> corporate proxy. It is **not** true for the loopback bridge this module
+> recommends (`cntlm`/`px` on `127.0.0.1`, [G-14]'s workaround), which resolves
+> the name itself and has no rebinding defense: through such a bridge an
+> advertised name can reach loopback/LAN services the proxy would have denied.
+> saife therefore (a) prints a named startup warning whenever the configured
+> upstream endpoint is loopback, telling the operator that chained dials do not
+> get the destination hard-deny and that the bridge must enforce it, and (b)
+> deliberately does NOT resolve or pre-check the destination at dial time — a
+> local check would false-deny under split-horizon DNS, where the upstream's
+> answer is the authoritative one. Where an operator needs the policy at a
+> loopback bridge, the bridge (or a wrapper in front of it) must enforce it.
+
 ### D-2. Upstream corporate proxy chaining (closes F-1, HTTP/HTTPS case)
 
 **[G-10, G-11, G-14, G-22, G-24, G-30, G-42, G-49]** Port omac's `internal/netproxy/dialer.go` `upstreamProxyDialer` as a second `Dialer` implementation alongside the direct dialer. When `HTTPS_PROXY`/`HTTP_PROXY` is set in the host environment (or `network.upstreamProxy` in the profile), the proxy chains allowed requests through the corporate egress proxy via HTTP CONNECT.

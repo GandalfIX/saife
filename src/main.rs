@@ -74,6 +74,7 @@ fn main() {
             plugin_dir,
             runner,
             allow_host_loopback,
+            allow_lan,
             cmd,
         } => run_cmd(
             backend,
@@ -94,6 +95,7 @@ fn main() {
             plugin_dir,
             runner,
             allow_host_loopback,
+            allow_lan,
             cmd,
         ),
         Cmd::Ps { json, .. } => ps_cmd(json),
@@ -764,6 +766,8 @@ fn run_cmd(
     runner: bool,
     // `--allow-host-loopback`: ADR-0007's session mode.
     allow_host_loopback: bool,
+    // M9: `--allow-lan`, the explicit escape hatch for the private/LAN deny.
+    allow_lan: bool,
     cmd: Vec<String>,
 ) -> i32 {
     // Backend selection is refused before anything is spawned or created. The
@@ -823,6 +827,7 @@ fn run_cmd(
         &plugin_dir,
         runner,
         allow_host_loopback,
+        allow_lan,
         &cmd,
     ) {
         Ok(code) => code,
@@ -865,6 +870,8 @@ fn run_inner(
     enable_runner: bool,
     // `--allow-host-loopback`: ADR-0007's session mode, threaded to the MXC path.
     allow_host_loopback: bool,
+    // M9: `--allow-lan`, threaded to the listener the MXC path starts.
+    allow_lan: bool,
     cmd: &[String],
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
@@ -928,6 +935,7 @@ fn run_inner(
                 plugin_dirs,
                 enable_runner,
                 allow_host_loopback,
+                allow_lan,
                 cmd,
             );
         }
@@ -1053,6 +1061,7 @@ fn run_inner(
         // Unchanged: this backend refuses `--plugin` and `--runner` by name
         // above, so it never has a mount that would need a listener.
         false,
+        allow_lan,
     )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
 
@@ -1195,6 +1204,8 @@ fn run_mxc_session(
     // `--runner`: start the build runner and publish its facade mount.
     enable_runner: bool,
     allow_host_loopback: bool,
+    // M9: `--allow-lan`, threaded to the listener this path starts.
+    allow_lan: bool,
     cmd: &[String],
 ) -> Result<i32> {
     // Decision 7: `--print-sid` yields the id and returns, exactly as the
@@ -1303,6 +1314,7 @@ fn run_mxc_session(
         audit_writer.clone(),
         std::sync::Arc::clone(&facade),
         enable_runner || !plugins.is_empty(),
+        allow_lan,
     )?;
     let proxy_port = proxy.as_ref().map(|(handle, _)| handle.port);
     let token = proxy.as_ref().map(|(_, env)| env.token.value());
@@ -1760,6 +1772,8 @@ fn start_session_proxy(
     // session asked for a facade mount (`--runner`, `--plugin`) and the
     // facade route exists only in the proxy.
     serve_without_egress: bool,
+    // M9: `--allow-lan`, the explicit escape hatch for the private/LAN deny.
+    allow_lan: bool,
 ) -> Result<Option<(net::proxy::ProxyHandle, net::ProxyEnv)>> {
     // The listener MUST outlive the child: the caller holds the handle until the
     // child has exited (see `seal_audit`).
@@ -1786,6 +1800,8 @@ fn start_session_proxy(
                     // No chaining: there is no origin to reach, so an upstream
                     // dialer would be a second way out wired up for nothing.
                     upstream: None,
+                    // Nothing it can reach has a destination to relax.
+                    allow_lan: false,
                     writer,
                     // Nothing to ask: the answer is the session's posture, not a
                     // per-host choice, so the dialog is constructed disabled.
@@ -1863,6 +1879,17 @@ fn start_session_proxy(
                 },
                 None => None,
             };
+            // H2 (security review 2026-11-09: partial → Medium). Under chaining
+            // saife does not resolve the destination, so its destination
+            // hard-deny never runs ([G-22]) and [G-44]'s "no tunnel to host
+            // services" holds only as far as the upstream enforces it. A remote
+            // corporate proxy is trusted to; the loopback bridge this module
+            // recommends (cntlm/px on 127.0.0.1) is not, so say so at startup.
+            // Not SAIFE_DIAG-gated: a silently weaker destination policy is
+            // exactly the class of fact an operator must not have to ask for.
+            if let Some(w) = upstream.as_ref().and_then(|d| d.loopback_bridge_warning()) {
+                eprintln!("[saife] warning: {w}");
+            }
             Some(spawn_session_listener(
                 net::proxy::ProxyConfig {
                     session_id: sid.to_string(),
@@ -1871,6 +1898,7 @@ fn start_session_proxy(
                     deny_domain: deny_domain.clone(),
                     blocked: false,
                     upstream,
+                    allow_lan,
                     writer: writer.clone(),
                     prompt,
                     facade,

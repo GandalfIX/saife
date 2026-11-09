@@ -1560,6 +1560,8 @@
                 deny_domain: Vec::new(),
                 blocked: false,
                 upstream: None,
+                // Test fixture stand-ins are local listeners; nothing here pins the LAN deny.
+                allow_lan: true,
                 writer: writer.clone(),
                 prompt,
                 facade: std::sync::Arc::new(crate::plugin::FacadeRegistry::new()),

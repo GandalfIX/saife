@@ -80,7 +80,7 @@ fn truncate_for_error(line: &str) -> String {
     }
 }
 
-fn render_summary(session_id: &str, events: &[&serde_json::Value]) -> String {
+pub(crate) fn render_summary(session_id: &str, events: &[&serde_json::Value]) -> String {
     let mut out = String::new();
     writeln!(out, "Session {session_id}").unwrap();
     if let Some(first) = events.first()
@@ -136,15 +136,39 @@ fn render_summary(session_id: &str, events: &[&serde_json::Value]) -> String {
     }
 
     // Hosts contacted (allowed).
-    let mut hosts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    //
+    // M8 (security review 2026-11-09): a host counts only when its request's
+    // TERMINAL leaf is `allow`. An allow leaf is written before the dial that
+    // can still deny the same request (a name resolving to loopback or a
+    // LAN range), so counting every allow leaf claimed a contact that never
+    // happened. Leaves are grouped by `req_id`; the last leaf for an id is its
+    // terminal disposition. Leaves without a `req_id` (older logs, or the
+    // credential-less refusal leaves whose host is `<unknown>`) keep the legacy
+    // shape: counted when their disposition is allow.
+    let mut by_request: std::collections::BTreeMap<u64, (String, bool)> =
+        std::collections::BTreeMap::new();
+    let mut legacy: Vec<(String, bool)> = Vec::new();
     for e in events {
-        if e.get("op").and_then(|x| x.as_str()) == Some("CONNECT")
-            && e.get("disposition").and_then(|x| x.as_str()) == Some("allow")
-        {
-            let host = e.get("host").and_then(|x| x.as_str()).unwrap_or("?");
-            let port = e.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
-            let key = format!("{host}:{port}");
-            *hosts.entry(key).or_insert(0) += 1;
+        if e.get("op").and_then(|x| x.as_str()) != Some("CONNECT") {
+            continue;
+        }
+        let host = e.get("host").and_then(|x| x.as_str()).unwrap_or("?");
+        let port = e.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
+        let key = format!("{host}:{port}");
+        let allow = e.get("disposition").and_then(|x| x.as_str()) == Some("allow");
+        match e.get("req_id").and_then(|x| x.as_u64()) {
+            // `insert` overwrites, so the final leaf for an id wins — that is
+            // the terminal disposition the reader needs.
+            Some(id) => {
+                by_request.insert(id, (key, allow));
+            }
+            None => legacy.push((key, allow)),
+        }
+    }
+    let mut hosts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (key, allow) in by_request.values().chain(legacy.iter()) {
+        if *allow {
+            *hosts.entry(key.clone()).or_insert(0) += 1;
         }
     }
     if !hosts.is_empty() {
@@ -338,3 +362,52 @@ mod tests {
         );
     }
 }
+
+    /// M8 (verdict: confirmed, Medium). `show` counted every `allow` leaf as a
+    /// contacted host, so a request whose admission was allowed and whose dial
+    /// was then denied read as a contact. Counting is now per request: the
+    /// terminal leaf (last for a `req_id`) decides. A leaf without an id keeps
+    /// the legacy shape so an older log still reads the way it was written.
+    #[test]
+    fn show_counts_only_a_terminal_allow_as_a_contacted_host() {
+        let sid = "m8-show-counting";
+        let events: Vec<serde_json::Value> = vec![
+            // Request 1: admitted, then refused at the dial. NOT a contact.
+            serde_json::json!({"op":"CONNECT","host":"10.0.0.1","port":443,
+                               "disposition":"allow","req_id":1,"seq":0}),
+            serde_json::json!({"op":"CONNECT","host":"10.0.0.1","port":443,
+                               "disposition":"deny","reason":"lan_refused",
+                               "req_id":1,"seq":1}),
+            // Request 2: served. Counted once.
+            serde_json::json!({"op":"CONNECT","host":"api.example.com","port":443,
+                               "disposition":"allow","req_id":2,"seq":2}),
+            // Request 3: same host, also served. Counted once more.
+            serde_json::json!({"op":"CONNECT","host":"api.example.com","port":443,
+                               "disposition":"allow","req_id":3,"seq":3}),
+            // A pre-M8 leaf (no req_id): legacy shape, still counted.
+            serde_json::json!({"op":"CONNECT","host":"legacy.example","port":8443,
+                               "disposition":"allow","seq":4}),
+            // A refusal leaf with no id and no contact.
+            serde_json::json!({"op":"CONNECT","host":"<unknown>","port":0,
+                               "disposition":"deny","reason":"no_token","seq":5}),
+        ];
+        let refs: Vec<&serde_json::Value> = events.iter().collect();
+        let out = render_summary(sid, &refs);
+
+        assert!(
+            !out.contains("10.0.0.1:443  x"),
+            "a request whose terminal leaf is deny is not a contact: {out}"
+        );
+        assert!(
+            out.contains("api.example.com:443  x2"),
+            "two served requests to one host count twice: {out}"
+        );
+        assert!(
+            out.contains("legacy.example:8443  x1"),
+            "a leaf without a req_id keeps the legacy shape: {out}"
+        );
+        assert!(
+            !out.contains("<unknown>:0  x"),
+            "a credential-less refusal is never a contacted host: {out}"
+        );
+    }
