@@ -75,15 +75,47 @@ impl KeyMaterial {
                 let _ = std::fs::remove_file(&tmp);
             }
         }
-        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let secret = dpapi_unprotect(&bytes)?;
+        // One decrypt path for minting and for reading: `load_existing_at` (M6)
+        // holds the read + DPAPI-decrypt + length check.
+        Self::load_existing_at(&path)
+    }
+
+    /// Load the current key, never creating one (M6).
+    ///
+    /// This is the **verify** path: losing the key must be a verdict of its own,
+    /// not a silent trust-anchor rotation. [`Self::ensure`] (create-if-missing)
+    /// stays reserved for the signing path.
+    pub fn load_existing() -> Result<Self> {
+        let path = key_path()?;
+        Self::load_existing_at(&path)
+    }
+
+    /// Path-injected form of [`Self::load_existing`], so the "never mint, never
+    /// mutate" contract is testable against a temp path instead of the user's
+    /// real key. Reading fails loudly (missing, undecryptable, wrong length) and
+    /// touches nothing.
+    pub fn load_existing_at(path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(path).map_err(|e| {
+            anyhow::anyhow!(
+                "no signing key at {}: {e} (verifying cannot create one; \
+                 run `saife setup` on the machine that signed this session)",
+                path.display()
+            )
+        })?;
+        let secret = dpapi_unprotect(&bytes)
+            .with_context(|| format!("signing key at {} cannot be decrypted", path.display()))?;
         if secret.len() != 32 {
-            bail!("ed25519-key file is {} bytes, expected 32 (decrypted)", secret.len());
+            bail!(
+                "signing key at {} is {} bytes, expected 32 (decrypted)",
+                path.display(),
+                secret.len()
+            );
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&secret);
-        let signing = SigningKey::from_bytes(&arr);
-        Ok(Self { signing })
+        Ok(Self {
+            signing: SigningKey::from_bytes(&arr),
+        })
     }
 
     /// Sign the 32-byte root (chain root = SHA-256 of last leaf's canonical
@@ -220,5 +252,68 @@ mod tests {
         assert!(p.to_string_lossy().contains("saife"));
         assert!(p.to_string_lossy().contains("signing"));
         assert!(p.to_string_lossy().contains("ed25519-key"));
+    }
+
+    fn missing_key_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "saife-m6-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// M6 (verdict doc: confirmed). `audit verify` used to call `ensure()`, which
+    /// MINTS a key when the file is missing - so losing the key turned every old
+    /// session's verdict into `BAD_SIGNATURE` and installed a new trust anchor as a
+    /// side effect of *verifying*. `load_existing` must read-or-fail, and a missing
+    /// key must stay missing.
+    #[test]
+    fn load_existing_on_a_missing_key_errors_and_mints_nothing() {
+        let path = missing_key_path("absent");
+        // `KeyMaterial` deliberately has no `Debug` (it wraps a secret), so match
+        // rather than `expect_err`.
+        let err = match KeyMaterial::load_existing_at(&path) {
+            Ok(_) => panic!("a missing key must be an error, not a mint"),
+            Err(e) => e,
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.to_ascii_lowercase().contains("signing key"),
+            "the error must say what is missing: {text}"
+        );
+        assert!(
+            text.contains(&path.display().to_string()),
+            "the error must name where it looked: {text}"
+        );
+        assert!(
+            !path.exists(),
+            "loading a missing key must not create the file"
+        );
+    }
+
+    /// An unreadable key file (wrong DPAPI scope, corruption) is an error too: it
+    /// proves nothing either way, and silently treating it as absent would send the
+    /// verifier off to `BAD_SIGNATURE` for the same wrong reason.
+    #[test]
+    fn load_existing_refuses_a_key_it_cannot_decrypt() {
+        let path = missing_key_path("garbage");
+        std::fs::write(&path, b"this is not a DPAPI blob").unwrap();
+        let err = match KeyMaterial::load_existing_at(&path) {
+            Ok(_) => panic!("an undecryptable key must be an error, not a mint"),
+            Err(e) => e,
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.to_ascii_lowercase().contains("decrypt"),
+            "the error must say what failed: {text}"
+        );
+        assert!(
+            std::fs::read(&path).unwrap() == b"this is not a DPAPI blob",
+            "a failed load must not touch the file"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

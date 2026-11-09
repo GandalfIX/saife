@@ -12,11 +12,30 @@ use crate::signing;
 
 pub fn run_verify(session_id: &str) -> i32 {
     match verify_inner(session_id) {
-        Ok(VerifyOutcome::Ok) => { println!("OK"); 0 }
-        Ok(VerifyOutcome::Incomplete(reason)) => { println!("INCOMPLETE: {reason}"); 1 }
-        Ok(VerifyOutcome::Tampered(reason)) => { println!("TAMPERED: {reason}"); 1 }
-        Ok(VerifyOutcome::BadSignature(reason)) => { println!("BAD_SIGNATURE: {reason}"); 1 }
-        Err(e) => { eprintln!("[saife] audit verify: {e:#}"); 1 }
+        Ok(VerifyOutcome::Ok) => {
+            println!("OK");
+            0
+        }
+        Ok(VerifyOutcome::Incomplete(reason)) => {
+            println!("INCOMPLETE: {reason}");
+            1
+        }
+        Ok(VerifyOutcome::Tampered(reason)) => {
+            println!("TAMPERED: {reason}");
+            1
+        }
+        Ok(VerifyOutcome::BadSignature(reason)) => {
+            println!("BAD_SIGNATURE: {reason}");
+            1
+        }
+        Ok(VerifyOutcome::KeyMissing(reason)) => {
+            println!("KEY_MISSING: {reason}");
+            1
+        }
+        Err(e) => {
+            eprintln!("[saife] audit verify: {e:#}");
+            1
+        }
     }
 }
 
@@ -24,15 +43,31 @@ pub fn run_verify(session_id: &str) -> i32 {
 /// mechanism it protects (the root that is written before the launch) and has to
 /// assert the *verdict* `verify` reaches, not a copy of it. The CLI entry point
 /// stays [`run_verify`].
+///
+/// `KeyMissing` is its own verdict (M6): verifying must never mint a key, so a
+/// missing key is reported distinctly rather than collapsed into `BadSignature`
+/// - and must not be reported as `Tampered`, which would blame the operator.
 #[derive(Debug)]
 pub(crate) enum VerifyOutcome {
     Ok,
     Incomplete(String),
     Tampered(String),
     BadSignature(String),
+    KeyMissing(String),
 }
 
 pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
+    verify_with_key_source(session_id, signing::KeyMaterial::load_existing)
+}
+
+/// Verify with an injected key loader (M6). The production path loads the
+/// existing key (never minting); tests inject a temp path so the "missing key"
+/// verdict and the "no file created" guarantee are provable without touching the
+/// user's real key.
+fn verify_with_key_source(
+    session_id: &str,
+    load_key: impl FnOnce() -> Result<signing::KeyMaterial>,
+) -> Result<VerifyOutcome> {
     let log_path = audit_log_path(session_id);
     if !log_path.exists() {
         return Ok(VerifyOutcome::Incomplete(format!("no audit log at {}", log_path.display())));
@@ -132,12 +167,31 @@ pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
     let root_path = log_path.with_extension("root");
     let sig_path = log_path.with_extension("sig");
     let committed_root = match std::fs::read_to_string(&root_path) {
-        Ok(s) => s.trim().to_string(),
+        Ok(s) => s,
         Err(_) => return Ok(VerifyOutcome::Incomplete(
             format!("no committed root (session did not end cleanly); {} events present", leaf_count)
         )),
     };
+    let committed_root = committed_root.trim().to_string();
     let computed = computed_root.unwrap();
+
+    // H5b: a root that is not a well-formed 32-byte hex value is not an edit -
+    // it is a half-written `fs::write` the kill interrupted (the commit now
+    // writes atomically, but an old run or an external actor can still leave a
+    // torn file). Calling it TAMPERED blames the operator for a crash; an
+    // interrupted commit is honest INCOMPLETE.
+    //
+    // Checked by character class, not `decode_hex`: `decode_hex` byte-slices a
+    // `&str` (the L-G shape), so a 64-*byte* non-ASCII root would panic instead
+    // of reporting a verdict.
+    if committed_root.len() != 64 || !committed_root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(VerifyOutcome::Incomplete(format!(
+            "committed root is not a complete 32-byte hash (got {} chars); \
+             the commit was interrupted - {} events present",
+            committed_root.len(),
+            leaf_count
+        )));
+    }
     if committed_root != computed {
         return Ok(VerifyOutcome::Tampered(format!(
             "root mismatch (committed {committed_root}, computed {computed})"
@@ -145,9 +199,21 @@ pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
     }
 
     // Verify the signature.
+    //
+    // H5b: a missing signature alongside a present root is the other half of an
+    // interrupted commit. The new writer publishes the signature first, so this
+    // state cannot be produced by it, but the ordering's job is exactly to make
+    // every half-committed pair read as INCOMPLETE rather than BAD_SIGNATURE - so
+    // the operator is never told a crash was a forgery.
     let sig_hex = match std::fs::read_to_string(&sig_path) {
         Ok(s) => s.trim().to_string(),
-        Err(_) => return Ok(VerifyOutcome::BadSignature("no .sig file".to_string())),
+        Err(_) => {
+            return Ok(VerifyOutcome::Incomplete(format!(
+                "committed root has no signature - the commit was interrupted, or the \
+                 signature was removed; {} events present",
+                leaf_count
+            )));
+        }
     };
     let sig_bytes = match decode_hex(&sig_hex) {
         Some(b) => b,
@@ -158,7 +224,13 @@ pub(crate) fn verify_inner(session_id: &str) -> Result<VerifyOutcome> {
         None => return Ok(VerifyOutcome::BadSignature("computed root is not valid hex".to_string())),
     };
 
-    let key = signing::KeyMaterial::ensure()?;
+    // M6: load, never mint. `ensure()` here meant a missing key both reported
+    // `BAD_SIGNATURE` for every old session (indistinguishable from tampering)
+    // and installed a fresh trust anchor as a side effect of verifying.
+    let key = match load_key() {
+        Ok(k) => k,
+        Err(e) => return Ok(VerifyOutcome::KeyMissing(format!("{e:#}"))),
+    };
     if !signing::verify_with_secret(&key.signing, &root_bytes, &sig_bytes) {
         return Ok(VerifyOutcome::BadSignature("signature does not verify".to_string()));
     }
@@ -444,6 +516,148 @@ mod tests {
                 "the verdict must say what it found: {m}"
             ),
             other => panic!("a torn tail is incomplete, not {other:?}"),
+        }
+        cleanup(&sid);
+    }
+
+    /// H5b (verdict doc: confirmed). `commit_audit_root` used to write `.root`
+    /// then `.sig` as two separate `fs::write`s; a kill between them left a
+    /// committed root whose signature was missing (or stale), and `verify`
+    /// reported `BAD_SIGNATURE`/`TAMPERED` instead of an honest "the commit was
+    /// interrupted". Every half-committed pair is now `INCOMPLETE`-class, never
+    /// tampering - so the operator never mistakes a crash for an edit.
+    ///
+    /// Root without its signature: an interrupted commit (sig-first ordering means
+    /// this cannot be produced by the new writer, but an external actor or an old
+    /// run can leave it). Today this is `BAD_SIGNATURE`; it must be `Incomplete`.
+    #[test]
+    fn a_root_without_its_signature_is_incomplete() {
+        let sid = fresh_sid("h5b-root-only");
+        plant_signed_chain(&sid, chain_leaf(&sid, true, true));
+        // Remove the signature, leaving the committed root alone.
+        std::fs::remove_file(audit_log_path(&sid).with_extension("sig")).unwrap();
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Incomplete(m) => assert!(
+                m.to_ascii_lowercase().contains("sig")
+                    || m.to_ascii_lowercase().contains("signature"),
+                "the verdict must name the missing half: {m}"
+            ),
+            VerifyOutcome::Tampered(m) => {
+                panic!("a root without a signature is a crash, not an edit: {m}")
+            }
+            VerifyOutcome::BadSignature(m) => {
+                panic!("a missing signature is incomplete, not bad-signature: {m}")
+            }
+            other => panic!("a root without a signature must be incomplete, got {other:?}"),
+        }
+        cleanup(&sid);
+    }
+
+    /// Signature without its root: the only half the new sig-first writer can leave
+    /// behind if it is killed before the root lands. `verify` already reported
+    /// `Incomplete` here, but the case is pinned so the ordering stays load-bearing.
+    #[test]
+    fn a_signature_without_its_root_is_incomplete() {
+        let sid = fresh_sid("h5b-sig-only");
+        plant_signed_chain(&sid, chain_leaf(&sid, true, true));
+        std::fs::remove_file(audit_log_path(&sid).with_extension("root")).unwrap();
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Incomplete(_) => {}
+            other => panic!("a signature without a root must be incomplete, got {other:?}"),
+        }
+        cleanup(&sid);
+    }
+
+    /// A truncated committed root (a half-written `fs::write` that the kill
+    /// interrupted) used to fail the hex comparison and read as `TAMPERED` - the
+    /// tool calling an interrupted commit an edit. It must be `Incomplete`.
+    #[test]
+    fn a_truncated_committed_root_is_incomplete_not_tampered() {
+        let sid = fresh_sid("h5b-trunc-root");
+        plant_signed_chain(&sid, chain_leaf(&sid, true, true));
+        // Half the 64-hex-char root: exactly the kind of torn file a kill produces.
+        let root_path = audit_log_path(&sid).with_extension("root");
+        let root = std::fs::read_to_string(&root_path).unwrap();
+        let half = &root[..root.len() / 2];
+        std::fs::write(&root_path, half).unwrap();
+
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Incomplete(m) => assert!(
+                m.to_ascii_lowercase().contains("root")
+                    || m.to_ascii_lowercase().contains("commit"),
+                "the verdict must name the interrupted commit: {m}"
+            ),
+            VerifyOutcome::Tampered(m) => {
+                panic!("a truncated root is a crash, not an edit: {m}")
+            }
+            other => panic!("a truncated root must be incomplete, got {other:?}"),
+        }
+        cleanup(&sid);
+    }
+
+    /// M6 (verdict doc: confirmed). `audit verify` used to call
+    /// `signing::KeyMaterial::ensure()`, which MINTS a fresh key when the file is
+    /// missing. So losing the key made every old session report `BAD_SIGNATURE`
+    /// (indistinguishable from tampering) AND installed a brand-new trust anchor as
+    /// a side effect of merely verifying. Verify must load-or-fail, report a
+    /// distinct `KeyMissing` verdict, and create no key file.
+    #[test]
+    fn a_missing_signing_key_is_its_own_verdict_and_mints_nothing() {
+        let sid = fresh_sid("m6-no-key");
+        // A fully committed chain (root + sig), exactly as a clean session left it.
+        plant_signed_chain(&sid, chain_leaf(&sid, true, true));
+
+        // The verifier's key does not exist: the loader is pointed at a path that
+        // was never created (and never will be, because verify must not mint).
+        let missing_key = std::env::temp_dir().join(format!(
+            "saife-m6-verify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!missing_key.exists());
+
+        match verify_with_key_source(&sid, || {
+            signing::KeyMaterial::load_existing_at(&missing_key)
+        })
+        .unwrap()
+        {
+            VerifyOutcome::KeyMissing(m) => assert!(
+                m.to_ascii_lowercase().contains("key"),
+                "the verdict must name what is missing: {m}"
+            ),
+            VerifyOutcome::BadSignature(m) => {
+                panic!("a missing key is not a bad signature: {m}")
+            }
+            other => panic!("a missing key must be KeyMissing, got {other:?}"),
+        }
+
+        assert!(
+            !missing_key.exists(),
+            "verifying a session must never mint a signing key"
+        );
+        cleanup(&sid);
+    }
+
+    /// A `.root` that is not hex at all (or is 64 *bytes* of non-ASCII) must still
+    /// produce a verdict. `decode_hex` byte-slices a `&str`, so routing the root
+    /// through it would panic here instead of answering — the H5b check runs on the
+    /// character class for exactly that reason.
+    #[test]
+    fn a_non_hex_committed_root_is_incomplete_without_panicking() {
+        let sid = fresh_sid("h5b-nonhex-root");
+        plant_signed_chain(&sid, chain_leaf(&sid, true, true));
+        // 32 non-ASCII chars == 64 bytes: the length check alone would let this
+        // through to a byte-slicing hex decoder.
+        let not_hex: String = "é".repeat(32);
+        assert_eq!(not_hex.len(), 64);
+        std::fs::write(audit_log_path(&sid).with_extension("root"), &not_hex).unwrap();
+
+        match verify_inner(&sid).unwrap() {
+            VerifyOutcome::Incomplete(_) => {}
+            other => panic!("a non-hex root is an interrupted commit, got {other:?}"),
         }
         cleanup(&sid);
     }
