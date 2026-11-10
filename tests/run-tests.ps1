@@ -734,7 +734,17 @@ function Invoke-Scenario-S5 {
         Detail = if ($passed) { 'write to .ssh denied' } else { "exit=$($r.ExitCode) exists=$exists stderr=$err" } }
 }
 
-# S-6 (GATE): download a binary into .sandbox\<sid>\bin and execute it.
+# S-6 (GATE): a binary placed in the per-session bin executes under the
+# sandbox. The install tree is SESSION-SCOPED since #40/L-O: teardown deletes
+# <cwd>\.sandbox\<sid> at the end of every run, so the old "install in run 1,
+# execute in run 2" model cannot exist any more (it asserted state that the
+# product now removes by design - see S-97). The gate keeps the property it
+# was written for - a downloaded tool runs INSIDE the containment - and
+# proves it in ONE run: the binary is placed while the tree exists (after
+# --print-sid, before the protecting DACL is applied) and executed as the
+# run's PAYLOAD, a direct spawn. `cmd` cannot spawn an exe under the
+# PROTECTED subtree inside the AppContainer (W1/W2), so a shell-based form
+# would fail for a reason that has nothing to do with this gate.
 function Invoke-Scenario-S6 {
     $d = New-ScenarioDir 6
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
@@ -742,28 +752,35 @@ function Invoke-Scenario-S6 {
     $sid = ($psid.Stdout -join '').Trim()
     if (-not $sid) { return @{ Num=6; Name='S-6 (GATE)'; Passed=$false; Skipped=$false; Detail='print-sid returned empty sid'; IsGate=$true } }
     $binName = 'hostname.exe'
-    $binWhere = Join-Path $d ".sandbox\$sid\bin\$binName"
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','copy',"C:\Windows\System32\$binName",".sandbox\$sid\bin\$binName") -WorkingDirectory $d
-    $installed = Test-Path -LiteralPath $binWhere
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',".sandbox\$sid\bin\$binName") -WorkingDirectory $d
+    $binDir = Join-Path $d ".sandbox\$sid\bin"
+    $binWhere = Join-Path $binDir $binName
+    $binExists = Test-Path -LiteralPath $binDir
+    if ($binExists) { Copy-Item -LiteralPath (Join-Path $env:SystemRoot "System32\$binName") -Destination $binWhere -Force }
+    $placed = Test-Path -LiteralPath $binWhere
+    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--',$binWhere) -WorkingDirectory $d
     $out2 = (($r2.Stdout | Where-Object { $_ -notmatch '^SESSION ' }) -join "`n")
-    $passed = ($r1.ExitCode -eq 0) -and $installed -and ($r2.ExitCode -eq 0) -and ($out2.Trim().Length -gt 0)
+    $treeGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sid"))
+    $passed = $binExists -and $placed -and ($r2.ExitCode -eq 0) -and ($out2.Trim().Length -gt 0) -and $treeGone
     return @{ Num=6; Name='S-6 (GATE)'; Passed=$passed; Skipped=$false; IsGate=$true
-        Detail = if ($passed) { "downloaded binary executed; sid=$sid" } else { "sid=$sid copyExit=$($r1.ExitCode) installed=$installed runExit=$($r2.ExitCode) out=$out2" } }
+        Detail = if ($passed) { "session-bin binary executed; tree removed at teardown; sid=$sid" } else { "sid=$sid binExists=$binExists placed=$placed runExit=$($r2.ExitCode) out=$out2 treeGone=$treeGone err=$(($r2.Stderr -join "`n"))" } }
 }
 
-# S-7: write into .sandbox\<sid>\bin works.
+# S-7: the CHILD can write into .sandbox\<sid>\bin. The marker is written and
+# read back INSIDE the same session, because teardown deletes the tree (#40/
+# L-O) - a post-run Test-Path would now assert the opposite of the product.
+# `type` only reads a file (no spawn under the PROTECTED subtree), so the
+# command line stays inside the shapes the AppContainer allows.
 function Invoke-Scenario-S7 {
     $d = New-ScenarioDir 7
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=7; Name='S-7'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
     $sid = ($psid.Stdout -join '').Trim()
-    $marker = Join-Path $d ".sandbox\$sid\bin\marker.txt"
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','echo','test','>',".sandbox\$sid\bin\marker.txt") -WorkingDirectory $d
-    $exists = Test-Path -LiteralPath $marker
-    $passed = ($r.ExitCode -eq 0) -and $exists
+    $cmdLine = "echo marker7 > .sandbox\$sid\bin\marker.txt && type .sandbox\$sid\bin\marker.txt"
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',$cmdLine) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'marker7')
     return @{ Num=7; Name='S-7'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "marker written; sid=$sid" } else { "exit=$($r.ExitCode) exists=$exists sid=$sid" } }
+        Detail = if ($passed) { "child wrote and read the marker in-session; sid=$sid" } else { "exit=$($r.ExitCode) out=$out err=$(($r.Stderr -join "`n")) sid=$sid" } }
 }
 
 # S-8: python from system install runs (skips if python absent).
@@ -777,33 +794,35 @@ function Invoke-Scenario-S8 {
         Detail = if ($passed) { 'python ran' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
-# S-9: python venv created in .sandbox\<sid>\venv (skips if python absent).
+# S-9: python venv created in .sandbox\<sid>\venv and executed, all in ONE
+# session (teardown deletes the tree - #40/L-O - so the old two-run form
+# asserted state the product removes). Both steps are DIRECT spawns: python
+# creates the venv (ensurepip spawns python from the new venv) and then runs
+# the venv's python via subprocess. Wrapping any of it in `cmd` is the
+# documented broken path inside the AppContainer (W1/W2).
 function Invoke-Scenario-S9 {
     $d = New-ScenarioDir 9
     if (-not (Get-Python)) { return @{ Num=9; Name='S-9'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
     $sid = ($psid.Stdout -join '').Trim()
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','python','-m','venv',".sandbox\$sid\venv") -WorkingDirectory $d
-    $pyExe = Join-Path $d ".sandbox\$sid\venv\Scripts\python.exe"
-    if ($r1.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pyExe)) {
-        return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe) stderr=$(($r1.Stderr -join "`n")) stdout=$(($r1.Stdout -join "`n"))" }
-    }
-    # r2 runs the venv python DIRECTLY. The previous form wrapped it in
-    # `cmd /c`, which is broken in two independent ways proven on
-    # 2026-10-12 (the in-VM diagnostic round plus local simulations):
-    # (a) cmd's /c quote heuristics strip quotes once the command line has
-    #     more than two (spaced exe path, quoted -c arg), mangling it into
-    #     "Access is denied."; (b) in-VM, cmd inside the AppContainer
-    #     cannot spawn an exe under the PROTECTED .sandbox\<sid> subtree at
-    #     all (W1/W2; still an open product question), while the direct
-    #     spawn passes everywhere.
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--',$pyExe,'-c',"print('venv works')") -WorkingDirectory $d
-    $out = ($r2.Stdout -join "`n")
-    $err = ($r2.Stderr -join "`n")
-    $passed = ($r2.ExitCode -eq 0) -and ($out -match 'venv works')
+    $probe = Join-Path $d 's9_probe.py'
+    Set-Content -LiteralPath $probe -Encoding ASCII -Value @'
+import os, subprocess, sys, venv
+target = os.path.join(".sandbox", sys.argv[1], "venv")
+venv.create(target, with_pip=True)
+exe = os.path.join(target, "Scripts", "python.exe")
+print("VENV_EXE_EXISTS", os.path.exists(exe))
+r = subprocess.run([exe, "-c", "print(43)"], capture_output=True, text=True)
+print("VENV_CHILD_RC", r.returncode)
+print("VENV_CHILD_OUT", r.stdout.strip())
+'@
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','python',$probe,$sid) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'VENV_EXE_EXISTS True') -and ($out -match 'VENV_CHILD_RC 0') -and ($out -match 'VENV_CHILD_OUT 43')
     return @{ Num=9; Name='S-9'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "venv python ran; sid=$sid" } else { "exit=$($r2.ExitCode) stdout=$out stderr=$err" } }
+        Detail = if ($passed) { "venv created in the session tree and its python ran; sid=$sid" } else { "exit=$($r.ExitCode) stdout=$out stderr=$err sid=$sid" } }
 }
 
 # S-10: child process inherits restrictions (depth 3).
@@ -856,29 +875,36 @@ function Invoke-Scenario-S12 {
         Detail = if ($passed) { 'breakaway denied with ERROR_ACCESS_DENIED (5)' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
-# S-13: per-session isolation — two sessions get distinct install trees.
+# S-13: per-session isolation - two sessions get distinct install trees, and
+# one session cannot read the other's tools. The trees are SESSION-SCOPED
+# (#40/L-O), so this can only be observed while both sessions exist: A
+# installs a tool into its own bin and holds the session open, B runs while
+# A is live and must be DENIED A's file; A's teardown then removes A's tree.
 function Invoke-Scenario-S13 {
     $d = New-ScenarioDir 13
-    $psidA = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
-    $psidB = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
-    if ($psidA.ExitCode -ne 0 -or $psidB.ExitCode -ne 0) { return @{ Num=13; Name='S-13'; Passed=$false; Skipped=$false; Detail="print-sid failed A=$($psidA.ExitCode) B=$($psidB.ExitCode)" } }
-    $sidA = ($psidA.Stdout -join '').Trim()
-    $sidB = ($psidB.Stdout -join '').Trim()
-    if (-not $sidA -or -not $sidB) { return @{ Num=13; Name='S-13'; Passed=$false; Skipped=$false; Detail="empty sid A='$sidA' B='$sidB'" } }
-    if ($sidA -eq $sidB) { return @{ Num=13; Name='S-13'; Passed=$false; Skipped=$false; Detail="sids not distinct: A=B='$sidA'" } }
-    $whereA = Join-Path $d ".sandbox\$sidA\bin\where.exe"
-    $whereB = Join-Path $d ".sandbox\$sidB\bin\where.exe"
-    Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidA,'--','cmd','/c','copy','C:\Windows\System32\where.exe',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d | Out-Null
-    $aInstalled = Test-Path -LiteralPath $whereA
-    $bExists = Test-Path -LiteralPath $whereB
-    $binB = Join-Path $d ".sandbox\$sidB\bin"
-    $binBExists = Test-Path -LiteralPath $binB
+    $sidA = 'S13A-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $sidB = 'S13B-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $installA = Join-Path $d 'install-a.cmd'
+    Set-Content -LiteralPath $installA -Encoding ASCII -Value @"
+@echo off
+copy C:\Windows\System32\where.exe .sandbox\$sidA\bin\where.exe >NUL
+echo installed > install-done.txt
+for /l %%i in (1,1,40000) do @ver>NUL
+"@
+    $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c install-a.cmd" -f $sidA) -WorkingDirectory $d
+    $installed = Wait-PathAppears -Path (Join-Path $d 'install-done.txt') -Seconds 30
     $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d
     $errB = ($rB.Stderr -join "`n")
     $bDenied = ($rB.ExitCode -ne 0) -and (Test-Denied $errB)
-    $passed = $aInstalled -and (-not $bExists) -and $binBExists -and $bDenied
+    $aExited = $procA.WaitForExit(120000)
+    if (-not $aExited) { try { $procA.Kill() } catch { } }
+    $errA = $procA.StandardError.ReadToEnd()
+    $null = $procA.StandardOutput.ReadToEnd()
+    $procA.Close()
+    $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
+    $passed = $installed -and ($sidA -ne $sidB) -and $bDenied -and $aExited -and $treeAGone
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; B denied A's tools" } else { "aInstalled=$aInstalled bExists=$bExists binBExists=$binBExists bDenied=$bDenied" } }
+        Detail = if ($passed) { "distinct sids; B denied A's live tree; A's tree removed at teardown" } else { "installed=$installed bDenied=$bDenied aExited=$aExited treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
@@ -1987,7 +2013,11 @@ function Invoke-Scenario-S62 {
     Set-Content -LiteralPath $bPath -Value $bJson -Encoding UTF8
     $r = Invoke-Sandbox -Args @('run','--profile',$aPath,'--','cmd','/c','echo','x') -WorkingDirectory $d
     $err = ($r.Stderr -join "`n")
-    $passed = ($r.ExitCode -ne 0) -and ($err -match 'Profile cycle detected') -and ($err -match 'a\.json.*b\.json.*a\.json')
+    # The product names the PROFILES in the cycle ("Profile cycle detected:
+    # a -> b -> a"), not their file paths. The arrow is matched loosely: its
+    # console encoding differs between hosts (a transcript shows it as
+    # 'Oaae' on an ANSI console), so a literal arrow would be a host check.
+    $passed = ($r.ExitCode -ne 0) -and ($err -match 'Profile cycle detected') -and ($err -match 'a\b.*b\b.*a\b')
     return @{ Num=62; Name='S-62 (AC-5.6)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'cycle detected + formatted' } else { "exit=$($r.ExitCode) stderr=$err" } }
 }
