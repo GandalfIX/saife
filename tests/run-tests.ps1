@@ -3277,7 +3277,19 @@ exit 0
         if ($o.disposition -eq 'deny' -and $o.reason -eq 'no_token' -and $o.source -eq 'default' -and $o.host -eq '<unknown>') { $tokenLeaf = $true }
         if ($o.host -eq 'example.com') { $admissionLeaf = $true }
     }
-    $passed = ($r.ExitCode -eq 0) -and $got407 -and $gotChallenge -and $gotNoBody -and $tokenLeaf -and (-not $admissionLeaf)
+    # The 407 contract is identical on both backends. What the SESSION then
+    # reports differs BY DESIGN: the AppContainer path exits with the child's
+    # code, while mxc's guardrail 1 refuses a session whose ONLY proxy contact
+    # was unauthenticated - nothing was ever proven, so the refusal (exit 126,
+    # reason workload_cannot_authenticate) is the product behaving correctly,
+    # not a backend defect. Neither shape admits anything.
+    $guardrailRefusal = ($r.ExitCode -eq 126)
+    if ($script:Backend -eq 'mxc') {
+        $refusalText = ($r.Stderr -join "`n")
+        $guardrailRefusal = $guardrailRefusal -and ($refusalText -match 'workload_cannot_authenticate')
+    }
+    $exitOk = if ($script:Backend -eq 'mxc') { $guardrailRefusal } else { ($r.ExitCode -eq 0) }
+    $passed = $exitOk -and $got407 -and $gotChallenge -and $gotNoBody -and $tokenLeaf -and (-not $admissionLeaf)
     return @{ Num=91; Name='S-91 (D-1 missing Proxy-Authorization)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'CONNECT with no Proxy-Authorization: 407 Proxy Authentication Required + Proxy-Authenticate + Content-Length: 0 (headers only); audit default/no_token (<unknown>), no admission leaf for example.com' }
                  else { "exit=$($r.ExitCode) got407=$got407 challenge=$gotChallenge noBody=$gotNoBody tokenLeaf=$tokenLeaf admissionLeaf=$admissionLeaf out=$(Get-LineHead -Lines @($out) -Max 200) err=$(Get-LineHead -Lines $r.Stderr -Max 160)" } }
