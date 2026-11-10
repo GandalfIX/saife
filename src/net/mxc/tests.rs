@@ -378,7 +378,16 @@
 
     #[test]
     fn declared_grants_are_carried_and_the_launcher_is_granted_automatically() {
-        let req = build(&input());
+        // The contract build filters `denied_paths` to paths that EXIST (PSEC,
+        // see `existing_paths_only`), so the declared deny must be a real
+        // path: a synthetic one is dropped here and this assertion passes for
+        // the wrong reason on a host where the spelled path happens to exist
+        // (measured in the 29680 guest, where `C:\Users\marku\.ssh` is absent).
+        let dir = std::env::temp_dir().join(format!("sbx-mxc-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut i = input();
+        i.filesystem.denied_paths = vec![dir.display().to_string()];
+        let req = build(&i);
         assert_eq!(req.policy.readwrite_paths, vec![r"C:\work".to_string()]);
         assert_eq!(
             req.policy.readonly_paths,
@@ -387,8 +396,10 @@
         );
         assert_eq!(
             req.policy.denied_paths,
-            vec![r"C:\Users\marku\.ssh".to_string()]
+            vec![dir.display().to_string()],
+            "an existing denied path is carried verbatim"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- D6: the config posture is pinned, not defaulted ------------------
