@@ -198,6 +198,20 @@ pub fn ensure_launcher_grant(filesystem: &mut MxcFilesystemInput, launcher: &Pat
     true
 }
 
+/// Keep only the paths that exist on this host. See the PSEC comment in
+/// `build_request`'s filesystem block: `CreateProcessSecurityEnvironment`
+/// fails the launch with `ERROR_PATH_NOT_FOUND` when the spec names an absent
+/// path, and the deny list legitimately names credential trees a host may not
+/// have. Order-preserving and de-duplication-neutral (callers dedupe first).
+fn existing_paths_only(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .cloned()
+        .collect()
+}
+
+
 /// Normalized comparison key for a Windows path.
 ///
 /// Two spellings that name the same object must compare equal, and none of these
@@ -2361,7 +2375,23 @@ pub fn build_request(
         filesystem: contract::OptionalField::present(contract::Filesystem {
             readwrite_paths: contract::OptionalField::present(filesystem.readwrite_paths.clone()),
             readonly_paths: contract::OptionalField::present(filesystem.readonly_paths.clone()),
-            denied_paths: contract::OptionalField::present(filesystem.denied_paths.clone()),
+            // PSEC requires every path in the spec to EXIST:
+            // `CreateProcessSecurityEnvironment` fails the whole launch with
+            // `ERROR_PATH_NOT_FOUND` (0x80070003) when any of them is absent.
+            // Regression found 2026-11-10: M3 (#40) pushes every builtin deny
+            // dir and credential file into `denied_paths` unconditionally, so a
+            // host without `~/.azure` or `~/.gnupg` could not launch mxc at all
+            // (0.4.0 only sent the four secret dirs and worked). Same rule as
+            // the AppContainer deny build: a path that does not exist needs no
+            // entry. The deny-covers-grant pre-flight in [`build_request`] saw
+            // the UNFILTERED list, so policy checks are unchanged. The GRANT
+            // lists are deliberately left alone: grants are created for paths
+            // that exist (cwd, launcher dir, resolved profile entries), and
+            // filtering them here would silently drop a misspelled grant
+            // instead of failing loudly on it.
+            denied_paths: contract::OptionalField::present(existing_paths_only(
+                &filesystem.denied_paths,
+            )),
         }),
         fallback: Default::default(),
         network: contract::OptionalField::present(network),

@@ -3098,3 +3098,30 @@
             "the default must keep the substrate-injected proxy"
         );
     }
+
+    /// PSEC fails the whole launch with `ERROR_PATH_NOT_FOUND` when the spec
+    /// names an absent path (measured 2026-11-10: #40's M3 pushes every builtin
+    /// deny dir/file into `denied_paths`, so a host without `~/.azure` or
+    /// `~/.gnupg` could not launch mxc at all). The contract build therefore
+    /// filters `denied_paths` to paths that exist; existing ones are kept in
+    /// order, absent ones are dropped.
+    #[test]
+    fn denied_paths_are_filtered_to_paths_that_exist() {
+        let dir = std::env::temp_dir().join(format!("sbx-psec-filter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("exists.txt");
+        std::fs::write(&present, "x").unwrap();
+        let absent = dir.join("no-such-file.txt");
+
+        let kept = existing_paths_only(&[
+            present.display().to_string(),
+            absent.display().to_string(),
+        ]);
+
+        assert_eq!(
+            kept,
+            vec![present.display().to_string()],
+            "the absent deny path must be dropped; the existing one kept in order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
