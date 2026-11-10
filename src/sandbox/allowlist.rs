@@ -168,7 +168,21 @@ pub(crate) fn build_allowlist_with(
     // covering grant. The trustee is the AppContainer SID, never the user or the
     // supervisor's own token, so this does not reduce the supervisor's access to
     // the deny trees (it reaches its own stores as the supervisor SID).
+    // A deny on a path that does not exist is SKIPPED here, not attempted:
+    // the ACE write fails with 0x80070002, and `grant_access` returns on the
+    // first DENY failure — so one missing credential directory (`~/.aws` on a
+    // host that never used AWS) used to abort the whole grant list, dropping
+    // every later deny, all ancestor traverse grants and both PROTECTED
+    // `.sandbox` entries. The session tree then inherited the temp dir's broad
+    // DACL and a sibling session could read it (measured 2026-11-09, S-13).
+    // The same rule already governed deny FILES (see `build_allowlist`); a
+    // path that does not exist needs no ACE. The pre-flight ABOVE still runs
+    // on the unfiltered lists, so a grant spelled into a deny path is refused
+    // even when that path is absent (the grant could create it).
     for p in &fs.deny {
+        if !p.exists() {
+            continue;
+        }
         push_entry(
             &mut entries,
             p.clone(),
@@ -179,6 +193,9 @@ pub(crate) fn build_allowlist_with(
         );
     }
     for deny in builtin_denies {
+        if !deny.exists() {
+            continue;
+        }
         push_entry(
             &mut entries,
             deny.clone(),
@@ -203,8 +220,13 @@ pub(crate) fn build_allowlist_with(
     // inheritable flag only invites a pointless `should_propagate` walk. The
     // deny applies to the file itself, where the RWX allow on the covering
     // directory would otherwise reach it — an explicit deny beats the
-    // inherited allow in the DACL evaluation order.
+    // inherited allow in the DACL evaluation order. The existence rule is the
+    // dir denies' (see above) — enforced here too, not only in
+    // `build_allowlist`'s call site, so every caller of this function is safe.
     for file in builtin_deny_files {
+        if !file.exists() {
+            continue;
+        }
         entries.push(AllowEntry {
             win32_path: file.clone(),
             access: FILE_ALL_ACCESS.0,
@@ -995,7 +1017,7 @@ mod tests {
     /// operator can see which rule produced a refusal.
     #[test]
     fn builtin_denies_are_entries_on_the_appcontainer_path() {
-        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let home = create_deny_fixture_home("entries");
         let denies = vec![home.join(".saife")];
         let fs = FilesystemSlice {
             allow: vec![std::path::PathBuf::from(r"C:\proj")],
@@ -1023,6 +1045,7 @@ mod tests {
             "label: {}",
             hit.label
         );
+        remove_deny_fixture_home(&home);
     }
 
     /// C1 red test 1: a deny ACE with mask 0 denies nothing — it intersects no
@@ -1032,12 +1055,14 @@ mod tests {
     /// non-zero mask.
     #[test]
     fn every_deny_entry_carries_a_non_zero_mask() {
-        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let home = create_deny_fixture_home("mask");
         let builtin = builtin_deny_dir_set(&home);
+        let configured = home.join("secrets");
+        std::fs::create_dir_all(&configured).unwrap();
         let fs = FilesystemSlice {
             allow: vec![std::path::PathBuf::from(r"C:\proj")],
             read_only: Vec::new(),
-            deny: vec![home.join("secrets")],
+            deny: vec![configured],
         };
         let entries = build_allowlist_with(
             "test-sid",
@@ -1061,13 +1086,14 @@ mod tests {
                 e.win32_path
             );
         }
+        remove_deny_fixture_home(&home);
     }
 
     /// C1 red test 1 (builtin half): the builtin deny set is exactly the six
     /// credential/control-plane directories, each denied with a non-zero mask.
     #[test]
     fn the_builtin_deny_set_yields_exactly_six_non_zero_denies() {
-        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let home = create_deny_fixture_home("six");
         let local = home.join("AppData").join("Local");
         let builtin = builtin_deny_dir_set(&home);
         let fs = FilesystemSlice {
@@ -1121,6 +1147,115 @@ mod tests {
         // control-plane trees.
         assert!(want.contains(&home.join(".saife")));
         assert!(want.contains(&local.join("saife")));
+        remove_deny_fixture_home(&home);
+    }
+
+    /// A deny ACE on a path that does not exist FAILS (0x80070002), and a
+    /// failed deny aborts the whole grant list (`grant_access` returns on the
+    /// first deny error). One missing credential directory — `~/.aws` on a
+    /// host that never used AWS — therefore stripped every deny after it, the
+    /// ancestor traverse grants AND both PROTECTED `.sandbox` entries, so the
+    /// session tree inherited the temp dir's broad DACL and another session
+    /// could read it (measured 2026-11-09: S-13's cross-session read). The
+    /// rule that already applied to deny FILES now applies to every deny
+    /// entry: a path that does not exist needs no ACE and is skipped.
+    #[test]
+    fn a_deny_for_a_path_that_does_not_exist_is_skipped() {
+        let home = create_deny_fixture_home("skip-builtin");
+        let missing = home.join(".never-installed");
+        let denies = vec![home.join(".ssh"), missing.clone()];
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from(r"C:\proj")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &denies,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.deny && e.win32_path == home.join(".ssh")),
+            "the existing deny must still be an entry: {:?}",
+            entries.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+        assert!(
+            !entries.iter().any(|e| e.deny && e.win32_path == missing),
+            "a deny for a missing path must not be an entry: {:?}",
+            entries.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+        remove_deny_fixture_home(&home);
+    }
+
+    /// The same rule for a configured (`filesystem.deny`) entry: a profile may
+    /// name a directory that this host does not have.
+    #[test]
+    fn a_configured_deny_for_a_path_that_does_not_exist_is_skipped() {
+        let home = create_deny_fixture_home("skip-configured");
+        let present = home.join("secrets");
+        std::fs::create_dir_all(&present).unwrap();
+        let missing = home.join("no-such-secrets");
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from(r"C:\proj")],
+            read_only: Vec::new(),
+            deny: vec![present.clone(), missing.clone()],
+        };
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.deny && e.win32_path == present),
+            "the existing configured deny must still be an entry"
+        );
+        assert!(
+            !entries.iter().any(|e| e.deny && e.win32_path == missing),
+            "a configured deny for a missing path must not be an entry"
+        );
+        remove_deny_fixture_home(&home);
+    }
+
+    /// Skipping the ACE does NOT relax the policy: the pre-flight runs on the
+    /// UNFILTERED deny list, so a grant spelled into a deny path is refused
+    /// even when that path does not exist yet (the grant could create it).
+    #[test]
+    fn the_preflight_still_refuses_a_grant_inside_a_missing_deny() {
+        let home = create_deny_fixture_home("preflight-missing");
+        let missing = home.join(".aws");
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert!(!missing.exists(), "fixture premise: .aws must be absent");
+        let fs = FilesystemSlice {
+            allow: vec![missing.join("credentials")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let err = match build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &[home.join(".ssh"), missing],
+            &[],
+        ) {
+            Ok(_) => panic!("a grant inside a missing deny path must still be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message().contains("deny covers grant"),
+            "the refusal must name the rule: {}",
+            err.message()
+        );
+        remove_deny_fixture_home(&home);
     }
 
     /// C1: a grant spelled the ways Win32 accepts for a denied directory must
@@ -1182,7 +1317,7 @@ mod tests {
     /// covering grant.
     #[test]
     fn a_grant_covering_a_deny_ships_and_the_deny_keeps_a_real_mask() {
-        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let home = create_deny_fixture_home("cover");
         let denies = vec![home.join(".ssh")];
         let fs = FilesystemSlice {
             allow: vec![home.clone()],
@@ -1210,6 +1345,7 @@ mod tests {
             "the deny under a covering grant needs a real mask - a zero-mask \
              deny is a no-op and the inherited $USERPROFILE allow reads ~/.ssh (C1)"
         );
+        remove_deny_fixture_home(&home);
     }
 
     /// M5 residual (security review 2026-11-09): `.sandbox` itself used to
@@ -1420,21 +1556,21 @@ mod tests {
             .iter()
             .filter(|e| e.deny && e.label.starts_with("builtin-deny-file:"))
             .collect();
-        assert_eq!(
-            file_denies.len(),
-            want.len(),
-            "every builtin credential file must be denied exactly once (and nothing else may \
-             join the set); denies: {:?}",
-            file_denies
-                .iter()
-                .map(|e| &e.win32_path)
-                .collect::<Vec<_>>()
-        );
+        // Host-independent form of the M2 invariant, after the existence rule:
+        // a deny for a path that does not exist is SKIPPED (a failed deny aborts
+        // the whole grant list — see `a_deny_for_a_path_that_does_not_exist_is_skipped`),
+        // so a runner without Maven legitimately ships no `settings.xml` deny.
+        // The invariant that still holds on every host: every credential file
+        // that EXISTS is denied with a real, non-inheritable mask; every absent
+        // one is absent from the entries but still named by the POLICY list; and
+        // nothing outside the set joins it.
+        let policy = crate::profile::builtin_deny_files();
         for file in &want {
             let hit = file_denies
                 .iter()
-                .find(|e| paths_eq_ci(&e.win32_path, file))
-                .unwrap_or_else(|| {
+                .find(|e| paths_eq_ci(&e.win32_path, file));
+            if file.exists() {
+                let hit = hit.unwrap_or_else(|| {
                     panic!(
                         "the jvm policy must deny {file:?} (a credential file inside a granted \
                          tree); file denies: {:?}",
@@ -1444,15 +1580,33 @@ mod tests {
                             .collect::<Vec<_>>()
                     )
                 });
-            assert_ne!(
-                hit.access, 0,
-                "the file deny for {file:?} must carry a real mask — a zero-mask deny ACE \
-                 denies nothing (C1, applied to files)"
-            );
+                assert_ne!(
+                    hit.access, 0,
+                    "the file deny for {file:?} must carry a real mask — a zero-mask deny ACE \
+                     denies nothing (C1, applied to files)"
+                );
+                assert!(
+                    !hit.inherit,
+                    "the deny for {file:?} must be non-inheritable: a file has no children to \
+                     shield, and an inheritable ACE only invites a pointless propagation walk"
+                );
+            } else {
+                assert!(
+                    hit.is_none(),
+                    "a deny for the absent {file:?} must be skipped, not attempted"
+                );
+                assert!(
+                    policy.iter().any(|p| paths_eq_ci(p, file)),
+                    "the POLICY must still name {file:?} - deleting it from builtin_deny_files \
+                     would let the existence rule hide a removed rule"
+                );
+            }
+        }
+        for e in &file_denies {
             assert!(
-                !hit.inherit,
-                "the deny for {file:?} must be non-inheritable: a file has no children to \
-                 shield, and an inheritable ACE only invites a pointless propagation walk"
+                want.iter().any(|w| paths_eq_ci(&e.win32_path, w)),
+                "unexpected credential-file deny {:?} - nothing outside the M2 set may join it",
+                e.win32_path
             );
         }
         // The deliberately-undenied credential: ~/.npmrc stays readable because
@@ -1487,8 +1641,12 @@ mod tests {
     /// granted RWX.
     #[test]
     fn m2_a_credential_file_grant_is_refused_but_the_parent_dir_passes() {
-        let home = std::path::PathBuf::from(r"C:\Users\test");
+        let home = create_deny_fixture_home("m2");
         let file = home.join(".gradle").join("gradle.properties");
+        // The deny is existence-dependent at build time, so the credential file
+        // must actually exist for part (b) to exercise "the deny ships".
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "org.gradle.jvmargs=-Xmx1g").unwrap();
         // (a) Granting the file itself, ON TOP OF the legitimate directory
         // grant: the pre-flight refuses the session because one grant names a
         // credential file. The directory grant does not rescue it.
@@ -1540,6 +1698,7 @@ mod tests {
             "the file deny needs a real mask - a zero-mask deny is a no-op and the inherited \
              .gradle allow reads gradle.properties (C1's lesson, applied to files)"
         );
+        remove_deny_fixture_home(&home);
     }
 
     /// The six builtin deny directories (the AppContainer builtin set — a
@@ -1552,5 +1711,23 @@ mod tests {
             .map(|d| home.join(d))
             .chain(std::iter::once(local.join("saife")))
             .collect()
+    }
+
+    /// A REAL fixture home with the six builtin deny directories present. The
+    /// deny rules are existence-dependent (a deny on a missing path is
+    /// skipped at build time), so a synthetic `C:\Users\test` home would
+    /// silently yield zero entries and test nothing.
+    fn create_deny_fixture_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir()
+            .join(format!("sbx-deny-fixture-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        for d in builtin_deny_dir_set(&home) {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        home
+    }
+
+    fn remove_deny_fixture_home(home: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(home);
     }
 }

@@ -682,9 +682,40 @@ pub fn restore_all(journal: &DaclJournal) -> Result<()> {
         if !seen.insert(entry.path.clone()) {
             continue;
         }
-        restore_one(&entry)?;
+        match restore_one(&entry) {
+            Ok(()) => {}
+            // A journaled path that no longer exists has nothing to restore:
+            // its ACEs went away with the object. Same rule as the build side
+            // (a deny on a missing path is skipped). This is what keeps
+            // teardown robust when the supervisor's own stores churn during
+            // the session: the propagated deny ACEs sit on every descendant of
+            // `~/.saife` and `%LOCALAPPDATA%\saife`, and audit leaves/logs are
+            // written and rotated there while the session runs, so paths
+            // vanish between grant and teardown (measured 2026-11-09: a
+            // 7,296-entry journal failed restore with 0x80070002 and was
+            // retained on every run).
+            Err(e) if is_absent_path_error(&e) => {
+                if std::env::var_os("SAIFE_DIAG").is_some() {
+                    eprintln!(
+                        "[journal] {} vanished before restore; nothing to restore",
+                        entry.path
+                    );
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
+}
+
+/// True when a restore failure means "the object is gone", not "the restore
+/// failed": `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3). A path
+/// that no longer exists carries no ACEs, so it needs no restore — retrying it
+/// forever (the journal is retained on failure) would be a leak, not a repair.
+fn is_absent_path_error(e: &windows::core::Error) -> bool {
+    let code = e.code();
+    code == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+        || code == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0)
 }
 
 /// Restore + log-on-failure wrapper for `run()` teardown and orphan reaping.
@@ -2279,4 +2310,31 @@ fn private_network_capability_sid_is_s_1_15_3_7() {
         let _ = LocalFree(Some(HLOCAL(pwstr.0 as *mut _)));
         let _ = FreeSid(sid);
     }
+}
+
+/// Restore treats a VANISHED path as restored, not as a failure: the object
+/// carries no ACEs any more, and keeping the journal for a retry that can never
+/// succeed leaks one journal per run (measured 2026-11-09: 7,296 entries of
+/// propagated deny ACEs over the supervisor's own audit store; one rotated leaf
+/// failed the whole restore with 0x80070002 and the journal was retained).
+/// Every other failure must still be fatal — a restore that cannot write is a
+/// host left with session ACEs, and the journal is the only record of them.
+#[test]
+fn only_an_absent_path_is_treated_as_restored() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+
+    for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
+        let e: windows::core::Error = HRESULT::from_win32(code.0).into();
+        assert!(
+            is_absent_path_error(&e),
+            "{code:?} means the object is gone and needs no restore"
+        );
+    }
+    // A real failure must stay fatal: the ACE is still on the host and the
+    // journal is the only record of it.
+    let denied: windows::core::Error = HRESULT::from_win32(ERROR_ACCESS_DENIED.0).into();
+    assert!(
+        !is_absent_path_error(&denied),
+        "{ERROR_ACCESS_DENIED:?} is a real restore failure - the ACE is still on the host"
+    );
 }

@@ -888,23 +888,33 @@ function Invoke-Scenario-S13 {
     Set-Content -LiteralPath $installA -Encoding ASCII -Value @"
 @echo off
 copy C:\Windows\System32\where.exe .sandbox\$sidA\bin\where.exe >NUL
-echo installed > install-done.txt
+if errorlevel 1 (echo install-failed>install-done.txt) else (echo installed>install-done.txt)
 for /l %%i in (1,1,40000) do @ver>NUL
 "@
     $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c install-a.cmd" -f $sidA) -WorkingDirectory $d
-    $installed = Wait-PathAppears -Path (Join-Path $d 'install-done.txt') -Seconds 30
     $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d
     $errB = ($rB.Stderr -join "`n")
-    $bDenied = ($rB.ExitCode -ne 0) -and (Test-Denied $errB)
+    # The flag's CONTENT proves A's copy succeeded - the child writes
+    # 'installed' only when `copy` returned 0, so B's denial cannot pass
+    # vacuously. The host does NOT read A's tree mid-run (only the owner
+    # survives the PROTECTED DACL on some paths, and that is not the
+    # property under test).
+    $installed = Wait-PathAppears -Path (Join-Path $d 'install-done.txt') -Seconds 30
+    $flagText = if ($installed) { ((Get-Content -LiteralPath (Join-Path $d 'install-done.txt') -ErrorAction SilentlyContinue) -join ' ').Trim() } else { '' }
+    # B's block can surface as EITHER message shape: an explicit access denial,
+    # or "path not found" - B cannot even LIST the protected `.sandbox` parent,
+    # so the sibling name does not resolve. Both mean "B could not read A's
+    # tool"; the non-vacuity legs above prove the file existed while A ran.
+    $bBlocked = ($rB.ExitCode -ne 0) -and ((Test-Denied $errB) -or ($errB -match '(?i)(cannot find|not find|nicht finden)'))
     $aExited = $procA.WaitForExit(120000)
     if (-not $aExited) { try { $procA.Kill() } catch { } }
     $errA = $procA.StandardError.ReadToEnd()
     $null = $procA.StandardOutput.ReadToEnd()
     $procA.Close()
     $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
-    $passed = $installed -and ($sidA -ne $sidB) -and $bDenied -and $aExited -and $treeAGone
+    $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; B denied A's live tree; A's tree removed at teardown" } else { "installed=$installed bDenied=$bDenied aExited=$aExited treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)" } }
+        Detail = if ($passed) { "distinct sids; B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed flag=$flagText bBlocked=$bBlocked aExited=$aExited treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
