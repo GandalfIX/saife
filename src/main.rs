@@ -1080,8 +1080,34 @@ fn run_inner(
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
     let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
 
+    // Fail-close (decision 2026-11-10): a DENY ACE that could not be applied
+    // means the session would run with MORE access than the profile allows —
+    // `grant_access` says so in its own error ("refusing the session rather
+    // than running it with the deny missing"). This used to print that error
+    // as a warning and start the child anyway, which made the message a lie:
+    // the child ran while the deny was missing (fail-open). The session is now
+    // refused: a SESSION_REFUSED leaf names the cause, the grants that DID
+    // land come off the host (same teardown order as a normal run), and the
+    // process exits `EXIT_REFUSED` — the refusal code the mxc guardrails use.
     if let Err(e) = sandbox::grant_access(&session.ac_sid.0, &entries, run_journal.as_ref()) {
-        eprintln!("[saife] warning: some ACL grants failed: {e}");
+        eprintln!("[saife] refused: the DACL grants could not be applied: {e}");
+        eprintln!("[saife]          fail-close: the session is refused rather than run with a deny missing");
+        let refusal = audit::session_start::TierRefusal::refused(
+            "dacl_apply_failed",
+            audit::session_start::TIER_APPCONTAINER_DACL,
+        );
+        if let Err(aerr) = audit::session_start::append_refusal(&audit_writer, &sid, refusal) {
+            eprintln!("[saife] warning: could not record the refusal in the audit: {aerr}");
+        }
+        if let Some(j) = &run_journal
+            && sandbox::appcontainer::restore_or_warn(j)
+        {
+            j.remove_file();
+        }
+        sandbox::appcontainer::delete_profile(&session.ac_name);
+        let _ = remove_session_sandbox_dir(&cwd, &sid);
+        seal_audit(audit_writer, proxy.map(|(handle, _)| handle), &sid);
+        return Ok(EXIT_REFUSED);
     }
 
     let env_block = sandbox::build_env_block(&sid, &cwd, proxy.as_ref().map(|(_, env)| env));
@@ -1172,7 +1198,6 @@ const EXIT_RUNNER_REFUSED: i32 = 5;
 /// `126` is `timeout(1)`'s "found but could not be executed", which is what a
 /// refusal means here: the workload may well have run, but this session is not a
 /// contained, proven session and its result is not evidence.
-#[cfg(feature = "mxc-backend")]
 const EXIT_REFUSED: i32 = 126;
 
 /// Run one session through the MXC `processcontainer` backend (P3.0).

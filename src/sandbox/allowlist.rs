@@ -362,6 +362,34 @@ pub(crate) fn build_allowlist_with(
         );
     }
 
+    // A deny ACE that no grant can reach does nothing: the AppContainer is
+    // denied by default, so the deny only matters where a grant would
+    // otherwise leak the tree in. Marking such denies NON-inheritable here
+    // (grant_one's propagation walks inheritable entries) removes exactly the
+    // case that made deny propagation explode: a deny on `~/.saife` or
+    // `%LOCALAPPDATA%\saife` used to propagate to every pre-existing
+    // descendant — thousands of files the supervisor itself writes during the
+    // session — for ACEs that changed nothing (7,296 journal entries
+    // measured, S-98). A deny COVERED by a grant keeps its inheritance: there
+    // the ACE is the only thing standing between the grant and the files.
+    let grants: Vec<std::path::PathBuf> = fs
+        .allow
+        .iter()
+        .chain(fs.read_only.iter())
+        .cloned()
+        .chain(
+            entries
+                .iter()
+                .filter(|e| !e.deny)
+                .map(|e| e.win32_path.clone()),
+        )
+        .collect();
+    for e in entries.iter_mut().filter(|e| e.deny && e.inherit) {
+        if !grants.iter().any(|g| crate::profile::path_covers(g, &e.win32_path)) {
+            e.inherit = false;
+        }
+    }
+
     Ok(entries)
 }
 
@@ -1254,6 +1282,70 @@ mod tests {
             err.message().contains("deny covers grant"),
             "the refusal must name the rule: {}",
             err.message()
+        );
+        remove_deny_fixture_home(&home);
+    }
+
+    /// An UNCOVERED deny (no grant reaches it) must not propagate: the
+    /// AppContainer is denied by default, so those ACEs change nothing, yet
+    /// `should_propagate` walks every inheritable entry's descendants — which
+    /// produced 7,296 journal entries for the two `.saife` control-plane trees
+    /// on a run that granted only `--allow-cwd` (S-98, measured 2026-11-09).
+    #[test]
+    fn an_uncovered_deny_does_not_propagate() {
+        let home = create_deny_fixture_home("uncovered");
+        let fs = FilesystemSlice {
+            allow: vec![std::path::PathBuf::from(r"C:\proj")],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &[home.join(".ssh")],
+            &[],
+        )
+        .unwrap();
+        let deny = entries
+            .iter()
+            .find(|e| e.deny && e.win32_path == home.join(".ssh"))
+            .expect("the existing deny must still be an entry");
+        assert!(
+            !deny.inherit,
+            "an uncovered deny must be non-inheritable - inheritance is what makes the \
+             propagation walk apply it to every pre-existing descendant"
+        );
+        remove_deny_fixture_home(&home);
+    }
+
+    /// A deny COVERED by a grant keeps its inheritance: there the deny is the
+    /// only thing standing between the grant and the files inside it, so new
+    /// files must inherit the deny and pre-existing ones must be walked.
+    #[test]
+    fn a_covered_deny_stays_inheritable() {
+        let home = create_deny_fixture_home("covered");
+        let fs = FilesystemSlice {
+            allow: vec![home.clone()],
+            read_only: Vec::new(),
+            deny: Vec::new(),
+        };
+        let entries = build_allowlist_with(
+            "test-sid",
+            std::path::Path::new(r"C:\proj"),
+            &fs,
+            &[home.join(".ssh")],
+            &[],
+        )
+        .unwrap();
+        let deny = entries
+            .iter()
+            .find(|e| e.deny && e.win32_path == home.join(".ssh"))
+            .expect("the existing deny must still be an entry");
+        assert!(
+            deny.inherit,
+            "a deny inside a granted tree must stay inheritable - without inheritance a \
+             pre-existing file inside it stays readable through the covering grant"
         );
         remove_deny_fixture_home(&home);
     }

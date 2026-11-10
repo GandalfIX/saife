@@ -82,7 +82,12 @@
   EXISTED mid-session, so "gone after" cannot pass vacuously. All three are
   AppContainer-only: the mxc path creates no profile, no install tree and no
   journal.
-  Suite total: 96 scenarios in 1..=98 with 93 reserved.
+  S-99 pins FAIL-CLOSE: a DENY ACE that cannot be applied refuses the
+  session (exit 126, a SESSION_REFUSED leaf with reason=dacl_apply_failed,
+  no child, and the grants that did land restored). The trigger is a deny
+  on a TrustedInstaller-owned system directory; a shell that CAN rewrite
+  that DACL SKIPS the scenario rather than passing for the wrong reason.
+  Suite total: 97 scenarios in 1..=99 with 93 reserved.
 
   BACKEND SELECTION (P3.1 harness plumbing): -Backend appcontainer|mxc
   (default appcontainer) is passed to EVERY `run` invocation as
@@ -3476,6 +3481,50 @@ function Invoke-Scenario-S98 {
                  else { "seen=$seen exited=$exited exitCode=$exitCode journalAfter=$after stderr=$(Get-LineHead -Lines @($stderr) -Max 200)" } }
 }
 
+# S-99: FAIL-CLOSE. A DENY ACE that cannot be applied must REFUSE the session:
+# the workload must not run with the deny missing. The trigger is a deny on a
+# TrustedInstaller-owned system directory, whose DACL this process cannot
+# rewrite. A shell that CAN rewrite it (some elevated lanes can) has no failed
+# deny to observe, so the scenario SKIPS with that reason instead of passing.
+# Asserted: exit 126, the refusal on stderr, NO child output, a SESSION_REFUSED
+# leaf with reason=dacl_apply_failed, and no session ACE left on the scenario
+# dir (the refusal path must restore what did land).
+function Invoke-Scenario-S99 {
+    $d = New-ScenarioDir 99
+    $sid = 'S99-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $target = Join-Path $env:SystemRoot 'System32\drivers\etc'
+    if (-not (Test-Path -LiteralPath $target)) {
+        return @{ Num=99; Name='S-99 (fail-close)'; Passed=$true; Skipped=$true; Detail="deny trigger missing: $target" }
+    }
+    $profilePath = Join-Path $d 'failclose.json'
+    $json = @{
+        meta = @{ name = 'failclose'; schema_version = 1; version = '1.0.0'; description = 'S-99 fail-close' }
+        filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @($target) }
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $profilePath -Value $json -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--sid',$sid,'--','cmd','/c','echo','should-not-run') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $err = ($r.Stderr -join "`n")
+    if ($r.ExitCode -eq 0 -and ($out -match 'should-not-run')) {
+        return @{ Num=99; Name='S-99 (fail-close)'; Passed=$true; Skipped=$true
+            Detail = "this shell can re-DACL $target - no failed deny to observe (elevated lane?)" }
+    }
+    $strayAces = 0
+    if (Get-Command Get-SessionAceCount -ErrorAction SilentlyContinue) { $strayAces = Get-SessionAceCount -Path $d }
+    $refused = $false
+    $reason = ''
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'SESSION_REFUSED') { $refused = $true; $reason = [string]$o.reason }
+    }
+    $childRan = ($out -match 'should-not-run')
+    $passed = ($r.ExitCode -eq 126) -and ($err -match 'refused') -and (-not $childRan) -and $refused -and ($reason -eq 'dacl_apply_failed') -and ($strayAces -eq 0)
+    return @{ Num=99; Name='S-99 (fail-close)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "failed deny refused the session: exit 126, SESSION_REFUSED reason=dacl_apply_failed, no child, no stray ACEs" }
+                 else { "exit=$($r.ExitCode) childRan=$childRan refusedLeaf=$refused reason='$reason' strayAces=$strayAces err=$(Get-LineHead -Lines @($err) -Max 200)" } }
+}
+
 # ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
@@ -3509,7 +3558,7 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 98
+$script:MaxScenario = 99
 # S-93 is RESERVED, and deliberately not registered at all (P2.4).
 #
 # It is the harness form of guardrail 1's NEGATIVE case (ADR-0004: a session must
@@ -3577,6 +3626,7 @@ $script:AppContainerOnlyScenarios = @{
     96 = 'asserts the AppContainer PROFILE footprint (Packages dir + HKCU Storage key); the mxc path creates no named AppContainer profile'
     97 = 'asserts the per-session <cwd>\.sandbox\<sid> install tree, which the mxc path does not create'
     98 = 'asserts DACL-journal file lifetime; the mxc path writes no ACLs, so it keeps no journal'
+    99 = 'asserts the AppContainer grant phase refuses the session on a failed deny; the mxc path applies its own policy and has no DACL grant phase'
 }
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
@@ -3605,6 +3655,7 @@ $script:ScenarioFunctions = @{
     96 = { Invoke-Scenario-S96 }
     97 = { Invoke-Scenario-S97 }
     98 = { Invoke-Scenario-S98 }
+    99 = { Invoke-Scenario-S99 }
 }
 
 
