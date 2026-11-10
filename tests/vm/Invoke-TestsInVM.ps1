@@ -1506,7 +1506,7 @@ public static class WinSta {
     } catch {
         Write-Host "[vm-run] ERROR: artifact fetch failed: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host ("[vm-run] keeping the VM (checkpoint failed-run) so the completed run's results survive; partial artifacts: {0}" -f $hostResultsDir) -ForegroundColor Yellow
-        $null = Invoke-TestVmTeardown -Failed $true -ForceKeep -VmName $vmName -VhdxPath $vhdxPath -KeepOnFailure:$KeepOnFailure
+        $null = Invoke-TestVmTeardown -Failed $true -ForceKeep $true -VmName $vmName -VhdxPath $vhdxPath -KeepOnFailure:$KeepOnFailure
         Write-Host ("[vm-run] manual cleanup when done debugging: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Remove-TestVM.ps1 -Name {0}" -f $vmName) -ForegroundColor Yellow
         Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
         exit 1
