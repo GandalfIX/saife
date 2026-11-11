@@ -20,6 +20,9 @@ Contents
   plugins/tngtech/plugin.json         example host-side sidecar plugin
   plugins/tngtech/sidecar.py          its implementation (Python 3, stdlib only)
   plugins/tngtech/agents/opencode/    the agent skill that teaches opencode to use it
+  THIRD-PARTY-LICENSES.md            license texts of every bundled dependency
+  saife-<version>-sbom-<arch>.cdx.json
+                                      machine-readable SBOM (CycloneDX 1.6)
   VERSION.txt                         build provenance
   SHA256SUMS.txt                      checksums of every file above
 

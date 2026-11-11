@@ -355,6 +355,32 @@ $checks = @(
                         Label = 'winget install --id GitHub.cli -e' })
         WhenMissing = 'https://cli.github.com'
     }
+    @{
+        Name     = 'cargo-about (license bundle)'
+        Category = 'optional'
+        Why      = 'build-dist.ps1 generates THIRD-PARTY-LICENSES.md from Cargo.lock; -Release refuses to ship without it'
+        Probe    = {
+            $v = Get-FirstLine 'cargo-about' @('--version')
+            if (-not $v) { return @{ Ok = $false } }
+            return @{ Ok = $true; Found = $v }
+        }
+        Fix      = @(@{ Exe = 'cargo'; Args = @('install', 'cargo-about', '--locked', '--features', 'cli'); Admin = $false
+                        Label = 'cargo install cargo-about --locked --features cli' })
+        WhenMissing = 'cargo install cargo-about --locked --features cli'
+    }
+    @{
+        Name     = 'cargo-cyclonedx (SBOM)'
+        Category = 'optional'
+        Why      = 'build-dist.ps1 generates the CycloneDX SBOM a release asset must carry'
+        Probe    = {
+            $v = Get-FirstLine 'cargo' @('cyclonedx', '--version')
+            if (-not $v) { return @{ Ok = $false } }
+            return @{ Ok = $true; Found = $v }
+        }
+        Fix      = @(@{ Exe = 'cargo'; Args = @('install', 'cargo-cyclonedx', '--locked'); Admin = $false
+                        Label = 'cargo install cargo-cyclonedx --locked' })
+        WhenMissing = 'cargo install cargo-cyclonedx --locked'
+    }
 )
 
 # Two prerequisites exist only for ARM64 targets, and both are hard requirements there: ring 0.17
