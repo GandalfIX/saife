@@ -896,7 +896,13 @@ copy C:\Windows\System32\where.exe .sandbox\$sidA\bin\where.exe >NUL
 if errorlevel 1 (echo install-failed>install-done.txt) else (echo installed>install-done.txt)
 for /l %%i in (1,1,40000) do @ver>NUL
 "@
-    $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c install-a.cmd" -f $sidA) -WorkingDirectory $d
+    # The batch file is named by ABSOLUTE path on purpose. `cmd /c name.cmd`
+    # makes cmd resolve the name against its own cwd, and that resolution has
+    # failed on its own in a loaded guest ('install-a.cmd' is not recognized)
+    # while every containment property held - the same fragility S-6 was
+    # rewritten to avoid. An absolute path opens the file directly, so a
+    # failure here means what it says instead of blaming the sandbox.
+    $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sidA, $installA) -WorkingDirectory $d
     $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d
     $errB = ($rB.Stderr -join "`n")
     # The flag's CONTENT proves A's copy succeeded - the child writes
@@ -915,11 +921,12 @@ for /l %%i in (1,1,40000) do @ver>NUL
     if (-not $aExited) { try { $procA.Kill() } catch { } }
     $errA = $procA.StandardError.ReadToEnd()
     $null = $procA.StandardOutput.ReadToEnd()
+    $aExit = if ($aExited) { $procA.ExitCode } else { 'killed' }
     $procA.Close()
     $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
     $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed flag=$flagText bBlocked=$bBlocked aExited=$aExited treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)" } }
+        Detail = if ($passed) { "distinct sids; B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed flag=$flagText bBlocked=$bBlocked aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
