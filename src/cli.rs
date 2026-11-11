@@ -108,6 +108,11 @@ which needs administrator rights for network sessions. Rebuild without \
 /// it costs, so a switch to the other backend is never silent. It does not
 /// replace any refusal text and does not touch the audit vocabulary: a refused
 /// session still refuses, and the chain still records why.
+///
+/// Every non-test reader sits behind `mxc-backend` (the hint names the tier
+/// gate's alternative), so the constant is expected to be unreferenced in a
+/// build without the feature.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 pub const MXC_UNAVAILABLE_HINT: &str = "the MXC containment tier did not run on this host: \
 retry with `--backend appcontainer`, which contains the session with an AppContainer token \
 and DACL grants instead of the MXC tier - network posture differs (the loopback exemption \
