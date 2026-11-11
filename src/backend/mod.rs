@@ -19,9 +19,9 @@
 //! backends EXIST. A binary without `mxc-backend` refuses `--backend mxc` with
 //! the same message [`crate::cli::route_backend`] does, rather than falling back.
 
-mod appcontainer;
+pub(crate) mod appcontainer;
 #[cfg(feature = "mxc-backend")]
-mod mxc;
+pub(crate) mod mxc;
 
 use crate::net;
 use crate::profile;
@@ -72,6 +72,13 @@ pub struct SessionRequest<'a> {
     /// The workload, verbatim: `argv[0]` is the program, the rest are its words.
     pub cmd: &'a [String],
 }
+
+/// Exit code for a session a guardrail refused.
+///
+/// `126` is `timeout(1)`'s "found but could not be executed", which is what a
+/// refusal means here: the workload may well have run, but this session is not a
+/// contained, proven session and its result is not evidence.
+pub(crate) const EXIT_REFUSED: i32 = 126;
 
 /// One containment mechanism.
 ///

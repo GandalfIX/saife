@@ -6,10 +6,10 @@
 //! before `--print-sid` answers, the audit root is armed before the child
 //! exists, and teardown restores DACLs before deleting the profile.
 
-use super::{ContainmentBackend, SessionRequest};
+use super::{ContainmentBackend, SessionRequest, EXIT_REFUSED};
 use crate::{
     appcontainer_session_facts, audit, join_cmdline, net, plugin, sandbox, seal_audit,
-    start_session_proxy, EXIT_REFUSED,
+    start_session_proxy,
 };
 use anyhow::{Context, Result};
 
