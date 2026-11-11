@@ -908,10 +908,27 @@ function Invoke-Scenario-S13 {
         "echo installed>install-done.txt 2>>steps.txt",
         "echo step-done>>steps.txt",
         "for /l %%i in (1,1,1000000) do @ver>NUL" -join ([Environment]::NewLine))
-    # Start A. No diag, no sampling: this scenario asserts a containment
-    # property. A failed grant is fail-close now, so a session that cannot
-    # use its own cwd says so instead of running half-armed.
+    # Start A with diag so the propagation counters reach the detail line.
+    $env:SAIFE_DIAG = '1'
     $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sidA, $installA) -WorkingDirectory $d
+    Remove-Item Env:SAIFE_DIAG -ErrorAction SilentlyContinue
+    # Drain both pipes from the start: diag output (and the session JSON) exceeds the pipe buffer, and a writer blocked on a full pipe
+    # never reaches the child spawn. Reading only after WaitForExit deadlocks exactly like this.
+    $outTaskA = $procA.StandardOutput.ReadToEndAsync()
+    $errTaskA = $procA.StandardError.ReadToEndAsync()
+    # While A lives, watch the batch file for the session's AppContainer ACE
+    # (any S-1-15-2 trustee): the synchronous propagation must have written
+    # it BEFORE the child spawns, so the first sample already sees it. A file
+    # that never shows the ACE while A lived means the grant walk failed.
+    $aceSeen = 'never'
+    for ($k = 0; $k -lt 40; $k++) {
+        $hit = (Get-Acl -LiteralPath $installA -ErrorAction SilentlyContinue).Access |
+            Where-Object { $_.IdentityReference.Value -match '^S-1-15-2-' } |
+            Select-Object -First 1
+        if ($hit) { $aceSeen = 'yes at sample {0}' -f $k; break }
+        if ($procA.HasExited) { $aceSeen = 'exited without ace'; break }
+        Start-Sleep -Milliseconds 500
+    }
     # The marker must exist BEFORE B runs: B's denial is only evidence of
     # containment when it names a file that EXISTS. The wait is A's own
     # session budget (120 s) - startup latency is variable (measured 1.8 s ..
@@ -936,14 +953,14 @@ function Invoke-Scenario-S13 {
     $bBlocked = ($rB.ExitCode -ne 0) -and ((Test-Denied $errB) -or ($errB -match '(?i)(cannot find|not find|nicht finden|system cannot find)'))
     $aExited = $procA.WaitForExit(180000)
     if (-not $aExited) { try { $procA.Kill() } catch { } }
-    $errA = $procA.StandardError.ReadToEnd()
-    $outA = $procA.StandardOutput.ReadToEnd()
+    $errA = try { $errTaskA.Result } catch { "" }
+    $outA = try { $outTaskA.Result } catch { "" }
     $aExit = if ($aExited) { $procA.ExitCode } else { 'killed' }
     $procA.Close()
     $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
     $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; A installed (marker at ${markerSeconds}s); B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed markerAfter=${markerSeconds}s flag=$flagText bBlocked=$bBlocked bExit=$($rB.ExitCode) aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 200) aErr=$(Get-LineHead -Lines @($errA) -Last 6) aOut=$(Get-LineHead -Lines @($outA) -Max 200) steps=$(Get-Content -LiteralPath (Join-Path $d 'steps.txt') -ErrorAction SilentlyContinue) copyOut=$(Get-LineHead -Lines (Get-Content -LiteralPath (Join-Path $d 'copy-out.txt') -ErrorAction SilentlyContinue) -Max 200) aFileAcl=$((Get-Acl -LiteralPath (Join-Path $d 'install-a.cmd') -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Access -ErrorAction SilentlyContinue | ForEach-Object { '{0}={1}' -f $_.IdentityReference.Value, $_.FileSystemRights } | Select-Object -First 10) -join ' | ')" } }
+        Detail = if ($passed) { "distinct sids; A installed (marker at ${markerSeconds}s); B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed markerAfter=${markerSeconds}s flag=$flagText bBlocked=$bBlocked bExit=$($rB.ExitCode) aExited=$aExited aExit=$aExit treeAGone=$treeAGone aceSeen=$aceSeen aGrantDiag=$((@($errA) | Where-Object { $_ -match '\[grant\]|\[journal\]' } | Select-Object -First 8) -join ' | ') bErr=$(Get-LineHead -Lines @($errB) -Max 200) aErr=$(Get-LineHead -Lines @($errA) -Last 6) aOut=$(Get-LineHead -Lines @($outA) -Max 200) steps=$(Get-Content -LiteralPath (Join-Path $d 'steps.txt') -ErrorAction SilentlyContinue) copyOut=$(Get-LineHead -Lines (Get-Content -LiteralPath (Join-Path $d 'copy-out.txt') -ErrorAction SilentlyContinue) -Max 200) aFileAcl=$((Get-Acl -LiteralPath (Join-Path $d 'install-a.cmd') -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Access -ErrorAction SilentlyContinue | ForEach-Object { '{0}={1}' -f $_.IdentityReference.Value, $_.FileSystemRights } | Select-Object -First 10) -join ' | ')" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
