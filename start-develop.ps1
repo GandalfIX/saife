@@ -63,15 +63,26 @@ function Invoke-Checker {
         [bool]$EmitJson,
         [bool]$PassInstall,
         [bool]$PassYes,
-        [bool]$PassSkipOptional
+        [bool]$PassSkipOptional,
+        # Capture mode is for -Json only, where the child's output is parsed into
+        # the merged payload. In console mode the child's report MUST reach the
+        # terminal: it holds the [MISS] rows and the fix lines the summary's
+        # "see the fix lines above" points at. Capturing it there is how the
+        # first version lost them (found on a second machine: a wall of
+        # "[MISS] ... fix: cargo install ..." was promised and never printed).
+        [switch]$Capture
     )
     $args = @('-NoProfile', '-File', $Path)
     if ($EmitJson) { $args += '-Json' }
     if ($PassInstall) { $args += '-Install' }
     if ($PassYes) { $args += '-Yes' }
     if ($PassSkipOptional) { $args += '-SkipOptional' }
-    $out = & pwsh @args 2>&1 | Out-String
-    return @{ Text = $out; Exit = $LASTEXITCODE }
+    if ($Capture) {
+        $out = & pwsh @args 2>&1 | Out-String
+        return @{ Text = $out; Exit = $LASTEXITCODE }
+    }
+    & pwsh @args 2>&1 | Write-Host
+    return @{ Exit = $LASTEXITCODE }
 }
 
 # ---------------------------------------------------------------- layer 1: build prerequisites
@@ -80,7 +91,7 @@ $buildPayload = $null
 if (-not $SkipBuildPrereqs) {
     if (Test-Path -LiteralPath $prereqs) {
         if ($Json) {
-            $r = Invoke-Checker $prereqs $true $false $false $SkipOptional
+            $r = Invoke-Checker $prereqs $true $false $false $SkipOptional -Capture
             try {
                 $buildPayload = $r.Text | ConvertFrom-Json
                 $buildOk = [bool]$buildPayload.required_ok
@@ -100,7 +111,7 @@ if (-not $SkipBuildPrereqs) {
 
 # ---------------------------------------------------------------- layer 2: analysis tools
 if ($Json) {
-    $r = Invoke-Checker $devtools $true $false $false $SkipOptional
+    $r = Invoke-Checker $devtools $true $false $false $SkipOptional -Capture
     $toolsPayload = $null
     try {
         $toolsPayload = $r.Text | ConvertFrom-Json
