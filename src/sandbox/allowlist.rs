@@ -103,13 +103,14 @@ pub fn build_allowlist_exposed(
     let effective = crate::profile::effective_denies(exposed)
         .map_err(|e| Error::new(E_INVALIDARG, e.to_string()))?;
     // A path that does not exist needs no ACE: `grant_one` fails with
-    // 0x80070002, and `grant_access` treats a failed DENY as a refused session
-    // (fail-close since 2026-11-10). The dir list needed the same filter the
-    // file list always had - on a host without `~/.aws` the three absent tree
-    // denies used to fail the grant pass and run the session with a warning
-    // instead. The pre-flight on a grant inside such a deny is skipped with the
-    // entry; that is the same trade the file denies already make, and the
-    // documented one ("a path that does not exist needs no deny").
+    // 0x80070002, and `grant_access` treats a failed DENY as a refused session,
+    // so an absent tree would fail the launch on a host that never used that
+    // tool. The dir list needs the same existence filter the file list has -
+    // without it, `~/.aws` missing turned three tree denies into a warning and
+    // a session that ran without them. Filtering also drops the pre-flight
+    // check for a grant inside such a path; that is the trade the file denies
+    // already make, and it is safe: a path that does not exist has no DACL to
+    // defend.
     let dirs: Vec<std::path::PathBuf> = effective.dirs.into_iter().filter(|p| p.exists()).collect();
     let files: Vec<std::path::PathBuf> =
         effective.files.into_iter().filter(|p| p.exists()).collect();
@@ -1448,7 +1449,6 @@ mod tests {
             home.join(".git-credentials"),
             home.join(".docker").join("config.json"),
             home.join(".kube").join("config"),
-            home.join(".config").join("gh"),
             home.join(".pypirc"),
             appdata.join("NuGet").join("NuGet.Config"),
         ];
@@ -1589,10 +1589,10 @@ mod tests {
             .chain(std::iter::once(local.join("saife")))
             .collect()
     }
-    /// 2026-11-10: the exposure resolver sits in front of the pre-flight, so a
-    /// session cannot start with a half-understood exposure: a label that names
-    /// a private-key tree (`.ssh`) or one that names nothing is refused before
-    /// a single ACE is written.
+    /// The exposure resolver runs in front of the pre-flight, so a session
+    /// cannot start with a half-understood exposure: a label that names a
+    /// private-key tree (`.ssh`) or one that names nothing is refused before a
+    /// single ACE is written.
     #[test]
     fn a_secret_or_unknown_exposure_refuses_before_any_grant() {
         let _env = crate::env_lock();

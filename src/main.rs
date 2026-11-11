@@ -1424,9 +1424,9 @@ fn run_mxc_session(
         } else {
             audit::session_start::LOOPBACK_CLOSED
         })
-        // 2026-11-10: the credential posture this session launches with, from
-        // the same resolver the filesystem policy used - so the leaf cannot
-        // describe an exposure the launch does not have.
+        // The credential posture this session launches with, resolved through
+        // the same `effective_denies` the filesystem policy used - so the leaf
+        // cannot describe an exposure the launch does not have.
         .with_exposed_credentials(credential_exposure_facts(exposed)?)
         .with_policy(credential_policy_facts()?),
     );

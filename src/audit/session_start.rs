@@ -675,9 +675,9 @@ fn write_leaf(
     if let Some(reach) = facts.loopback {
         e.insert("loopback".into(), json!(reach));
     }
-    // 2026-11-10: the exposures and the machine policy are session posture -
-    // the audit is where "this session could read ~/.kube/config" is proven
-    // later, not stderr.
+    // Exposures and the machine policy are session posture: stderr warns while
+    // it runs, and the audit is what proves afterwards that this session could
+    // read `~/.kube/config`.
     if !facts.exposed_credentials.is_empty() {
         e.insert(
             "exposed_credentials".into(),
@@ -1207,11 +1207,10 @@ mod tests {
             "a refused session has no CONNECT leaf: {leaves:?}"
         );
     }
-    /// 2026-11-10: a session that exposes a credential says so in its root
-    /// leaf - label, path and class, never the value - and a policy in force
-    /// is recorded with the files it came from. The default session's leaf
-    /// carries neither key, so "no exposure" stays distinguishable from "not
-    /// recorded".
+    /// A session that exposes a credential says so in its root leaf - label,
+    /// path and class, never the value - and a policy in force is recorded with
+    /// the files it came from. The default session's leaf carries neither key,
+    /// so "no exposure" stays distinguishable from "not recorded".
     #[test]
     fn the_root_leaf_records_exposures_and_the_credential_policy() {
         let sid = fresh_sid("exposed");

@@ -293,10 +293,10 @@ pub enum DenyKind {
     File,
 }
 
-/// Why an entry is always denied (the 2026-11-10 classification, replacing the
-/// one flat opinion). The two classes differ in what an operator may do with
-/// them: a `Secret` is never exposable, a `ToolCredential` can be, per session,
-/// by label, with an audit leaf.
+/// Why an entry is always denied. The class is what decides whether an operator
+/// may lift the deny for a session: a `Secret` never is, a `ToolCredential` can
+/// be, by label, with an audit leaf - because a private key has no legitimate
+/// workload reader while `gh` cannot run without its own token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialClass {
     /// A private key or the tool's own control plane. No workload has a
@@ -374,17 +374,25 @@ pub fn credential_denies_with(
         // Class ToolCredential - one entry per tool that cannot run without
         // the credential, in the flat list's order. `label` is what
         // `--expose-credential` takes.
-        for (label, dir, file) in [
-            ("gradle", Some(".gradle"), "gradle.properties"),
-            ("maven", Some(".m2"), "settings.xml"),
-            ("cargo", Some(".cargo"), "credentials.toml"),
-            ("git", None, ".git-credentials"),
-            ("docker", Some(".docker"), "config.json"),
-            ("kube", Some(".kube"), "config"),
-            // The gh CLI's config dir (`hosts.yml` holds the OAuth token);
-            // denied as the tree it is, which no shipped profile grants.
-            ("gh", Some(".config"), "gh"),
-            ("pypi", None, ".pypirc"),
+        for (label, dir, file, kind) in [
+            (
+                "gradle",
+                Some(".gradle"),
+                "gradle.properties",
+                DenyKind::File,
+            ),
+            ("maven", Some(".m2"), "settings.xml", DenyKind::File),
+            ("cargo", Some(".cargo"), "credentials.toml", DenyKind::File),
+            ("git", None, ".git-credentials", DenyKind::File),
+            ("docker", Some(".docker"), "config.json", DenyKind::File),
+            ("kube", Some(".kube"), "config", DenyKind::File),
+            // `hosts.yml` inside this directory holds the OAuth token, so the
+            // deny has to be inheritable: denying the directory object alone
+            // leaves its children readable through a grant on `~/.config` -
+            // the tree every other tool also writes to. The entry is the `gh`
+            // subtree, never `.config` itself.
+            ("gh", Some(".config"), "gh", DenyKind::Dir),
+            ("pypi", None, ".pypirc", DenyKind::File),
         ] {
             out.push(CredentialDeny {
                 label,
@@ -392,7 +400,7 @@ pub fn credential_denies_with(
                     Some(dir) => home.join(dir).join(file),
                     None => home.join(file),
                 },
-                kind: DenyKind::File,
+                kind,
                 class: CredentialClass::ToolCredential,
             });
         }
@@ -2118,10 +2126,11 @@ mod tests {
 
         assert_eq!(
             real_dirs.len(),
-            5,
-            "the five home-rooted dir denies (.ssh/.aws/.azure/.gnupg/.saife): {real_dirs:?}"
+            6,
+            "the six home-rooted tree denies (.ssh/.aws/.azure/.gnupg/.saife and the gh config \
+             directory, which is a tree): {real_dirs:?}"
         );
-        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
+        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife", ".config\\gh"] {
             assert!(
                 real_dirs.iter().any(|d| d == &real.join(dir)),
                 "the real profile must deny ~/{dir}: {real_dirs:?}"
@@ -2129,7 +2138,7 @@ mod tests {
         }
         assert_eq!(
             fake_dirs.len(),
-            5,
+            6,
             "the fake root denies a different tree: {fake_dirs:?}"
         );
         assert!(
@@ -3648,7 +3657,7 @@ mod tests {
         );
     }
 
-    // ---- The classified credential-deny set (2026-11-10) ----
+    // ---- The classified credential-deny set ----
     //
     // The builtin deny list was one flat opinion. It is now classified: the
     // entries a workload has NO legitimate reason to read (private keys, the
@@ -3669,7 +3678,7 @@ mod tests {
             Some(local.as_path()),
             Some(appdata.as_path()),
         );
-        assert_eq!(denies.len(), 15, "6 dir entries + 9 file entries");
+        assert_eq!(denies.len(), 15, "6 secret trees + 9 tool credentials");
         for d in &denies {
             assert!(
                 !d.label.is_empty(),
@@ -3695,6 +3704,20 @@ mod tests {
             [
                 "gradle", "maven", "cargo", "git", "docker", "kube", "gh", "pypi", "nuget"
             ]
+        );
+        // `gh` is a config DIRECTORY, unlike its eight siblings: a file-kind
+        // deny on it would leave `hosts.yml` readable through a grant on
+        // `~/.config`, which is precisely the hole the deny exists to close.
+        let gh = denies.iter().find(|d| d.label == "gh").expect("gh entry");
+        assert_eq!(
+            gh.kind,
+            DenyKind::Dir,
+            "`~/.config/gh` is a tree, not a file"
+        );
+        assert_eq!(
+            gh.path,
+            home.join(".config").join("gh"),
+            "the gh subtree, never .config"
         );
     }
 

@@ -1002,9 +1002,10 @@ mod m3_credential_deny_base {
 
     /// With no `profile_dir` at all (an UNSET `USERPROFILE`), the credential
     /// dirs must still be denied — they come from the OS known folder.
-    /// 2026-11-10: `--expose-credential kube` removes exactly the `kube`
-    /// entry from the DENIED PATHS the container hears, keeps every sibling
-    /// deny, and cannot be spelled for a `Secret`-class tree (.ssh).
+    /// `--expose-credential kube` removes exactly the `kube` entry from the
+    /// DENIED PATHS the container hears, keeps every sibling deny, and cannot
+    /// be spelled for a `Secret`-class tree (`.ssh`) - the exposure is one
+    /// named entry, never a blanket un-deny.
     #[test]
     fn an_exposed_label_removes_exactly_that_deny_from_the_request() {
         let _env = crate::env_lock();
@@ -1047,9 +1048,9 @@ mod m3_credential_deny_base {
         }
     }
 
-    /// 2026-11-10: a `Secret`-class label is refused at the filesystem-policy
-    /// boundary too, not only in the resolver's unit tests - the mxc backend
-    /// refuses by the same rule the AppContainer backend uses.
+    /// A `Secret`-class label is refused at the filesystem-policy boundary too,
+    /// not only in the resolver's unit tests: both backends must refuse by the
+    /// same rule, or the flag's promise depends on which backend runs.
     #[test]
     fn an_secret_label_is_refused_at_the_mxc_boundary() {
         let _env = crate::env_lock();

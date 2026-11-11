@@ -21,7 +21,9 @@ minor release may break the profile schema; the error message names the fix.
   secrets. Inspect what is in force with `saife credentials list`.
 - **Credential classes and per-session exposure.** The always-denied set is now classified:
   `secret` (`.ssh`, `.aws`, `.azure`, `.gnupg`, the tool's own control plane) and
-  `tool-credential` (gradle, maven, cargo, git, docker, kube, gh, pypi, nuget). `--expose-credential
+  `tool-credential` (gradle, maven, cargo, git, docker, kube, gh, pypi, nuget, where the `gh`
+  entry is the `~/.config/gh` directory and its deny inherits, so `hosts.yml` inside it is
+  covered while `~/.config` stays readable). `--expose-credential
   <label>` drops exactly that one entry for one session, prints why on stderr, and records it in
   the session's root audit leaf (`exposed_credentials`: label, path, class - never the value). A
   `secret` label and an unknown label are refused before a single ACE is written; the default

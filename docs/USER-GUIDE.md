@@ -307,13 +307,16 @@ override an explicit deny.
 
 ### 4.4a Credential denies: what is always denied, and what an operator can do
 
-Nine credential files and six trees are denied for **every** launch, on both backends, whatever a
-profile grants: `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.saife`,
-`%LOCALAPPDATA%\saife` (class `secret`), and `~/.gradle/gradle.properties`,
+Seven trees and eight files are denied for **every** launch, on both backends, whatever a
+profile grants. Class `secret` - never exposable, because no workload has a legitimate reason to
+read them: `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.saife`, `%LOCALAPPDATA%\saife`. Class
+`tool-credential` - denied because an accident must not hand the workload a token, exposable per
+session by name because the tool cannot run without it: `~/.gradle/gradle.properties`,
 `~/.m2/settings.xml`, `~/.cargo/credentials.toml`, `~/.git-credentials`,
-`~/.docker/config.json`, `~/.kube/config`, `~/.config/gh`, `~/.pypirc`,
-`%APPDATA%\NuGet\NuGet.Config` (class `tool-credential`). `saife credentials list` prints the set
-with the class and the path.
+`~/.docker/config.json`, `~/.kube/config`, `~/.pypirc`, `%APPDATA%\NuGet\NuGet.Config`, and the
+`~/.config/gh` **directory** - a directory, deliberately: the deny must reach `hosts.yml` inside
+it, and it must stay the `gh` subtree, because `~/.config` is where every other tool also writes.
+`saife credentials` prints the set with the class and the path.
 
 The list is **code**, not configuration: a floor that lives in a file the workload can reach is
 not a floor. Two things extend it - and neither can weaken it:

@@ -100,7 +100,8 @@ for **every** profile, whatever the operator grants:
 - `~/.git-credentials`
 - `~/.docker/config.json`
 - `~/.kube/config`
-- `~/.config/gh`
+- `~/.config/gh` (the directory - the deny inherits, so `hosts.yml` inside it
+  is covered; the entry stays the `gh` subtree, never `~/.config`)
 - `%APPDATA%\NuGet\NuGet.Config`
 - `~/.pypirc`
 
