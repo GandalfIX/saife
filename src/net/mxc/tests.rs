@@ -1956,6 +1956,7 @@
                 &[],
                 None,
                 Path::new(TEST_LAUNCHER),
+                &[],
             )
             .expect("a writable grant outside the workspace is honoured");
             assert_eq!(
@@ -1982,6 +1983,7 @@
             &[],
             Some(Path::new(PROFILE)),
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("none of these grants is covered by a deny");
         assert_eq!(
@@ -2015,6 +2017,7 @@
             &[r"C:\Users\marku\.local".to_string()],
             None,
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect_err("a deny above a writable grant cannot be honoured");
         let message = err.to_string();
@@ -2216,6 +2219,7 @@
             &[],
             Some(Path::new(PROFILE)),
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("a descendant deny is expressible");
         assert!(
@@ -2257,6 +2261,7 @@
             &[r"C:\secrets".to_string()],
             Some(Path::new(PROFILE)),
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("no deny in this policy contains a grant")
     }
@@ -2302,6 +2307,7 @@
             ],
             None,
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("a deny that contains no grant is kept");
         let secrets: Vec<_> = fs
@@ -2352,6 +2358,7 @@
             &[r"c:/WORK/".to_string()],
             None,
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect_err("`C:\\work` denies the workspace it grants");
         assert_eq!(
@@ -2376,6 +2383,7 @@
             &[PROFILE.to_string()],
             Some(Path::new(PROFILE)),
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect_err("a profile deny with the workspace inside it cannot be honoured");
         assert_eq!(
@@ -2407,6 +2415,7 @@
             &[format!(r"{PROFILE}\.ssh"), format!(r"{PROFILE}\Documents")],
             Some(Path::new(PROFILE)),
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("denies below the granted workspace are exactly what a deny list is for");
         assert!(fs.denied_paths.contains(&format!(r"{PROFILE}\.ssh")));
@@ -2431,6 +2440,7 @@
             &[r"D:\secrets".to_string(), r"C:\work2".to_string()],
             None,
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("neither deny contains a grant");
         for expected in [r"D:\secrets", r"C:\work2"] {
@@ -2459,6 +2469,7 @@
             &[PROFILE.to_string()],
             Some(Path::new(PROFILE)),
             Path::new(&launcher),
+            &[],
         )
         .expect_err("the launcher's directory is under the denied profile");
         assert_eq!(
@@ -2485,6 +2496,7 @@
             &[],
             Some(Path::new(PROFILE)),
             Path::new(&launcher),
+            &[],
         )
         .expect("no deny contains a grant");
         assert!(
@@ -2531,6 +2543,7 @@
             &[here.display().to_string()],
             None,
             Path::new(r"tools\sandbox\saife-launch.exe"),
+            &[],
         )
         .expect_err("the current directory is an ancestor of the resolved launcher directory");
         assert_eq!(
@@ -2556,6 +2569,7 @@
             &[],
             None,
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect("`.` resolves to the current directory");
         assert_eq!(
@@ -2563,7 +2577,9 @@
             vec![here.display().to_string()],
             "the grant must be the resolved directory, not `.`"
         );
-        let absolute = filesystem_policy(&here, &[], &[], &[], None, Path::new(TEST_LAUNCHER))
+        let absolute = filesystem_policy(&here, &[], &[], &[], None, Path::new(TEST_LAUNCHER),
+        &[],
+    )
             .expect("the absolute spelling of the same workspace");
         assert_eq!(
             relative.readwrite_paths, absolute.readwrite_paths,
@@ -2577,6 +2593,7 @@
             &[here.display().to_string()],
             None,
             Path::new(TEST_LAUNCHER),
+            &[],
         )
         .expect_err("the current directory is the workspace it would grant");
         assert_eq!(
@@ -2592,7 +2609,9 @@
     /// named refusal rather than a guess that voids the guard.
     #[test]
     fn a_path_that_cannot_be_made_absolute_is_a_named_refusal() {
-        let err = filesystem_policy(Path::new(""), &[], &[], &[], None, Path::new(TEST_LAUNCHER))
+        let err = filesystem_policy(Path::new(""), &[], &[], &[], None, Path::new(TEST_LAUNCHER),
+        &[],
+    )
             .expect_err("an empty cwd has no key to compare");
         assert_eq!(
             err,
@@ -2658,6 +2677,7 @@
                 &[],
                 Some(Path::new(PROFILE)),
                 Path::new(TEST_LAUNCHER),
+                &[],
             )
             .expect_err("the built-in credential deny contains the workspace");
             assert_eq!(
@@ -2808,6 +2828,7 @@
                 &[deny.to_string()],
                 None,
                 Path::new(TEST_LAUNCHER),
+                &[],
             )
             .expect_err("these are one directory to Windows, so the deny covers the grant");
             assert_eq!(

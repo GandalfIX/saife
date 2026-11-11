@@ -253,6 +253,25 @@ pub struct FilesystemFacts {
 /// never field-by-field at the call site, because the fields are private and there
 /// is deliberately **no `Default`**: a caller cannot half-fill it, and cannot
 /// leave the tier or the elevation unsaid.
+/// One credential exposure, as the leaf records it: the label the operator
+/// named, the path whose deny is dropped, and the class. Never the value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExposedCredentialFacts {
+    pub label: String,
+    pub path: String,
+    pub class: &'static str,
+}
+
+/// The machine policy in force, as the leaf records it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PolicyFacts {
+    pub dirs: usize,
+    pub files: usize,
+    /// The policy files, file-name only (not the full path: it is
+    /// `%PROGRAMDATA%\saife\deny.d\<name>` by construction).
+    pub sources: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStartFacts {
     /// Guardrail 2's per-session tier record.
@@ -273,6 +292,16 @@ pub struct SessionStartFacts {
     /// [`LOOPBACK_CLOSED`] and [`LOOPBACK_OPEN_UNSCOPED`]; the leaf omits the key
     /// when this is `None`, keeping "not recorded" and "closed" distinguishable.
     loopback: Option<&'static str>,
+    /// The credential exposures the operator named (`--expose-credential`):
+    /// label, path and class. Names and paths only - never the value. Empty
+    /// means no exposure was requested; the leaf omits the key then, keeping
+    /// the default session's leaf clean.
+    exposed_credentials: Vec<ExposedCredentialFacts>,
+    /// The machine policy (`%PROGRAMDATA%\saife\deny.d`) in force for this
+    /// session: how many dirs/files it added and WHICH FILES. The file names
+    /// are the deployment's identity; a leaf that names them can be compared
+    /// against the policy directory after the fact.
+    policy: Option<PolicyFacts>,
 }
 
 impl SessionStartFacts {
@@ -291,7 +320,23 @@ impl SessionStartFacts {
             proxy_endpoint: None,
             filesystem: None,
             loopback: None,
+            exposed_credentials: Vec::new(),
+            policy: None,
         }
+    }
+
+    /// Record the credential exposures this session launches with.
+    #[allow(dead_code)]
+    pub fn with_exposed_credentials(mut self, exposed: Vec<ExposedCredentialFacts>) -> Self {
+        self.exposed_credentials = exposed;
+        self
+    }
+
+    /// Record the machine policy in force for this session.
+    #[allow(dead_code)]
+    pub fn with_policy(mut self, policy: PolicyFacts) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     /// Record the resolved filesystem policy (P3.5).
@@ -629,6 +674,28 @@ fn write_leaf(
     // fs_* keys above.
     if let Some(reach) = facts.loopback {
         e.insert("loopback".into(), json!(reach));
+    }
+    // Exposures and the machine policy are session posture: stderr warns while
+    // it runs, and the audit is what proves afterwards that this session could
+    // read `~/.kube/config`.
+    if !facts.exposed_credentials.is_empty() {
+        e.insert(
+            "exposed_credentials".into(),
+            json!(
+                facts
+                    .exposed_credentials
+                    .iter()
+                    .map(|x| serde_json::json!({
+                        "label": x.label,
+                        "path": x.path,
+                        "class": x.class,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if let Some(policy) = &facts.policy {
+        e.insert("credential_policy".into(), json!(policy));
     }
     writer.append(e)
 }
@@ -1138,6 +1205,66 @@ mod tests {
         assert!(
             leaves.iter().all(|l| l["op"] != "CONNECT"),
             "a refused session has no CONNECT leaf: {leaves:?}"
+        );
+    }
+    /// A session that exposes a credential says so in its root leaf - label,
+    /// path and class, never the value - and a policy in force is recorded with
+    /// the files it came from. The default session's leaf carries neither key,
+    /// so "no exposure" stays distinguishable from "not recorded".
+    #[test]
+    fn the_root_leaf_records_exposures_and_the_credential_policy() {
+        let sid = fresh_sid("exposed");
+        let facts = SessionStartFacts::appcontainer_dacl(false)
+            .with_exposed_credentials(vec![ExposedCredentialFacts {
+                label: "gh".into(),
+                path: r"C:\Users\u\.config\gh".into(),
+                class: "tool-credential",
+            }])
+            .with_policy(PolicyFacts {
+                dirs: 1,
+                files: 0,
+                sources: vec!["corp.json".into()],
+            });
+        let start = SessionStart::arm(
+            std::sync::Arc::new(
+                crate::audit::AuditWriter::open(&sid, false).expect("audit writer"),
+            ),
+            &sid,
+            "cmd".to_string(),
+            facts,
+        );
+        start.complete(None).expect("leaf");
+
+        let all = leaves(&sid);
+        let root = all.first().expect("a root leaf");
+        let exposed = root
+            .get("exposed_credentials")
+            .and_then(|v| v.as_array())
+            .expect("the exposure is on the leaf");
+        assert_eq!(exposed.len(), 1);
+        assert_eq!(exposed[0]["label"], "gh");
+        assert_eq!(exposed[0]["class"], "tool-credential");
+        assert_eq!(root["credential_policy"]["sources"][0], "corp.json");
+        assert!(
+            !root.to_string().contains("token"),
+            "the leaf must never carry a credential value: {root}"
+        );
+
+        let plain = fresh_sid("plain");
+        let start = SessionStart::arm(
+            std::sync::Arc::new(
+                crate::audit::AuditWriter::open(&plain, false).expect("audit writer"),
+            ),
+            &plain,
+            "cmd".to_string(),
+            SessionStartFacts::appcontainer_dacl(false),
+        );
+        start.complete(None).expect("leaf");
+        let root = leaves(&plain);
+        let root = root.first().expect("a root leaf");
+        assert!(
+            root.get("exposed_credentials").is_none() && root.get("credential_policy").is_none(),
+            "a session with no exposure omits both keys: {root}"
         );
     }
 }

@@ -311,6 +311,11 @@ pub struct Cli {
     pub cmd: Cmd,
 }
 
+// `Cmd` is clap's command tree: `Run` carries a dozen flags and every other
+// variant is a subcommand handle. The size difference is the CLI's shape, not a
+// data layout anyone reads; boxing `Run` would only move the flags behind a heap
+// allocation at parse time.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Run a command in the sandbox.
@@ -363,6 +368,17 @@ pub enum Cmd {
         /// Network profile name: none | minimal | developer.
         #[arg(long, value_name = "NAME")]
         network_profile: Option<String>,
+
+        /// Expose one always-denied credential to this session (repeatable).
+        /// The builtin denies are classified: `secret` entries (`.ssh`, `.aws`,
+        /// `.azure`, `.gnupg`, the tool's own control plane) can NEVER be
+        /// exposed, and `tool-credential` entries (gradle, maven, cargo, git,
+        /// docker, kube, gh, pypi, nuget) can, by label. An exposure is loud:
+        /// it is named on stderr and written to the audit log. The default
+        /// stays deny - this is for the case where the tool cannot run
+        /// otherwise and you accept that the workload can read that file.
+        #[arg(long, value_name = "LABEL")]
+        expose_credential: Vec<String>,
 
         /// Strict audit mode: abort the run if the audit log can't be opened or
         /// the session-start event can't be written. CONNECT audit events remain
@@ -476,6 +492,10 @@ pub enum Cmd {
         #[command(subcommand)]
         action: ProfileAction,
     },
+
+    /// Show the always-denied credential set: the builtin entries with their
+    /// class, plus whatever the machine policy adds.
+    Credentials,
 
     /// Manage the learned allow/deny store (permanent prompt decisions).
     Learned {

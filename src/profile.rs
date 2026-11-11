@@ -282,98 +282,456 @@ pub(crate) fn system_profile_root() -> Option<PathBuf> {
 /// fails, and a warning is printed then so the degradation is visible. The `%LOCALAPPDATA%`
 /// part keeps its env-derived behaviour (the known-folder equivalent is not in
 /// this module yet).
-pub fn builtin_deny_dirs() -> Vec<std::path::PathBuf> {
-    builtin_deny_dirs_with(
-        credential_deny_base().as_deref(),
-        std::env::var_os("LOCALAPPDATA").as_deref(),
-    )
+/// What kind of filesystem object a credential deny names: a whole tree or one
+/// file. The backends treat them differently (a dir deny is inheritable, a file
+/// deny is not), so the policy loader must know which shape an entry has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenyKind {
+    /// A directory, denied with an inheritable ACE (the whole subtree).
+    Dir,
+    /// A single file, denied with a non-inheritable ACE.
+    File,
 }
 
-/// Injectable form of [`builtin_deny_dirs`]: builds the six denies from `home`
-/// (the profile root) and the `%LOCALAPPDATA%\saife` control-plane tree from
-/// `local_appdata`. Both are `Option` so tests can pin the base without mutating
-/// the process environment (the suite has tests that repoint `USERPROFILE`, and a
-/// global env mutation would race them).
-pub(crate) fn builtin_deny_dirs_with(
-    home: Option<&std::path::Path>,
-    local_appdata: Option<&std::ffi::OsStr>,
-) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Some(home) = home {
-        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
-            out.push(home.join(dir));
+/// Why an entry is always denied. The class is what decides whether an operator
+/// may lift the deny for a session: a `Secret` never is, a `ToolCredential` can
+/// be, by label, with an audit leaf - because a private key has no legitimate
+/// workload reader while `gh` cannot run without its own token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialClass {
+    /// A private key or the tool's own control plane. No workload has a
+    /// legitimate reason to read it, so no flag exposes it - an exposure
+    /// request for one is refused by name.
+    Secret,
+    /// A credential a tool needs to function (gh, kubectl, docker, cargo, git,
+    /// maven, gradle, nuget, pypi). Denied by default - that is what keeps an
+    /// ACCIDENT from handing the workload a token - and exposable per session
+    /// with `--expose-credential`, loudly. Serving these without exposing the
+    /// value at all is F-2 (ADR-0001: credential injection at the proxy, which
+    /// needs selective TLS termination).
+    ToolCredential,
+}
+
+impl DenyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DenyKind::Dir => "dir",
+            DenyKind::File => "file",
         }
     }
-    if let Some(local) = local_appdata.map(std::path::PathBuf::from) {
-        out.push(local.join("saife"));
+}
+
+impl CredentialClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialClass::Secret => "secret",
+            CredentialClass::ToolCredential => "tool-credential",
+        }
     }
-    out
 }
 
-/// Credential FILES denied for EVERY launch, on both backends, whatever the
-/// profile says (M2: security-review 2026-11-09, verdict "partial").
-///
-/// `~/.gradle` and `~/.m2` are RWX in the shipped `jvm.json` because Gradle
-/// and Maven cannot run without their trees, and the credentials inside those
-/// trees (`gradle.properties`, `settings.xml`) must not ship with the grant.
-/// The same reasoning covers cargo's registry token, git's credential store,
-/// docker/kube client configs, the GitHub CLI's hosts file and the PyPI
-/// upload token. A whole-directory deny is the explicitly rejected
-/// alternative: the deny contains a grant, and both backends refuse such a
-/// session rather than silently narrowing it — `jvm.json` would become
-/// unlaunchable. Denying the descendant FILE keeps the directory grant
-/// working while the credential inside it stays unreadable.
-///
-/// **`~/.npmrc` is deliberately NOT on this list.** It is the credential —
-/// and also the configuration: npm must read it to find the registry and the
-/// token, so denying it breaks every authenticated npm install. The trade-off
-/// is documented in `profiles/README.md` instead of being "fixed" with a deny
-/// the workload would route around anyway (an unauthenticated registry reads
-/// everything else the token names).
-///
-/// Derived from the same OS-known profile root [`builtin_deny_dirs`] uses (M3),
-/// so the two deny sets can never disagree about whose tree they deny; `%APPDATA%`
-/// for `NuGet.Config` keeps its env-derived behaviour. If the base is `None`
-/// (the known-folder lookup failed AND `USERPROFILE` is unset) the
-/// home-rooted files are simply absent — the `%APPDATA%\NuGet` deny still ships.
-pub fn builtin_deny_files() -> Vec<std::path::PathBuf> {
-    builtin_deny_files_with(
-        credential_deny_base().as_deref(),
-        std::env::var_os("APPDATA").as_deref(),
-    )
+/// One entry of the always-denied set, with the identity the operator and the
+/// audit use. `label` is the stable name `--expose-credential` takes; it is
+/// `&'static str` because the set is code, not configuration - a profile file
+/// could not strengthen it, and a policy file cannot weaken it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialDeny {
+    pub label: &'static str,
+    pub path: std::path::PathBuf,
+    pub kind: DenyKind,
+    pub class: CredentialClass,
 }
 
-/// Injectable form of [`builtin_deny_files`]: the home-rooted credential
-/// files under `home`, plus the `%APPDATA%\NuGet\NuGet.Config` deny under
-/// `appdata`. See [`builtin_deny_dirs_with`] for why the seam exists.
-pub(crate) fn builtin_deny_files_with(
+/// The authoritative always-denied set: the six trees and nine credential
+/// files, each with its label, kind and class. The flat
+/// [`builtin_deny_dirs`]/[`builtin_deny_files`] are derivations of this list -
+/// one source of truth, because a list that lives twice rots twice (the first
+/// review already found the flat list and the mxc list disagreeing).
+pub fn credential_denies_with(
     home: Option<&std::path::Path>,
-    appdata: Option<&std::ffi::OsStr>,
-) -> Vec<std::path::PathBuf> {
+    local_appdata: Option<&std::path::Path>,
+    appdata: Option<&std::path::Path>,
+) -> Vec<CredentialDeny> {
     let mut out = Vec::new();
     if let Some(home) = home {
-        for (dir, file) in [
-            (Some(".gradle"), "gradle.properties"),
-            (Some(".m2"), "settings.xml"),
-            (Some(".cargo"), "credentials.toml"),
-            (None, ".git-credentials"),
-            (Some(".docker"), "config.json"),
-            (Some(".kube"), "config"),
-            // The gh CLI's config dir (`hosts.yml` holds the OAuth token);
-            // denied as the tree it is, which no shipped profile grants.
-            (Some(".config"), "gh"),
-            (None, ".pypirc"),
+        // Class Secret - the trees a private key lives in, plus the tool's own
+        // control plane. The order is the flat list's historical order; the
+        // count tests pin it.
+        for (label, dir) in [
+            ("ssh", ".ssh"),
+            ("aws", ".aws"),
+            ("azure", ".azure"),
+            ("gnupg", ".gnupg"),
+            ("saife", ".saife"),
         ] {
-            out.push(match dir {
-                Some(dir) => home.join(dir).join(file),
-                None => home.join(file),
+            out.push(CredentialDeny {
+                label,
+                path: home.join(dir),
+                kind: DenyKind::Dir,
+                class: CredentialClass::Secret,
+            });
+        }
+        // Google Cloud's credential store: `credentials.db` and
+        // `access_tokens.db` are live OAuth tokens, not config. Windows gcloud
+        // defaults to `%APPDATA%\gcloud` (denied below), other platforms to
+        // `~/.config/gcloud`; denying both costs nothing and covers a
+        // `CLOUDSDK_CONFIG`-less install of either shape.
+        out.push(CredentialDeny {
+            label: "gcloud",
+            path: home.join(".config").join("gcloud"),
+            kind: DenyKind::Dir,
+            class: CredentialClass::Secret,
+        });
+        // Class ToolCredential - one entry per tool that cannot run without
+        // the credential, in the flat list's order. `label` is what
+        // `--expose-credential` takes.
+        for (label, dir, file, kind) in [
+            (
+                "gradle",
+                Some(".gradle"),
+                "gradle.properties",
+                DenyKind::File,
+            ),
+            ("maven", Some(".m2"), "settings.xml", DenyKind::File),
+            ("cargo", Some(".cargo"), "credentials.toml", DenyKind::File),
+            ("git", None, ".git-credentials", DenyKind::File),
+            ("docker", Some(".docker"), "config.json", DenyKind::File),
+            ("kube", Some(".kube"), "config", DenyKind::File),
+            // `hosts.yml` inside this directory holds the OAuth token, so the
+            // deny has to be inheritable: denying the directory object alone
+            // leaves its children readable through a grant on `~/.config` -
+            // the tree every other tool also writes to. The entry is the `gh`
+            // subtree, never `.config` itself.
+            ("gh", Some(".config"), "gh", DenyKind::Dir),
+            ("pypi", None, ".pypirc", DenyKind::File),
+        ] {
+            out.push(CredentialDeny {
+                label,
+                path: match dir {
+                    Some(dir) => home.join(dir).join(file),
+                    None => home.join(file),
+                },
+                kind,
+                class: CredentialClass::ToolCredential,
             });
         }
     }
-    if let Some(appdata) = appdata.map(std::path::PathBuf::from) {
-        out.push(appdata.join("NuGet").join("NuGet.Config"));
+    if let Some(local) = local_appdata {
+        out.push(CredentialDeny {
+            label: "saife-local",
+            path: local.join("saife"),
+            kind: DenyKind::Dir,
+            class: CredentialClass::Secret,
+        });
+    }
+    if let Some(appdata) = appdata {
+        out.push(CredentialDeny {
+            label: "nuget",
+            path: appdata.join("NuGet").join("NuGet.Config"),
+            kind: DenyKind::File,
+            class: CredentialClass::ToolCredential,
+        });
+        // Windows gcloud's default config root, beside the `~/.config/gcloud`
+        // tree above - same store, the spelling depends on the platform.
+        out.push(CredentialDeny {
+            label: "gcloud-appdata",
+            path: appdata.join("gcloud"),
+            kind: DenyKind::Dir,
+            class: CredentialClass::Secret,
+        });
     }
     out
+}
+
+/// The always-denied set from the process environment (the real machine).
+pub fn credential_denies() -> Vec<CredentialDeny> {
+    credential_denies_with(
+        credential_deny_base().as_deref(),
+        std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    )
+}
+
+/// One exposure an operator requested and the resolver accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExposedCredential {
+    /// The label the operator named, exactly as accepted.
+    pub label: String,
+    /// The path whose deny is dropped for this session.
+    pub path: std::path::PathBuf,
+    /// Always `ToolCredential` - `Secret` entries refuse at resolve time.
+    pub class: CredentialClass,
+}
+
+/// The deny set a session actually launches with: the builtin entries minus the
+/// ones the operator exposed, plus the machine policy's additions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EffectiveDenies {
+    pub dirs: Vec<std::path::PathBuf>,
+    pub files: Vec<std::path::PathBuf>,
+    pub policy: PolicyDenies,
+    pub exposed: Vec<ExposedCredential>,
+}
+
+/// Resolve the effective deny set. `exposed` carries the labels the operator
+/// named; an unknown label or a `Secret` label is refused here (a typo must not
+/// silently no-op, and a private key is not the operator's to give), which is
+/// what makes the flag loud by construction. `policy_dir` is the machine
+/// policy's `deny.d` directory; `None` skips the policy (tests pin the deny set
+/// without the machine's own deployment).
+pub fn effective_denies_with(
+    exposed: &[String],
+    home: Option<&std::path::Path>,
+    local_appdata: Option<&std::path::Path>,
+    appdata: Option<&std::path::Path>,
+    policy_dir: Option<&std::path::Path>,
+) -> Result<EffectiveDenies> {
+    let all = credential_denies_with(home, local_appdata, appdata);
+    let policy = match policy_dir {
+        Some(dir) => policy_denies_in(dir)?,
+        None => PolicyDenies::default(),
+    };
+    let mut eff = EffectiveDenies {
+        dirs: all
+            .iter()
+            .filter(|d| d.kind == DenyKind::Dir)
+            .map(|d| d.path.clone())
+            .collect(),
+        files: all
+            .iter()
+            .filter(|d| d.kind == DenyKind::File)
+            .map(|d| d.path.clone())
+            .collect(),
+        policy,
+        exposed: Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for label in exposed {
+        if !seen.insert(label.to_lowercase()) {
+            continue;
+        }
+        let entry = all
+            .iter()
+            .find(|d| d.label.eq_ignore_ascii_case(label))
+            .ok_or_else(|| {
+                let known: Vec<&str> = all.iter().map(|d| d.label).collect();
+                anyhow::anyhow!(
+                    "unknown credential label `{}` - the known labels are: {}",
+                    label,
+                    known.join(", ")
+                )
+            })?;
+        if entry.class == CredentialClass::Secret {
+            anyhow::bail!(
+                "`{}` is classified `{}` and can never be exposed: it is a private key or the \
+                 tool's own control plane, and no workload has a legitimate reason to read it",
+                label,
+                entry.class.as_str()
+            );
+        }
+        if entry.kind == DenyKind::Dir {
+            eff.dirs.retain(|p| !path_covers(p, &entry.path));
+        } else {
+            eff.files.retain(|p| !path_covers(p, &entry.path));
+        }
+        eff.exposed.push(ExposedCredential {
+            label: label.to_string(),
+            path: entry.path.clone(),
+            class: entry.class,
+        });
+    }
+    // The machine policy joins the set the backends consume. Additive only:
+    // nothing above removed an entry on its behalf, and there is no key in a
+    // policy file that could.
+    for dir in &eff.policy.dirs {
+        if !eff.dirs.iter().any(|p| path_covers(p, dir)) {
+            eff.dirs.push(dir.clone());
+        }
+    }
+    for file in &eff.policy.files {
+        if !eff.files.iter().any(|p| path_covers(p, file)) {
+            eff.files.push(file.clone());
+        }
+    }
+    // The policy directory itself is denied: the file names alone reveal where
+    // the org keeps secrets, which is more than a workload needs to know. It
+    // exists only when a policy is deployed, and a deny on a missing path is
+    // skipped by the backends.
+    if let Some(dir) = policy_dir.filter(|dir| dir.exists()) {
+        eff.dirs.push(dir.to_path_buf());
+    }
+    Ok(eff)
+}
+
+/// The effective deny set on this machine: builtin entries plus the machine
+/// policy, minus the exposure the operator requested.
+pub fn effective_denies(exposed: &[String]) -> Result<EffectiveDenies> {
+    // Resolve the policy through `policy_denies()` so `saife credentials list`
+    // and `saife run` go through ONE load path (and its one error message).
+    let policy_dir = policy_dir();
+    effective_denies_with(
+        exposed,
+        credential_deny_base().as_deref(),
+        std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        policy_dir.as_deref(),
+    )
+}
+
+/// What the machine policy added, and where it came from - the audit records
+/// the sources, not just a count, so a session's leaf names the files in force.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicyDenies {
+    /// Whole trees the policy denies, in file order (a policy is deployed as
+    /// several files; the order is the sorted file order, so two machines read
+    /// the same files into the same order).
+    pub dirs: Vec<std::path::PathBuf>,
+    /// Single files the policy denies, in the same order.
+    pub files: Vec<std::path::PathBuf>,
+    /// The policy files these entries came from, in load order.
+    pub sources: Vec<std::path::PathBuf>,
+}
+
+/// The machine-wide policy directory: `%PROGRAMDATA%\saife\deny.d`. It lives
+/// under ProgramData deliberately - the point of an additive policy is that an
+/// admin can deploy it and a standard user cannot weaken it, and the builtin
+/// list is code for the same reason (a floor that lives in a file the workload
+/// may reach is not a floor).
+pub fn policy_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("PROGRAMDATA")
+        .map(|pd| std::path::PathBuf::from(pd).join("saife").join("deny.d"))
+}
+
+pub(crate) fn policy_denies_in(dir: &std::path::Path) -> Result<PolicyDenies> {
+    if !dir.is_dir() {
+        return Ok(PolicyDenies::default());
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read policy directory {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    files.sort_by_key(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+    let mut out = PolicyDenies::default();
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("read policy file {}", file.display()))?;
+        let raw: RawPolicy = serde_json::from_str(&text)
+            .with_context(|| format!("parse policy file {}", file.display()))?;
+        if raw.schema_version != 1 {
+            anyhow::bail!(
+                "{}: schema_version {} is not supported by this build (this build speaks 1)",
+                file.display(),
+                raw.schema_version
+            );
+        }
+        if raw.deny.dirs.is_empty() && raw.deny.files.is_empty() {
+            anyhow::bail!(
+                "{} adds no deny entry - an empty policy file is a deployment mistake, not a no-op",
+                file.display()
+            );
+        }
+        for entry in &raw.deny.dirs {
+            let path = policy_path(entry, &file, dir)?;
+            if !out
+                .dirs
+                .iter()
+                .any(|p| path_covers(p, &path) || path_covers(&path, p))
+            {
+                out.dirs.push(path);
+            }
+        }
+        for entry in &raw.deny.files {
+            let path = policy_path(entry, &file, dir)?;
+            if !out
+                .files
+                .iter()
+                .any(|p| path_covers(p, &path) || path_covers(&path, p))
+            {
+                out.files.push(path);
+            }
+        }
+        out.sources.push(file);
+    }
+    Ok(out)
+}
+
+/// Validate one policy path at load time: it must resolve to an ABSOLUTE path
+/// with no `..` component. A relative spelling would depend on a cwd a policy
+/// does not have (the session's, the supervisor's, whichever ran first), and a
+/// `..` climb would make the same file mean different things on different
+/// machines. `$CWD`/`$SID` are refused by name: they are per-session values,
+/// and a policy that named the session's cwd would deny a different tree per
+/// launch - the operator should deny the real path.
+fn policy_path(
+    raw: &str,
+    file: &std::path::Path,
+    policy_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    if raw.contains("$CWD") || raw.contains("$SID") {
+        anyhow::bail!(
+            "{}: `{}` uses a per-session variable; a policy denies a real path, not a cwd",
+            file.display(),
+            raw
+        );
+    }
+    let expanded = expand_vars(raw, policy_dir)
+        .with_context(|| format!("{}: expand `{}`", file.display(), raw))?;
+    let path = std::path::PathBuf::from(&expanded);
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "{}: `{}` is not absolute after expansion - a policy deny must name the tree it hides",
+            file.display(),
+            raw
+        );
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("{}: `{}` climbs out with `..`", file.display(), raw);
+    }
+    Ok(path)
+}
+
+/// The schema of one machine-policy file. Additive by construction: there is no
+/// `allow` key to remove anything, and `deny_unknown_fields` refuses a moved
+/// key rather than aliasing it - the same stance the profile loader takes.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicy {
+    schema_version: u32,
+    deny: RawPolicyDeny,
+    /// Optional free text for the human who reads the deployment; carried for
+    /// the file's own documentation, never interpreted.
+    #[serde(default)]
+    #[allow(dead_code)]
+    note: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyDeny {
+    #[serde(default)]
+    dirs: Vec<String>,
+    #[serde(default)]
+    files: Vec<String>,
 }
 
 /// The base the credential denies are rooted at: the OS-known profile
@@ -1769,16 +2127,37 @@ mod tests {
         };
         let fake = std::path::PathBuf::from(r"C:\Users\does-not-exist-fake-m3");
 
-        let real_dirs = builtin_deny_dirs_with(Some(&real), None);
-        let fake_dirs = builtin_deny_dirs_with(Some(&fake), None);
-        let none_dirs = builtin_deny_dirs_with(None, None);
+        let real_dirs: Vec<PathBuf> = credential_denies_with(Some(&real), None, None)
+            .iter()
+            .filter(|c| c.kind == DenyKind::Dir)
+            .map(|c| c.path.clone())
+            .collect();
+        let fake_dirs: Vec<PathBuf> = credential_denies_with(Some(&fake), None, None)
+            .iter()
+            .filter(|c| c.kind == DenyKind::Dir)
+            .map(|c| c.path.clone())
+            .collect();
+        let none_dirs: Vec<PathBuf> = credential_denies_with(None, None, None)
+            .iter()
+            .filter(|c| c.kind == DenyKind::Dir)
+            .map(|c| c.path.clone())
+            .collect();
 
         assert_eq!(
             real_dirs.len(),
-            5,
-            "the five home-rooted dir denies (.ssh/.aws/.azure/.gnupg/.saife): {real_dirs:?}"
+            7,
+            "the seven home-rooted tree denies (.ssh/.aws/.azure/.gnupg/.saife, the gh config \
+             directory and gcloud's store): {real_dirs:?}"
         );
-        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife"] {
+        for dir in [
+            ".ssh",
+            ".aws",
+            ".azure",
+            ".gnupg",
+            ".saife",
+            ".config\\gh",
+            ".config\\gcloud",
+        ] {
             assert!(
                 real_dirs.iter().any(|d| d == &real.join(dir)),
                 "the real profile must deny ~/{dir}: {real_dirs:?}"
@@ -1786,7 +2165,7 @@ mod tests {
         }
         assert_eq!(
             fake_dirs.len(),
-            5,
+            7,
             "the fake root denies a different tree: {fake_dirs:?}"
         );
         assert!(
@@ -1802,12 +2181,20 @@ mod tests {
         // is the wiring proof. After M3 it derives the base from the OS known
         // folder (== `real`) and never reads USERPROFILE, so a concurrent test
         // repointing USERPROFILE cannot race this call.
-        let dirs = builtin_deny_dirs();
+        let dirs: Vec<PathBuf> = credential_denies()
+            .iter()
+            .filter(|c| c.kind == DenyKind::Dir)
+            .map(|c| c.path.clone())
+            .collect();
         assert!(
             dirs.iter().any(|d| d == &real.join(".ssh")),
             "builtin_deny_dirs() must root at the OS profile, not USERPROFILE: {dirs:?}"
         );
-        let files = builtin_deny_files();
+        let files: Vec<PathBuf> = credential_denies()
+            .iter()
+            .filter(|c| c.kind == DenyKind::File)
+            .map(|c| c.path.clone())
+            .collect();
         assert!(
             files
                 .iter()
@@ -1828,12 +2215,20 @@ mod tests {
             );
             return;
         };
-        let dirs = builtin_deny_dirs_with(Some(&real), std::env::var_os("LOCALAPPDATA").as_deref());
+        let dirs: Vec<PathBuf> = credential_denies()
+            .iter()
+            .filter(|c| c.kind == DenyKind::Dir)
+            .map(|c| c.path.clone())
+            .collect();
         assert!(
             dirs.iter().any(|d| d == &real.join(".ssh")),
             "the credential dir denies must be present with no env input: {dirs:?}"
         );
-        let files = builtin_deny_files_with(Some(&real), std::env::var_os("APPDATA").as_deref());
+        let files: Vec<PathBuf> = credential_denies()
+            .iter()
+            .filter(|c| c.kind == DenyKind::File)
+            .map(|c| c.path.clone())
+            .collect();
         assert!(
             files
                 .iter()
@@ -3287,5 +3682,289 @@ mod tests {
             checked_ok,
             "expected to check the documented examples, found {count}"
         );
+    }
+
+    // ---- The classified credential-deny set ----
+    //
+    // The builtin deny list was one flat opinion. It is now classified: the
+    // entries a workload has NO legitimate reason to read (private keys, the
+    // control plane) can never be exposed, and the entries a tool needs to
+    // function (gh, kubectl, docker, cargo, git, maven, gradle, nuget, pypi)
+    // can be exposed per session by label, loudly and audited. The flat
+    // `builtin_deny_dirs`/`builtin_deny_files` keep their exact output for
+    // callers that do not name an exposure - including the order, which the
+    // existing count tests below pin.
+
+    #[test]
+    fn every_credential_deny_carries_a_label_and_a_class() {
+        let home = PathBuf::from(r"C:\Users\u");
+        let local = PathBuf::from(r"C:\Users\u\AppData\Local");
+        let appdata = PathBuf::from(r"C:\Users\u\AppData\Roaming");
+        let denies = credential_denies_with(
+            Some(home.as_path()),
+            Some(local.as_path()),
+            Some(appdata.as_path()),
+        );
+        assert_eq!(denies.len(), 17, "8 secret trees + 9 tool credentials");
+        for d in &denies {
+            assert!(
+                !d.label.is_empty(),
+                "an unlabeled entry cannot be named by a flag"
+            );
+        }
+        let secrets: Vec<_> = denies
+            .iter()
+            .filter(|d| d.class == CredentialClass::Secret)
+            .map(|d| d.label)
+            .collect();
+        assert_eq!(
+            secrets,
+            [
+                "ssh",
+                "aws",
+                "azure",
+                "gnupg",
+                "saife",
+                "gcloud",
+                "saife-local",
+                "gcloud-appdata"
+            ]
+        );
+        let tools: Vec<_> = denies
+            .iter()
+            .filter(|d| d.class == CredentialClass::ToolCredential)
+            .map(|d| d.label)
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                "gradle", "maven", "cargo", "git", "docker", "kube", "gh", "pypi", "nuget"
+            ]
+        );
+        // `gh` is a config DIRECTORY, unlike its eight siblings: a file-kind
+        // deny on it would leave `hosts.yml` readable through a grant on
+        // `~/.config`, which is precisely the hole the deny exists to close.
+        let gh = denies.iter().find(|d| d.label == "gh").expect("gh entry");
+        assert_eq!(
+            gh.kind,
+            DenyKind::Dir,
+            "`~/.config/gh` is a tree, not a file"
+        );
+        assert_eq!(
+            gh.path,
+            home.join(".config").join("gh"),
+            "the gh subtree, never .config"
+        );
+    }
+
+    #[test]
+    fn exposing_a_tool_credential_removes_exactly_that_entry() {
+        let home = PathBuf::from(r"C:\Users\u");
+        let local = PathBuf::from(r"C:\Users\u\AppData\Local");
+        let appdata = PathBuf::from(r"C:\Users\u\AppData\Roaming");
+        let eff = effective_denies_with(
+            &["gh".to_string()],
+            Some(home.as_path()),
+            Some(local.as_path()),
+            Some(appdata.as_path()),
+            None,
+        )
+        .expect("a valid label");
+        let eff_files: Vec<PathBuf> = eff.files.clone();
+        assert!(
+            eff_files.contains(&home.join(".kube").join("config")),
+            "an unexposed sibling stays denied"
+        );
+        assert!(
+            !eff_files.iter().any(|p| p.ends_with(".config\\gh")),
+            "gh is gone"
+        );
+        assert_eq!(eff.exposed.len(), 1);
+        assert_eq!(eff.exposed[0].label, "gh");
+        assert_eq!(eff.exposed[0].class, CredentialClass::ToolCredential);
+    }
+
+    #[test]
+    fn exposing_a_secret_is_refused_by_name() {
+        let err = effective_denies_with(
+            &["ssh".to_string()],
+            Some(&PathBuf::from(r"C:\Users\u")),
+            None,
+            None,
+            None,
+        )
+        .expect_err("a private key is never exposable");
+        let text = err.to_string();
+        assert!(text.contains("ssh"), "the refusal names the label: {text}");
+        assert!(text.contains("never"), "the refusal says why: {text}");
+    }
+
+    #[test]
+    fn an_unknown_exposure_label_is_refused_with_the_known_ones() {
+        let err = effective_denies_with(
+            &["ghh".to_string()],
+            Some(&PathBuf::from(r"C:\Users\u")),
+            None,
+            None,
+            None,
+        )
+        .expect_err("a typo must not silently no-op");
+        let text = err.to_string();
+        assert!(
+            text.contains("ghh") && text.contains("gh"),
+            "names the typo and the real labels: {text}"
+        );
+    }
+
+    #[test]
+    fn the_policy_dir_adds_dirs_and_files_in_sorted_order() {
+        let dir = std::env::temp_dir().join(format!("saife-policy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("b-gcloud.json"),
+            r#"{"schema_version": 1, "deny": {"dirs": ["C:/ProgramData/Corp/gcloud"], "files": ["C:/Users/u/.netrc"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("a-vault.json"),
+            r#"{"schema_version": 1, "deny": {"dirs": ["C:/ProgramData/Corp/vault-tokens"], "files": []}}"#,
+        )
+        .unwrap();
+        let policy = policy_denies_in(&dir).expect("valid policy files");
+        assert_eq!(
+            policy.dirs,
+            vec![
+                PathBuf::from("C:/ProgramData/Corp/vault-tokens"),
+                PathBuf::from("C:/ProgramData/Corp/gcloud")
+            ],
+            "sorted by FILE name, not by the paths inside them"
+        );
+        assert_eq!(policy.files, vec![PathBuf::from("C:/Users/u/.netrc")]);
+        assert_eq!(policy.sources.len(), 2, "the audit wants the file names");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_policy_file_with_an_unknown_key_is_refused_naming_the_file() {
+        let dir = std::env::temp_dir().join(format!("saife-policy-test-{}-2", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bad.json");
+        std::fs::write(
+            &f,
+            r#"{"schema_version": 1, "deny": {"dirs": []}, "allow": ["C:/temp"]}"#,
+        )
+        .unwrap();
+        let err = policy_denies_in(&dir).expect_err("an unknown key is a moved key, not an alias");
+        assert!(
+            err.to_string().contains("bad.json"),
+            "names the file: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_policy_file_with_a_relative_path_is_refused_naming_the_file() {
+        let dir = std::env::temp_dir().join(format!("saife-policy-test-{}-3", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("rel.json"),
+            r#"{"schema_version": 1, "deny": {"dirs": ["secrets"]}}"#,
+        )
+        .unwrap();
+        let err = policy_denies_in(&dir)
+            .expect_err("a relative deny depends on a cwd the policy has none of");
+        assert!(
+            err.to_string().contains("rel.json"),
+            "names the file: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_policy_file_that_adds_nothing_is_refused() {
+        let dir = std::env::temp_dir().join(format!("saife-policy-test-{}-4", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("empty.json"),
+            r#"{"schema_version": 1, "deny": {"dirs": [], "files": []}}"#,
+        )
+        .unwrap();
+        let err = policy_denies_in(&dir)
+            .expect_err("an empty policy file is a deployment mistake, not a no-op");
+        assert!(
+            err.to_string().contains("empty.json"),
+            "names the file: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_policy_deny_reaches_the_effective_set_and_the_policy_root_denies_itself() {
+        let dir = std::env::temp_dir().join(format!("saife-policy-test-{}-5", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("p.json"),
+            r#"{"schema_version": 1, "deny": {"dirs": ["C:/ProgramData/Corp/secrets"], "files": []}}"#,
+        )
+        .unwrap();
+        let eff = effective_denies_with(
+            &[],
+            Some(&PathBuf::from(r"C:\Users\u")),
+            None,
+            None,
+            Some(&dir),
+        )
+        .expect("policy loads");
+        assert!(
+            eff.policy
+                .dirs
+                .contains(&PathBuf::from("C:/ProgramData/Corp/secrets"))
+        );
+        assert!(
+            eff.dirs
+                .contains(&PathBuf::from("C:/ProgramData/Corp/secrets")),
+            "the policy reaches the set the backends consume, not just the report"
+        );
+        assert!(
+            eff.dirs.contains(&dir),
+            "the policy directory itself is denied - the file names alone reveal where the org keeps secrets"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_exposed_label_and_a_policy_deny_coexist() {
+        let home = PathBuf::from(r"C:\Users\u");
+        let local = PathBuf::from(r"C:\Users\u\AppData\Local");
+        let appdata = PathBuf::from(r"C:\Users\u\AppData\Roaming");
+        let dir = std::env::temp_dir().join(format!("saife-policy-test-{}-6", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("p.json"),
+            r#"{"schema_version": 1, "deny": {"dirs": ["C:/ProgramData/Corp/secrets"], "files": []}}"#,
+        )
+        .unwrap();
+        let eff = effective_denies_with(
+            &["kube".to_string()],
+            Some(home.as_path()),
+            Some(local.as_path()),
+            Some(appdata.as_path()),
+            Some(&dir),
+        )
+        .unwrap();
+        let names: Vec<PathBuf> = eff.files.clone();
+        assert!(!names.contains(&home.join(".kube").join("config")));
+        assert!(names.contains(&appdata.join("NuGet").join("NuGet.Config")));
+        assert!(
+            eff.dirs
+                .contains(&PathBuf::from("C:/ProgramData/Corp/secrets"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

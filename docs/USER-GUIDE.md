@@ -305,6 +305,62 @@ override an explicit deny.
 `--network-profile none|minimal|developer` picks a built-in set of hosts
 (`none` = block, `minimal` = the Anthropic API, `developer` = common dev hosts).
 
+### 4.4a Credential denies: what is always denied, and what an operator can do
+
+Nine trees and eight files are denied for **every** launch, on both backends, whatever a
+profile grants. Class `secret` - never exposable, because no workload has a legitimate reason to
+read them: `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.config/gcloud` (and the Windows
+spelling `%APPDATA%\gcloud`), `~/.saife`, `%LOCALAPPDATA%\saife`. Class
+`tool-credential` - denied because an accident must not hand the workload a token, exposable per
+session by name because the tool cannot run without it: `~/.gradle/gradle.properties`,
+`~/.m2/settings.xml`, `~/.cargo/credentials.toml`, `~/.git-credentials`,
+`~/.docker/config.json`, `~/.kube/config`, `~/.pypirc`, `%APPDATA%\NuGet\NuGet.Config`, and the
+`~/.config/gh` **directory** - a directory, deliberately: the deny must reach `hosts.yml` inside
+it, and it must stay the `gh` subtree, because `~/.config` is where every other tool also writes.
+`saife credentials` prints the set with the class and the path.
+
+The list is **code**, not configuration: a floor that lives in a file the workload can reach is
+not a floor. Two things extend it - and neither can weaken it:
+
+**A machine policy (additive).** An administrator drops `*.json` into
+`%PROGRAMDATA%\saife\deny.d\`:
+
+```json
+{
+  "schema_version": 1,
+  "deny": {
+    "dirs": ["$HOME/.config/gcloud", "C:/ProgramData/Corp/vault-tokens"],
+    "files": ["$HOME/.netrc", "$HOME/.pgpass"]
+  },
+  "note": "corp baseline: cloud CLI state and netrc"
+}
+```
+
+Files load in sorted order, each entry must resolve to an absolute path (no `..`, no `$CWD`/`$SID`),
+and a file that cannot be parsed, names an unknown key, adds nothing, or speaks another
+`schema_version` **refuses the session by name** - a policy that cannot be trusted to parse cannot
+be trusted to deny. A missing directory is a fresh install, not an error. There is no `allow` key
+by construction: a policy cannot remove a builtin deny, and `deny_unknown_fields` refuses the
+attempt instead of ignoring it. The policy directory itself is denied to the workload.
+
+**A per-session exposure (deliberate).** When a tool cannot run without reading its own credential
+- `gh` and `~/.config/gh` are the usual case - name the entry:
+
+```powershell
+saife run --profile opencode --allow-cwd --expose-credential gh -- gh api user
+```
+
+The flag drops **exactly that entry** for **one session**. It prints the label and path on stderr,
+and writes `exposed_credentials` (label, path, class - never the value) into the session's root
+audit leaf, so "this session could read it" is provable later. `--expose-credential ssh` is
+refused: a `secret`-class tree has no legitimate workload reader, and a typo is refused with the
+list of known labels rather than silently doing nothing. The default stays deny.
+
+This is the honest half of the problem, not the whole one: the workload can read the file while
+the session runs. Serving the credential **without** exposing it - the proxy injects the header,
+the file never becomes readable - is F-2 (ADR-0001), which needs selective TLS termination and is
+not implemented.
+
 ### 4.5 The prompt
 
 For a host that is neither allowed nor denied, the interactive prompt asks:

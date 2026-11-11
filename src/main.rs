@@ -66,6 +66,7 @@ fn main() {
             allow_cwd,
             allow,
             read_only,
+            expose_credential,
             block_net,
             allow_domain,
             deny_domain,
@@ -88,6 +89,7 @@ fn main() {
             allow_cwd,
             allow,
             read_only,
+            expose_credential,
             block_net,
             allow_domain,
             deny_domain,
@@ -107,6 +109,7 @@ fn main() {
         Cmd::Ps { json, .. } => ps_cmd(json),
         Cmd::Audit { action } => audit_cmd(action),
         Cmd::Profile { action } => profile_cmd(action),
+        Cmd::Credentials => credentials_cmd(),
         Cmd::Runner { subcommand } => runner_cmd(subcommand),
         Cmd::Learned {
             subcommand,
@@ -192,6 +195,51 @@ fn profile_cmd(action: cli::ProfileAction) -> i32 {
             0
         }
         ProfileAction::Show { name, expanded } => profile::show_profile(&name, expanded),
+    }
+}
+
+/// `saife credentials list`: the always-denied set, classified.
+///
+/// The list is the only place an operator can see what a session will deny
+/// before launching: the builtin entries with their class (a `secret` can
+/// never be exposed; a `tool-credential` can, per session, loudly), plus the
+/// machine policy's additions with the file they came from. A policy that
+/// cannot be parsed prints its refusal here as well - `saife run` will refuse
+/// the session, so `list` must not lie about that.
+fn credentials_cmd() -> i32 {
+    match crate::profile::effective_denies(&[]) {
+        Ok(eff) => {
+            let all = crate::profile::credential_denies();
+            for d in &all {
+                let exposed = if eff.exposed.iter().any(|e| e.path == d.path) {
+                    " (exposed)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}\t{}\t{}\t{}{}",
+                    d.class.as_str(),
+                    d.kind.as_str(),
+                    d.label,
+                    d.path.display(),
+                    exposed
+                );
+            }
+            for d in &eff.policy.dirs {
+                println!("policy\tdir\t-\t{}", d.display());
+            }
+            for f in &eff.policy.files {
+                println!("policy\tfile\t-\t{}", f.display());
+            }
+            for s in &eff.policy.sources {
+                println!("policy\tsource\t-\t{}", s.display());
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("[saife] {e:#}");
+            1
+        }
     }
 }
 
@@ -745,6 +793,54 @@ fn upstream_parse_failure_warning(
 /// listener binds still records them; `proxy_endpoint` is added by `complete`,
 /// which is the only caller that knows a port. `None` under `--block-net`, which
 /// binds nothing.
+/// The exposures a launch carries, as the audit records them: label, path,
+/// class - never the value. Resolved through the same `effective_denies` the
+/// filesystem policy uses, so the leaf and the launch cannot disagree; a
+/// refused exposure (unknown label, `Secret` class) surfaces here and stops the
+/// session before anything is granted.
+fn credential_exposure_facts(
+    exposed: &[String],
+) -> anyhow::Result<Vec<audit::session_start::ExposedCredentialFacts>> {
+    if exposed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let eff = profile::effective_denies(exposed)?;
+    for x in &eff.exposed {
+        eprintln!(
+            "[saife] exposing credential `{}` ({}) to this session: the workload can read it. \
+             Denied again next run unless named.",
+            x.label,
+            x.path.display()
+        );
+    }
+    Ok(eff
+        .exposed
+        .iter()
+        .map(|x| audit::session_start::ExposedCredentialFacts {
+            label: x.label.clone(),
+            path: x.path.display().to_string(),
+            class: x.class.as_str(),
+        })
+        .collect())
+}
+
+/// The machine policy in force, as the audit records it (counts plus the file
+/// names - the deployment's identity). An unparseable policy refuses the
+/// session here, exactly as it does in the filesystem path.
+fn credential_policy_facts() -> anyhow::Result<audit::session_start::PolicyFacts> {
+    let eff = profile::effective_denies(&[])?;
+    Ok(audit::session_start::PolicyFacts {
+        dirs: eff.policy.dirs.len(),
+        files: eff.policy.files.len(),
+        sources: eff
+            .policy
+            .sources
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect(),
+    })
+}
+
 fn appcontainer_session_facts() -> audit::session_start::SessionStartFacts {
     audit::session_start::SessionStartFacts::appcontainer_dacl(setup::is_elevated())
 }
@@ -756,6 +852,7 @@ fn run_cmd(
     allow_cwd: bool,
     allow: Vec<String>,
     read_only: Vec<String>,
+    expose_credential: Vec<String>,
     block_net: bool,
     allow_domain: Vec<String>,
     deny_domain: Vec<String>,
@@ -820,6 +917,7 @@ fn run_cmd(
         allow_cwd,
         &allow,
         &read_only,
+        &expose_credential,
         block_net,
         &allow_domain,
         &deny_domain,
@@ -854,6 +952,7 @@ fn run_inner(
     allow_cwd: bool,
     allow: &[String],
     read_only: &[String],
+    exposed: &[String],
     block_net: bool,
     allow_domain: &[String],
     deny_domain: &[String],
@@ -927,6 +1026,7 @@ fn run_inner(
         fs: &fs,
         limits: &limits,
         runner_paths: &resolved.runner.paths,
+        exposed,
         audit_strict,
         print_sid,
         no_interactive,

@@ -8,7 +8,8 @@
 use super::{ContainmentBackend, SessionRequest, EXIT_REFUSED};
 use std::io::IsTerminal;
 use crate::{
-    audit, cli, join_cmdline, net, plugin, profile, seal_audit, setup, start_session_proxy,
+    audit, cli, credential_exposure_facts, credential_policy_facts, join_cmdline, net,
+    plugin, profile, seal_audit, setup, start_session_proxy,
 };
 use anyhow::{Context, Result};
 
@@ -24,6 +25,7 @@ impl ContainmentBackend for MxcBackend {
             req.fs,
             req.limits,
             req.runner_paths,
+            req.exposed,
             req.audit_strict,
             req.print_sid,
             req.no_interactive,
@@ -143,6 +145,9 @@ fn run_mxc_session(
     // The session profile's `runner.sync.paths`: what a build request that names no paths
     // inherits. Empty is the whole project, i.e. what every profile without the block gets.
     runner_paths: &[String],
+    // `--expose-credential`: the builtin deny entries the operator named, resolved
+    // (and refused, if a label is unknown or a `Secret`) by `filesystem_policy`.
+    exposed: &[String],
     audit_strict: bool,
     print_sid: bool,
     no_interactive: bool,
@@ -198,6 +203,7 @@ fn run_mxc_session(
         &denies,
         home.as_deref(),
         &launcher,
+        exposed,
     ) {
         Ok(policy) => policy,
         Err(e) => {
@@ -237,7 +243,12 @@ fn run_mxc_session(
             audit::session_start::LOOPBACK_OPEN_UNSCOPED
         } else {
             audit::session_start::LOOPBACK_CLOSED
-        }),
+        })
+        // The credential posture this session launches with, resolved through
+        // the same `effective_denies` the filesystem policy used - so the leaf
+        // cannot describe an exposure the launch does not have.
+        .with_exposed_credentials(credential_exposure_facts(exposed)?)
+        .with_policy(credential_policy_facts()?),
     );
 
     // (5) The SAME listener the AppContainer path starts, with its own per-run

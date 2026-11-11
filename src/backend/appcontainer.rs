@@ -1,15 +1,14 @@
 //! The AppContainer backend: the in-repo Windows supervisor.
 //!
-//! The body still lives in [`crate::run_appcontainer_session`] — this commit only
-//! puts it behind the trait, unchanged. Nothing here may reorder its steps: the
+//! The body lives here, behind the trait. Nothing here may reorder its steps: the
 //! DACL journal opens before any host mutation, the per-session tree exists
 //! before `--print-sid` answers, the audit root is armed before the child
 //! exists, and teardown restores DACLs before deleting the profile.
 
 use super::{ContainmentBackend, SessionRequest, EXIT_REFUSED};
 use crate::{
-    appcontainer_session_facts, audit, join_cmdline, net, plugin, sandbox, seal_audit,
-    start_session_proxy,
+    appcontainer_session_facts, audit, credential_exposure_facts, credential_policy_facts,
+    join_cmdline, net, plugin, sandbox, seal_audit, start_session_proxy,
 };
 use anyhow::{Context, Result};
 
@@ -34,6 +33,7 @@ fn run_appcontainer_session(req: &SessionRequest<'_>) -> Result<i32> {
     let net_cfg_resolved = req.net_cfg;
     let fs = req.fs;
     let limits = req.limits;
+    let exposed = req.exposed;
     let audit_strict = req.audit_strict;
     let print_sid = req.print_sid;
     let plugins = req.plugins;
@@ -118,7 +118,9 @@ fn run_appcontainer_session(req: &SessionRequest<'_>) -> Result<i32> {
         audit_writer.clone(),
         sid,
         cmd.join(" "),
-        appcontainer_session_facts(),
+        appcontainer_session_facts()
+            .with_exposed_credentials(credential_exposure_facts(exposed)?)
+            .with_policy(credential_policy_facts()?),
     );
 
     let net_cfg = net_cfg_resolved.clone();
@@ -174,7 +176,7 @@ fn run_appcontainer_session(req: &SessionRequest<'_>) -> Result<i32> {
     session_start.complete(proxy_port.map(audit::session_start::LoopbackEndpoint::new))?;
 
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
-    let entries = sandbox::build_allowlist(sid, cwd, fs)?;
+    let entries = sandbox::build_allowlist_exposed(sid, cwd, fs, exposed)?;
 
     // Fail-close (decision 2026-11-10): a DENY ACE that could not be applied
     // means the session would run with MORE access than the profile allows —

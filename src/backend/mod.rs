@@ -77,6 +77,11 @@ pub struct SessionRequest<'a> {
     /// no paths inherits. Empty is the whole project.
     #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
     pub runner_paths: &'a [String],
+    /// `--expose-credential` labels: this session's deliberate, logged carve-outs
+    /// from the builtin credential denies. Resolved by the backends, never by the
+    /// crate root — a refused label must stop the session before an ACE is written,
+    /// and that is a backend's own step.
+    pub exposed: &'a [String],
     pub audit_strict: bool,
     pub print_sid: bool,
     /// `--no-interactive`: passed through to a backend that can choose its stdio.
