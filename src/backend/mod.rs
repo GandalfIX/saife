@@ -3,9 +3,9 @@
 //! One trait, one implementation per enforcement mechanism:
 //!
 //! * [`AppContainerBackend`] — the in-repo Windows AppContainer supervisor
-//!   (profile + per-session DACLs + job object), [`crate::run_appcontainer_session`].
+//!   (profile + per-session DACLs + job object), [`appcontainer::run_appcontainer_session`].
 //! * [`MxcBackend`] — the ProcessContainer backend (`mxc-backend` feature),
-//!   [`crate::run_mxc_session`].
+//!   [`mxc::run_mxc_session`].
 //!
 //! The trait exists to make the *third* mechanism cheap: a backend is selected
 //! once, from the resolved CLI, and owns its whole session lifecycle — prepare,
@@ -18,6 +18,31 @@
 //! The selection is the only place a feature state is allowed to decide which
 //! backends EXIST. A binary without `mxc-backend` refuses `--backend mxc` with
 //! the same message [`crate::cli::route_backend`] does, rather than falling back.
+//!
+//! # Adding a backend
+//!
+//! The whole extension contract fits in four steps, and the compiler does most
+//! of the checking:
+//!
+//! 1. Write the mechanism as one private module beside the existing ones and
+//!    implement [`ContainmentBackend`] — the request carries only
+//!    platform-neutral types (paths, strings, slices), so the signature does not
+//!    lock the mechanism to an OS.
+//! 2. Add the arm to [`select`]. This is the ONLY place a mechanism becomes
+//!    reachable, and everything feature-conditional about the platform lives
+//!    behind that arm when the backend that needs it actually exists; there is
+//!    no preemptive platform gating.
+//! 3. Add the [`crate::cli::Backend`] variant. `route_backend`'s matrix is
+//!    fail-closed, so an ungated variant refuses until it is wired.
+//! 4. Reuse the shared vocabulary instead of inventing exits: refuse BY NAME
+//!    (`EXIT_REFUSED` for a session whose guarantee cannot hold, exit 5 for a
+//!    capability the operator asked for that this backend cannot carry out, and
+//!    mirror the child's code for a session that ran and failed).
+//!
+//! What a new backend must NOT take over from the crate root: profile,
+//! network and filesystem resolution, the audit chain's root, seal and exit
+//! mapping, and the per-session id. Two mechanisms must not produce two stories
+//! about what the operator asked for.
 
 pub(crate) mod appcontainer;
 #[cfg(feature = "mxc-backend")]
