@@ -1,4 +1,5 @@
 mod audit;
+mod backend;
 mod cli;
 mod net;
 // Plugins/sidecars are a capability of the mxc backend; without the feature the
@@ -27,8 +28,9 @@ use cli::Cmd;
 
 /// Whether the MXC backend is wired into the session path.
 ///
-/// P3.0 wires it: [`run_inner`] routes `--backend mxc` to [`run_mxc_session`],
-/// which launches through [`net::mxc::launch_session`]. Until this flipped, the
+/// P3.0 wired it: [`run_inner`] selects the backend through [`backend::select`]
+/// and [`backend::ContainmentBackend::run`] launches through
+/// [`net::mxc::launch_session`]. Before that flip, the
 /// flag was refused rather than falling back to `appcontainer`
 /// ([`cli::route_backend`]) — the refusal still exists and still fires for a
 /// binary built without the feature.
@@ -839,10 +841,6 @@ fn run_cmd(
 }
 
 #[allow(clippy::too_many_arguments)]
-// `no_interactive` only reaches the MXC path, which a feature-less build does
-// not have: the parameter stays (both builds take the same shape) and is
-// allowed to go unread there.
-#[cfg_attr(not(feature = "mxc-backend"), allow(unused_variables))]
 fn run_inner(
     // P3.0: the backend `cli::route_backend` already approved. `AppContainer`
     // keeps the code path below byte for byte; `Mxc` branches out after the
@@ -913,42 +911,52 @@ fn run_inner(
         None => new_session_id(),
     };
 
-    // P3.0: `--backend mxc` runs its own session. Placed here — after the shared
-    // resolution (profile, network, filesystem, sid) and BEFORE the DACL journal,
-    // the per-session install dirs and every AppContainer call — so the MXC path
-    // never touches host ACL state it does not use, and the AppContainer path
-    // below is exactly what it was.
-    if backend == cli::Backend::Mxc {
-        #[cfg(feature = "mxc-backend")]
-        {
-            return run_mxc_session(
-                &sid,
-                &cwd,
-                &net_cfg_resolved,
-                &fs,
-                &limits,
-                &resolved.runner.paths,
-                audit_strict,
-                print_sid,
-                no_interactive,
-                plugins,
-                plugin_dirs,
-                enable_runner,
-                allow_host_loopback,
-                allow_lan,
-                cmd,
-            );
-        }
-        // Unreachable through the CLI: `route_backend` refuses `mxc` in a binary
-        // without the feature. Spelled as the same refusal rather than an
-        // `unreachable!()` so a future caller that skips the router still fails
-        // closed and says why.
-        #[cfg(not(feature = "mxc-backend"))]
-        {
-            anyhow::bail!("{}", cli::MXC_FEATURE_MISSING);
-        }
-    }
+    // The backend the router chose owns everything from here on. Both paths get
+    // the SAME resolved inputs - one `SessionRequest` - so two backends cannot
+    // disagree about what the operator asked for, and the dispatch is the only
+    // arm a feature state decides. `--backend mxc` in a binary without the
+    // feature is the router's refusal restated (fail closed, never a fallback).
+    let req = backend::SessionRequest {
+        sid: &sid,
+        cwd: &cwd,
+        net_cfg: &net_cfg_resolved,
+        fs: &fs,
+        limits: &limits,
+        runner_paths: &resolved.runner.paths,
+        audit_strict,
+        print_sid,
+        no_interactive,
+        plugins,
+        plugin_dirs,
+        enable_runner,
+        allow_host_loopback,
+        allow_lan,
+        cmd,
+    };
+    backend::select(backend)?.run(&req)
+}
 
+/// Run one session through the AppContainer backend.
+///
+/// Moved out of [`run_inner`] unchanged when the backends moved behind
+/// [`backend::ContainmentBackend`]: the body below is byte-identical to what
+/// `run_inner` used to execute after the shared resolution, and the locals it
+/// used are rebound from the request. Everything that makes a run evidence -
+/// the DACL journal, the audit root, the teardown order - is in here and must
+/// stay in here.
+fn run_appcontainer_session(req: &backend::SessionRequest<'_>) -> Result<i32> {
+    // Rebound from the request: no logic, just the names the moved body uses.
+    let sid = req.sid;
+    let cwd = req.cwd;
+    let net_cfg_resolved = req.net_cfg;
+    let fs = req.fs;
+    let limits = req.limits;
+    let audit_strict = req.audit_strict;
+    let print_sid = req.print_sid;
+    let plugins = req.plugins;
+    let enable_runner = req.enable_runner;
+    let allow_lan = req.allow_lan;
+    let cmd = req.cmd;
     // Plugins are wired on the MXC path only (POC). Refused by NAME rather than
     // ignored: asking for a capability and silently not getting it is the failure
     // mode this project exists to prevent, and the AppContainer session differs
@@ -985,7 +993,7 @@ fn run_inner(
     let run_journal = match sandbox::dacl_journal::DaclJournal::open(
         &journal_dir,
         sandbox::dacl_journal::JournalHeader {
-            run_id: sid.clone(),
+            run_id: sid.to_string(),
             owner_pid: std::process::id(),
             owner_created: sandbox::dacl_journal::current_process_creation_time(),
         },
@@ -998,7 +1006,7 @@ fn run_inner(
     };
 
     // Ensure the per-session install dirs exist.
-    sandbox::ensure_session_dirs(&cwd, &sid)
+    sandbox::ensure_session_dirs(cwd, sid)
         .with_context(|| format!("create session dirs for {sid}"))?;
 
     if print_sid {
@@ -1017,10 +1025,10 @@ fn run_inner(
     // process's elevation), so a run that returns early still leaves a root a
     // reader can select on. One root per run, and it is written before the child
     // exists, so no leaf the child causes can precede it.
-    let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(&sid, audit_strict)?);
+    let audit_writer = std::sync::Arc::new(audit::AuditWriter::open(sid, audit_strict)?);
     let session_start = audit::session_start::SessionStart::arm(
         audit_writer.clone(),
-        &sid,
+        sid,
         cmd.join(" "),
         appcontainer_session_facts(),
     );
@@ -1028,7 +1036,7 @@ fn run_inner(
     let net_cfg = net_cfg_resolved.clone();
 
     // Build the AppContainer session.
-    let session = sandbox::create_session(&sid)
+    let session = sandbox::create_session(sid)
         .with_context(|| format!("create AppContainer session for {sid}"))?;
 
     // Register loopback for the AC SID before spawning the proxy. The
@@ -1055,7 +1063,7 @@ fn run_inner(
     let proxy = start_session_proxy(
         &net_cfg,
         limits.prompt_timeout_secs,
-        &sid,
+        sid,
         audit_writer.clone(),
         std::sync::Arc::new(plugin::FacadeRegistry::new()),
         // Unchanged: this backend refuses `--plugin` and `--runner` by name
@@ -1078,7 +1086,7 @@ fn run_inner(
     session_start.complete(proxy_port.map(audit::session_start::LoopbackEndpoint::new))?;
 
     // Build the full allow-list (Option E per-session dirs + resolved profile entries).
-    let entries = sandbox::build_allowlist(&sid, &cwd, &fs)?;
+    let entries = sandbox::build_allowlist(sid, cwd, fs)?;
 
     // Fail-close (decision 2026-11-10): a DENY ACE that could not be applied
     // means the session would run with MORE access than the profile allows —
@@ -1096,7 +1104,7 @@ fn run_inner(
             "dacl_apply_failed",
             audit::session_start::TIER_APPCONTAINER_DACL,
         );
-        if let Err(aerr) = audit::session_start::append_refusal(&audit_writer, &sid, refusal) {
+        if let Err(aerr) = audit::session_start::append_refusal(&audit_writer, sid, refusal) {
             eprintln!("[saife] warning: could not record the refusal in the audit: {aerr}");
         }
         if let Some(j) = &run_journal
@@ -1105,12 +1113,12 @@ fn run_inner(
             j.remove_file();
         }
         sandbox::appcontainer::delete_profile(&session.ac_name);
-        let _ = remove_session_sandbox_dir(&cwd, &sid);
-        seal_audit(audit_writer, proxy.map(|(handle, _)| handle), &sid);
+        let _ = remove_session_sandbox_dir(cwd, sid);
+        seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
         return Ok(EXIT_REFUSED);
     }
 
-    let env_block = sandbox::build_env_block(&sid, &cwd, proxy.as_ref().map(|(_, env)| env));
+    let env_block = sandbox::build_env_block(sid, cwd, proxy.as_ref().map(|(_, env)| env));
 
     let cmdline = join_cmdline(cmd);
 
@@ -1119,14 +1127,14 @@ fn run_inner(
     let exit_code = sandbox::spawn(
         &session,
         &job,
-        &cwd,
+        cwd,
         env_block,
         &cmdline,
         !net_cfg.is_blocked(),
     )
     .context("spawn sandboxed process")?;
 
-    seal_audit(audit_writer, proxy.map(|(handle, _)| handle), &sid);
+    seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
 
     // MXC F-C/F-D teardown order matters: restore host DACLs BEFORE deleting
     // the profile (a crash between the two leaves restorable journal state,
@@ -1144,10 +1152,11 @@ fn run_inner(
     // removed, so every run left one behind. Best-effort on purpose: the tree is
     // litter once its ACEs are restored, and a workload may still hold a file in
     // it - a finished run must not fail over that.
-    let _ = remove_session_sandbox_dir(&cwd, &sid);
+    let _ = remove_session_sandbox_dir(cwd, sid);
 
     Ok(exit_code as i32)
 }
+
 
 /// Remove this session's `.sandbox/<sid>` tree at teardown (L-O).
 ///
