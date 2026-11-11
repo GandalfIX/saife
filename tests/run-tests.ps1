@@ -902,31 +902,119 @@ for /l %%i in (1,1,40000) do @ver>NUL
     # while every containment property held - the same fragility S-6 was
     # rewritten to avoid. An absolute path opens the file directly, so a
     # failure here means what it says instead of blaming the sandbox.
-    $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sidA, $installA) -WorkingDirectory $d
-    $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d
+    # A failed GRANT is a silent warning unless SAIFE_DIAG is set (a failed
+    # DENY refuses the session, a failed grant does not) - so a guest whose
+    # cwd grant did not land leaves the child with no access to its own cwd
+    # and no clue in the log. Turn the diag on for A's supervisor only and
+    # restore it after; A's stderr (which the Detail carries) then names the
+    # failing grant and the Win32 error.
+    $prevDiag = $env:SAIFE_DIAG
+    $env:SAIFE_DIAG = '1'
+    try {
+        $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sidA, $installA) -WorkingDirectory $d
+    } finally {
+        # Restore, do not clear: the whole lane may already run with -Diag.
+        if ($null -eq $prevDiag) { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
+        else { $env:SAIFE_DIAG = $prevDiag }
+    }
+    Start-Sleep -Seconds 2
+    $icaclsEarly = (icacls $d 2>&1 | ForEach-Object { $_.ToString() }) -join ' | '
+    $tB0 = Get-Date
+    # B runs ASYNCHRONOUSLY so the harness can sample the shared dir's DACL
+    # while both sessions are live: a fail that only shows in the final
+    # dump cannot distinguish "B broke A" from "A tore itself down".
+    $bProc = Start-SandboxProcess -Arguments "run --allow-cwd --sid $sidB -- cmd /c type .sandbox\$sidA\bin\where.exe" -WorkingDirectory $d
+    $errTaskB = $bProc.StandardError.ReadToEndAsync()
+    $outTaskB = $bProc.StandardOutput.ReadToEndAsync()
+    $aclSamples = @()
+    $bStart = Get-Date
+    $lastSig = ''
+    while (-not $bProc.WaitForExit(2000)) {
+        $aceLines = @(icacls $d 2>&1 | Select-String 'S-1-15' | ForEach-Object {
+            if ("$_" -match '(S-1-15[0-9-]+(?:\([^)]*\))*)') { $Matches[1] } })
+        $sig = 'A{0}:{1}' -f $(if ($procA.HasExited) { 'x' } else { 'o' }), ($aceLines -join ',')
+        if ($sig -ne $lastSig) {
+            $aclSamples += 't+{0:n0}s {1}' -f ((Get-Date) - $bStart).TotalSeconds, $sig
+            $lastSig = $sig
+        }
+        if ($aclSamples.Count -gt 25) { break }
+    }
+    $bExited = $bProc.WaitForExit(120000)
+    if (-not $bExited) { try { $bProc.Kill() } catch { } }
+    $rB = @{ ExitCode = if ($bExited) { $bProc.ExitCode } else { -2 }; Stderr = @($errTaskB.Result -split "`r?`n"); Stdout = @($outTaskB.Result -split "`r?`n") }
+    $bSeconds = [int]((Get-Date) - $bStart).TotalSeconds
     $errB = ($rB.Stderr -join "`n")
     # The flag's CONTENT proves A's copy succeeded - the child writes
     # 'installed' only when `copy` returned 0, so B's denial cannot pass
     # vacuously. The host does NOT read A's tree mid-run (only the owner
     # survives the PROTECTED DACL on some paths, and that is not the
     # property under test).
-    $installed = Wait-PathAppears -Path (Join-Path $d 'install-done.txt') -Seconds 30
+    # The marker budget is A's own session budget (120 s), not an arbitrary
+    # 30 s: session startup latency is variable (measured 1.8 s .. 26 s on
+    # one host with one binary, minutes apart - the guest under load runs
+    # longer still), and the property under test is that the copy succeeded
+    # WHILE A held the tree, not that it happened within half a minute. A
+    # late marker still proves the install; a missing one after A's own
+    # budget means the child genuinely lost its cwd.
+    $markerSeconds = -1
+    $markerPath = Join-Path $d 'install-done.txt'
+    for ($w = 0; $w -lt 240; $w++) {
+        if (Test-Path -LiteralPath $markerPath) { $markerSeconds = [int]($w / 2); break }
+        Start-Sleep -Milliseconds 500
+    }
+    $installed = ($markerSeconds -ge 0)
     $flagText = if ($installed) { ((Get-Content -LiteralPath (Join-Path $d 'install-done.txt') -ErrorAction SilentlyContinue) -join ' ').Trim() } else { '' }
     # B's block can surface as EITHER message shape: an explicit access denial,
     # or "path not found" - B cannot even LIST the protected `.sandbox` parent,
     # so the sibling name does not resolve. Both mean "B could not read A's
     # tool"; the non-vacuity legs above prove the file existed while A ran.
     $bBlocked = ($rB.ExitCode -ne 0) -and ((Test-Denied $errB) -or ($errB -match '(?i)(cannot find|not find|nicht finden)'))
+    # Drain both pipes WHILE A runs. Reading after WaitForExit deadlocks once
+    # the diag's verbose stderr fills the pipe buffer: the child blocks on
+    # write, never exits, and the reader waits forever. Async first, wait
+    # after.
+    $errTask = $procA.StandardError.ReadToEndAsync()
+    $outTask = $procA.StandardOutput.ReadToEndAsync()
     $aExited = $procA.WaitForExit(120000)
     if (-not $aExited) { try { $procA.Kill() } catch { } }
-    $errA = $procA.StandardError.ReadToEnd()
-    $null = $procA.StandardOutput.ReadToEnd()
+    $errA = $errTask.Result
+    $procAStandardOut = @($outTask.Result -split "`r?`n")
     $aExit = if ($aExited) { $procA.ExitCode } else { 'killed' }
     $procA.Close()
     $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
     $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
+    # Diagnose an A-could-not-read-its-own-cwd failure in place: the DACLs
+    # the harness user sees, the file's size, and A's supervisor output
+    # (warnings there - propagation truncation, journal problems - name the
+    # cause). Everything goes into the Detail line so a VM lane carries it
+    # home without needing -Keep.
+    $diag = ''
+    if (-not $passed) {
+        $icaclsOut = @()
+        foreach ($target in @($d, (Join-Path $d 'install-a.cmd'), (Join-Path $d '.sandbox'), (Join-Path $d ".sandbox\$sidA"))) {
+            if (Test-Path -LiteralPath $target) {
+                $icaclsOut += (icacls $target 2>&1 | ForEach-Object { $_.ToString() })
+            } else { $icaclsOut += "MISSING: $target" }
+        }
+        $errLines = @($errA -split "`r?`n")
+        $grantLines = @($errLines | Where-Object { $_ -match '\[grant\]|\[journal\]|refused|warning' } | Select-Object -First 40)
+        Set-Content -LiteralPath (Join-Path $d 'a-stderr.log') -Value $errA -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $d 'a-stdout.log') -Value ($procAStandardOut -join "`n") -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $d 'acl-early.txt') -Value $icaclsEarly -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $d 'acl-afterb.txt') -Value $icaclsAfterB -Encoding UTF8
+        $diag = " || timing: markerAfter=${markerSeconds}s bDuration=${bSeconds}s"
+        $diag += ' || aclEarly: ' + $icaclsEarly
+        $diag += ' || aclTimeline: ' + (($aclSamples | Select-Object -First 25) -join ' ; ')
+        $diag += ' || aclAfterB: ' + $icaclsAfterB
+        $diag += ' || grants: ' + ($grantLines -join ' | ')
+        $diag += ' || aTail: ' + ((@($errLines) | Select-Object -Last 10) -join ' | ')
+        $diag += ' || icacls: ' + (($icaclsOut | Select-Object -First 12) -join ' | ')
+        $diag += ' || file: '
+        try { $diag += (Get-Item -LiteralPath (Join-Path $d 'install-a.cmd') -Force | Select-Object -ExpandProperty Length) } catch { $diag += 'gone' }
+        $diag += ' || aOut: ' + ((($procAStandardOut) | Select-Object -First 6) -join ' | ')
+    }
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed flag=$flagText bBlocked=$bBlocked aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)" } }
+        Detail = if ($passed) { "distinct sids; B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed flag=$flagText bBlocked=$bBlocked aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)$diag" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
