@@ -52,6 +52,15 @@ A build WITHOUT the feature falls back to `mxc`'s absence loudly (it prints
 decided by `cli::default_backend(feature_enabled)`, not by a constant, because a
 constant would name a backend a feature-less binary cannot execute.
 
+**A tier that cannot run names its alternative:** when the tier gate (guardrail 2) or
+the backend's own launch refuses because the MXC containment tier did not run on
+this host, the failure line is followed by `cli::MXC_UNAVAILABLE_HINT`, which names
+`--backend appcontainer` and the posture that retry changes. The predicate is
+`MxcError::suggests_appcontainer`: a tier mismatch and the SDK's `backend_error` /
+`backend_unavailable` only. An evidence-gate refusal (`guard`, `unproven`), a request
+the caller built wrongly, and a double-launch refusal print no hint, because a
+backend switch would not address them.
+
 **Guardrail 1 refusals are informative, not generic:** `proxy_probe_unmet` means
 the child never reached this listener (blocked loopback, dead listener, wrong
 credential); `workload_cannot_authenticate` means something DID reach it without

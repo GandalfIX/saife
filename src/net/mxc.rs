@@ -1814,6 +1814,33 @@ pub enum MxcError {
     Concurrency(EpochAlreadyOpen),
 }
 
+impl MxcError {
+    /// `true` when this failure means the MXC containment tier did not run on
+    /// this host, so the operator's remedy is the `--backend appcontainer` retry
+    /// ([`crate::cli::MXC_UNAVAILABLE_HINT`]): the tier gate refused a degraded
+    /// or unnamed tier, or the backend could not bring the containment up
+    /// (`backend_error` — the spawn refusal a host policy produces — or
+    /// `backend_unavailable`).
+    ///
+    /// The other failures answer a different question and must NOT offer the
+    /// backend switch: `Guard`/`Unproven` refused a session that DID run under
+    /// the tier, `Request` is a request the caller built wrongly, `Concurrency`
+    /// refused a second launch that would share one attribution window, and an
+    /// SDK `malformed_request`/`policy_validation`/`unsupported_containment`
+    /// refusal is a request-shape failure. Suggesting a weaker backend there
+    /// would send the operator to change something that is not the cause.
+    pub fn suggests_appcontainer(&self) -> bool {
+        match self {
+            Self::Tier(_) => true,
+            Self::Sdk(e) => matches!(
+                e.code,
+                v1::ErrorCode::BackendUnavailable | v1::ErrorCode::BackendError
+            ),
+            Self::Guard(_) | Self::Unproven(_) | Self::Request(_) | Self::Concurrency(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for MxcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

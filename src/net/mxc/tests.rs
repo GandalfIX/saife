@@ -1726,6 +1726,50 @@
         assert!(matches!(err, MxcError::Tier(_)), "{err:?}");
     }
 
+    /// The operator's remedy when the tier cannot run: the failures that mean
+    /// "this host cannot run the containment" (the tier gate, a backend that
+    /// refused the launch) offer the `--backend appcontainer` retry, and the
+    /// failures that are about something else (an evidence gate, a request the
+    /// caller built wrongly, a config-side SDK error) do not — suggesting a
+    /// weaker backend there answers a different question than the operator's.
+    #[test]
+    fn availability_failures_offer_the_appcontainer_retry_and_others_do_not() {
+        // The tier gate: a probe that reported a degraded tier.
+        let degraded = verify_tier(
+            &tier_record(ProbeView {
+                tier: Some("appcontainer-dacl"),
+                needs_dacl_augmentation: Some(true),
+            }),
+            TierExpectation::Exactly(REQUIRED_TIER),
+        )
+        .expect_err("a degraded tier is refused when base-container is required");
+        let err: MxcError = degraded.into();
+        assert!(err.suggests_appcontainer(), "{err:?}");
+
+        // A backend that could not bring the containment up: a spawn refusal
+        // arrives as `backend_error` (the reported 0x80070003) and an
+        // unavailable engine as `backend_unavailable`.
+        for code in [v1::ErrorCode::BackendError, v1::ErrorCode::BackendUnavailable] {
+            let err = MxcError::Sdk(v1::Error::new(code, "spawning the sandboxed process failed"));
+            assert!(err.suggests_appcontainer(), "{err:?}");
+        }
+
+        // Not availability: the SDK refused the request or its configuration,
+        // or the evidence gate refused a session that DID run.
+        for code in [
+            v1::ErrorCode::MalformedRequest,
+            v1::ErrorCode::PolicyValidation,
+            v1::ErrorCode::UnsupportedContainment,
+        ] {
+            let err = MxcError::Sdk(v1::Error::new(code, "the request was refused"));
+            assert!(!err.suggests_appcontainer(), "{err:?}");
+        }
+        let err: MxcError = RequestError::EmptyCommand.into();
+        assert!(!err.suggests_appcontainer(), "{err:?}");
+        let err: MxcError = GuardError::ProbeUnmet.into();
+        assert!(!err.suggests_appcontainer(), "{err:?}");
+    }
+
     /// A requirement that cannot be shown to be met is not met. A literal
     /// `observed != expected` check would let a silent probe through, which is the
     /// one case a degraded dispatch is most likely to produce.
