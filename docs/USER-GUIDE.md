@@ -307,9 +307,10 @@ override an explicit deny.
 
 ### 4.4a Credential denies: what is always denied, and what an operator can do
 
-Seven trees and eight files are denied for **every** launch, on both backends, whatever a
+Nine trees and eight files are denied for **every** launch, on both backends, whatever a
 profile grants. Class `secret` - never exposable, because no workload has a legitimate reason to
-read them: `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.saife`, `%LOCALAPPDATA%\saife`. Class
+read them: `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.config/gcloud` (and the Windows
+spelling `%APPDATA%\gcloud`), `~/.saife`, `%LOCALAPPDATA%\saife`. Class
 `tool-credential` - denied because an accident must not hand the workload a token, exposable per
 session by name because the tool cannot run without it: `~/.gradle/gradle.properties`,
 `~/.m2/settings.xml`, `~/.cargo/credentials.toml`, `~/.git-credentials`,

@@ -10,6 +10,10 @@ minor release may break the profile schema; the error message names the fix.
 
 ### Added
 
+- **Google Cloud's credential store is denied with the builtin set.**
+  `~/.config/gcloud` and the Windows spelling `%APPDATA%\gcloud` hold
+  `credentials.db` and `access_tokens.db` - live OAuth tokens. Both are class
+  `secret` and never exposable, matching `.aws` and `.azure`.
 - **Additive machine policy for credential denies.** `%PROGRAMDATA%\saife\deny.d\*.json` adds
   deny entries for every session on the machine, on both backends. Additive by construction: the
   schema has no `allow` key, so a policy can hide more but never un-hide what the code denies, and

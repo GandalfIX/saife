@@ -371,6 +371,17 @@ pub fn credential_denies_with(
                 class: CredentialClass::Secret,
             });
         }
+        // Google Cloud's credential store: `credentials.db` and
+        // `access_tokens.db` are live OAuth tokens, not config. Windows gcloud
+        // defaults to `%APPDATA%\gcloud` (denied below), other platforms to
+        // `~/.config/gcloud`; denying both costs nothing and covers a
+        // `CLOUDSDK_CONFIG`-less install of either shape.
+        out.push(CredentialDeny {
+            label: "gcloud",
+            path: home.join(".config").join("gcloud"),
+            kind: DenyKind::Dir,
+            class: CredentialClass::Secret,
+        });
         // Class ToolCredential - one entry per tool that cannot run without
         // the credential, in the flat list's order. `label` is what
         // `--expose-credential` takes.
@@ -419,6 +430,14 @@ pub fn credential_denies_with(
             path: appdata.join("NuGet").join("NuGet.Config"),
             kind: DenyKind::File,
             class: CredentialClass::ToolCredential,
+        });
+        // Windows gcloud's default config root, beside the `~/.config/gcloud`
+        // tree above - same store, the spelling depends on the platform.
+        out.push(CredentialDeny {
+            label: "gcloud-appdata",
+            path: appdata.join("gcloud"),
+            kind: DenyKind::Dir,
+            class: CredentialClass::Secret,
         });
     }
     out
@@ -2126,11 +2145,19 @@ mod tests {
 
         assert_eq!(
             real_dirs.len(),
-            6,
-            "the six home-rooted tree denies (.ssh/.aws/.azure/.gnupg/.saife and the gh config \
-             directory, which is a tree): {real_dirs:?}"
+            7,
+            "the seven home-rooted tree denies (.ssh/.aws/.azure/.gnupg/.saife, the gh config \
+             directory and gcloud's store): {real_dirs:?}"
         );
-        for dir in [".ssh", ".aws", ".azure", ".gnupg", ".saife", ".config\\gh"] {
+        for dir in [
+            ".ssh",
+            ".aws",
+            ".azure",
+            ".gnupg",
+            ".saife",
+            ".config\\gh",
+            ".config\\gcloud",
+        ] {
             assert!(
                 real_dirs.iter().any(|d| d == &real.join(dir)),
                 "the real profile must deny ~/{dir}: {real_dirs:?}"
@@ -2138,7 +2165,7 @@ mod tests {
         }
         assert_eq!(
             fake_dirs.len(),
-            6,
+            7,
             "the fake root denies a different tree: {fake_dirs:?}"
         );
         assert!(
@@ -3678,7 +3705,7 @@ mod tests {
             Some(local.as_path()),
             Some(appdata.as_path()),
         );
-        assert_eq!(denies.len(), 15, "6 secret trees + 9 tool credentials");
+        assert_eq!(denies.len(), 17, "8 secret trees + 9 tool credentials");
         for d in &denies {
             assert!(
                 !d.label.is_empty(),
@@ -3692,7 +3719,16 @@ mod tests {
             .collect();
         assert_eq!(
             secrets,
-            ["ssh", "aws", "azure", "gnupg", "saife", "saife-local"]
+            [
+                "ssh",
+                "aws",
+                "azure",
+                "gnupg",
+                "saife",
+                "gcloud",
+                "saife-local",
+                "gcloud-appdata"
+            ]
         );
         let tools: Vec<_> = denies
             .iter()

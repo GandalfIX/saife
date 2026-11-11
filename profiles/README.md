@@ -108,8 +108,9 @@ for **every** profile, whatever the operator grants:
 A missing file is skipped silently on the AppContainer backend (the tool is
 not installed); the mxc backend lists it as an inert policy entry.
 
-The list is classified: the trees above are `secret` (never exposable), the
-files are `tool-credential` (exposable per session with
+The list is classified: the trees above are `secret` (never exposable - the set
+also covers Google Cloud's store, `~/.config/gcloud` and the Windows spelling
+`%APPDATA%\gcloud`), the files are `tool-credential` (exposable per session with
 `--expose-credential <label>` - `gh`, `kube`, `docker`, `gradle`, `maven`,
 `cargo`, `git`, `pypi`, `nuget` - which is loud and audited, and exists because
 `gh`/`kubectl`/`docker` cannot run without their credential). `saife credentials
