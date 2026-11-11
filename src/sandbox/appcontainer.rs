@@ -162,14 +162,58 @@ fn ensure_profile_resources() {
 }
 
 /// Grant the AppContainer SID the requested access on `entries` by writing
-/// an explicit DACL onto each directory. Failures on individual entries are
-/// logged to stderr but do not abort (the spike showed that some SystemRoot
-/// grants fail on locked-down machines — harmless because those dirs are
-/// world-readable).
+/// an explicit DACL onto each directory. Every failure falls into one of
+/// three cases:
+///
+/// * a DENY failed -> the session is refused (more access than the profile
+///   allows; the fail-open case this project was built to prevent);
+/// * a GRANT failed on a path that does not exist -> the entry is SKIPPED
+///   (nothing to grant; when the workload creates the path it inherits from
+///   the parent, which carries the granted ACE - the same decision the
+///   deny entries made for missing paths);
+/// * a GRANT failed on a path under an OS install tree (%SystemRoot%,
+///   %ProgramFiles% and its x86 twin) -> warn and continue: those trees are
+///   world-readable and their DACL writes legitimately fail for a
+///   non-owner (TrustedInstaller owns them; measured 0x80070005 on
+///   System32, SystemRoot and Program Files in the guest lanes).
+/// * every other failed grant refuses the session: a workload that silently
+///   runs without access it was promised is a broken session, not a
+///   warning (2026-11-11: a guest whose cwd grant silently failed ran a
+///   child that could not read its own working directory).
 ///
 /// `journal`, when present, receives every grant BEFORE it is applied
 /// (MXC filesystem_dacl.rs pattern): teardown replays the journal to
 /// restore the host, and a crash leaves a restorable record behind.
+fn grant_failure_is_fatal(e: &AllowEntry, err: &windows::core::Error) -> bool {
+    if e.deny {
+        return true;
+    }
+    if is_absent_path_error(err) {
+        return false;
+    }
+    if is_os_install_tree(&e.win32_path) {
+        return false;
+    }
+    true
+}
+
+/// OS install trees: their DACL cannot be written by anyone but
+/// TrustedInstaller, and the session needs only the read access the system
+/// grant already provides. Checked against the environment so the rule
+/// follows the machine it runs on.
+fn is_os_install_tree(path: &std::path::Path) -> bool {
+    for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(root) = std::env::var(var)
+            && path.strip_prefix(root).is_ok()
+        {
+            // The tree root itself counts: the SystemRoot grant targets
+            // %SystemRoot% directly and fails exactly like its children.
+            return true;
+        }
+    }
+    false
+}
+
 pub fn grant_access(
     ac_sid: &PSID,
     entries: &[AllowEntry],
@@ -178,23 +222,32 @@ pub fn grant_access(
     let diag = std::env::var_os("SAIFE_DIAG").is_some();
     for e in entries {
         if let Err(err) = grant_one(ac_sid, e, journal) {
-            // A failed GRANT means less access than the profile asked for: warn and
-            // carry on. A failed DENY means MORE access than the profile allows, so
-            // the session must not start - continuing was fail-open, and only visible
-            // under SAIFE_DIAG.
-            if e.deny {
+            if grant_failure_is_fatal(e, &err) {
                 return Err(Error::new(
                     E_ACCESSDENIED,
                     format!(
-                        "deny ACE for {:?} could not be applied: {err} - refusing the session \
-                         rather than running it with the deny missing",
-                        e.win32_path
+                        "{} ACE for {:?} could not be applied: {err} - refusing the session \r
+                         rather than running it with the {} missing",
+                        if e.deny { "deny" } else { "grant" },
+                        e.win32_path,
+                        if e.deny { "deny" } else { "grant" },
                     ),
                 ));
             }
-            if diag {
+            // Skipped or tolerated: absent paths and OS install trees. Both
+            // lose nothing the session was promised, but the absence of the
+            // ACE must still be visible: this is the same half the deny
+            // entries print under.
+            if std::env::var_os("SAIFE_DIAG").is_some() {
                 eprintln!(
-                    "[grant] WARN: {:>16} {:?} failed: {err}",
+                    "[grant] {}: {:>16} {:?} failed: {err}",
+                    if e.deny {
+                        "FAILED".to_string()
+                    } else if is_absent_path_error(&err) {
+                        "SKIP".to_string()
+                    } else {
+                        "TOLERATED".to_string()
+                    },
                     if e.deny {
                         format!("{} [deny]", e.label)
                     } else {
@@ -682,9 +735,40 @@ pub fn restore_all(journal: &DaclJournal) -> Result<()> {
         if !seen.insert(entry.path.clone()) {
             continue;
         }
-        restore_one(&entry)?;
+        match restore_one(&entry) {
+            Ok(()) => {}
+            // A journaled path that no longer exists has nothing to restore:
+            // its ACEs went away with the object. Same rule as the build side
+            // (a deny on a missing path is skipped). This is what keeps
+            // teardown robust when the supervisor's own stores churn during
+            // the session: the propagated deny ACEs sit on every descendant of
+            // `~/.saife` and `%LOCALAPPDATA%\saife`, and audit leaves/logs are
+            // written and rotated there while the session runs, so paths
+            // vanish between grant and teardown (measured 2026-11-09: a
+            // 7,296-entry journal failed restore with 0x80070002 and was
+            // retained on every run).
+            Err(e) if is_absent_path_error(&e) => {
+                if std::env::var_os("SAIFE_DIAG").is_some() {
+                    eprintln!(
+                        "[journal] {} vanished before restore; nothing to restore",
+                        entry.path
+                    );
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
+}
+
+/// True when a restore failure means "the object is gone", not "the restore
+/// failed": `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3). A path
+/// that no longer exists carries no ACEs, so it needs no restore — retrying it
+/// forever (the journal is retained on failure) would be a leak, not a repair.
+fn is_absent_path_error(e: &windows::core::Error) -> bool {
+    let code = e.code();
+    code == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+        || code == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0)
 }
 
 /// Restore + log-on-failure wrapper for `run()` teardown and orphan reaping.
@@ -1337,6 +1421,83 @@ mod propagation_tests {
 
     const TEST_SID: &str = "S-1-15-2-3149-3149-3149";
     const DIR_INHERIT_FLAGS: u8 = 0x3; // SUB_CONTAINERS_AND_OBJECTS_INHERIT
+
+    fn grant_entry(path: std::path::PathBuf, label: &str) -> AllowEntry {
+        AllowEntry {
+            win32_path: path,
+            access: RWX,
+            label: label.to_string(),
+            deny: false,
+            protected: false,
+            inherit: true,
+        }
+    }
+
+    /// A grant whose path does not exist yet has nothing to apply. Skipping
+    /// it matches the decision the deny entries already made for missing
+    /// paths: when the workload creates the path it inherits from the parent,
+    /// which carries the granted ACE. Profiles name paths that may not
+    /// exist yet (a tool's state dir on a fresh machine), so refusing here
+    /// would refuse sessions that are fine.
+    #[test]
+    fn a_grant_for_a_missing_path_is_skipped() {
+        let dir = TempDir(tmp_tag("grantmissing"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let sid = make_sid(TEST_SID);
+        grant_access(&sid, &[grant_entry(dir.0.join("not-yet"), "allow:test")], None)
+            .expect("a missing grant path is skipped, not fatal");
+    }
+
+    /// OS install trees are world-readable and their DACLs belong to
+    /// TrustedInstaller: the write fails for any supervisor without
+    /// take-ownership, and the session loses nothing real (measured in the
+    /// guest lanes: System32, SystemRoot and Program Files, all 0x80070005).
+    #[test]
+    fn a_failed_grant_under_an_os_install_tree_stays_a_warning() {
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let mut entries = vec![
+            grant_entry(std::path::PathBuf::from(&sysroot).join("System32"), "System32"),
+            grant_entry(std::path::PathBuf::from(&sysroot), "SystemRoot"),
+        ];
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            entries.push(grant_entry(std::path::PathBuf::from(pf), "java-runtime"));
+        }
+        let sid = make_sid(TEST_SID);
+        grant_access(&sid, &entries, None)
+            .expect("OS install trees are tolerated, not fatal");
+    }
+
+    #[test]
+    fn is_os_install_tree_follows_the_environment() {
+        let sysroot = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()),
+        );
+        assert!(is_os_install_tree(&sysroot.join("System32")));
+        assert!(is_os_install_tree(&sysroot));
+        assert!(!is_os_install_tree(&std::env::temp_dir()));
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            assert!(is_os_install_tree(&std::path::PathBuf::from(pf).join("Java")));
+        }
+    }
+
+    /// The fatal case outside the OS trees: a system-owned directory a
+    /// non-owner cannot re-DACL. `C:\System Volume Information` is exactly
+    /// that shape on every NTFS system volume; the test skips itself if the
+    /// machine does not have it rather than asserting on a missing path.
+    #[test]
+    fn a_grant_outside_the_os_trees_that_cannot_be_applied_refuses_the_session() {
+        let probe = std::path::Path::new(r"C:\System Volume Information");
+        if !probe.exists() {
+            return;
+        }
+        let sid = make_sid(TEST_SID);
+        let err = grant_access(&sid, &[grant_entry(probe.to_path_buf(), "allow:test")], None)
+            .expect_err("a grant the supervisor cannot apply must refuse the session");
+        assert!(
+            format!("{err}").contains("refusing the session"),
+            "the refusal must say so, got: {err}"
+        );
+    }
 
     /// PSID from a SID string (leaks on purpose; tests are short-lived).
     fn make_sid(s: &str) -> PSID {
@@ -2279,4 +2440,31 @@ fn private_network_capability_sid_is_s_1_15_3_7() {
         let _ = LocalFree(Some(HLOCAL(pwstr.0 as *mut _)));
         let _ = FreeSid(sid);
     }
+}
+
+/// Restore treats a VANISHED path as restored, not as a failure: the object
+/// carries no ACEs any more, and keeping the journal for a retry that can never
+/// succeed leaks one journal per run (measured 2026-11-09: 7,296 entries of
+/// propagated deny ACEs over the supervisor's own audit store; one rotated leaf
+/// failed the whole restore with 0x80070002 and the journal was retained).
+/// Every other failure must still be fatal — a restore that cannot write is a
+/// host left with session ACEs, and the journal is the only record of them.
+#[test]
+fn only_an_absent_path_is_treated_as_restored() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+
+    for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
+        let e: windows::core::Error = HRESULT::from_win32(code.0).into();
+        assert!(
+            is_absent_path_error(&e),
+            "{code:?} means the object is gone and needs no restore"
+        );
+    }
+    // A real failure must stay fatal: the ACE is still on the host and the
+    // journal is the only record of it.
+    let denied: windows::core::Error = HRESULT::from_win32(ERROR_ACCESS_DENIED.0).into();
+    assert!(
+        !is_absent_path_error(&denied),
+        "{ERROR_ACCESS_DENIED:?} is a real restore failure - the ACE is still on the host"
+    );
 }

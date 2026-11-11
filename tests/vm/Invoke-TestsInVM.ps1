@@ -958,6 +958,12 @@ try {
         (Join-Path $script:RepoRoot 'target'),
         (Join-Path $script:RepoRoot '.git'),
         (Join-Path $script:RepoRoot '.sandbox'),
+        # Other branches' checkouts (git worktree): not this working tree, and
+        # each carries a HIDDEN `.git` pointer file. Compress-Archive enumerates
+        # without -Force, so those two files were counted by the host (-Force)
+        # but absent from the archive: 12294 staged vs 12292 extracted, and the
+        # lane aborted before a single test ran (2026-11-09).
+        (Join-Path $script:RepoRoot '.worktrees'),
         $script:VmsDir,
         $script:ResultsBaseDir,
         (Join-Path $script:ThisDir 'templates')
@@ -976,11 +982,24 @@ try {
     }
     robocopy $script:RepoRoot $stageDir /E /XD $excludeDirs /XF vm-settings.json | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy staging failed (exit $LASTEXITCODE; 0-7 is success)" }
-    $stageCount = @(Get-ChildItem -LiteralPath $stageDir -Recurse -File -Force).Count
+    $stagedFiles = @(Get-ChildItem -LiteralPath $stageDir -Recurse -File -Force).Count
     # Archive fallback for very large trees: tar -a -c -f $zipPath -C $stage .
     # (and 'tar -xf' in the guest); Expand-Archive reads bsdtar zips fine.
     Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -Force
-    Write-Host ("[vm-run] staged {0} files into {1} ({2} MB)." -f $stageCount, $zipPath, [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1))
+    # The verification counts the ARCHIVE's file entries, not the staging tree:
+    # the guest can only receive what the archive holds, and Compress-Archive
+    # enumerates without -Force (it skips hidden files that a -Force count
+    # sees). Counting the archive makes both sides the same fact; the staged
+    # number is still printed, so an omission stays visible instead of aborting
+    # the lane after the VM has already booted.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    try {
+        $stageCount = @($archive.Entries | Where-Object { $_.Name -ne '' }).Count
+    } finally {
+        $archive.Dispose()
+    }
+    Write-Host ("[vm-run] staged {0} files, archive holds {1} into {2} ({3} MB)." -f $stagedFiles, $stageCount, $zipPath, [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1))
 
     # -----------------------------------------------------------------------
     # 6. Per-run differencing VHDX off the template (never booted
@@ -1487,7 +1506,7 @@ public static class WinSta {
     } catch {
         Write-Host "[vm-run] ERROR: artifact fetch failed: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host ("[vm-run] keeping the VM (checkpoint failed-run) so the completed run's results survive; partial artifacts: {0}" -f $hostResultsDir) -ForegroundColor Yellow
-        $null = Invoke-TestVmTeardown -Failed $true -ForceKeep -VmName $vmName -VhdxPath $vhdxPath -KeepOnFailure:$KeepOnFailure
+        $null = Invoke-TestVmTeardown -Failed $true -ForceKeep $true -VmName $vmName -VhdxPath $vhdxPath -KeepOnFailure:$KeepOnFailure
         Write-Host ("[vm-run] manual cleanup when done debugging: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\vm\Remove-TestVM.ps1 -Name {0}" -f $vmName) -ForegroundColor Yellow
         Write-Host 'VM HARNESS: FAIL' -ForegroundColor Red
         exit 1

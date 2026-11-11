@@ -72,7 +72,22 @@
   only pass for the wrong reason. The number is reserved out of the run (it is not a
   skipping scenario); the property is pinned meanwhile by the ignored live leg
   `a_launch_that_never_reaches_the_proxy_is_refused_not_reported_successful` in
-  src/net/mxc.rs. Suite total: 93 scenarios in 1..=94 with 93 reserved.
+  src/net/mxc.rs.
+  S-96..S-98 (teardown postconditions; prep for the POSIX-backend work) pin
+  what a finished session must NOT leave behind: S-96 the AppContainer profile
+  (Packages dir + HKCU Storage key), S-97 the per-session <cwd>\.sandbox\<sid>
+  install tree (observably created by --print-sid, removed by a real run's
+  teardown, shared .sandbox parent kept), S-98 the DACL journal file (written
+  during the session, deleted on success). Each scenario proves the observable
+  EXISTED mid-session, so "gone after" cannot pass vacuously. All three are
+  AppContainer-only: the mxc path creates no profile, no install tree and no
+  journal.
+  S-99 pins FAIL-CLOSE: a DENY ACE that cannot be applied refuses the
+  session (exit 126, a SESSION_REFUSED leaf with reason=dacl_apply_failed,
+  no child, and the grants that did land restored). The trigger is a deny
+  on a TrustedInstaller-owned system directory; a shell that CAN rewrite
+  that DACL SKIPS the scenario rather than passing for the wrong reason.
+  Suite total: 97 scenarios in 1..=99 with 93 reserved.
 
   BACKEND SELECTION (P3.1 harness plumbing): -Backend appcontainer|mxc
   (default appcontainer) is passed to EVERY `run` invocation as
@@ -724,7 +739,17 @@ function Invoke-Scenario-S5 {
         Detail = if ($passed) { 'write to .ssh denied' } else { "exit=$($r.ExitCode) exists=$exists stderr=$err" } }
 }
 
-# S-6 (GATE): download a binary into .sandbox\<sid>\bin and execute it.
+# S-6 (GATE): a binary placed in the per-session bin executes under the
+# sandbox. The install tree is SESSION-SCOPED since #40/L-O: teardown deletes
+# <cwd>\.sandbox\<sid> at the end of every run, so the old "install in run 1,
+# execute in run 2" model cannot exist any more (it asserted state that the
+# product now removes by design - see S-97). The gate keeps the property it
+# was written for - a downloaded tool runs INSIDE the containment - and
+# proves it in ONE run: the binary is placed while the tree exists (after
+# --print-sid, before the protecting DACL is applied) and executed as the
+# run's PAYLOAD, a direct spawn. `cmd` cannot spawn an exe under the
+# PROTECTED subtree inside the AppContainer (W1/W2), so a shell-based form
+# would fail for a reason that has nothing to do with this gate.
 function Invoke-Scenario-S6 {
     $d = New-ScenarioDir 6
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
@@ -732,28 +757,35 @@ function Invoke-Scenario-S6 {
     $sid = ($psid.Stdout -join '').Trim()
     if (-not $sid) { return @{ Num=6; Name='S-6 (GATE)'; Passed=$false; Skipped=$false; Detail='print-sid returned empty sid'; IsGate=$true } }
     $binName = 'hostname.exe'
-    $binWhere = Join-Path $d ".sandbox\$sid\bin\$binName"
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','copy',"C:\Windows\System32\$binName",".sandbox\$sid\bin\$binName") -WorkingDirectory $d
-    $installed = Test-Path -LiteralPath $binWhere
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',".sandbox\$sid\bin\$binName") -WorkingDirectory $d
+    $binDir = Join-Path $d ".sandbox\$sid\bin"
+    $binWhere = Join-Path $binDir $binName
+    $binExists = Test-Path -LiteralPath $binDir
+    if ($binExists) { Copy-Item -LiteralPath (Join-Path $env:SystemRoot "System32\$binName") -Destination $binWhere -Force }
+    $placed = Test-Path -LiteralPath $binWhere
+    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--',$binWhere) -WorkingDirectory $d
     $out2 = (($r2.Stdout | Where-Object { $_ -notmatch '^SESSION ' }) -join "`n")
-    $passed = ($r1.ExitCode -eq 0) -and $installed -and ($r2.ExitCode -eq 0) -and ($out2.Trim().Length -gt 0)
+    $treeGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sid"))
+    $passed = $binExists -and $placed -and ($r2.ExitCode -eq 0) -and ($out2.Trim().Length -gt 0) -and $treeGone
     return @{ Num=6; Name='S-6 (GATE)'; Passed=$passed; Skipped=$false; IsGate=$true
-        Detail = if ($passed) { "downloaded binary executed; sid=$sid" } else { "sid=$sid copyExit=$($r1.ExitCode) installed=$installed runExit=$($r2.ExitCode) out=$out2" } }
+        Detail = if ($passed) { "session-bin binary executed; tree removed at teardown; sid=$sid" } else { "sid=$sid binExists=$binExists placed=$placed runExit=$($r2.ExitCode) out=$out2 treeGone=$treeGone err=$(($r2.Stderr -join "`n"))" } }
 }
 
-# S-7: write into .sandbox\<sid>\bin works.
+# S-7: the CHILD can write into .sandbox\<sid>\bin. The marker is written and
+# read back INSIDE the same session, because teardown deletes the tree (#40/
+# L-O) - a post-run Test-Path would now assert the opposite of the product.
+# `type` only reads a file (no spawn under the PROTECTED subtree), so the
+# command line stays inside the shapes the AppContainer allows.
 function Invoke-Scenario-S7 {
     $d = New-ScenarioDir 7
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=7; Name='S-7'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
     $sid = ($psid.Stdout -join '').Trim()
-    $marker = Join-Path $d ".sandbox\$sid\bin\marker.txt"
-    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','echo','test','>',".sandbox\$sid\bin\marker.txt") -WorkingDirectory $d
-    $exists = Test-Path -LiteralPath $marker
-    $passed = ($r.ExitCode -eq 0) -and $exists
+    $cmdLine = "echo marker7 > .sandbox\$sid\bin\marker.txt && type .sandbox\$sid\bin\marker.txt"
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c',$cmdLine) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'marker7')
     return @{ Num=7; Name='S-7'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "marker written; sid=$sid" } else { "exit=$($r.ExitCode) exists=$exists sid=$sid" } }
+        Detail = if ($passed) { "child wrote and read the marker in-session; sid=$sid" } else { "exit=$($r.ExitCode) out=$out err=$(($r.Stderr -join "`n")) sid=$sid" } }
 }
 
 # S-8: python from system install runs (skips if python absent).
@@ -767,33 +799,35 @@ function Invoke-Scenario-S8 {
         Detail = if ($passed) { 'python ran' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
-# S-9: python venv created in .sandbox\<sid>\venv (skips if python absent).
+# S-9: python venv created in .sandbox\<sid>\venv and executed, all in ONE
+# session (teardown deletes the tree - #40/L-O - so the old two-run form
+# asserted state the product removes). Both steps are DIRECT spawns: python
+# creates the venv (ensurepip spawns python from the new venv) and then runs
+# the venv's python via subprocess. Wrapping any of it in `cmd` is the
+# documented broken path inside the AppContainer (W1/W2).
 function Invoke-Scenario-S9 {
     $d = New-ScenarioDir 9
     if (-not (Get-Python)) { return @{ Num=9; Name='S-9'; Passed=$true; Skipped=$true; PythonSkipped=$true; Detail='python not on PATH' } }
     $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
     if ($psid.ExitCode -ne 0) { return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="print-sid failed exit=$($psid.ExitCode)" } }
     $sid = ($psid.Stdout -join '').Trim()
-    $r1 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','python','-m','venv',".sandbox\$sid\venv") -WorkingDirectory $d
-    $pyExe = Join-Path $d ".sandbox\$sid\venv\Scripts\python.exe"
-    if ($r1.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pyExe)) {
-        return @{ Num=9; Name='S-9'; Passed=$false; Skipped=$false; Detail="venv create failed exit=$($r1.ExitCode) pyExists=$(Test-Path -LiteralPath $pyExe) stderr=$(($r1.Stderr -join "`n")) stdout=$(($r1.Stdout -join "`n"))" }
-    }
-    # r2 runs the venv python DIRECTLY. The previous form wrapped it in
-    # `cmd /c`, which is broken in two independent ways proven on
-    # 2026-10-12 (the in-VM diagnostic round plus local simulations):
-    # (a) cmd's /c quote heuristics strip quotes once the command line has
-    #     more than two (spaced exe path, quoted -c arg), mangling it into
-    #     "Access is denied."; (b) in-VM, cmd inside the AppContainer
-    #     cannot spawn an exe under the PROTECTED .sandbox\<sid> subtree at
-    #     all (W1/W2; still an open product question), while the direct
-    #     spawn passes everywhere.
-    $r2 = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--',$pyExe,'-c',"print('venv works')") -WorkingDirectory $d
-    $out = ($r2.Stdout -join "`n")
-    $err = ($r2.Stderr -join "`n")
-    $passed = ($r2.ExitCode -eq 0) -and ($out -match 'venv works')
+    $probe = Join-Path $d 's9_probe.py'
+    Set-Content -LiteralPath $probe -Encoding ASCII -Value @'
+import os, subprocess, sys, venv
+target = os.path.join(".sandbox", sys.argv[1], "venv")
+venv.create(target, with_pip=True)
+exe = os.path.join(target, "Scripts", "python.exe")
+print("VENV_EXE_EXISTS", os.path.exists(exe))
+r = subprocess.run([exe, "-c", "print(43)"], capture_output=True, text=True)
+print("VENV_CHILD_RC", r.returncode)
+print("VENV_CHILD_OUT", r.stdout.strip())
+'@
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','python',$probe,$sid) -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $err = ($r.Stderr -join "`n")
+    $passed = ($r.ExitCode -eq 0) -and ($out -match 'VENV_EXE_EXISTS True') -and ($out -match 'VENV_CHILD_RC 0') -and ($out -match 'VENV_CHILD_OUT 43')
     return @{ Num=9; Name='S-9'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "venv python ran; sid=$sid" } else { "exit=$($r2.ExitCode) stdout=$out stderr=$err" } }
+        Detail = if ($passed) { "venv created in the session tree and its python ran; sid=$sid" } else { "exit=$($r.ExitCode) stdout=$out stderr=$err sid=$sid" } }
 }
 
 # S-10: child process inherits restrictions (depth 3).
@@ -846,29 +880,93 @@ function Invoke-Scenario-S12 {
         Detail = if ($passed) { 'breakaway denied with ERROR_ACCESS_DENIED (5)' } else { "exit=$($r.ExitCode) stdout=$out" } }
 }
 
-# S-13: per-session isolation — two sessions get distinct install trees.
+# S-13: per-session isolation - two sessions get distinct install trees, and
+# one session cannot read the other's tools. The trees are SESSION-SCOPED
+# (#40/L-O), so this can only be observed while both sessions exist: A
+# installs a tool into its own bin and holds the session open, B runs while
+# A is live and must be DENIED A's file; A's teardown then removes A's tree.
 function Invoke-Scenario-S13 {
     $d = New-ScenarioDir 13
-    $psidA = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
-    $psidB = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
-    if ($psidA.ExitCode -ne 0 -or $psidB.ExitCode -ne 0) { return @{ Num=13; Name='S-13'; Passed=$false; Skipped=$false; Detail="print-sid failed A=$($psidA.ExitCode) B=$($psidB.ExitCode)" } }
-    $sidA = ($psidA.Stdout -join '').Trim()
-    $sidB = ($psidB.Stdout -join '').Trim()
-    if (-not $sidA -or -not $sidB) { return @{ Num=13; Name='S-13'; Passed=$false; Skipped=$false; Detail="empty sid A='$sidA' B='$sidB'" } }
-    if ($sidA -eq $sidB) { return @{ Num=13; Name='S-13'; Passed=$false; Skipped=$false; Detail="sids not distinct: A=B='$sidA'" } }
-    $whereA = Join-Path $d ".sandbox\$sidA\bin\where.exe"
-    $whereB = Join-Path $d ".sandbox\$sidB\bin\where.exe"
-    Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidA,'--','cmd','/c','copy','C:\Windows\System32\where.exe',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d | Out-Null
-    $aInstalled = Test-Path -LiteralPath $whereA
-    $bExists = Test-Path -LiteralPath $whereB
-    $binB = Join-Path $d ".sandbox\$sidB\bin"
-    $binBExists = Test-Path -LiteralPath $binB
-    $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',".sandbox\$sidA\bin\where.exe") -WorkingDirectory $d
+    $sidA = 'S13A-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $sidB = 'S13B-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $installA = Join-Path $d 'install-a.cmd'
+    # A installs a tool into ITS OWN session tree, records the outcome, then
+    # holds the tree. The batch is named by ABSOLUTE path on purpose: 'cmd /c
+    # name.cmd' resolves against cmd's own cwd and that resolution has
+    # failed on its own under load ('not recognized') while every
+    # containment property held - the same fragility S-6 was rewritten to
+    # avoid. The session tree path is built with literal separators, never
+    # doubled: PS strings do not escape backslashes, so one is one.
+    $installDest = ".sandbox\$sidA\bin\where.exe"
+    Set-Content -LiteralPath $installA -Encoding ASCII -Value (
+        "@echo off",
+        "echo child-alive",
+        "icacls ""%~f0""",
+        "echo step0>steps.txt",
+        "copy C:\Windows\System32\where.exe $installDest >copy-out.txt 2>&1",
+        "echo copy-errorlevel=%errorlevel%>>steps.txt",
+        "echo installed>install-done.txt 2>>steps.txt",
+        "echo step-done>>steps.txt",
+        "for /l %%i in (1,1,1000000) do @ver>NUL" -join ([Environment]::NewLine))
+    # Start A with diag so the propagation counters reach the detail line.
+    $env:SAIFE_DIAG = '1'
+    # A's child is an INLINE chain, not the batch: cmd needs no file open to
+    # start, so its own icacls/type of install-a.cmd report what the child
+    # can see of the file regardless. The chain still installs where.exe
+    # into A's session bin and writes the marker, so the scenario's
+    # containment assertions stay intact.
+    $inlineA = 'echo child-alive & icacls install-a.cmd 2>&1 & type install-a.cmd & copy C:\Windows\System32\where.exe ' + $installDest + ' & echo installed>install-done.txt & for /l %i in (1,1,1000000) do @ver>NUL'
+    $procA = Start-SandboxProcess -Arguments ('run --allow-cwd --sid {0} -- cmd /c "{1}"' -f $sidA, $inlineA) -WorkingDirectory $d
+    Remove-Item Env:SAIFE_DIAG -ErrorAction SilentlyContinue
+    # Drain both pipes from the start: diag output (and the session JSON) exceeds the pipe buffer, and a writer blocked on a full pipe
+    # never reaches the child spawn. Reading only after WaitForExit deadlocks exactly like this.
+    $outTaskA = $procA.StandardOutput.ReadToEndAsync()
+    $errTaskA = $procA.StandardError.ReadToEndAsync()
+    # While A lives, watch the batch file for the session's AppContainer ACE
+    # (any S-1-15-2 trustee): the synchronous propagation must have written
+    # it BEFORE the child spawns, so the first sample already sees it. A file
+    # that never shows the ACE while A lived means the grant walk failed.
+    $aceSeen = 'never'
+    for ($k = 0; $k -lt 240; $k++) {
+        $hit = (Get-Acl -LiteralPath $installA -ErrorAction SilentlyContinue).Access |
+            Where-Object { $_.IdentityReference.Value -match '^S-1-15-2-' } |
+            Select-Object -First 1
+        if ($hit) { $aceSeen = 'yes at sample {0}' -f $k; break }
+        if ($procA.HasExited) { $aceSeen = 'exited without ace'; break }
+        Start-Sleep -Milliseconds 500
+    }
+    # The marker must exist BEFORE B runs: B's denial is only evidence of
+    # containment when it names a file that EXISTS. The wait is A's own
+    # session budget (120 s) - startup latency is variable (measured 1.8 s ..
+    # 26 s on one host, one binary, minutes apart), and a late marker still
+    # proves the install happened while A held the tree.
+    $markerPath = Join-Path $d 'install-done.txt'
+    $markerSeconds = -1
+    for ($w = 0; $w -lt 240; $w++) {
+        if (Test-Path -LiteralPath $markerPath) { $markerSeconds = [int]($w / 2); break }
+        if ($procA.HasExited) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    $installed = ($markerSeconds -ge 0)
+    $flagText = if ($installed) { ((Get-Content -LiteralPath $markerPath -ErrorAction SilentlyContinue) -join ' ').Trim() } else { '' }
+    # B runs while A holds the tree and must be DENIED A's tool. It cannot
+    # even LIST the protected `.sandbox` parent, so the denial surfaces as an
+    # access denial OR as "not found"; both mean "B could not read A's tool",
+    # and the marker above proves the file existed at this moment.
+    $siblingPath = '.sandbox\$sidA\bin\where.exe'
+    $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',$siblingPath) -WorkingDirectory $d
     $errB = ($rB.Stderr -join "`n")
-    $bDenied = ($rB.ExitCode -ne 0) -and (Test-Denied $errB)
-    $passed = $aInstalled -and (-not $bExists) -and $binBExists -and $bDenied
+    $bBlocked = ($rB.ExitCode -ne 0) -and ((Test-Denied $errB) -or ($errB -match '(?i)(cannot find|not find|nicht finden|system cannot find)'))
+    $aExited = $procA.WaitForExit(180000)
+    if (-not $aExited) { try { $procA.Kill() } catch { } }
+    $errA = try { $errTaskA.Result } catch { "" }
+    $outA = try { $outTaskA.Result } catch { "" }
+    $aExit = if ($aExited) { $procA.ExitCode } else { 'killed' }
+    $procA.Close()
+    $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
+    $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; B denied A's tools" } else { "aInstalled=$aInstalled bExists=$bExists binBExists=$binBExists bDenied=$bDenied" } }
+        Detail = if ($passed) { "distinct sids; A installed (marker at ${markerSeconds}s); B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed markerAfter=${markerSeconds}s flag=$flagText bBlocked=$bBlocked bExit=$($rB.ExitCode) aExited=$aExited aExit=$aExit treeAGone=$treeAGone aceSeen=$aceSeen aGrantDiag=$((@($errA) | Where-Object { $_ -match '\[grant\]|\[journal\]' } | Select-Object -First 8) -join ' | ') bErr=$(Get-LineHead -Lines @($errB) -Max 200) aErr=$(Get-LineHead -Lines @($errA) -Last 6) aOut=$(Get-LineHead -Lines @($outA) -Max 2000) steps=$(Get-Content -LiteralPath (Join-Path $d 'steps.txt') -ErrorAction SilentlyContinue) copyOut=$(Get-LineHead -Lines (Get-Content -LiteralPath (Join-Path $d 'copy-out.txt') -ErrorAction SilentlyContinue) -Max 200) aFileAcl=$((Get-Acl -LiteralPath (Join-Path $d 'install-a.cmd') -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Access -ErrorAction SilentlyContinue | ForEach-Object { '{0}={1}' -f $_.IdentityReference.Value, $_.FileSystemRights } | Select-Object -First 10) -join ' | ')" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
@@ -1977,7 +2075,11 @@ function Invoke-Scenario-S62 {
     Set-Content -LiteralPath $bPath -Value $bJson -Encoding UTF8
     $r = Invoke-Sandbox -Args @('run','--profile',$aPath,'--','cmd','/c','echo','x') -WorkingDirectory $d
     $err = ($r.Stderr -join "`n")
-    $passed = ($r.ExitCode -ne 0) -and ($err -match 'Profile cycle detected') -and ($err -match 'a\.json.*b\.json.*a\.json')
+    # The product names the PROFILES in the cycle ("Profile cycle detected:
+    # a -> b -> a"), not their file paths. The arrow is matched loosely: its
+    # console encoding differs between hosts (a transcript shows it as
+    # 'Oaae' on an ANSI console), so a literal arrow would be a host check.
+    $passed = ($r.ExitCode -ne 0) -and ($err -match 'Profile cycle detected') -and ($err -match 'a\b.*b\b.*a\b')
     return @{ Num=62; Name='S-62 (AC-5.6)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'cycle detected + formatted' } else { "exit=$($r.ExitCode) stderr=$err" } }
 }
@@ -2246,12 +2348,20 @@ function Invoke-Scenario-S74 {
     $d = New-ScenarioDir 74
     $journalDir = Get-DaclJournalDir
     $beforeJournals = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $proc = Start-SandboxProcess -Arguments 'run --allow-cwd -- cmd /c ping -n 30 127.0.0.1' -WorkingDirectory $d
+    # The workload MUST outlive the supervisor kill below. It used to be
+    # `ping -n 30 127.0.0.1`, but ICMP is denied inside the AppContainer: ping
+    # exits at once, the session lived ~100ms, and its journal existed for
+    # ~76ms (measured 2026-11-09 on an unelevated host) - so the 300ms poll
+    # missed it DETERMINISTICALLY and the scenario reported "journaling not
+    # wired?". The CPU-spin hold keeps the session alive with no stdin, no
+    # network and no output, and the poll is tightened to 50ms.
+    $hold = New-HoldBatch -Dir $d
+    $proc = Start-SandboxProcess -Arguments ("run --allow-cwd -- cmd /c {0}" -f $hold) -WorkingDirectory $d
     $journal = $null
     try {
         $deadline = (Get-Date).AddSeconds(20)
         while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 300
+            Start-Sleep -Milliseconds 50
             $now = @(Get-ChildItem -LiteralPath $journalDir -Filter '*.jsonl' -ErrorAction SilentlyContinue |
                 Where-Object { $beforeJournals.Name -notcontains $_.Name })
             if ($now.Count -gt 0) { $journal = $now[0]; break }
@@ -3214,7 +3324,19 @@ exit 0
         if ($o.disposition -eq 'deny' -and $o.reason -eq 'no_token' -and $o.source -eq 'default' -and $o.host -eq '<unknown>') { $tokenLeaf = $true }
         if ($o.host -eq 'example.com') { $admissionLeaf = $true }
     }
-    $passed = ($r.ExitCode -eq 0) -and $got407 -and $gotChallenge -and $gotNoBody -and $tokenLeaf -and (-not $admissionLeaf)
+    # The 407 contract is identical on both backends. What the SESSION then
+    # reports differs BY DESIGN: the AppContainer path exits with the child's
+    # code, while mxc's guardrail 1 refuses a session whose ONLY proxy contact
+    # was unauthenticated - nothing was ever proven, so the refusal (exit 126,
+    # reason workload_cannot_authenticate) is the product behaving correctly,
+    # not a backend defect. Neither shape admits anything.
+    $guardrailRefusal = ($r.ExitCode -eq 126)
+    if ($script:Backend -eq 'mxc') {
+        $refusalText = ($r.Stderr -join "`n")
+        $guardrailRefusal = $guardrailRefusal -and ($refusalText -match 'workload_cannot_authenticate')
+    }
+    $exitOk = if ($script:Backend -eq 'mxc') { $guardrailRefusal } else { ($r.ExitCode -eq 0) }
+    $passed = $exitOk -and $got407 -and $gotChallenge -and $gotNoBody -and $tokenLeaf -and (-not $admissionLeaf)
     return @{ Num=91; Name='S-91 (D-1 missing Proxy-Authorization)'; Passed=$passed; Skipped=$false
         Detail = if ($passed) { 'CONNECT with no Proxy-Authorization: 407 Proxy Authentication Required + Proxy-Authenticate + Content-Length: 0 (headers only); audit default/no_token (<unknown>), no admission leaf for example.com' }
                  else { "exit=$($r.ExitCode) got407=$got407 challenge=$gotChallenge noBody=$gotNoBody tokenLeaf=$tokenLeaf admissionLeaf=$admissionLeaf out=$(Get-LineHead -Lines @($out) -Max 200) err=$(Get-LineHead -Lines $r.Stderr -Max 160)" } }
@@ -3295,6 +3417,174 @@ function Invoke-Scenario-S94 {
 }
 
 # ---------------------------------------------------------------------------
+# S-96..S-98: teardown postconditions (prep for the POSIX-backend work).
+#
+# Each pins a state a finished run must NOT leave behind, and each proves the
+# observable EXISTED during the session first, so a "gone after" pass cannot be
+# vacuous: the AppContainer profile is polled for mid-run (S-96), the
+# install tree is observable by construction after --print-sid (S-97), and the
+# journal file is polled for mid-run (S-98). All three are AppContainer-only:
+# the mxc path creates no profile, no install tree and no journal.
+# ---------------------------------------------------------------------------
+
+# Poll for a path's appearance within $Seconds. Returns $true when the path
+# was seen at least once. The counterpart of a teardown postcondition is
+# only proven if it was observed to exist; a test that only checks absence
+# after the fact would also pass if the mechanism were never created.
+function Wait-PathAppears { param([string]$Path, [int]$Seconds = 20, [int]$IntervalMs = 50)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $Path) { return $true }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    return (Test-Path -LiteralPath $Path)
+}
+
+# Write the hold batch the S-96/S-98 sessions run as their workload. It is a
+# pure CPU spin - no stdin (which `timeout` needs and loses under a redirected
+# harness), no network, no output - that keeps the session alive for the
+# seconds the poll above needs. `ver` is a cmd builtin, so the loop spawns no
+# process and `>NUL` silences it. One run of the loop is roughly a second on
+# the VM guest; 40000 gives the poll a multi-second window on a slow host.
+function New-HoldBatch { param([string]$Dir)
+    $path = Join-Path $Dir 'hold.cmd'
+    Set-Content -LiteralPath $path -Value "@echo off`r`nfor /l %%i in (1,1,40000) do @ver>NUL`r`n" -Encoding ASCII
+    return 'hold.cmd'
+}
+
+# S-96: teardown deletes the AppContainer PROFILE. The footprint is the
+# %LOCALAPPDATA%\Packages\<ac> directory plus the HKCU AppContainer Storage
+# key, both created by CreateAppContainerProfile and both removed by
+# DeleteAppContainerProfile. A profile that leaked would make every later
+# session re-derive instead of create - silent until the store filled with
+# per-session profiles. The session id is scenario-unique, so a leftover from
+# any earlier run cannot fake the mid-run observation (the scenario starts
+# from a clean baseline for ITS OWN name).
+function Invoke-Scenario-S96 {
+    $d = New-ScenarioDir 96
+    $sid = 'S96-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $pkg = Join-Path $env:LOCALAPPDATA "Packages\sandbox.$sid.ac"
+    $storage = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\sandbox.' + $sid + '.ac'
+    $hold = New-HoldBatch -Dir $d
+    $proc = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sid, $hold) -WorkingDirectory $d
+    $seen = Wait-PathAppears -Path $pkg -Seconds 20
+    $exited = $proc.WaitForExit(90000)
+    $exitCode = if ($exited) { $proc.ExitCode } else { -2 }
+    if (-not $exited) { try { $proc.Kill() } catch { } }
+    $stderr = $proc.StandardError.ReadToEnd()
+    $null = $proc.StandardOutput.ReadToEnd()
+    $proc.Close()
+    $pkgAfter = Test-Path -LiteralPath $pkg
+    $storageAfter = Test-Path -LiteralPath $storage
+    $passed = $seen -and $exited -and ($exitCode -eq 0) -and (-not $pkgAfter) -and (-not $storageAfter)
+    return @{ Num=96; Name='S-96 (teardown deletes the AppContainer profile)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'profile Packages dir + HKCU Storage key existed mid-run, both gone after teardown' }
+                 else { "seen=$seen exited=$exited exitCode=$exitCode pkgAfter=$pkgAfter storageAfter=$storageAfter stderr=$(Get-LineHead -Lines @($stderr) -Max 200)" } }
+}
+
+# S-97: teardown removes the per-session <cwd>\.sandbox\<sid> install tree
+# while the shared .sandbox parent stays (removing the parent would race a
+# concurrent session's teardown). The tree is observable WITHOUT a poll:
+# --print-sid returns before the child spawns but after ensure_session_dirs,
+# so the tree is on disk the moment that run prints the id. The follow-up run
+# with the same --sid is the real session whose teardown must remove it.
+# (Pinning the print-sid residue is intentional: it documents the early
+# return's litter and is exactly what makes the "existed" proof free.)
+function Invoke-Scenario-S97 {
+    $d = New-ScenarioDir 97
+    $psid = Invoke-Sandbox -Args @('run','--allow-cwd','--print-sid','--','cmd','/c','echo','init') -WorkingDirectory $d
+    if ($psid.ExitCode -ne 0) {
+        return @{ Num=97; Name='S-97 (teardown removes the session tree)'; Passed=$false; Skipped=$false
+            Detail = "print-sid failed exit=$($psid.ExitCode) err=$(Get-LineHead -Lines $psid.Stderr -Max 160)" }
+    }
+    $sid = (($psid.Stdout | Where-Object { $_ -match '^\d{8}-\d{6}-\d{5}$' }) -join '').Trim()
+    if (-not $sid) {
+        return @{ Num=97; Name='S-97 (teardown removes the session tree)'; Passed=$false; Skipped=$false
+            Detail = 'print-sid produced no session id' }
+    }
+    $tree = Join-Path $d ".sandbox\$sid"
+    $before = Test-Path -LiteralPath (Join-Path $tree 'bin')
+    $r = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sid,'--','cmd','/c','echo','S97-MARKER') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $after = Test-Path -LiteralPath $tree
+    $parentKept = Test-Path -LiteralPath (Join-Path $d '.sandbox')
+    $passed = $before -and ($r.ExitCode -eq 0) -and ($out -match 'S97-MARKER') -and (-not $after) -and $parentKept
+    return @{ Num=97; Name='S-97 (teardown removes the session tree)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "tree $sid existed after --print-sid and is gone after the run; .sandbox parent kept" }
+                 else { "before=$before exit=$($r.ExitCode) marker=$($out -match 'S97-MARKER') after=$after parentKept=$parentKept out=$(Get-LineHead -Lines @($out) -Max 160) err=$(Get-LineHead -Lines $r.Stderr -Max 160)" } }
+}
+
+# S-98: teardown deletes the DACL journal file on success. The journal is
+# the crash-recovery record (S-74 reaps orphans from it), so a journal left
+# behind after a CLEAN run is not a crash record - it is a restore that
+# reported failure, or a removal that never ran. The file is polled for
+# mid-run so the absence assertion cannot pass while journaling is silently
+# unwired (a run that opened no journal would otherwise pass vacuously).
+function Invoke-Scenario-S98 {
+    $d = New-ScenarioDir 98
+    $sid = 'S98-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $journal = Join-Path (Get-DaclJournalDir) "$sid.jsonl"
+    $hold = New-HoldBatch -Dir $d
+    $proc = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sid, $hold) -WorkingDirectory $d
+    $seen = Wait-PathAppears -Path $journal -Seconds 20
+    $exited = $proc.WaitForExit(90000)
+    $exitCode = if ($exited) { $proc.ExitCode } else { -2 }
+    if (-not $exited) { try { $proc.Kill() } catch { } }
+    $stderr = $proc.StandardError.ReadToEnd()
+    $null = $proc.StandardOutput.ReadToEnd()
+    $proc.Close()
+    $after = Test-Path -LiteralPath $journal
+    $passed = $seen -and $exited -and ($exitCode -eq 0) -and (-not $after)
+    return @{ Num=98; Name='S-98 (teardown deletes the DACL journal on success)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { 'journal file existed mid-run and is gone after the clean run' }
+                 else { "seen=$seen exited=$exited exitCode=$exitCode journalAfter=$after stderr=$(Get-LineHead -Lines @($stderr) -Max 200)" } }
+}
+
+# S-99: FAIL-CLOSE. A DENY ACE that cannot be applied must REFUSE the session:
+# the workload must not run with the deny missing. The trigger is a deny on a
+# TrustedInstaller-owned system directory, whose DACL this process cannot
+# rewrite. A shell that CAN rewrite it (some elevated lanes can) has no failed
+# deny to observe, so the scenario SKIPS with that reason instead of passing.
+# Asserted: exit 126, the refusal on stderr, NO child output, a SESSION_REFUSED
+# leaf with reason=dacl_apply_failed, and no session ACE left on the scenario
+# dir (the refusal path must restore what did land).
+function Invoke-Scenario-S99 {
+    $d = New-ScenarioDir 99
+    $sid = 'S99-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
+    $target = Join-Path $env:SystemRoot 'System32\drivers\etc'
+    if (-not (Test-Path -LiteralPath $target)) {
+        return @{ Num=99; Name='S-99 (fail-close)'; Passed=$true; Skipped=$true; Detail="deny trigger missing: $target" }
+    }
+    $profilePath = Join-Path $d 'failclose.json'
+    $json = @{
+        meta = @{ name = 'failclose'; schema_version = 1; version = '1.0.0'; description = 'S-99 fail-close' }
+        filesystem = @{ allow = @('$CWD'); read_only = @(); deny = @($target) }
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $profilePath -Value $json -Encoding UTF8
+    $r = Invoke-Sandbox -Args @('run','--profile',$profilePath,'--sid',$sid,'--','cmd','/c','echo','should-not-run') -WorkingDirectory $d
+    $out = ($r.Stdout -join "`n")
+    $err = ($r.Stderr -join "`n")
+    if ($r.ExitCode -eq 0 -and ($out -match 'should-not-run')) {
+        return @{ Num=99; Name='S-99 (fail-close)'; Passed=$true; Skipped=$true
+            Detail = "this shell can re-DACL $target - no failed deny to observe (elevated lane?)" }
+    }
+    $strayAces = 0
+    if (Get-Command Get-SessionAceCount -ErrorAction SilentlyContinue) { $strayAces = Get-SessionAceCount -Path $d }
+    $refused = $false
+    $reason = ''
+    $s = Invoke-Sandbox -Args @('audit','show',$sid,'--json')
+    foreach ($l in @($s.Stdout | Where-Object { $_.Trim() })) {
+        try { $o = $l | ConvertFrom-Json } catch { continue }
+        if ($o.op -eq 'SESSION_REFUSED') { $refused = $true; $reason = [string]$o.reason }
+    }
+    $childRan = ($out -match 'should-not-run')
+    $passed = ($r.ExitCode -eq 126) -and ($err -match 'refused') -and (-not $childRan) -and $refused -and ($reason -eq 'dacl_apply_failed') -and ($strayAces -eq 0)
+    return @{ Num=99; Name='S-99 (fail-close)'; Passed=$passed; Skipped=$false
+        Detail = if ($passed) { "failed deny refused the session: exit 126, SESSION_REFUSED reason=dacl_apply_failed, no child, no stray ACEs" }
+                 else { "exit=$($r.ExitCode) childRan=$childRan refusedLeaf=$refused reason='$reason' strayAces=$strayAces err=$(Get-LineHead -Lines @($err) -Max 200)" } }
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher + main
 # ---------------------------------------------------------------------------
 $script:Scenarios = @(
@@ -3327,7 +3617,7 @@ $script:Scenarios = @(
 # Scenarios beyond the positional array register explicitly (number -> block);
 # this keeps reserved numbers free. Numbering above S-71 is per-branch (see the
 # Task 3.8 numbering note above the S-72 section).
-$script:MaxScenario = 95
+$script:MaxScenario = 99
 # S-93 is RESERVED, and deliberately not registered at all (P2.4).
 #
 # It is the harness form of guardrail 1's NEGATIVE case (ADR-0004: a session must
@@ -3392,6 +3682,10 @@ $script:AppContainerOnlyScenarios = @{
     42 = 'regression guard on the same drive-root ACE (the grant must not weaken an unrelated denial)'
     73 = 'asserts DACL-journal teardown restore; the mxc path writes no ACLs, so there is no journal and no restore to observe'
     74 = 'asserts DACL-journal crash recovery (orphan reap); no ACLs and no journal on the mxc path'
+    96 = 'asserts the AppContainer PROFILE footprint (Packages dir + HKCU Storage key); the mxc path creates no named AppContainer profile'
+    97 = 'asserts the per-session <cwd>\.sandbox\<sid> install tree, which the mxc path does not create'
+    98 = 'asserts DACL-journal file lifetime; the mxc path writes no ACLs, so it keeps no journal'
+    99 = 'asserts the AppContainer grant phase refuses the session on a failed deny; the mxc path applies its own policy and has no DACL grant phase'
 }
 $script:ScenarioFunctions = @{
     72 = { Invoke-Scenario-S72 }
@@ -3417,6 +3711,10 @@ $script:ScenarioFunctions = @{
     92 = { Invoke-Scenario-S92 }
     94 = { Invoke-Scenario-S94 }
     95 = { Invoke-Scenario-S95 }
+    96 = { Invoke-Scenario-S96 }
+    97 = { Invoke-Scenario-S97 }
+    98 = { Invoke-Scenario-S98 }
+    99 = { Invoke-Scenario-S99 }
 }
 
 

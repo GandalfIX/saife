@@ -378,7 +378,16 @@
 
     #[test]
     fn declared_grants_are_carried_and_the_launcher_is_granted_automatically() {
-        let req = build(&input());
+        // The contract build filters `denied_paths` to paths that EXIST (PSEC,
+        // see `existing_paths_only`), so the declared deny must be a real
+        // path: a synthetic one is dropped here and this assertion passes for
+        // the wrong reason on a host where the spelled path happens to exist
+        // (measured in the 29680 guest, where `C:\Users\marku\.ssh` is absent).
+        let dir = std::env::temp_dir().join(format!("sbx-mxc-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut i = input();
+        i.filesystem.denied_paths = vec![dir.display().to_string()];
+        let req = build(&i);
         assert_eq!(req.policy.readwrite_paths, vec![r"C:\work".to_string()]);
         assert_eq!(
             req.policy.readonly_paths,
@@ -387,8 +396,10 @@
         );
         assert_eq!(
             req.policy.denied_paths,
-            vec![r"C:\Users\marku\.ssh".to_string()]
+            vec![dir.display().to_string()],
+            "an existing denied path is carried verbatim"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- D6: the config posture is pinned, not defaulted ------------------
@@ -1713,6 +1724,50 @@
         // The MxcError wrapper keeps the detail reachable.
         let err: MxcError = refusal.clone().into();
         assert!(matches!(err, MxcError::Tier(_)), "{err:?}");
+    }
+
+    /// The operator's remedy when the tier cannot run: the failures that mean
+    /// "this host cannot run the containment" (the tier gate, a backend that
+    /// refused the launch) offer the `--backend appcontainer` retry, and the
+    /// failures that are about something else (an evidence gate, a request the
+    /// caller built wrongly, a config-side SDK error) do not — suggesting a
+    /// weaker backend there answers a different question than the operator's.
+    #[test]
+    fn availability_failures_offer_the_appcontainer_retry_and_others_do_not() {
+        // The tier gate: a probe that reported a degraded tier.
+        let degraded = verify_tier(
+            &tier_record(ProbeView {
+                tier: Some("appcontainer-dacl"),
+                needs_dacl_augmentation: Some(true),
+            }),
+            TierExpectation::Exactly(REQUIRED_TIER),
+        )
+        .expect_err("a degraded tier is refused when base-container is required");
+        let err: MxcError = degraded.into();
+        assert!(err.suggests_appcontainer(), "{err:?}");
+
+        // A backend that could not bring the containment up: a spawn refusal
+        // arrives as `backend_error` (the reported 0x80070003) and an
+        // unavailable engine as `backend_unavailable`.
+        for code in [v1::ErrorCode::BackendError, v1::ErrorCode::BackendUnavailable] {
+            let err = MxcError::Sdk(v1::Error::new(code, "spawning the sandboxed process failed"));
+            assert!(err.suggests_appcontainer(), "{err:?}");
+        }
+
+        // Not availability: the SDK refused the request or its configuration,
+        // or the evidence gate refused a session that DID run.
+        for code in [
+            v1::ErrorCode::MalformedRequest,
+            v1::ErrorCode::PolicyValidation,
+            v1::ErrorCode::UnsupportedContainment,
+        ] {
+            let err = MxcError::Sdk(v1::Error::new(code, "the request was refused"));
+            assert!(!err.suggests_appcontainer(), "{err:?}");
+        }
+        let err: MxcError = RequestError::EmptyCommand.into();
+        assert!(!err.suggests_appcontainer(), "{err:?}");
+        let err: MxcError = GuardError::ProbeUnmet.into();
+        assert!(!err.suggests_appcontainer(), "{err:?}");
     }
 
     /// A requirement that cannot be shown to be met is not met. A literal
@@ -3118,4 +3173,31 @@
             req.policy.network_proxy.is_enabled(),
             "the default must keep the substrate-injected proxy"
         );
+    }
+
+    /// PSEC fails the whole launch with `ERROR_PATH_NOT_FOUND` when the spec
+    /// names an absent path (measured 2026-11-10: #40's M3 pushes every builtin
+    /// deny dir/file into `denied_paths`, so a host without `~/.azure` or
+    /// `~/.gnupg` could not launch mxc at all). The contract build therefore
+    /// filters `denied_paths` to paths that exist; existing ones are kept in
+    /// order, absent ones are dropped.
+    #[test]
+    fn denied_paths_are_filtered_to_paths_that_exist() {
+        let dir = std::env::temp_dir().join(format!("sbx-psec-filter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("exists.txt");
+        std::fs::write(&present, "x").unwrap();
+        let absent = dir.join("no-such-file.txt");
+
+        let kept = existing_paths_only(&[
+            present.display().to_string(),
+            absent.display().to_string(),
+        ]);
+
+        assert_eq!(
+            kept,
+            vec![present.display().to_string()],
+            "the absent deny path must be dropped; the existing one kept in order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
