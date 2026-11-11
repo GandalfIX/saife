@@ -162,14 +162,29 @@ fn ensure_profile_resources() {
 }
 
 /// Grant the AppContainer SID the requested access on `entries` by writing
-/// an explicit DACL onto each directory. Failures on individual entries are
-/// logged to stderr but do not abort (the spike showed that some SystemRoot
-/// grants fail on locked-down machines — harmless because those dirs are
-/// world-readable).
+/// an explicit DACL onto each directory. A failure on a DENY aborts the
+/// session (more access than the profile allows); a failure on a GRANT
+/// aborts it too (less access than the profile promises) — EXCEPT the two
+/// known-harmless system grants, whose targets are world-readable on every
+/// supported build and whose DACL write legitimately fails on locked-down
+/// machines (the spike saw exactly `System32`/`SystemRoot` fail with
+/// 0x80070005). Failures on individual system entries are logged to stderr
+/// under SAIFE_DIAG.
 ///
 /// `journal`, when present, receives every grant BEFORE it is applied
 /// (MXC filesystem_dacl.rs pattern): teardown replays the journal to
 /// restore the host, and a crash leaves a restorable record behind.
+///
+/// The label set a failed grant may NOT come from: everything except
+/// `System32` and `SystemRoot`. A workspace, `--allow`, profile, per-session
+/// or ancestor entry that cannot be applied means the workload runs without
+/// access it was promised — a session the child cannot use is a refusal, not
+/// a warning (2026-11-11: a guest whose cwd grant silently failed ran a child
+/// that could not read its own working directory).
+fn grant_failure_is_fatal(e: &AllowEntry) -> bool {
+    !matches!(e.label.as_str(), "System32" | "SystemRoot")
+}
+
 pub fn grant_access(
     ac_sid: &PSID,
     entries: &[AllowEntry],
@@ -178,17 +193,20 @@ pub fn grant_access(
     let diag = std::env::var_os("SAIFE_DIAG").is_some();
     for e in entries {
         if let Err(err) = grant_one(ac_sid, e, journal) {
-            // A failed GRANT means less access than the profile asked for: warn and
-            // carry on. A failed DENY means MORE access than the profile allows, so
-            // the session must not start - continuing was fail-open, and only visible
-            // under SAIFE_DIAG.
-            if e.deny {
+            // A failed GRANT means less access than the profile asked for: a
+            // session that cannot use what it was promised is refused, like a
+            // failed DENY — the only difference is the direction of the breach.
+            // The named exception stays a warning: System32/SystemRoot are
+            // world-readable everywhere, so the session loses nothing real.
+            if e.deny || grant_failure_is_fatal(e) {
                 return Err(Error::new(
                     E_ACCESSDENIED,
                     format!(
-                        "deny ACE for {:?} could not be applied: {err} - refusing the session \
-                         rather than running it with the deny missing",
-                        e.win32_path
+                        "{} ACE for {:?} could not be applied: {err} - refusing the session \
+                         rather than running it with the {} missing",
+                        if e.deny { "deny" } else { "grant" },
+                        e.win32_path,
+                        if e.deny { "deny" } else { "grant" },
                     ),
                 ));
             }
@@ -1368,6 +1386,60 @@ mod propagation_tests {
 
     const TEST_SID: &str = "S-1-15-2-3149-3149-3149";
     const DIR_INHERIT_FLAGS: u8 = 0x3; // SUB_CONTAINERS_AND_OBJECTS_INHERIT
+
+    /// A failed GRANT means the session would run with LESS access than the
+    /// profile promised. For denials that is a refusal (fail-close on MORE
+    /// access); for grants it is a refusal too: a workload that silently
+    /// cannot reach the workspace it was told it has is a broken session, and
+    /// until this test existed the failure was a warning only SAIFE_DIAG could
+    /// see (measured 2026-11-11: a guest whose cwd grant failed ran a child
+    /// that could not read its own batch file, with no message).
+    #[test]
+    fn a_failed_workspace_grant_refuses_the_session() {
+        let dir = TempDir(tmp_tag("grantfail"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let missing = dir.0.join("does-not-exist");
+        let entry = AllowEntry {
+            win32_path: missing,
+            access: RWX,
+            label: "allow:test".into(),
+            deny: false,
+            protected: false,
+            inherit: true,
+        };
+        let sid = make_sid(TEST_SID);
+        let err = grant_access(&sid, &[entry], None)
+            .expect_err("a grant that cannot be applied must refuse the session");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing the session"),
+            "the refusal must say so, got: {msg}"
+        );
+    }
+
+    /// The two known-harmless grants stay warnings: System32/SystemRoot are
+    /// world-readable on every supported build, the grant is belt-and-braces,
+    /// and a locked-down machine legitimately refuses the DACL write
+    /// (measured: exactly these two fail with 0x80070005).
+    #[test]
+    fn a_failed_system_grant_stays_a_warning() {
+        let dir = TempDir(tmp_tag("sysgrant"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let entries: Vec<AllowEntry> = ["System32", "SystemRoot"]
+            .iter()
+            .map(|label| AllowEntry {
+                win32_path: dir.0.join(format!("missing-{label}")),
+                access: RWX,
+                label: (*label).into(),
+                deny: false,
+                protected: false,
+                inherit: true,
+            })
+            .collect();
+        let sid = make_sid(TEST_SID);
+        grant_access(&sid, &entries, None)
+            .expect("the System32/SystemRoot grants are allowed to fail");
+    }
 
     /// PSID from a SID string (leaks on purpose; tests are short-lived).
     fn make_sid(s: &str) -> PSID {
