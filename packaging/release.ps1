@@ -204,9 +204,21 @@ function Test-Asset([string]$zipPath, [string]$arch) {
     $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
     try { $entries = $zip.Entries.FullName } finally { $zip.Dispose() }
     $leaf = [IO.Path]::GetFileName($zipPath)
-    foreach ($required in 'saife.exe', 'saife-launch.exe', 'README.txt') {
-        if ($entries -notcontains $required) {
-            Refuse "$leaf is not flat: '$required' is not at the archive root (entries: $($entries -join ', '))"
+    # THIRD-PARTY-LICENSES.md and the SBOMs are required, not decorative: shipping
+    # the binaries without them violates the dependency licenses and misses the
+    # EU Cyber Resilience Act. The SBOM names carry the version, so a stale
+    # archive from an older release fails here too.
+    $required = @(
+        'saife.exe',
+        'saife-launch.exe',
+        'README.txt',
+        'THIRD-PARTY-LICENSES.md',
+        "saife-$version-sbom-x64.cdx.json",
+        "saife-$version-sbom-arm64.cdx.json"
+    )
+    foreach ($name in $required) {
+        if ($entries -notcontains $name) {
+            Refuse "$leaf is not flat: '$name' is not at the archive root (entries: $($entries -join ', '))"
         }
     }
     $probeDir = Join-Path ([IO.Path]::GetTempPath()) ("saife-probe-" + [guid]::NewGuid().ToString('N'))

@@ -1,0 +1,49 @@
+# Third-party licenses
+
+SAIFE Sandbox contains third-party code. This file lists every dependency that is
+compiled into the shipped `saife.exe` / `saife-launch.exe` binaries, grouped by
+license, with the full license text and the copyright holders the licenses ask
+to be named. The MIT, Apache-2.0, BSD, ISC, Unlicense and Unicode-3.0 licenses
+all require this text to be reproduced in every distribution of the binary.
+
+The file is generated from `Cargo.lock` by
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) with the
+configuration in `packaging/licenses/`. Do not edit it by hand; regenerate it
+with `packaging/licenses/generate.ps1`.
+
+Where a licence expression offers a choice (for example `MIT OR Apache-2.0`),
+the text reproduced below is the one `accepted` in `about.toml` selects first.
+No dependency is licensed under a copyleft licence.
+
+## Overview
+
+| License | Dependencies |
+|---------|--------------|
+{{#each overview}}
+| {{{name}}} ({{{id}}}) | {{count}} |
+{{/each}}
+
+## License texts
+
+{{#each licenses}}
+{{#if first_of_kind}}
+### {{{name}}} ({{{id}}})
+{{else}}
+### {{{id}}} - additional text variant
+{{/if}}
+
+Used by:
+{{#each used_by}}
+- [{{{crate.name}}} {{{crate.version}}}]({{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{{crate.name}}}{{/if}}){{#if crate.authors}}{{#each crate.authors}} - {{{this}}}{{/each}}{{/if}}
+{{/each}}
+
+<details>
+<summary>License text</summary>
+
+```
+{{{text}}}
+```
+
+</details>
+
+{{/each}}

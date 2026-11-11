@@ -27,7 +27,12 @@ param(
     [switch]$Release,
     # Must-match override of the Cargo.toml version - a typo here publishes an asset
     # whose name disagrees with the binary inside it, so a mismatch is refused.
-    [string]$ReleaseVersion
+    [string]$ReleaseVersion,
+    # Omit THIRD-PARTY-LICENSES.md and the SBOMs from a DEV bundle. The release path
+    # refuses this: shipping a binary without its dependency licenses violates the
+    # MIT/Apache-2.0/BSD/ISC/Unicode-3.0 terms, and the EU Cyber Resilience Act
+    # requires a machine-readable SBOM.
+    [switch]$SkipLicenses
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +63,12 @@ if ($toml -notmatch '(?sm)\[package\].*?^\s*version\s*=\s*"([^"]+)"') {
 $version = $Matches[1]
 if ($ReleaseVersion -and $ReleaseVersion -ne $version) {
     throw ("-ReleaseVersion {0} does not match Cargo.toml ({1}); bump Cargo.toml or drop the flag" -f $ReleaseVersion, $version)
+}
+# A release asset without its dependency licenses is a licence violation, and
+# without the SBOM it misses the EU Cyber Resilience Act. Refuse rather than rely
+# on the operator remembering.
+if ($SkipLicenses -and ($Release -or $ReleaseVersion)) {
+    throw '-SkipLicenses cannot be combined with -Release: a release asset must carry THIRD-PARTY-LICENSES.md and the SBOMs'
 }
 # Windows resource version: the numeric core padded to four components (`0.3.0.0`).
 $core = ($version -split '[-+]')[0]
@@ -166,6 +177,22 @@ Copy-Item (Join-Path $pluginSrc 'agents/opencode/SKILL.md') -Destination (Join-P
 
 Copy-Item (Join-Path $PSScriptRoot 'README.txt') -Destination $dist
 
+# Compliance artifacts, generated from Cargo.lock - never hand-edited. The MIT,
+# Apache-2.0, BSD, ISC, Unlicense and Unicode-3.0 licences require the licence
+# text to travel with every distribution of the binary; the SBOM is the
+# machine-readable form the EU Cyber Resilience Act asks for. -SkipLicenses opts
+# a dev bundle out and -Release refuses it.
+if ($SkipLicenses) {
+    Write-Host '== licenses + SBOM: SKIPPED (-SkipLicenses; -Release refuses this)' -ForegroundColor Yellow
+} else {
+    Write-Host '== third-party licenses + SBOM'
+    & (Join-Path $PSScriptRoot 'licenses\generate.ps1') `
+        -Version $version `
+        -LicensesPath (Join-Path $dist 'THIRD-PARTY-LICENSES.md') `
+        -SbomDir $dist
+    if ($LASTEXITCODE -ne 0) { throw "license/SBOM generation failed (exit $LASTEXITCODE)" }
+}
+
 Write-Host '== provenance + checksums'
 $sha = 'unknown'; $branch = 'unknown'
 if (Test-Path $repo) {
@@ -226,6 +253,11 @@ if ($Release -or $ReleaseVersion) {
         Copy-Item (Join-Path $archBin 'saife-launch.exe') -Destination $relStage
         Copy-Item (Join-Path $dist 'profiles'), (Join-Path $dist 'plugins') -Destination $relStage -Recurse
         Copy-Item (Join-Path $dist 'README.txt') -Destination $relStage
+        Copy-Item (Join-Path $dist 'THIRD-PARTY-LICENSES.md') -Destination $relStage
+        # Both SBOMs travel in both archives: each file is named for its
+        # architecture, so a copy in the "wrong" archive cannot be mistaken for
+        # that architecture's bill of materials.
+        Copy-Item (Join-Path $dist 'saife-*.cdx.json') -Destination $relStage
 
         $relZip = Join-Path $root (Get-AssetName -Version $version -Arch $arch)
         if (Test-Path $relZip) { Remove-Item $relZip -Force }
