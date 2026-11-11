@@ -12,9 +12,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::FILETIME;
+use windows::Win32::Foundation::{FILETIME, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -258,18 +259,36 @@ pub fn current_process_creation_time() -> i64 {
 /// site until 2026-11-11, which made every new supervisor reap LIVE runs'
 /// journals (restoring their DACLs out from under them) and keep the dead
 /// ones' files forever.
+///
+/// ZOMBIES: a process that has been killed still answers `OpenProcess` while
+/// any handle to it stays open (the supervisor's killer keeps one, and so does
+/// every test harness that started it). Its threads are gone and nothing will
+/// ever restore its journal, so it is DEAD for recovery purposes; the
+/// zero-timeout wait on the same handle tells the two apart, because only a
+/// terminated process's object is signalled. The wait needs `SYNCHRONIZE` on
+/// the handle, so the query-only open is the fallback for callers that may
+/// not even wait.
 pub fn is_process_alive(pid: u32, created: i64) -> bool {
-    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
+    let (handle, can_wait) =
+        match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        {
+            Ok(h) => (h, true),
+            Err(_) => (
+                match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+                    Ok(h) => h,
+                    Err(_) => return false,
+                },
+                false,
+            ),
+        };
     let mut create = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
     let ok =
         unsafe { GetProcessTimes(handle, &mut create, &mut exit, &mut kernel, &mut user).is_ok() }
-            && filetime_to_i64(&create) == created;
+            && filetime_to_i64(&create) == created
+            && (!can_wait || unsafe { WaitForSingleObject(handle, 0) != WAIT_OBJECT_0 });
     unsafe {
         let _ = windows::Win32::Foundation::CloseHandle(handle);
     }
@@ -461,6 +480,49 @@ mod tests {
         assert!(!is_process_alive(me, created + 1));
         // PID 0 never opens: the dead branch.
         assert!(!is_process_alive(0, created));
+    }
+
+    #[test]
+    fn a_killed_process_with_a_retained_handle_is_not_alive() {
+        // A terminated process object lingers as long as some handle to it
+        // stays open - the caller that started it typically holds one. This
+        // is exactly the state a killed supervisor's harness leaves behind,
+        // and it must read as DEAD: OpenProcess succeeds and the creation
+        // time matches, but the object is signalled.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "waitfor /t 30 never-signal-xyz"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the zombie-fixture child spawns");
+        let pid = child.id();
+        let created = {
+            let handle = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                    .expect("the fixture child opens while it runs")
+            };
+            let mut create = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            unsafe { GetProcessTimes(handle, &mut create, &mut exit, &mut kernel, &mut user) }
+                .expect("a live child reports its times");
+            let created = filetime_to_i64(&create);
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+            created
+        };
+        assert!(is_process_alive(pid, created), "the running child is alive");
+        child.kill().expect("the fixture child is killable");
+        child.wait().expect("the kill is observable");
+        // The fixture still holds the child's handle here, so the process
+        // object lingers: the zombie branch is exercised for real.
+        assert!(
+            !is_process_alive(pid, created),
+            "a killed child with a retained handle is not an owner"
+        );
+        drop(child);
     }
 
     /// M4 startup half: `recover_orphans` must count `reaped` only when the
