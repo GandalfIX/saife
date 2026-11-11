@@ -101,6 +101,18 @@ pub const MXC_FEATURE_FALLBACK: &str = "this build was made with \
 which needs administrator rights for network sessions. Rebuild without \
 --no-default-features for the unelevated default backend.";
 
+/// The remedy line printed after an MXC failure that means "this host cannot run
+/// the containment tier" ([`net::mxc::MxcError::suggests_appcontainer`]).
+///
+/// The failure itself names the issue; this line names the alternative and what
+/// it costs, so a switch to the other backend is never silent. It does not
+/// replace any refusal text and does not touch the audit vocabulary: a refused
+/// session still refuses, and the chain still records why.
+pub const MXC_UNAVAILABLE_HINT: &str = "the MXC containment tier did not run on this host: \
+retry with `--backend appcontainer`, which contains the session with an AppContainer token \
+and DACL grants instead of the MXC tier - network posture differs (the loopback exemption \
+needs administrator rights), see `saife run --help`";
+
 pub fn resolve_backend(
     backend: Backend,
     concurrency: Option<usize>,
@@ -753,6 +765,20 @@ mod tests {
         // The fallback message names the flag a user would pass, not the feature.
         assert!(MXC_FEATURE_FALLBACK.contains("--backend appcontainer"));
         assert!(MXC_FEATURE_FALLBACK.contains("--no-default-features"));
+    }
+
+    /// The remedy line for an unavailable tier names the issue, the alternative
+    /// backend, and the posture difference a switch opens — the three facts an
+    /// operator needs before changing a containment backend.
+    #[test]
+    fn the_tier_unavailable_hint_names_the_issue_the_flag_and_the_posture() {
+        assert!(MXC_UNAVAILABLE_HINT.contains("tier"));
+        assert!(MXC_UNAVAILABLE_HINT.contains("--backend appcontainer"));
+        // Honest about what the retry trades away, so a switch is not silent.
+        assert!(
+            MXC_UNAVAILABLE_HINT.contains("AppContainer"),
+            "{MXC_UNAVAILABLE_HINT}"
+        );
     }
 
     #[test]

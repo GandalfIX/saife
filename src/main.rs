@@ -1175,6 +1175,21 @@ const EXIT_RUNNER_REFUSED: i32 = 5;
 #[cfg(feature = "mxc-backend")]
 const EXIT_REFUSED: i32 = 126;
 
+#[cfg(feature = "mxc-backend")]
+/// Prints [`cli::MXC_UNAVAILABLE_HINT`] when `e` is an availability failure
+/// ([`net::mxc::MxcError::suggests_appcontainer`]).
+///
+/// The failure line goes first and keeps its shape (the audit leaf and the exit
+/// code are decided from it); this is one remedy line beside it, so the
+/// operator reads both the issue and the alternative without a second run. A
+/// failure that is NOT about availability prints nothing extra — a hint beside
+/// an unrelated error would send them to change the wrong thing.
+fn emit_mxc_unavailable_hint(e: &net::mxc::MxcError) {
+    if e.suggests_appcontainer() {
+        eprintln!("[saife] {}", cli::MXC_UNAVAILABLE_HINT);
+    }
+}
+
 /// Run one session through the MXC `processcontainer` backend (P3.0).
 ///
 /// Same resolved inputs as the AppContainer path, on the parts MXC can express,
@@ -1517,7 +1532,11 @@ fn run_mxc_session(
         budget,
         &input,
     )?;
-    let probed = net::mxc::probe_tier(&request)?;
+    let probed = net::mxc::probe_tier(&request).inspect_err(|e| {
+        // The tier could not even be named on this host, so the session never
+        // starts: the same remedy line the tier gate prints.
+        emit_mxc_unavailable_hint(e);
+    })?;
     let endpoint = proxy_port.map(audit::session_start::LoopbackEndpoint::new);
 
     // (7b) THE ROOT — before the child can exist (P3.1, S-55). Every fact the leaf
@@ -1541,6 +1560,7 @@ fn run_mxc_session(
         )?;
         seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
         eprintln!("[saife] mxc: {mismatch}");
+        emit_mxc_unavailable_hint(&net::mxc::MxcError::Tier(mismatch.clone()));
         return Ok(EXIT_REFUSED);
     }
     session_start
@@ -1577,12 +1597,16 @@ fn run_mxc_session(
                 audit::session_start::append_refusal(&audit_writer, sid, refusal)?;
                 seal_audit(audit_writer, proxy.map(|(handle, _)| handle), sid);
                 eprintln!("[saife] mxc: {e}");
+                emit_mxc_unavailable_hint(&e);
                 return Ok(launch_failure_exit(&e));
             }
             // Nothing was established (no request, no container, no epoch, an SDK
             // failure): the root from (7b) is the whole record, and no refusal leaf
             // is added — a refusal leaf would claim a gate ran when none did.
-            None => return Err(e.into()),
+            None => {
+                emit_mxc_unavailable_hint(&e);
+                return Err(e.into());
+            }
         },
     };
 
