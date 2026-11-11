@@ -101,22 +101,79 @@ pub const MXC_FEATURE_FALLBACK: &str = "this build was made with \
 which needs administrator rights for network sessions. Rebuild without \
 --no-default-features for the unelevated default backend.";
 
-/// The remedy line printed after an MXC failure that means "this host cannot run
-/// the containment tier" ([`net::mxc::MxcError::suggests_appcontainer`]).
+/// The sentence printed before the retry command when an MXC failure means
+/// "this host cannot run the containment tier"
+/// ([`net::mxc::MxcError::suggests_appcontainer`]).
 ///
-/// The failure itself names the issue; this line names the alternative and what
-/// it costs, so a switch to the other backend is never silent. It does not
-/// replace any refusal text and does not touch the audit vocabulary: a refused
-/// session still refuses, and the chain still records why.
+/// The failure itself names the issue; the line that follows is the operator's
+/// OWN command with the backend switched ([`appcontainer_retry_command`]), so the
+/// remedy is one paste and the retry re-runs the session that failed — same
+/// profile, same grants, same workload, other backend. It does not replace any
+/// refusal text and does not touch the audit vocabulary: a refused session still
+/// refuses, and the chain still records why.
 ///
 /// Every non-test reader sits behind `mxc-backend` (the hint names the tier
 /// gate's alternative), so the constant is expected to be unreferenced in a
 /// build without the feature.
 #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
-pub const MXC_UNAVAILABLE_HINT: &str = "the MXC containment tier did not run on this host: \
-retry with `--backend appcontainer`, which contains the session with an AppContainer token \
-and DACL grants instead of the MXC tier - network posture differs (the loopback exemption \
-needs administrator rights), see `saife run --help`";
+pub const MXC_UNAVAILABLE_PREFIX: &str =
+    "the MXC containment tier did not run on this host - retry with: ";
+
+/// The backend token [`appcontainer_retry_command`] substitutes, and the value
+/// it inserts when the operator gave no `--backend` at all.
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+const APPCONTAINER_BACKEND_VALUE: &str = "appcontainer";
+
+/// The operator's OWN command line with the backend switched to `appcontainer`.
+///
+/// Rules, in order:
+/// * `--backend <value>` and `--backend=<value>` are replaced in place, so an
+///   explicit `--backend mxc` never becomes two conflicting flags;
+/// * with no `--backend` at all it is inserted after the subcommand (`argv[1]`),
+///   which is where the run-scoped flag belongs;
+/// * every other token is kept verbatim, including the `--` separator and the
+///   workload, because the advice must re-run the session that just failed.
+///
+/// A token containing a space is wrapped in double quotes so a paste keeps it
+/// whole; tokens are otherwise never re-quoted, and nothing is escaped. This is
+/// display text, never an executed command. Every non-test reader sits behind
+/// `mxc-backend`, like [`MXC_UNAVAILABLE_PREFIX`].
+#[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
+pub fn appcontainer_retry_command(argv: &[String]) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len() + 2);
+    let mut backend_given = false;
+    let mut rest = argv.iter();
+    while let Some(token) = rest.next() {
+        if token == "--backend" {
+            out.push(token.clone());
+            out.push(APPCONTAINER_BACKEND_VALUE.to_string());
+            // Drop the value the operator passed, if the flag had one at all.
+            let _ = rest.next();
+            backend_given = true;
+        } else if token.starts_with("--backend=") {
+            out.push("--backend".to_string());
+            out.push(APPCONTAINER_BACKEND_VALUE.to_string());
+            backend_given = true;
+        } else {
+            out.push(token.clone());
+        }
+    }
+    if !backend_given && out.len() > 1 {
+        // After the subcommand: `saife run --backend appcontainer ...`.
+        out.insert(2, APPCONTAINER_BACKEND_VALUE.to_string());
+        out.insert(2, "--backend".to_string());
+    }
+    out.iter()
+        .map(|token| {
+            if token.contains(' ') || token.contains('\t') {
+                format!("\"{token}\"")
+            } else {
+                token.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 pub fn resolve_backend(
     backend: Backend,
@@ -772,18 +829,43 @@ mod tests {
         assert!(MXC_FEATURE_FALLBACK.contains("--no-default-features"));
     }
 
-    /// The remedy line for an unavailable tier names the issue, the alternative
-    /// backend, and the posture difference a switch opens — the three facts an
-    /// operator needs before changing a containment backend.
+    /// The retry is the operator's OWN command with the backend switched — copy,
+    /// paste, done. Not a description of a flag: every other token (the workload,
+    /// its `--`, the grants) survives verbatim, or the advice would be a different
+    /// session than the one that just failed.
     #[test]
-    fn the_tier_unavailable_hint_names_the_issue_the_flag_and_the_posture() {
-        assert!(MXC_UNAVAILABLE_HINT.contains("tier"));
-        assert!(MXC_UNAVAILABLE_HINT.contains("--backend appcontainer"));
-        // Honest about what the retry trades away, so a switch is not silent.
-        assert!(
-            MXC_UNAVAILABLE_HINT.contains("AppContainer"),
-            "{MXC_UNAVAILABLE_HINT}"
+    fn the_retry_command_is_the_operators_own_command_with_the_other_backend() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        };
+        // No --backend given: insert it after the subcommand.
+        assert_eq!(
+            appcontainer_retry_command(&argv(&["saife", "run", "--allow-cwd", "--", "cmd", "/c", "echo", "ok"])),
+            "saife run --backend appcontainer --allow-cwd -- cmd /c echo ok"
         );
+        // An explicit --backend mxc is REPLACED, never duplicated.
+        assert_eq!(
+            appcontainer_retry_command(&argv(&["saife", "run", "--backend", "mxc", "--allow-cwd", "--", "cmd"])),
+            "saife run --backend appcontainer --allow-cwd -- cmd"
+        );
+        // The `=` form normalizes to the space form the CLI also accepts.
+        assert_eq!(
+            appcontainer_retry_command(&argv(&["saife", "run", "--backend=mxc", "--allow-cwd"])),
+            "saife run --backend appcontainer --allow-cwd"
+        );
+        // A token with spaces stays one token, quoted so a paste keeps it whole.
+        assert_eq!(
+            appcontainer_retry_command(&argv(&["saife", "run", "--", r"C:\Program Files\x.exe"])),
+            "saife run --backend appcontainer -- \"C:\\Program Files\\x.exe\""
+        );
+    }
+
+    /// The failure sentence names the issue, so the line reads as issue +
+    /// copy-pasteable remedy even when the operator only sees the tail of stderr.
+    #[test]
+    fn the_unavailable_tier_line_names_the_issue_before_the_retry_command() {
+        assert!(MXC_UNAVAILABLE_PREFIX.contains("tier"));
+        assert!(MXC_UNAVAILABLE_PREFIX.ends_with("retry with: "), "{MXC_UNAVAILABLE_PREFIX}");
     }
 
     #[test]
