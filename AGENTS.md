@@ -54,8 +54,10 @@ constant would name a backend a feature-less binary cannot execute.
 
 **A tier that cannot run names its alternative:** when the tier gate (guardrail 2) or
 the backend's own launch refuses because the MXC containment tier did not run on
-this host, the failure line is followed by `cli::MXC_UNAVAILABLE_HINT`, which names
-`--backend appcontainer` and the posture that retry changes. The predicate is
+this host, the failure line is followed by the operator's OWN command with
+`--backend appcontainer` in place of the backend that could not run
+(`cli::appcontainer_retry_command`, after `cli::MXC_UNAVAILABLE_PREFIX`) — one
+paste re-runs the same session on the other backend. The predicate is
 `MxcError::suggests_appcontainer`: a tier mismatch and the SDK's `backend_error` /
 `backend_unavailable` only. An evidence-gate refusal (`guard`, `unproven`), a request
 the caller built wrongly, and a double-launch refusal print no hint, because a

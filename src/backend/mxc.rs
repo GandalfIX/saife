@@ -64,18 +64,37 @@ pub(crate) const EXIT_PLUGIN_REFUSED: i32 = 5;
 pub(crate) const EXIT_RUNNER_REFUSED: i32 = 5;
 
 #[cfg(feature = "mxc-backend")]
-/// Prints [`cli::MXC_UNAVAILABLE_HINT`] when `e` is an availability failure
-/// ([`net::mxc::MxcError::suggests_appcontainer`]).
+/// Prints the retry for `e` when it is an availability failure
+/// ([`net::mxc::MxcError::suggests_appcontainer`]): the operator's own command
+/// line with `--backend appcontainer` in place of the backend that could not
+/// run ([`cli::appcontainer_retry_command`]), after
+/// [`cli::MXC_UNAVAILABLE_PREFIX`].
 ///
 /// The failure line goes first and keeps its shape (the audit leaf and the exit
-/// code are decided from it); this is one remedy line beside it, so the
-/// operator reads both the issue and the alternative without a second run. A
-/// failure that is NOT about availability prints nothing extra — a hint beside
-/// an unrelated error would send them to change the wrong thing.
+/// code are decided from it); this is one copy-paste line beside it, so the
+/// operator re-runs the SAME session on the other backend without rebuilding it
+/// by hand. A failure that is NOT about availability prints nothing extra — a
+/// hint beside an unrelated error would send them to change the wrong thing.
+///
+/// `std::env::args()` is this supervisor's own command line: the hint is printed
+/// from the process the operator started, before any backend-owned re-exec.
 pub(crate) fn emit_mxc_unavailable_hint(e: &net::mxc::MxcError) {
     if e.suggests_appcontainer() {
-        eprintln!("[saife] {}", cli::MXC_UNAVAILABLE_HINT);
+        let argv: Vec<String> = std::env::args().collect();
+        eprintln!("{}", mxc_unavailable_line(&argv));
     }
+}
+
+/// The full stderr line for an availability failure: the `[saife]` prefix, the
+/// issue sentence, and the operator's own command with the other backend. Pure so
+/// the test can pin the assembled text the operator actually reads.
+#[cfg(feature = "mxc-backend")]
+pub(crate) fn mxc_unavailable_line(argv: &[String]) -> String {
+    format!(
+        "[saife] {}{}",
+        cli::MXC_UNAVAILABLE_PREFIX,
+        cli::appcontainer_retry_command(argv)
+    )
 }
 
 /// Run one session through the MXC `processcontainer` backend (P3.0).
@@ -679,4 +698,26 @@ pub(crate) fn emit_child_output(outcome: &net::mxc::SessionOutcome) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(&outcome.stderr);
     let _ = err.flush();
+}
+
+
+#[cfg(all(test, feature = "mxc-backend"))]
+mod hint_tests {
+    use super::mxc_unavailable_line;
+
+    /// The line an operator reads after the failure: prefix plus their own
+    /// command with the backend switched. Pinned as ONE string, end to end,
+    /// because this text is the product's answer to the question "and now?" —
+    /// both halves (prefix, builder) are pinned separately, and this test
+    /// proves the assembled line is what the doc claims it is.
+    #[test]
+    fn the_unavailable_tier_line_is_prefix_plus_the_operators_own_command() {
+        let argv = ["saife", "run", "--allow-cwd", "--", "cmd", "/c", "echo", "ok"]
+            .iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            mxc_unavailable_line(&argv),
+            "[saife] the MXC containment tier did not run on this host - retry with: \
+saife run --backend appcontainer --allow-cwd -- cmd /c echo ok"
+        );
+    }
 }
