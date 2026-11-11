@@ -900,6 +900,8 @@ function Invoke-Scenario-S13 {
     $installDest = ".sandbox\$sidA\bin\where.exe"
     Set-Content -LiteralPath $installA -Encoding ASCII -Value (
         "@echo off",
+        "echo child-alive",
+        "icacls ""%~f0""",
         "echo step0>steps.txt",
         "copy C:\Windows\System32\where.exe $installDest >copy-out.txt 2>&1",
         "echo copy-errorlevel=%errorlevel%>>steps.txt",
@@ -941,7 +943,7 @@ function Invoke-Scenario-S13 {
     $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
     $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; A installed (marker at ${markerSeconds}s); B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed markerAfter=${markerSeconds}s flag=$flagText bBlocked=$bBlocked bExit=$($rB.ExitCode) aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 200) aErr=$(Get-LineHead -Lines @($errA) -Last 6) aOut=$(Get-LineHead -Lines @($outA) -Max 200) steps=$(Get-Content -LiteralPath (Join-Path $d 'steps.txt') -ErrorAction SilentlyContinue) copyOut=$(Get-LineHead -Lines (Get-Content -LiteralPath (Join-Path $d 'copy-out.txt') -ErrorAction SilentlyContinue) -Max 200)" } }
+        Detail = if ($passed) { "distinct sids; A installed (marker at ${markerSeconds}s); B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed markerAfter=${markerSeconds}s flag=$flagText bBlocked=$bBlocked bExit=$($rB.ExitCode) aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 200) aErr=$(Get-LineHead -Lines @($errA) -Last 6) aOut=$(Get-LineHead -Lines @($outA) -Max 200) steps=$(Get-Content -LiteralPath (Join-Path $d 'steps.txt') -ErrorAction SilentlyContinue) copyOut=$(Get-LineHead -Lines (Get-Content -LiteralPath (Join-Path $d 'copy-out.txt') -ErrorAction SilentlyContinue) -Max 200) aFileAcl=$((Get-Acl -LiteralPath (Join-Path $d 'install-a.cmd') -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Access -ErrorAction SilentlyContinue | ForEach-Object { '{0}={1}' -f $_.IdentityReference.Value, $_.FileSystemRights } | Select-Object -First 10) -join ' | ')" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).
