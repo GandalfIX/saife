@@ -753,6 +753,7 @@ pub fn filesystem_policy(
     configured_denies: &[String],
     profile_dir: Option<&Path>,
     launcher: &Path,
+    exposed: &[String],
 ) -> Result<MxcFilesystemInput, RequestError> {
     // Both paths enter the deny-versus-grant comparison, and a relative spelling
     // (`tools\sandbox`, or empty for `.`) has no key an absolute deny could
@@ -838,7 +839,17 @@ pub fn filesystem_policy(
     // directory or unset entirely. The old name-based `continue` skipped a real
     // `~/.ssh` whenever a (possibly different) `profile_dir\.ssh` had already been
     // pushed, so a repointed env removed the deny on BOTH backends.
-    for dir in crate::profile::builtin_deny_dirs() {
+    // The always-denied set, resolved: builtin entries minus the ones the
+    // operator exposed by label, plus the machine policy's additions - the
+    // same source the AppContainer backend consumes, so the two backends
+    // cannot drift apart (the review's C-divergence note). An exposure that
+    // names an unknown label or a `Secret`-class entry refuses HERE, so an
+    // mxc session cannot start with a half-understood exposure either.
+    let effective =
+        crate::profile::effective_denies(exposed).map_err(|e| RequestError::CredentialPolicy {
+            reason: e.to_string(),
+        })?;
+    for dir in effective.dirs {
         push_deny(
             &mut filesystem.denied_paths,
             &dir.display().to_string(),
@@ -862,7 +873,7 @@ pub fn filesystem_policy(
     // entries handed to the container, not filesystem objects this process
     // writes a DACL onto, so a credential file that is not installed is an
     // inert deny rather than a failed launch.
-    for file in crate::profile::builtin_deny_files() {
+    for file in effective.files {
         push_deny(
             &mut filesystem.denied_paths,
             &file.display().to_string(),
@@ -949,6 +960,7 @@ mod m3_credential_deny_base {
             &[],
             Some(fake),
             Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+            &[],
         )
         .expect("neither tree contains a grant");
 
@@ -972,7 +984,11 @@ mod m3_credential_deny_base {
             );
         }
         // And the control plane / file denies follow the real root too.
-        for want in crate::profile::builtin_deny_files() {
+        for want in crate::profile::credential_denies()
+            .into_iter()
+            .filter(|c| c.kind == crate::profile::DenyKind::File)
+            .map(|c| c.path)
+        {
             let spelled = want.display().to_string();
             assert!(
                 fs.denied_paths
@@ -986,6 +1002,75 @@ mod m3_credential_deny_base {
 
     /// With no `profile_dir` at all (an UNSET `USERPROFILE`), the credential
     /// dirs must still be denied — they come from the OS known folder.
+    /// 2026-11-10: `--expose-credential kube` removes exactly the `kube`
+    /// entry from the DENIED PATHS the container hears, keeps every sibling
+    /// deny, and cannot be spelled for a `Secret`-class tree (.ssh).
+    #[test]
+    fn an_exposed_label_removes_exactly_that_deny_from_the_request() {
+        let _env = crate::env_lock();
+        let home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE must be set"),
+        );
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[],
+            &[],
+            &[],
+            Some(&home),
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+            &["kube".to_string()],
+        )
+        .expect("kube is a tool credential and the label is known");
+
+        let kube = home.join(".kube").join("config").display().to_string();
+        assert!(
+            fs.denied_paths
+                .iter()
+                .all(|deny| path_key(deny) != path_key(&kube)),
+            "--expose-credential kube must remove the kube deny from the request: {:?}",
+            fs.denied_paths
+        );
+        for file in crate::profile::credential_denies()
+            .into_iter()
+            .filter(|c| c.label != "kube")
+            .filter(|c| c.kind == crate::profile::DenyKind::File)
+            .map(|c| c.path)
+        {
+            let spelled = file.display().to_string();
+            assert!(
+                fs.denied_paths
+                    .iter()
+                    .any(|deny| path_key(deny) == path_key(&spelled)),
+                "an exposure for kube must not un-deny {spelled}: {:?}",
+                fs.denied_paths
+            );
+        }
+    }
+
+    /// 2026-11-10: a `Secret`-class label is refused at the filesystem-policy
+    /// boundary too, not only in the resolver's unit tests - the mxc backend
+    /// refuses by the same rule the AppContainer backend uses.
+    #[test]
+    fn an_secret_label_is_refused_at_the_mxc_boundary() {
+        let _env = crate::env_lock();
+        let home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE must be set"),
+        );
+        let err = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &[],
+            &[],
+            &[],
+            Some(&home),
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+            &["ssh".to_string()],
+        )
+        .expect_err("ssh is a private-key tree and can never be exposed");
+        assert!(
+            matches!(err, RequestError::CredentialPolicy { .. }),
+            "the refusal travels as CredentialPolicy: {err}"
+        );
+    }
     #[test]
     fn m3_an_absent_profile_dir_still_denies_every_credential_tree() {
         let Some(real) = crate::profile::system_profile_root() else {
@@ -1001,6 +1086,7 @@ mod m3_credential_deny_base {
             &[],
             None,
             Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+            &[],
         )
         .expect("no deny contains a grant");
 
@@ -1716,6 +1802,13 @@ pub enum RequestError {
     /// session on the NEXT launch (that is the whole wrapper design), so a workload
     /// that can rewrite it is scheduling code to run with the supervisor's rights.
     GrantCoversLauncher { grant: String, launcher: String },
+    /// The machine policy or an exposure request could not be resolved. A policy
+    /// that cannot be parsed is a policy that cannot be trusted to deny, so this
+    /// refuses the session rather than starting without the policy's denies.
+    CredentialPolicy {
+        /// The resolver's message, unedited.
+        reason: String,
+    },
 }
 
 impl fmt::Display for RequestError {
@@ -1755,6 +1848,12 @@ impl fmt::Display for RequestError {
                  If `{deny}` is one of the built-in profile credential denies (`.ssh`, `.aws`, \
                  `.azure`, `.gnupg` under the user profile), no configuration can remove it — \
                  move the workspace outside it"
+            ),
+            Self::CredentialPolicy { reason } => write!(
+                f,
+                "the machine credential policy or an exposure request could not be resolved: {reason}. \
+                 A policy that cannot be parsed cannot be trusted to deny, so the session is \
+                 refused rather than started without it"
             ),
             Self::InvalidRequest { reason } => write!(
                 f,
@@ -3252,10 +3351,15 @@ mod m2_credential_file_denies {
             &[],
             Some(&home),
             Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+            &[],
         )
         .expect("a file deny is a descendant of a grant, never an ancestor");
 
-        for file in crate::profile::builtin_deny_files() {
+        for file in crate::profile::credential_denies()
+            .into_iter()
+            .filter(|c| c.kind == crate::profile::DenyKind::File)
+            .map(|c| c.path)
+        {
             let spelled = file.display().to_string();
             assert!(
                 fs.denied_paths

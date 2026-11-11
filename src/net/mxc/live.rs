@@ -992,6 +992,7 @@
             &[],
             None,
             &launcher,
+            &[],
         )
         .expect("no deny in this session covers a grant");
         input.network.proxy_port = None;
@@ -1066,6 +1067,7 @@
             &[],
             Some(profile.path()),
             &launcher,
+            &[],
         )
         .expect("a deny BESIDE the grant is expressible");
         input.network.proxy_port = None;
@@ -1211,7 +1213,8 @@
                     &[],
                     profile_dir,
                     &launcher,
-                )
+            &[],
+        )
                 .expect("no deny covers the deep grant");
                 input.network.proxy_port = None;
                 let _ = std::fs::remove_file(&results);
@@ -1658,6 +1661,7 @@
             denies,
             profile.as_deref(),
             launcher,
+            &[],
         )
         .expect("no deny in this session's configuration contains a grant");
         MxcSessionInput {
@@ -2004,6 +2008,7 @@
                 .map(PathBuf::from)
                 .as_deref(),
             &launcher,
+            &[],
         )
         .expect("no deny in this session's configuration contains a grant");
         println!("EVIDENCE filesystem_policy={policy:?}");
@@ -4375,6 +4380,7 @@ exit /b 0
             &[],
             Some(Path::new(&home)),
             std::path::Path::new(r"C:\launcher.exe"),
+            &[],
         )
         .expect("no deny covers a grant");
         let want = Path::new(&home).join(".saife").display().to_string();
@@ -4405,6 +4411,7 @@ exit /b 0
             &[],
             None,
             std::path::Path::new(r"C:\launcher.exe"),
+            &[],
         )
         .expect_err("a grant inside .saife must be refused");
         assert!(
@@ -4427,6 +4434,7 @@ exit /b 0
             &[],
             None,
             &launcher,
+            &[],
         )
         .expect_err("a grant containing the launcher must be refused");
         match err {

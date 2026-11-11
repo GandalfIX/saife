@@ -64,10 +64,25 @@ pub fn ensure_session_dirs(cwd: &std::path::Path, sid: &str) -> std::io::Result<
 /// the session's AppContainer SID with a PROTECTED_DACL — it does NOT inherit
 /// the broad `$CWD` Allow. So session B's AppContainer SID, which has an Allow
 /// on `$CWD` (inherited), does NOT get an Allow on session A's subtree.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_allowlist(
     sid: &str,
     cwd: &std::path::Path,
     fs: &FilesystemSlice,
+) -> Result<Vec<AllowEntry>> {
+    build_allowlist_exposed(sid, cwd, fs, &[])
+}
+
+/// [`build_allowlist`] with the operator's credential exposures: the labels in
+/// `exposed` have their builtin deny dropped for this session (the resolver
+/// refuses an unknown label or a `Secret`-class one), and the machine policy's
+/// additions join the set. Same resolver the mxc backend consumes, so the two
+/// backends cannot drift.
+pub fn build_allowlist_exposed(
+    sid: &str,
+    cwd: &std::path::Path,
+    fs: &FilesystemSlice,
+    exposed: &[String],
 ) -> Result<Vec<AllowEntry>> {
     // The built-in deny set is read from the environment here, once, so the body
     // below is a pure function of its arguments and can be tested without mutating
@@ -80,11 +95,24 @@ pub fn build_allowlist(
     // file that does not exist needs no deny. The mxc backend keeps the full
     // list — its `denied_paths` are policy entries, not filesystem objects, so a
     // missing path is inert there.
-    let dirs = crate::profile::builtin_deny_dirs();
-    let files: Vec<std::path::PathBuf> = crate::profile::builtin_deny_files()
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect();
+    // One resolver for both backends: builtin entries minus what the operator
+    // exposed by label, plus the machine policy (`%PROGRAMDATA%\saife\deny.d`).
+    // A policy that cannot be parsed refuses the session here, before any grant
+    // is written - a policy that cannot be trusted to deny must not be silently
+    // missing.
+    let effective = crate::profile::effective_denies(exposed)
+        .map_err(|e| Error::new(E_INVALIDARG, e.to_string()))?;
+    // A path that does not exist needs no ACE: `grant_one` fails with
+    // 0x80070002, and `grant_access` treats a failed DENY as a refused session
+    // (fail-close since 2026-11-10). The dir list needed the same filter the
+    // file list always had - on a host without `~/.aws` the three absent tree
+    // denies used to fail the grant pass and run the session with a warning
+    // instead. The pre-flight on a grant inside such a deny is skipped with the
+    // entry; that is the same trade the file denies already make, and the
+    // documented one ("a path that does not exist needs no deny").
+    let dirs: Vec<std::path::PathBuf> = effective.dirs.into_iter().filter(|p| p.exists()).collect();
+    let files: Vec<std::path::PathBuf> =
+        effective.files.into_iter().filter(|p| p.exists()).collect();
     build_allowlist_with(sid, cwd, fs, &dirs, &files)
 }
 
@@ -1388,8 +1416,16 @@ mod tests {
             "m2-sid",
             &cwd,
             &resolved.filesystem,
-            &crate::profile::builtin_deny_dirs(),
-            &crate::profile::builtin_deny_files(),
+            &crate::profile::credential_denies()
+                .into_iter()
+                .filter(|c| c.kind == crate::profile::DenyKind::Dir)
+                .map(|c| c.path)
+                .collect::<Vec<_>>(),
+            &crate::profile::credential_denies()
+                .into_iter()
+                .filter(|c| c.kind == crate::profile::DenyKind::File)
+                .map(|c| c.path)
+                .collect::<Vec<_>>(),
         )
         .expect("the jvm profile must build an allowlist");
 
@@ -1552,5 +1588,36 @@ mod tests {
             .map(|d| home.join(d))
             .chain(std::iter::once(local.join("saife")))
             .collect()
+    }
+    /// 2026-11-10: the exposure resolver sits in front of the pre-flight, so a
+    /// session cannot start with a half-understood exposure: a label that names
+    /// a private-key tree (`.ssh`) or one that names nothing is refused before
+    /// a single ACE is written.
+    #[test]
+    fn a_secret_or_unknown_exposure_refuses_before_any_grant() {
+        let _env = crate::env_lock();
+        let home = std::path::PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("USERPROFILE must be set"),
+        );
+        let fs = FilesystemSlice {
+            allow: vec![],
+            read_only: vec![],
+            deny: vec![],
+        };
+
+        let err = match build_allowlist_exposed("x-ssh", &home, &fs, &["ssh".to_string()]) {
+            Err(e) => e,
+            Ok(_) => panic!("a private-key tree is never exposable"),
+        };
+        assert!(err.to_string().contains("ssh"), "refuses by label: {err}");
+
+        let err = match build_allowlist_exposed("x-typo", &home, &fs, &["ghh".to_string()]) {
+            Err(e) => e,
+            Ok(_) => panic!("a typo must not silently no-op"),
+        };
+        assert!(
+            err.to_string().contains("ghh") && err.to_string().contains("gh"),
+            "names the typo and the real labels: {err}"
+        );
     }
 }

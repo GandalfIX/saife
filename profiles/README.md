@@ -105,7 +105,15 @@ for **every** profile, whatever the operator grants:
 - `~/.pypirc`
 
 A missing file is skipped silently on the AppContainer backend (the tool is
-not installed); the mxc backend lists it as an inert policy entry. A grant of
+not installed); the mxc backend lists it as an inert policy entry.
+
+The list is classified: the trees above are `secret` (never exposable), the
+files are `tool-credential` (exposable per session with
+`--expose-credential <label>` - `gh`, `kube`, `docker`, `gradle`, `maven`,
+`cargo`, `git`, `pypi`, `nuget` - which is loud and audited, and exists because
+`gh`/`kubectl`/`docker` cannot run without their credential). `saife credentials
+list` shows the set; `%PROGRAMDATA%\saife\deny.d\*.json` adds entries machine-wide
+without being able to remove one. See the user guide, section 4.4a. A grant of
 one of these files *itself* is refused at session start (the deny names the
 file), while a grant of its parent directory still passes — that asymmetry is
 what keeps `jvm.json` launchable.
