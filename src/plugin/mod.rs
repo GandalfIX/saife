@@ -777,7 +777,11 @@ mod tests {
     #[test]
     fn the_install_root_lives_inside_the_denied_control_plane() {
         let root = global_plugins_root().expect("USERPROFILE is set on every Windows host");
-        let denied = crate::profile::builtin_deny_dirs();
+        let denied: Vec<std::path::PathBuf> = crate::profile::credential_denies()
+            .into_iter()
+            .filter(|c| c.kind == crate::profile::DenyKind::Dir)
+            .map(|c| c.path)
+            .collect();
         assert!(
             denied.iter().any(|d| crate::profile::path_covers(d, &root)),
             "the global plugin root {} must sit inside one of the builtin deny \
