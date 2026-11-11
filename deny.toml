@@ -1,0 +1,94 @@
+# cargo-deny configuration - the supply-chain gate.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+# Run: cargo deny check  (advisories + licenses + bans + sources in one pass)
+# This file is the policy; packaging/check-devtools.ps1 installs the tool that enforces it.
+
+[graph]
+# Audit BOTH feature states in one pass: the mxc-sdk dependency is feature-gated
+# (mxc-backend), so a default-features graph would silently exclude exactly the
+# one exact-pinned, security-relevant crate this policy most wants to see.
+all-features = true
+# Only the Windows targets this repo builds (x64 host and the arm64 cross-build
+# that `build-dist.ps1 -Arch arm64` supports) - unix-only deps are out of scope.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+[advisories]
+# Lint levels here are stated instead of left to tool defaults, so the policy does
+# not drift when cargo-deny changes its defaults. (cargo-deny 0.20 removed the
+# `vulnerability` lint level - advisories now always fail - and made `unmaintained`
+# / `unsound` scope selectors; their scope defaults to all crates, which is what
+# this policy wants.)
+yanked = "deny"
+# Every ignored advisory carries a written reason and is re-reviewed on each bump.
+ignore = []
+
+[licenses]
+# Everything in Cargo.lock today is permissive; this list is the union of the SPDX
+# identifiers those crates declare (LGPL-2.1-or-later appears only inside an OR
+# expression, which MIT satisfies, so it needs no entry). Two identifiers that show
+# up only inside OR-expressions are deliberately absent, because no crate NEEDS
+# them - allowing them would hide a future crate that is only LLVM-exception or
+# only BSD-1-Clause licensed:
+#   "Apache-2.0 WITH LLVM-exception"   (appears as one arm of an OR today)
+#   "BSD-1-Clause"                     (appears as one arm of an OR today)
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# The workspace crate (`sandbox`) is not published under that name.
+ignore = true
+
+[bans]
+# Two versions of one crate in the graph is a supply-chain smell and a compile-time
+# cost; deny and fix with `cargo update -p <crate> --precise <ver>` when it fires.
+# The skip list below is the written exception register: every entry names the
+# duplicate we cannot remove (all of them today come from the exact-pinned
+# mxc-sdk 1.0.1 build-dependency chain, or from a transitive crate we do not
+# own). When an upstream update removes a duplicate, its skip entry becomes
+# stale and cargo-deny reports it - delete it then.
+multiple-versions = "deny"
+# A `*` version requirement is not a pin, it is a hope.
+wildcards = "deny"
+# No crate is banned outright yet; add entries here the moment a crate must leave
+# the tree (with a reason - an undocumented ban reads as a mystery to the next
+# developer who hits it).
+deny = []
+skip = [
+    # The mxc-sdk build chain (sha2 0.11 -> digest 0.11) duplicates the crypto
+    # generation our signing path pins (sha2 0.10 -> digest 0.10). sha2 0.10 is a
+    # direct dependency; 0.11 is only a build dependency of mxc-sdk and neither
+    # side can move.
+    { crate = "block-buffer@0.12.1", reason = "build dep of mxc-sdk (via digest 0.11); our side pins 0.10" },
+    { crate = "cpufeatures@0.3.1", reason = "build dep of mxc-sdk (via sha2 0.11); our side pins 0.2" },
+    { crate = "crypto-common@0.2.2", reason = "build dep of mxc-sdk (via digest 0.11); our side pins 0.1" },
+    { crate = "digest@0.11.3", reason = "build dep of mxc-sdk (via sha2 0.11); our side pins 0.10" },
+    { crate = "sha2@0.11.1", reason = "build dep of mxc-sdk; our signing path pins sha2 0.10" },
+    # mxc-sdk and its build chain (tempfile, uuid) sit on getrandom 0.4; our
+    # tree (ring) is on 0.2. Exact-pinned SDK, not movable from here.
+    { crate = "getrandom@0.4.3", reason = "mxc-sdk build chain (tempfile, uuid); ring pins 0.2" },
+    # syn 2 is required by the windows 0.62 proc-macro crates and tokio-macros;
+    # syn 3 is what clap/serde/thiserror derive on. Neither generation can go.
+    { crate = "syn@2.0.119", reason = "required by windows 0.62 / tokio-macros proc-macros; the rest of the tree is on syn 3" },
+    # three windows-sys generations across the tree: ring pins 0.52, mxc-sdk's
+    # winreg pins 0.59, the tokio/anstyle generation is on 0.61.
+    { crate = "windows-sys@0.52.0", reason = "pinned by ring" },
+    { crate = "windows-sys@0.59.0", reason = "pinned by mxc-sdk's winreg 0.55" },
+]
+
+[sources]
+# The tree comes from crates.io. A git dependency or an unknown registry is a
+# policy decision someone writes down, not a silent default.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -90,6 +90,18 @@ mxc-sdk = { version = "=1.0.1", optional = true }
 # warning rather than a failed build.
 winresource = "0.1"
 
+# cargo-shear (packaging/check-devtools.ps1 installs it) is the unused-dependency
+# gate. The TLS chain below is NOT unused by accident: F-2 (credential injection
+# / TLS termination at the proxy) declares it ahead of the wiring - see the
+# "MVP DEVIATION FROM SPEC NARRATIVE" note at the top of src/net/proxy.rs, which
+# is the source of truth for this list. Keep the two in sync; a dep that leaves
+# that list without an import is a real finding.
+[package.metadata.cargo-shear]
+ignored = ["hyper", "hyper-util", "rustls", "rustls-native-certs", "http", "http-body-util", "bytes"]
+# The wbd-d03 SDK spike binary under tests/vm/spikes is a deliberately standalone
+# throwaway; it is not linked into this crate.
+ignored-paths = ["tests/vm/spikes/**"]
+
 
 [features]
 # ON BY DEFAULT (2026-10-22). The feature SELECTS the default backend: a build with

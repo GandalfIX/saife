@@ -187,6 +187,47 @@ Gates for any change: both feature states green (default and `--no-default-featu
 `cargo build --release` 0 warnings, touched files `rustfmt`-clean, CRLF
 preserved (byte counts, not `grep`: this host's `grep` hides CR).
 
+### Local analysis tools
+
+New machine? `pwsh -File start-develop.ps1 -Install` checks and installs both layers
+(build prerequisites via `packaging/check-prereqs.ps1`, then these tools via
+`packaging/check-devtools.ps1`). Every tool below is free, permissively licensed, and
+installs with `cargo install` into `%USERPROFILE%\.cargo\bin` — no elevation, nothing
+outside the user profile. CI does not run them: they are the contributor's pre-PR pass.
+
+| Command | What it checks | What you should see |
+|---|---|---|
+| `cargo deny check` | RustSec advisories, license policy, duplicate/banned crates, dependency sources (`deny.toml` is the policy) | `advisories ok, bans ok, licenses ok, sources ok` |
+| `cargo shear` | dependencies declared but never imported (`Cargo.toml` `[package.metadata.cargo-shear]` holds the written exceptions) | `✓ no issues found` |
+| `cargo mutants --file src/<file>.rs` | whether the unit tests of one file catch changed behaviour; every surviving mutant is a test gap | `N mutants tested: M survived` — triage each survivor (drop `--file` for the whole crate; add `--list` to just see what would run) |
+
+If `cargo deny check` fails:
+
+- `error[vulnerability]` / `error[unsound]` → a dependency has an advisory. Point-update
+  it as the advisory suggests (`cargo update -p <crate>`) and run the test gates.
+- `error[duplicate]` → a new duplicate version entered the graph. Remove it if possible;
+  if it comes from the exact-pinned `mxc-sdk` build chain, add a documented `skip`
+  entry to `deny.toml` (that file's skip list is the exception register — every entry
+  carries a reason).
+- `error[rejected]` under licenses → a new license identifier; add it to `allow` only
+  after reading the license.
+
+Optional tools (installed by the same script with `-SkipOptional` dropped):
+`cargo-geiger` (unsafe census, heuristic), `cargo-fuzz` + a nightly toolchain
+(coverage-guided fuzzing of the parsers), Miri (UB detection — **cannot execute the
+Win32 FFI paths**, pure-Rust units only).
+
+Deliberately NOT in the set:
+
+- `cargo-semver-checks`: it checks **library** API surfaces; this crate is bin-only
+  ("only library targets contain an API surface ... skipped: sandbox"), so it refuses
+  to run. The public surface here is the CLI + audit vocabulary, covered by the gates
+  and the guard tests instead.
+- clippy `undocumented_unsafe_blocks` / `multiple_unsafe_ops_per_block` at crate level:
+  measured 2026-11-11 at ~120 undocumented blocks and ~46 multi-op blocks across
+  `src/` — enabling them requires a per-block SAFETY-comment campaign with a real
+  justification per Win32 call, which is its own change, not a lint flip.
+
 ### Code scanning (CodeQL)
 
 Alerts live at <https://github.com/GandalfIX/saife/security/code-scanning>. The
