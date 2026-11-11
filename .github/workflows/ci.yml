@@ -30,5 +30,9 @@ jobs:
       # The release script's pre-tag guard: a tag pushed without the files the
       # release uploads cannot be withdrawn, so it is checked before tagging.
       - run: pwsh -NoProfile -File packaging/tests/release-side-files.ps1
+      # The license/SBOM artifacts must not silently leave the release path:
+      # the dependency licenses require the texts in every distribution, and the
+      # EU Cyber Resilience Act requires the machine-readable SBOM.
+      - run: pwsh -NoProfile -File packaging/tests/licenses-guard.ps1
       # The per-architecture winget rewrite, against the shipped manifest. Offline.
       - run: pwsh -NoProfile -File packaging/tests/winget-manifest.ps1
