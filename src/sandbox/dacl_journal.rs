@@ -186,7 +186,17 @@ pub fn recover_orphans(
         if header.owner_pid == std::process::id() {
             continue;
         }
-        if is_alive(&header) {
+        let alive = is_alive(&header);
+        if std::env::var_os("SAIFE_DIAG").is_some() {
+            eprintln!(
+                "[journal] {} {} (owner_pid={} owner_created={})",
+                if alive { "keeping live journal" } else { "REAPING orphan journal" },
+                path.display(),
+                header.owner_pid,
+                header.owner_created
+            );
+        }
+        if alive {
             continue;
         }
         let journal = DaclJournal { file: path };
@@ -242,6 +252,12 @@ pub fn current_process_creation_time() -> i64 {
 /// Is `pid` alive AND still the same process instance that owns `created`?
 /// Real `is_alive` for `recover_orphans`: a journal belongs to a live run
 /// only while its owner PID exists and its creation time is unchanged.
+///
+/// POLARITY: this answers "is the owner ALIVE", and that is what
+/// `recover_orphans`'s first closure must pass. It was inverted at the call
+/// site until 2026-11-11, which made every new supervisor reap LIVE runs'
+/// journals (restoring their DACLs out from under them) and keep the dead
+/// ones' files forever.
 pub fn is_process_alive(pid: u32, created: i64) -> bool {
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => h,
@@ -428,6 +444,23 @@ mod tests {
             j.entries().unwrap().len() == 1,
             "the journal is intact after the lock is released"
         );
+    }
+
+    /// The polarity contract the call site depends on: this predicate answers
+    /// "is the owner ALIVE". Inverted at the call site (2026-11-11) it reaped
+    /// live runs' journals and kept dead ones, which made a concurrent
+    /// session lose the DACLs it was holding.
+    #[test]
+    fn a_live_process_is_alive_a_recycled_or_missing_one_is_not() {
+        let me = std::process::id();
+        let created = current_process_creation_time();
+        assert!(created != 0, "the current process has a creation time");
+        assert!(is_process_alive(me, created));
+        // Same PID, different creation time: a recycled PID is a different
+        // process, and its journal is not this run's to restore.
+        assert!(!is_process_alive(me, created + 1));
+        // PID 0 never opens: the dead branch.
+        assert!(!is_process_alive(0, created));
     }
 
     /// M4 startup half: `recover_orphans` must count `reaped` only when the

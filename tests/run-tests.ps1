@@ -890,131 +890,55 @@ function Invoke-Scenario-S13 {
     $sidA = 'S13A-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
     $sidB = 'S13B-{0}-{1}' -f $PID, (Get-Random -Maximum 99999)
     $installA = Join-Path $d 'install-a.cmd'
-    Set-Content -LiteralPath $installA -Encoding ASCII -Value @"
-@echo off
-copy C:\Windows\System32\where.exe .sandbox\$sidA\bin\where.exe >NUL
-if errorlevel 1 (echo install-failed>install-done.txt) else (echo installed>install-done.txt)
-for /l %%i in (1,1,40000) do @ver>NUL
-"@
-    # The batch file is named by ABSOLUTE path on purpose. `cmd /c name.cmd`
-    # makes cmd resolve the name against its own cwd, and that resolution has
-    # failed on its own in a loaded guest ('install-a.cmd' is not recognized)
-    # while every containment property held - the same fragility S-6 was
-    # rewritten to avoid. An absolute path opens the file directly, so a
-    # failure here means what it says instead of blaming the sandbox.
-    # A failed GRANT is a silent warning unless SAIFE_DIAG is set (a failed
-    # DENY refuses the session, a failed grant does not) - so a guest whose
-    # cwd grant did not land leaves the child with no access to its own cwd
-    # and no clue in the log. Turn the diag on for A's supervisor only and
-    # restore it after; A's stderr (which the Detail carries) then names the
-    # failing grant and the Win32 error.
-    $prevDiag = $env:SAIFE_DIAG
-    $env:SAIFE_DIAG = '1'
-    try {
-        $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sidA, $installA) -WorkingDirectory $d
-    } finally {
-        # Restore, do not clear: the whole lane may already run with -Diag.
-        if ($null -eq $prevDiag) { Remove-Item env:SAIFE_DIAG -ErrorAction SilentlyContinue }
-        else { $env:SAIFE_DIAG = $prevDiag }
-    }
-    Start-Sleep -Seconds 2
-    $icaclsEarly = (icacls $d 2>&1 | ForEach-Object { $_.ToString() }) -join ' | '
-    $tB0 = Get-Date
-    # B runs ASYNCHRONOUSLY so the harness can sample the shared dir's DACL
-    # while both sessions are live: a fail that only shows in the final
-    # dump cannot distinguish "B broke A" from "A tore itself down".
-    $bProc = Start-SandboxProcess -Arguments "run --allow-cwd --sid $sidB -- cmd /c type .sandbox\$sidA\bin\where.exe" -WorkingDirectory $d
-    $errTaskB = $bProc.StandardError.ReadToEndAsync()
-    $outTaskB = $bProc.StandardOutput.ReadToEndAsync()
-    $aclSamples = @()
-    $bStart = Get-Date
-    $lastSig = ''
-    while (-not $bProc.WaitForExit(2000)) {
-        $aceLines = @(icacls $d 2>&1 | Select-String 'S-1-15' | ForEach-Object {
-            if ("$_" -match '(S-1-15[0-9-]+(?:\([^)]*\))*)') { $Matches[1] } })
-        $sig = 'A{0}:{1}' -f $(if ($procA.HasExited) { 'x' } else { 'o' }), ($aceLines -join ',')
-        if ($sig -ne $lastSig) {
-            $aclSamples += 't+{0:n0}s {1}' -f ((Get-Date) - $bStart).TotalSeconds, $sig
-            $lastSig = $sig
-        }
-        if ($aclSamples.Count -gt 25) { break }
-    }
-    $bExited = $bProc.WaitForExit(120000)
-    if (-not $bExited) { try { $bProc.Kill() } catch { } }
-    $rB = @{ ExitCode = if ($bExited) { $bProc.ExitCode } else { -2 }; Stderr = @($errTaskB.Result -split "`r?`n"); Stdout = @($outTaskB.Result -split "`r?`n") }
-    $bSeconds = [int]((Get-Date) - $bStart).TotalSeconds
-    $errB = ($rB.Stderr -join "`n")
-    # The flag's CONTENT proves A's copy succeeded - the child writes
-    # 'installed' only when `copy` returned 0, so B's denial cannot pass
-    # vacuously. The host does NOT read A's tree mid-run (only the owner
-    # survives the PROTECTED DACL on some paths, and that is not the
-    # property under test).
-    # The marker budget is A's own session budget (120 s), not an arbitrary
-    # 30 s: session startup latency is variable (measured 1.8 s .. 26 s on
-    # one host with one binary, minutes apart - the guest under load runs
-    # longer still), and the property under test is that the copy succeeded
-    # WHILE A held the tree, not that it happened within half a minute. A
-    # late marker still proves the install; a missing one after A's own
-    # budget means the child genuinely lost its cwd.
-    $markerSeconds = -1
+    # A installs a tool into ITS OWN session tree, records the outcome, then
+    # holds the tree. The batch is named by ABSOLUTE path on purpose: 'cmd /c
+    # name.cmd' resolves against cmd's own cwd and that resolution has
+    # failed on its own under load ('not recognized') while every
+    # containment property held - the same fragility S-6 was rewritten to
+    # avoid. The session tree path is built with literal separators, never
+    # doubled: PS strings do not escape backslashes, so one is one.
+    $installDest = ".sandbox\$sidA\bin\where.exe"
+    Set-Content -LiteralPath $installA -Encoding ASCII -Value (
+        "@echo off",
+        "copy C:\Windows\System32\where.exe $installDest >NUL",
+        "if errorlevel 1 (echo install-failed>install-done.txt) else (echo installed>install-done.txt)",
+        "for /l %%i in (1,1,1000000) do @ver>NUL" -join ([Environment]::NewLine))
+    # Start A. No diag, no sampling: this scenario asserts a containment
+    # property. A failed grant is fail-close now, so a session that cannot
+    # use its own cwd says so instead of running half-armed.
+    $procA = Start-SandboxProcess -Arguments ("run --allow-cwd --sid {0} -- cmd /c {1}" -f $sidA, $installA) -WorkingDirectory $d
+    # The marker must exist BEFORE B runs: B's denial is only evidence of
+    # containment when it names a file that EXISTS. The wait is A's own
+    # session budget (120 s) - startup latency is variable (measured 1.8 s ..
+    # 26 s on one host, one binary, minutes apart), and a late marker still
+    # proves the install happened while A held the tree.
     $markerPath = Join-Path $d 'install-done.txt'
+    $markerSeconds = -1
     for ($w = 0; $w -lt 240; $w++) {
         if (Test-Path -LiteralPath $markerPath) { $markerSeconds = [int]($w / 2); break }
+        if ($procA.HasExited) { break }
         Start-Sleep -Milliseconds 500
     }
     $installed = ($markerSeconds -ge 0)
-    $flagText = if ($installed) { ((Get-Content -LiteralPath (Join-Path $d 'install-done.txt') -ErrorAction SilentlyContinue) -join ' ').Trim() } else { '' }
-    # B's block can surface as EITHER message shape: an explicit access denial,
-    # or "path not found" - B cannot even LIST the protected `.sandbox` parent,
-    # so the sibling name does not resolve. Both mean "B could not read A's
-    # tool"; the non-vacuity legs above prove the file existed while A ran.
-    $bBlocked = ($rB.ExitCode -ne 0) -and ((Test-Denied $errB) -or ($errB -match '(?i)(cannot find|not find|nicht finden)'))
-    # Drain both pipes WHILE A runs. Reading after WaitForExit deadlocks once
-    # the diag's verbose stderr fills the pipe buffer: the child blocks on
-    # write, never exits, and the reader waits forever. Async first, wait
-    # after.
-    $errTask = $procA.StandardError.ReadToEndAsync()
-    $outTask = $procA.StandardOutput.ReadToEndAsync()
-    $aExited = $procA.WaitForExit(120000)
+    $flagText = if ($installed) { ((Get-Content -LiteralPath $markerPath -ErrorAction SilentlyContinue) -join ' ').Trim() } else { '' }
+    # B runs while A holds the tree and must be DENIED A's tool. It cannot
+    # even LIST the protected `.sandbox` parent, so the denial surfaces as an
+    # access denial OR as "not found"; both mean "B could not read A's tool",
+    # and the marker above proves the file existed at this moment.
+    $siblingPath = '.sandbox\$sidA\bin\where.exe'
+    $rB = Invoke-Sandbox -Args @('run','--allow-cwd','--sid',$sidB,'--','cmd','/c','type',$siblingPath) -WorkingDirectory $d
+    $errB = ($rB.Stderr -join "`n")
+    $bBlocked = ($rB.ExitCode -ne 0) -and ((Test-Denied $errB) -or ($errB -match '(?i)(cannot find|not find|nicht finden|system cannot find)'))
+    $aExited = $procA.WaitForExit(180000)
     if (-not $aExited) { try { $procA.Kill() } catch { } }
-    $errA = $errTask.Result
-    $procAStandardOut = @($outTask.Result -split "`r?`n")
+    $errA = $procA.StandardError.ReadToEnd()
+    $outA = $procA.StandardOutput.ReadToEnd()
     $aExit = if ($aExited) { $procA.ExitCode } else { 'killed' }
     $procA.Close()
     $treeAGone = -not (Test-Path -LiteralPath (Join-Path $d ".sandbox\$sidA"))
     $passed = $installed -and ($flagText -match 'installed') -and ($sidA -ne $sidB) -and $bBlocked -and $aExited -and $treeAGone
-    # Diagnose an A-could-not-read-its-own-cwd failure in place: the DACLs
-    # the harness user sees, the file's size, and A's supervisor output
-    # (warnings there - propagation truncation, journal problems - name the
-    # cause). Everything goes into the Detail line so a VM lane carries it
-    # home without needing -Keep.
-    $diag = ''
-    if (-not $passed) {
-        $icaclsOut = @()
-        foreach ($target in @($d, (Join-Path $d 'install-a.cmd'), (Join-Path $d '.sandbox'), (Join-Path $d ".sandbox\$sidA"))) {
-            if (Test-Path -LiteralPath $target) {
-                $icaclsOut += (icacls $target 2>&1 | ForEach-Object { $_.ToString() })
-            } else { $icaclsOut += "MISSING: $target" }
-        }
-        $errLines = @($errA -split "`r?`n")
-        $grantLines = @($errLines | Where-Object { $_ -match '\[grant\]|\[journal\]|refused|warning' } | Select-Object -First 40)
-        Set-Content -LiteralPath (Join-Path $d 'a-stderr.log') -Value $errA -Encoding UTF8
-        Set-Content -LiteralPath (Join-Path $d 'a-stdout.log') -Value ($procAStandardOut -join "`n") -Encoding UTF8
-        Set-Content -LiteralPath (Join-Path $d 'acl-early.txt') -Value $icaclsEarly -Encoding UTF8
-        Set-Content -LiteralPath (Join-Path $d 'acl-afterb.txt') -Value $icaclsAfterB -Encoding UTF8
-        $diag = " || timing: markerAfter=${markerSeconds}s bDuration=${bSeconds}s"
-        $diag += ' || aclEarly: ' + $icaclsEarly
-        $diag += ' || aclTimeline: ' + (($aclSamples | Select-Object -First 25) -join ' ; ')
-        $diag += ' || aclAfterB: ' + $icaclsAfterB
-        $diag += ' || grants: ' + ($grantLines -join ' | ')
-        $diag += ' || aTail: ' + ((@($errLines) | Select-Object -Last 10) -join ' | ')
-        $diag += ' || icacls: ' + (($icaclsOut | Select-Object -First 12) -join ' | ')
-        $diag += ' || file: '
-        try { $diag += (Get-Item -LiteralPath (Join-Path $d 'install-a.cmd') -Force | Select-Object -ExpandProperty Length) } catch { $diag += 'gone' }
-        $diag += ' || aOut: ' + ((($procAStandardOut) | Select-Object -First 6) -join ' | ')
-    }
     return @{ Num=13; Name='S-13'; Passed=$passed; Skipped=$false
-        Detail = if ($passed) { "distinct sids; B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed flag=$flagText bBlocked=$bBlocked aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 160) aErr=$(Get-LineHead -Lines @($errA) -Max 160)$diag" } }
+        Detail = if ($passed) { "distinct sids; A installed (marker at ${markerSeconds}s); B blocked from A's live tree; A's tree removed at teardown" } else { "installed=$installed markerAfter=${markerSeconds}s flag=$flagText bBlocked=$bBlocked bExit=$($rB.ExitCode) aExited=$aExited aExit=$aExit treeAGone=$treeAGone bErr=$(Get-LineHead -Lines @($errB) -Max 200) aErr=$(Get-LineHead -Lines @($errA) -Last 6) aOut=$(Get-LineHead -Lines @($outA) -Max 200)" } }
 }
 
 # S-14: persist/reuse (SKIP — not implemented in this slice).

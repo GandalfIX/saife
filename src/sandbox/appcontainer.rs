@@ -162,27 +162,56 @@ fn ensure_profile_resources() {
 }
 
 /// Grant the AppContainer SID the requested access on `entries` by writing
-/// an explicit DACL onto each directory. A failure on a DENY aborts the
-/// session (more access than the profile allows); a failure on a GRANT
-/// aborts it too (less access than the profile promises) — EXCEPT the two
-/// known-harmless system grants, whose targets are world-readable on every
-/// supported build and whose DACL write legitimately fails on locked-down
-/// machines (the spike saw exactly `System32`/`SystemRoot` fail with
-/// 0x80070005). Failures on individual system entries are logged to stderr
-/// under SAIFE_DIAG.
+/// an explicit DACL onto each directory. Every failure falls into one of
+/// three cases:
+///
+/// * a DENY failed -> the session is refused (more access than the profile
+///   allows; the fail-open case this project was built to prevent);
+/// * a GRANT failed on a path that does not exist -> the entry is SKIPPED
+///   (nothing to grant; when the workload creates the path it inherits from
+///   the parent, which carries the granted ACE - the same decision the
+///   deny entries made for missing paths);
+/// * a GRANT failed on a path under an OS install tree (%SystemRoot%,
+///   %ProgramFiles% and its x86 twin) -> warn and continue: those trees are
+///   world-readable and their DACL writes legitimately fail for a
+///   non-owner (TrustedInstaller owns them; measured 0x80070005 on
+///   System32, SystemRoot and Program Files in the guest lanes).
+/// * every other failed grant refuses the session: a workload that silently
+///   runs without access it was promised is a broken session, not a
+///   warning (2026-11-11: a guest whose cwd grant silently failed ran a
+///   child that could not read its own working directory).
 ///
 /// `journal`, when present, receives every grant BEFORE it is applied
 /// (MXC filesystem_dacl.rs pattern): teardown replays the journal to
 /// restore the host, and a crash leaves a restorable record behind.
-///
-/// The label set a failed grant may NOT come from: everything except
-/// `System32` and `SystemRoot`. A workspace, `--allow`, profile, per-session
-/// or ancestor entry that cannot be applied means the workload runs without
-/// access it was promised — a session the child cannot use is a refusal, not
-/// a warning (2026-11-11: a guest whose cwd grant silently failed ran a child
-/// that could not read its own working directory).
-fn grant_failure_is_fatal(e: &AllowEntry) -> bool {
-    !matches!(e.label.as_str(), "System32" | "SystemRoot")
+fn grant_failure_is_fatal(e: &AllowEntry, err: &windows::core::Error) -> bool {
+    if e.deny {
+        return true;
+    }
+    if is_absent_path_error(err) {
+        return false;
+    }
+    if is_os_install_tree(&e.win32_path) {
+        return false;
+    }
+    true
+}
+
+/// OS install trees: their DACL cannot be written by anyone but
+/// TrustedInstaller, and the session needs only the read access the system
+/// grant already provides. Checked against the environment so the rule
+/// follows the machine it runs on.
+fn is_os_install_tree(path: &std::path::Path) -> bool {
+    for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(root) = std::env::var(var)
+            && path.strip_prefix(root).is_ok()
+        {
+            // The tree root itself counts: the SystemRoot grant targets
+            // %SystemRoot% directly and fails exactly like its children.
+            return true;
+        }
+    }
+    false
 }
 
 pub fn grant_access(
@@ -193,16 +222,11 @@ pub fn grant_access(
     let diag = std::env::var_os("SAIFE_DIAG").is_some();
     for e in entries {
         if let Err(err) = grant_one(ac_sid, e, journal) {
-            // A failed GRANT means less access than the profile asked for: a
-            // session that cannot use what it was promised is refused, like a
-            // failed DENY — the only difference is the direction of the breach.
-            // The named exception stays a warning: System32/SystemRoot are
-            // world-readable everywhere, so the session loses nothing real.
-            if e.deny || grant_failure_is_fatal(e) {
+            if grant_failure_is_fatal(e, &err) {
                 return Err(Error::new(
                     E_ACCESSDENIED,
                     format!(
-                        "{} ACE for {:?} could not be applied: {err} - refusing the session \
+                        "{} ACE for {:?} could not be applied: {err} - refusing the session \r
                          rather than running it with the {} missing",
                         if e.deny { "deny" } else { "grant" },
                         e.win32_path,
@@ -210,9 +234,20 @@ pub fn grant_access(
                     ),
                 ));
             }
-            if diag {
+            // Skipped or tolerated: absent paths and OS install trees. Both
+            // lose nothing the session was promised, but the absence of the
+            // ACE must still be visible: this is the same half the deny
+            // entries print under.
+            if std::env::var_os("SAIFE_DIAG").is_some() {
                 eprintln!(
-                    "[grant] WARN: {:>16} {:?} failed: {err}",
+                    "[grant] {}: {:>16} {:?} failed: {err}",
+                    if e.deny {
+                        "FAILED".to_string()
+                    } else if is_absent_path_error(&err) {
+                        "SKIP".to_string()
+                    } else {
+                        "TOLERATED".to_string()
+                    },
                     if e.deny {
                         format!("{} [deny]", e.label)
                     } else {
@@ -1387,58 +1422,81 @@ mod propagation_tests {
     const TEST_SID: &str = "S-1-15-2-3149-3149-3149";
     const DIR_INHERIT_FLAGS: u8 = 0x3; // SUB_CONTAINERS_AND_OBJECTS_INHERIT
 
-    /// A failed GRANT means the session would run with LESS access than the
-    /// profile promised. For denials that is a refusal (fail-close on MORE
-    /// access); for grants it is a refusal too: a workload that silently
-    /// cannot reach the workspace it was told it has is a broken session, and
-    /// until this test existed the failure was a warning only SAIFE_DIAG could
-    /// see (measured 2026-11-11: a guest whose cwd grant failed ran a child
-    /// that could not read its own batch file, with no message).
-    #[test]
-    fn a_failed_workspace_grant_refuses_the_session() {
-        let dir = TempDir(tmp_tag("grantfail"));
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let missing = dir.0.join("does-not-exist");
-        let entry = AllowEntry {
-            win32_path: missing,
+    fn grant_entry(path: std::path::PathBuf, label: &str) -> AllowEntry {
+        AllowEntry {
+            win32_path: path,
             access: RWX,
-            label: "allow:test".into(),
+            label: label.to_string(),
             deny: false,
             protected: false,
             inherit: true,
-        };
-        let sid = make_sid(TEST_SID);
-        let err = grant_access(&sid, &[entry], None)
-            .expect_err("a grant that cannot be applied must refuse the session");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("refusing the session"),
-            "the refusal must say so, got: {msg}"
-        );
+        }
     }
 
-    /// The two known-harmless grants stay warnings: System32/SystemRoot are
-    /// world-readable on every supported build, the grant is belt-and-braces,
-    /// and a locked-down machine legitimately refuses the DACL write
-    /// (measured: exactly these two fail with 0x80070005).
+    /// A grant whose path does not exist yet has nothing to apply. Skipping
+    /// it matches the decision the deny entries already made for missing
+    /// paths: when the workload creates the path it inherits from the parent,
+    /// which carries the granted ACE. Profiles name paths that may not
+    /// exist yet (a tool's state dir on a fresh machine), so refusing here
+    /// would refuse sessions that are fine.
     #[test]
-    fn a_failed_system_grant_stays_a_warning() {
-        let dir = TempDir(tmp_tag("sysgrant"));
+    fn a_grant_for_a_missing_path_is_skipped() {
+        let dir = TempDir(tmp_tag("grantmissing"));
         std::fs::create_dir_all(&dir.0).unwrap();
-        let entries: Vec<AllowEntry> = ["System32", "SystemRoot"]
-            .iter()
-            .map(|label| AllowEntry {
-                win32_path: dir.0.join(format!("missing-{label}")),
-                access: RWX,
-                label: (*label).into(),
-                deny: false,
-                protected: false,
-                inherit: true,
-            })
-            .collect();
+        let sid = make_sid(TEST_SID);
+        grant_access(&sid, &[grant_entry(dir.0.join("not-yet"), "allow:test")], None)
+            .expect("a missing grant path is skipped, not fatal");
+    }
+
+    /// OS install trees are world-readable and their DACLs belong to
+    /// TrustedInstaller: the write fails for any supervisor without
+    /// take-ownership, and the session loses nothing real (measured in the
+    /// guest lanes: System32, SystemRoot and Program Files, all 0x80070005).
+    #[test]
+    fn a_failed_grant_under_an_os_install_tree_stays_a_warning() {
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let mut entries = vec![
+            grant_entry(std::path::PathBuf::from(&sysroot).join("System32"), "System32"),
+            grant_entry(std::path::PathBuf::from(&sysroot), "SystemRoot"),
+        ];
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            entries.push(grant_entry(std::path::PathBuf::from(pf), "java-runtime"));
+        }
         let sid = make_sid(TEST_SID);
         grant_access(&sid, &entries, None)
-            .expect("the System32/SystemRoot grants are allowed to fail");
+            .expect("OS install trees are tolerated, not fatal");
+    }
+
+    #[test]
+    fn is_os_install_tree_follows_the_environment() {
+        let sysroot = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()),
+        );
+        assert!(is_os_install_tree(&sysroot.join("System32")));
+        assert!(is_os_install_tree(&sysroot));
+        assert!(!is_os_install_tree(&std::env::temp_dir()));
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            assert!(is_os_install_tree(&std::path::PathBuf::from(pf).join("Java")));
+        }
+    }
+
+    /// The fatal case outside the OS trees: a system-owned directory a
+    /// non-owner cannot re-DACL. `C:\System Volume Information` is exactly
+    /// that shape on every NTFS system volume; the test skips itself if the
+    /// machine does not have it rather than asserting on a missing path.
+    #[test]
+    fn a_grant_outside_the_os_trees_that_cannot_be_applied_refuses_the_session() {
+        let probe = std::path::Path::new(r"C:\System Volume Information");
+        if !probe.exists() {
+            return;
+        }
+        let sid = make_sid(TEST_SID);
+        let err = grant_access(&sid, &[grant_entry(probe.to_path_buf(), "allow:test")], None)
+            .expect_err("a grant the supervisor cannot apply must refuse the session");
+        assert!(
+            format!("{err}").contains("refusing the session"),
+            "the refusal must say so, got: {err}"
+        );
     }
 
     /// PSID from a SID string (leaks on purpose; tests are short-lived).

@@ -985,9 +985,14 @@ fn run_appcontainer_session(req: &backend::SessionRequest<'_>) -> Result<i32> {
     // this run's journal. Failure to open is a warning only — the run
     // proceeds unjournaled.
     let journal_dir = sandbox::dacl_journal::default_dir();
+    // The closure answers "is this journal's OWNER alive". A `!` here used
+    // to mean recover_orphans KEPT journals of dead processes and REAPED the
+    // journals of LIVE runs - a concurrent session on the shared cwd lost its
+    // DACLs (its ACEs were restored out from under it) while old crashes
+    // littered the store. Observed 2026-11-11; S-13 was the visible edge.
     sandbox::dacl_journal::recover_orphans(
         &journal_dir,
-        &|h| !sandbox::dacl_journal::is_process_alive(h.owner_pid, h.owner_created),
+        &|h| sandbox::dacl_journal::is_process_alive(h.owner_pid, h.owner_created),
         &|j| sandbox::appcontainer::restore_or_warn(j),
     );
     let run_journal = match sandbox::dacl_journal::DaclJournal::open(
