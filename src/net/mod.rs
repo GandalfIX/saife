@@ -7,6 +7,9 @@ pub mod matcher;
 /// default backend (P3 flips it).
 #[cfg(feature = "mxc-backend")]
 pub mod mxc;
+/// S-3: which process owns a proxied connection, evidence only until S-4
+/// consumes it.
+pub mod owner;
 pub mod profile;
 pub mod prompt;
 pub mod proxy;

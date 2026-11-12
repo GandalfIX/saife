@@ -128,6 +128,7 @@
             false,
             None,
             None,
+            &crate::net::owner::SocketOwner::Unknown,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -164,6 +165,7 @@
             false,
             None,
             None,
+            &crate::net::owner::SocketOwner::Unknown,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -192,6 +194,7 @@
             true,
             None,
             None,
+            &crate::net::owner::SocketOwner::Unknown,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -229,6 +232,7 @@
             false,
             Some(12),
             None,
+            &crate::net::owner::SocketOwner::Unknown,
         )
         .unwrap();
         emit_connect(
@@ -242,6 +246,7 @@
             false,
             None,
             None,
+            &crate::net::owner::SocketOwner::Unknown,
         )
         .unwrap();
         let path = crate::audit::audit_log_path(&sid);
@@ -1495,6 +1500,36 @@
         assert_eq!(ev["disposition"], "deny");
         assert_eq!(ev["source"], "hard-deny");
         assert_eq!(ev["reason"], "loopback_refused");
+    }
+
+    #[test]
+    fn connect_leaf_records_the_owning_process() {
+        // S-3: the measurement rides the leaf of a real connection. The
+        // client here is THIS test process - and the test process is the
+        // saife binary itself - so the identity is `self`, exactly the
+        // classification that must never pass for a workload.
+        let (dialog, _calls) = recording_dialog(Ok(deny_once_result()));
+        let t = t36_setup("owner-leaf", &[], &[], dialog);
+        let resp = exchange(t.port, &connect_req("127.0.0.1:5432"));
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["reason"], "loopback_refused");
+        assert_eq!(
+            ev["socket_owner"]["status"], "self",
+            "a supervisory self-connection is never a workload identity: {ev}"
+        );
+        assert!(
+            ev["socket_owner"].get("pid").is_none(),
+            "`self` carries no PID - the status is the fact, the number is noise: {ev}"
+        );
+
+        // The credential-less refusals carry it too: the measurement happens
+        // before the token gate, so every leaf of this connection agrees.
+        let denied = exchange(t.port, &connect_req_no_auth("127.0.0.1:5432"));
+        assert!(denied.starts_with("HTTP/1.1 407"), "got: {denied}");
+        let ev = last_connect_event(&t.sid);
+        assert_eq!(ev["reason"], "no_token");
+        assert_eq!(ev["socket_owner"]["status"], "self", "got: {ev}");
     }
 
     #[test]

@@ -395,6 +395,10 @@ impl ConnCtx {
                     Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
                     // A trailing aggregate is not one request (M8).
                     None,
+                    // S-3: the aggregate's suppressed refusals came from
+                    // many connections, some long closed - no owner can
+                    // be measured for a leaf that stands for several.
+                    &crate::net::owner::SocketOwner::Unknown,
                 );
             }
         }
@@ -427,6 +431,10 @@ fn emit_connect(
     // single request (the credential-less refusal budgets, a trailing
     // aggregate).
     req_id: Option<u64>,
+    // S-3: which binary held this connection, as measured from the kernel
+    // TCP table while the connection was live. Evidence only; `unknown` is
+    // the honest shape for a gap and never changes the decision.
+    owner: &crate::net::owner::SocketOwner,
 ) -> Result<()> {
     use serde_json::{Map, json};
     let mut e = Map::new();
@@ -451,6 +459,7 @@ fn emit_connect(
     // M8: the request this leaf belongs to; `null` for a leaf that is not one
     // request. A first-class integer, never packed into `scope`.
     e.insert("req_id".into(), json!(req_id));
+    e.insert("socket_owner".into(), owner.audit_value());
     writer.append(e)?;
     Ok(())
 }
@@ -1516,7 +1525,14 @@ fn denied_by(reason: DenyReason) -> Decision {
 /// M8: `req_id` correlates the leaves one request produces - the admission
 /// `allow` and a later post-dial `deny` share it, so `audit show` can report
 /// the request's TERMINAL disposition instead of counting both.
-fn emit_decision(writer: &AuditWriter, host: &str, port: u16, d: &Decision, req_id: Option<u64>) {
+fn emit_decision(
+    writer: &AuditWriter,
+    host: &str,
+    port: u16,
+    d: &Decision,
+    req_id: Option<u64>,
+    owner: &crate::net::owner::SocketOwner,
+) {
     let _ = emit_connect(
         writer,
         host,
@@ -1529,6 +1545,7 @@ fn emit_decision(writer: &AuditWriter, host: &str, port: u16, d: &Decision, req_
         // A decision is one request: nothing is suppressed about it.
         None,
         req_id,
+        owner,
     );
 }
 
@@ -2179,6 +2196,13 @@ async fn respond_upstream_error(sock: &mut TcpStream, body: &str) {
 /// Handle one client connection: token gate, then either the CONNECT
 /// pipeline (D-1) or the /sandbox/* routing (D-4).
 async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
+    // S-3: measure WHO held this connection while the row still exists - a
+    // client can close between here and the decision, and a table lookup on a
+    // dead connection reads `unknown`. Evidence only: the value rides the
+    // audit leaves this connection produces and answers no decision itself.
+    // `(peer, local)`: the kernel table names the row from the CLIENT's side.
+    let owner =
+        crate::net::owner::SocketOwner::measure(sock.peer_addr().ok(), sock.local_addr().ok());
     // Read the request head (up to 8 KiB, terminated by \r\n\r\n). Bytes
     // past the terminator may be a request body — `head_end` keeps them
     // apart so the intent endpoints can read them.
@@ -2259,6 +2283,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         None,
                         // A credential-less refusal is not one request (M8).
                         None,
+                        &owner,
                     );
                 }
                 RefusalLeaf::Aggregate { suppressed } => {
@@ -2286,6 +2311,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
                         // An aggregate is not one request (M8).
                         None,
+                        &owner,
                     );
                 }
                 RefusalLeaf::Nothing => {}
@@ -2334,6 +2360,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         None,
                         // A credential-less refusal is not one request (M8).
                         None,
+                        &owner,
                     );
                 }
                 RefusalLeaf::Aggregate { suppressed } => {
@@ -2349,6 +2376,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
                         Some(u32::try_from(suppressed).unwrap_or(u32::MAX)),
                         // An aggregate is not one request (M8).
                         None,
+                        &owner,
                     );
                 }
                 RefusalLeaf::Nothing => {}
@@ -2365,7 +2393,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     let req_id = ctx.next_request_id();
 
     if method != "CONNECT" {
-        return handle_non_connect(sock, ctx, method, target, head, leftover).await;
+        return handle_non_connect(sock, ctx, method, target, head, leftover, owner).await;
     }
 
     // (1) Parse host:port from the CONNECT target.
@@ -2421,11 +2449,11 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
         // Audit BEFORE responding: the append is synchronous, so whoever
         // observes the 403 also observes the event (no flush ordering to
         // guess).
-        emit_decision(&ctx.writer, &host, port, &decision, Some(req_id));
+        emit_decision(&ctx.writer, &host, port, &decision, Some(req_id), &owner);
         respond_deny(&mut sock, &host, port, &decision).await?;
         return Ok(());
     }
-    emit_decision(&ctx.writer, &host, port, &decision, Some(req_id));
+    emit_decision(&ctx.writer, &host, port, &decision, Some(req_id), &owner);
 
     // Admission done — dial (Step 2): chained through the upstream
     // proxy, or DNS-pinned + Happy Eyeballs on the direct path.
@@ -2441,7 +2469,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
     let mut upstream_stream = match dialed {
         Ok(s) => s,
         Err(DialFailure::Denied(d)) => {
-            emit_decision(&ctx.writer, &host, port, &d, Some(req_id));
+            emit_decision(&ctx.writer, &host, port, &d, Some(req_id), &owner);
             respond_deny(&mut sock, &host, port, &d).await?;
             return Ok(());
         }
@@ -2463,7 +2491,14 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
             // admission leaf — consumers must not assume the pair is
             // universal.
             eprintln!("[proxy] upstream chaining to {host}:{port} via {endpoint} failed: {error}");
-            emit_decision(&ctx.writer, &host, port, &upstream_error_decision(), Some(req_id));
+            emit_decision(
+                &ctx.writer,
+                &host,
+                port,
+                &upstream_error_decision(),
+                Some(req_id),
+                &owner,
+            );
             respond_upstream_error(&mut sock, &body).await;
             return Ok(());
         }
@@ -3571,6 +3606,7 @@ async fn handle_forward(
     target: &str,
     head: &str,
     leftover: &[u8],
+    owner: crate::net::owner::SocketOwner,
 ) -> Result<()> {
     // M8: one id per connection, exactly as the CONNECT leg issues one. The
     // facade denial leaves and the decision leaves for this request share it.
@@ -3809,11 +3845,25 @@ async fn handle_forward(
 
     let decision = decide(&ctx, &fwd.host, fwd.port).await;
     if !decision.allowed {
-        emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision, Some(req_id));
+        emit_decision(
+            &ctx.writer,
+            &fwd.host,
+            fwd.port,
+            &decision,
+            Some(req_id),
+            &owner,
+        );
         respond_deny(&mut sock, &fwd.host, fwd.port, &decision).await?;
         return Ok(());
     }
-    emit_decision(&ctx.writer, &fwd.host, fwd.port, &decision, Some(req_id));
+    emit_decision(
+        &ctx.writer,
+        &fwd.host,
+        fwd.port,
+        &decision,
+        Some(req_id),
+        &owner,
+    );
 
     let mut upstream = match dial_upstream(
         ctx.upstream.as_deref(),
@@ -3827,7 +3877,7 @@ async fn handle_forward(
     {
         Ok(stream) => stream,
         Err(DialFailure::Denied(d)) => {
-            emit_decision(&ctx.writer, &fwd.host, fwd.port, &d, Some(req_id));
+            emit_decision(&ctx.writer, &fwd.host, fwd.port, &d, Some(req_id), &owner);
             respond_deny(&mut sock, &fwd.host, fwd.port, &d).await?;
             return Ok(());
         }
@@ -3848,7 +3898,14 @@ async fn handle_forward(
                 "[proxy] upstream chaining to {}:{} via {endpoint} failed: {error}",
                 fwd.host, fwd.port
             );
-            emit_decision(&ctx.writer, &fwd.host, fwd.port, &upstream_error_decision(), Some(req_id));
+            emit_decision(
+                &ctx.writer,
+                &fwd.host,
+                fwd.port,
+                &upstream_error_decision(),
+                Some(req_id),
+                &owner,
+            );
             respond_upstream_error(&mut sock, &body).await;
             return Ok(());
         }
@@ -3966,12 +4023,13 @@ async fn handle_non_connect(
     target: &str,
     head: &str,
     leftover: &[u8],
+    owner: crate::net::owner::SocketOwner,
 ) -> Result<()> {
     // Absolute-form is a proxy consultation: admit it, then forward. An
     // origin-form target starts with `/` and can never contain `://`, so
     // this cannot capture a control-plane request.
     if !target.starts_with('/') && target.contains("://") {
-        return handle_forward(sock, ctx, method, target, head, leftover).await;
+        return handle_forward(sock, ctx, method, target, head, leftover, owner).await;
     }
     if !target.starts_with("/sandbox/") {
         write_response(&mut sock, "400 Bad Request", "", "").await;
