@@ -79,9 +79,10 @@ skip = [
     # syn 2 is required by the windows 0.62 proc-macro crates and tokio-macros;
     # syn 3 is what clap/serde/thiserror derive on. Neither generation can go.
     { crate = "syn@2.0.119", reason = "required by windows 0.62 / tokio-macros proc-macros; the rest of the tree is on syn 3" },
-    # three windows-sys generations across the tree: ring pins 0.52, mxc-sdk's
-    # winreg pins 0.59, the tokio/anstyle generation is on 0.61.
-    { crate = "windows-sys@0.52.0", reason = "pinned by ring" },
+    # two windows-sys generations remain across the tree: mxc-sdk's winreg
+    # pins 0.59, the tokio/anstyle generation is on 0.61. (ring used to pin
+    # 0.52 as well; an update dropped that requirement - the skip entry came
+    # out the same day.)
     { crate = "windows-sys@0.59.0", reason = "pinned by mxc-sdk's winreg 0.55" },
 ]
 
