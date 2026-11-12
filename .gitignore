@@ -16,6 +16,9 @@
 /tests/vm/build-config*.json
 /dist/
 /target-static/
+# cargo-mutants writes its report here (outcomes.json, per-mutant diffs and logs,
+# megabytes of it) - a local artefact, never committed.
+/mutants.out/
 /*.zip
 .worktrees/
 # Python bytecode from the plugin sidecars' tests

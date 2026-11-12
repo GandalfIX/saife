@@ -20,6 +20,17 @@ Two things the default build order will trip you on:
 - **The VM lane is local on purpose.** `tests/vm/` needs Hyper-V and a guest
   image; CI cannot run it. A green CI run does not replace it.
 
+A fresh machine sets itself up with `pwsh -File start-develop.ps1 -Install` (build
+prerequisites plus the analysis tools; never elevated). Before opening the pull
+request, run the local analysis pass — details and the failure playbook in
+`docs/DEVELOPERS.md`, §4:
+
+```powershell
+cargo deny check                        # advisories, licenses, duplicates (deny.toml)
+cargo shear                             # unused dependencies
+cargo mutants --list --file src/signing.rs   # then drop --list to actually run it
+```
+
 ## House rules
 
 - **Tests first.** Write the failing test, watch it fail for the right reason,

@@ -232,6 +232,24 @@ It never elevates: a step that needs administrator rights is printed with a note
 Then go to [Build](#build); the contributor conventions (CRLF, no repo-wide
 `cargo fmt`, the two feature states) are in `docs/DEVELOPERS.md`.
 
+## Developer setup: one command
+
+`start-develop.ps1` runs both prerequisite layers, reports what is present, and offers
+to install anything missing (never elevated, nothing to undo):
+
+```powershell
+pwsh -File start-develop.ps1            # report: build prerequisites + analysis tools
+pwsh -File start-develop.ps1 -Install   # ask before installing each missing item
+pwsh -File start-develop.ps1 -Json      # one merged machine-readable payload
+```
+
+Layer 1 is `packaging/check-prereqs.ps1` (Rust, MSVC, Windows SDK, pwsh, git — see
+above). Layer 2 is `packaging/check-devtools.ps1`: `cargo-deny` (the supply-chain
+gate, config in `deny.toml`), `cargo-mutants` (mutation testing of the
+security-critical units) and `cargo-shear` (unused dependencies). All three install
+with `cargo install` into `%USERPROFILE%\.cargo\bin`, are free, and are permissively
+licensed. The commands they run are in `docs/DEVELOPERS.md`, §4.
+
 ## Backends and privileges
 
 `--backend mxc` (the default) runs the

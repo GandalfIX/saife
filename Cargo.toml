@@ -60,14 +60,7 @@ windows = { version = "0.62", features = [
     "UI_Notifications",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-native-certs = "0.8"
 tokio-util = "0.7"
-http = "1"
-http-body-util = "0.1"
-bytes = "1"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
 sha2 = "0.10"
 # L-L: used directly to wrap intermediate key bytes in `Zeroizing`. The
@@ -89,6 +82,17 @@ mxc-sdk = { version = "=1.0.1", optional = true }
 # only: nothing links it, and a host without the Windows SDK degrades to a
 # warning rather than a failed build.
 winresource = "0.1"
+
+# cargo-shear (packaging/check-devtools.ps1 installs it) is the unused-dependency
+# gate. The tree carries zero `ignored` crate entries: every dependency declared
+# here is imported. When the F-2 TLS/credential work (credential termination at
+# the proxy - see the "MVP DEVIATION" note at the top of src/net/proxy.rs) needs
+# the rustls/hyper/http chain again, redeclare it exactly when the first import
+# lands.
+[package.metadata.cargo-shear]
+# The wbd-d03 SDK spike binary under tests/vm/spikes is a deliberately standalone
+# throwaway; it is not linked into this crate.
+ignored-paths = ["tests/vm/spikes/**"]
 
 
 [features]
