@@ -1,0 +1,78 @@
+# Mutation-testing triage: what the evidence says and what we do about it
+
+Status: **analysis complete, implementation in progress on `test/mutant-gaps`**
+(not merged; branch only). Evidence captured 2026-11-12 with cargo-mutants 27.1.0.
+
+## The evidence and its limits
+
+- `cargo mutants` ran in the **main checkout on branch `chore/teardown-scenarios`**
+  (tree `06b9d43` + one uncommitted `dacl_journal.rs` edit). That tree is **not**
+  `origin/main`: `main` has 7 newer commits and `profile.rs` alone differs by
+  ~850 lines. The survivor list is therefore a **hypothesis**, not a verdict;
+  every lane below re-baselines against current `main` with a fresh scoped run.
+- The run evaluated **478 of ~1,300 mutants** and was stopped partway
+  (`runner/docker.rs`, `sandbox/*` were never reached).
+- The per-mutant logs prove the harness was sound: the full test suite
+  (921 tests on that tree) ran against every mutant, and the baseline passed.
+  The survivors are **real assertion gaps**, not tooling failure.
+- Headline numbers on the evaluated subset: **461 missed (96%), 1 caught,
+  16 timeouts**.
+
+## Classification of the 461 survivors + 16 timeouts
+
+| Class | missed | timeout | Decision |
+|---|---|---|---|
+| pure logic, no test asserts it | 393 | 16 | **tests** — highest-value first: CONNECT/URL parsing, path canonicalisation, audit timestamps, session budget |
+| OS/FFI-bound (DPAPI, drive grants, elevation, env probes) | 35 | 0 | **exclude with written reason** — unit tests cannot create the OS state; the VM/host lanes cover these |
+| GUI (TaskDialog, toast, warn-once) | 16 | 0 | **exclude with written reason** — no dialog backend in unit tests |
+| CLI dispatch wrappers (`*_cmd`, `run_show`, `run_verify`, `main`) | 10 | 0 | **tests where cheap** (call the function with args, assert exit code); remainder documented |
+| `fmt`/`Display`/`Debug` impls | 4 | 0 | **tests** for error-message surfaces (product contract: "informative refusals"), exclude the cosmetic rest |
+| `Drop`/`close`/lifecycle | 3 | 0 | **exclude with written reason** — resource release is unobservable in unit tests |
+| timeouts (mutation makes the suite hang) | — | 16 | **manual look** — a hang mutant often marks a real unbounded-loop condition near that code |
+
+Largest single files in the evaluated set: `net/proxy.rs` (87), `main.rs` (56),
+`profile.rs` (56), `setup.rs` (40), `bin/dirprobe.rs` (32), `audit/mod.rs` (32),
+`net/mxc.rs` (29), `net/prompt.rs` (24).
+
+## Policy decided
+
+1. **No new dependency for annotations.** `#[mutants::skip]` would require the
+   `mutants` crate as a dependency — rejected for supply-chain reasons. Exclusions
+   live in `.cargo/mutants.toml` via `exclude_re` (mutant-name regex) /
+   `exclude_globs`, one written reason per entry. The file is the single
+   exception register; without a reason, an exclusion is rejected in review.
+2. **Tests assert observable behaviour**, never mirror the implementation. Every
+   new test must be proven to kill its mutant by a scoped `cargo mutants --file
+   <file>` run on the branch, not by reading the code.
+3. **Exclusions are for mutants a unit test cannot observe** (needs elevation, a
+   real container, a dialog backend, or a resource to leak). Everything else
+   either gets a test or stays on the books as named debt in the per-lane
+   reports — silently dropping a survivor is forbidden.
+4. **Timeouts are manual cases**: a mutation that hangs the suite often marks a
+   real unbounded path (e.g. `find_head_end` in the HTTP head parser). Each gets
+   looked at, not auto-excluded.
+5. **Per-module campaigns**, not one big-bang: the register keeps the gate
+   honest per file; each follow-up PR raises one module's kill rate and moves
+   its remainder into the register or the debt list.
+
+## Work split (four lanes, disjoint files, each on its own branch off `main`)
+
+| Lane | Files | Branch |
+|---|---|---|
+| audit + signing + security_groups + cli | `src/audit/**`, `src/signing.rs`, `src/security_groups.rs`, `src/cli.rs` | `test/mutant-audit` |
+| profile + net glue | `src/profile.rs`, `src/net/{mod,learned,intent,upstream,mxc}.rs` | `test/mutant-net` |
+| proxy parsers | `src/net/proxy.rs` (+ its test module) | `test/mutant-proxy` |
+| orchestration + CLI + bins | `src/main.rs` + `src/tests.rs`, `src/bin/*`, `src/setup.rs`, `src/backend/*`, `src/plugin/mod.rs`, `src/net/prompt.rs`, `src/runner/mod.rs` | `test/mutant-orchestration` |
+
+Each lane: re-baseline survivors on current `main` → write tests / propose
+exclusions → prove kills → report per-file before/after counts.
+
+## What lands on `test/mutant-gaps`
+
+- this document (updated with the lanes' final numbers),
+- `.cargo/mutants.toml` exclusion register (assembled from the lanes' verified
+  candidates),
+- the lanes' test commits, merged in,
+- gates: both feature states green, clippy 0, `cargo deny`/`cargo shear` green,
+  and a fresh full-run kill-rate comparison on the branch as the closing
+  measurement.
