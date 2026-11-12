@@ -19,10 +19,10 @@
 //! before any bytes flow upstream). This satisfies every US-3 AC (they
 //! assert on the CONNECT line and the connection outcome, not on where TLS
 //! terminates). Terminating TLS at the proxy is future work tied to
-//! credential injection (F-2). rustls + rustls-native-certs are in
-//! Cargo.toml but unused in the MVP; they'll be wired in when F-2 lands.
-//! Likewise `hyper`, `hyper-util`, `http`, `http-body-util`, and `bytes`
-//! are present as deps for that future work and are NOT imported here.
+//! credential injection (F-2); the rustls / hyper / http dependency chain that
+//! work needs is deliberately NOT declared yet — `cargo shear` keeps
+//! Cargo.toml honest, so those crates get added together with their first
+//! import.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

@@ -198,7 +198,7 @@ outside the user profile. CI does not run them: they are the contributor's pre-P
 | Command | What it checks | What you should see |
 |---|---|---|
 | `cargo deny check` | RustSec advisories, license policy, duplicate/banned crates, dependency sources (`deny.toml` is the policy) | `advisories ok, bans ok, licenses ok, sources ok` |
-| `cargo shear` | dependencies declared but never imported (`Cargo.toml` `[package.metadata.cargo-shear]` holds the written exceptions) | `✓ no issues found` |
+| `cargo shear` | dependencies declared but never imported; the only written exception is the spike path in `Cargo.toml` `[package.metadata.cargo-shear]` | `✓ no issues found` |
 | `cargo mutants --file src/<file>.rs` | whether the unit tests of one file catch changed behaviour; every surviving mutant is a test gap | `N mutants tested: M survived` — triage each survivor (drop `--file` for the whole crate; add `--list` to just see what would run) |
 
 If `cargo deny check` fails:

@@ -28,16 +28,16 @@ ignore = []
 [licenses]
 # Everything in Cargo.lock today is permissive; this list is the union of the SPDX
 # identifiers those crates declare (LGPL-2.1-or-later appears only inside an OR
-# expression, which MIT satisfies, so it needs no entry). Two identifiers that show
-# up only inside OR-expressions are deliberately absent, because no crate NEEDS
-# them - allowing them would hide a future crate that is only LLVM-exception or
-# only BSD-1-Clause licensed:
+# expression, which MIT satisfies, so it needs no entry). Three identifiers that
+# show up only inside OR-expressions (or vanished with pruned dependencies) are
+# deliberately absent, because no crate NEEDS them - allowing them would hide a
+# future crate that is licensed under one of them:
 #   "Apache-2.0 WITH LLVM-exception"   (appears as one arm of an OR today)
 #   "BSD-1-Clause"                     (appears as one arm of an OR today)
+#   "ISC"                              (removed with the pruned rustls chain; re-add when a crate needs it)
 allow = [
     "Apache-2.0",
     "BSD-3-Clause",
-    "ISC",
     "MIT",
     "Unicode-3.0",
     "Unlicense",
