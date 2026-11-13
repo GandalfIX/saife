@@ -17,8 +17,10 @@
 /dist/
 /target-static/
 # cargo-mutants writes its report here (outcomes.json, per-mutant diffs and logs,
-# megabytes of it) - a local artefact, never committed.
+# megabytes of it) - a local artefact, never committed. `--iterate` keeps the
+# previous results under mutants.out.old, so both names are ignored.
 /mutants.out/
+/mutants.out.old/
 /*.zip
 .worktrees/
 # Python bytecode from the plugin sidecars' tests
