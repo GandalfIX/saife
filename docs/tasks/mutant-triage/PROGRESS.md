@@ -22,18 +22,29 @@ overwrite this section when they finish.
 
 ## Survivors fixed on this branch
 
+Proven on the branch itself with scoped `--iterate` runs (the audit proof run
+went **10 missed -> 6 caught + 4 excluded = 0 missed**):
+
 | Mutation (proven by scoped run only after the baseline completes) | Fix |
 |---|---|
 | `audit/mod.rs` iso8601 date arithmetic + `-> "xyzzy"` | `iso8601_utc` split into clock-free `iso8601_from_unix`; known-value test (epoch edges, leap days incl. the 2000 century one) |
-| `civil_from_days` arithmetic | table extended: pre-epoch, era boundary, non-leap century, month rollovers |
+| `civil_from_days` arithmetic, incl. the negative-era branch | table extended: pre-epoch, era boundary, non-leap century, month rollovers, ISO-year-0 leap day |
 | `AuditWriter::open_at` `seq > 0` -> `>=` | test: a NEW chain (`seq == 0`) must keep a stale `<sid>.root`; H5b only drops it for a continuation |
+| `open_at` NotFound tolerance (3 mutants) | a continuation WITHOUT a root pair opens; a stale pair that is a DIRECTORY refuses a strict continuation |
 | `Filter::parse` `idx + 1` -> `idx - 1` | test: `req_id=7` matches the number 7 (not `"=7"`) |
 | `ordered_match` `Op::Lte` arms / `!=` boundary | test: `<=`/`>=` include equality for `ts` and integers |
 | `show_profile_inner` `retain(!allow)` delete | step extracted as `drop_readonly_duplicated_by_allow`; test: an allow-listed group grant disappears from `read_only` |
-| `resolve_network_with` `name != "none"` -> `==` | **exclusion candidate**: the mutant only silences a stderr warning that cannot be reached for the "none" profile; an in-process test cannot observe stderr |
+| `render_summary` deny split, two denial shapes, half-committed pair | counted split (2 allowed + 1 denied breaks the symmetric false-green), CONNECT vs fs denial rendering, root-without-signature is ABSENT/NOT COMMITTED |
+| `truncate_for_error`, `run_show`/`run_verify` exit codes, `holder_is_alive` created==0, `validate_session_id` length boundary, `session_start` accessors | each pinned to its observable contract |
+| `net/proxy.rs` `rfc3339_utc` date arithmetic | the duplicate civil-date algorithm DELETED: `rfc3339_utc` now calls `crate::audit::civil_from_days` (one implementation, two callers) |
+| `percent_decode` grammar (~25 mutants) | table: both hex cases, `%2b` vs `+`, truncated/non-hex/dangling escapes verbatim, adjacent escapes |
+| `parse_connect_target` / `split_authority` refusals | bad port, port 0, overflow, empty host, userinfo, unbracketed IPv6 |
+| `find_head_end` (was a TIMEOUT), `head_framing_error`, `head_lines`, `relayed_response_head` | framing table: offset past CRLFCRLF, bare CR/LF, obs-fold, CRLF-only split, status line kept while proxy-hop fields are stripped |
+| `interleave_families` `||` -> `&&` | **exclusion (equivalent)**, documented in `.cargo/mutants.toml` |
 
-Remaining from the re-baseline arrives with the running job, then the same
-test-or-exclude pass continues per file.
+Exclusion register (`.cargo/mutants.toml`), every entry with a written reason:
+clock-free wrapper, cwd-isolated branch, non-183 lock error, stderr-only
+warning, the interleave equivalence.
 
 ## The evidence and its limits
 
