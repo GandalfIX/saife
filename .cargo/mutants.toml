@@ -43,4 +43,47 @@ exclude_re = [
     # concatenation. The interleaving itself IS asserted by
     # `interleave_families_alternates_and_keeps_order`.
     "^src/net/proxy.rs:1286:22: ",
+
+    # The object guard on the intent endpoints is subsumed by the field
+    # validation behind it: a body that is not a JSON object has no "target"
+    # and no "reason", so the mutant answers the same 400 as the guard for
+    # every body. No input produces a different response.
+    " in intent_(record|explain)$",
+
+    # Warn-once bookkeeping: both mutants change only whether an eprintln
+    # fires (once vs not at all). stderr is not observable from an
+    # in-process unit test, and the audit event the warning accompanies is
+    # asserted separately.
+    " in warn_(no_dialog|prompt_budget)_once$",
+
+    # Diagnostic Debug impl: it deliberately elides the closure (`(..)`), so
+    # its only contract is "prints something"; asserting a diagnostic
+    # rendering would pin a format that carries no behaviour.
+    "LaunchResetHook>::fmt",
+
+    # Drop/session-lifecycle hooks: `Drop for LiveTokenClaim` releases the
+    # claim slot and `ProxyHandle::shutdown` cancels the listener. Both are
+    # observed only across listener lifetimes (a served request that must
+    # stop accepting), not from inside one test; the teardown paths they
+    # guard are exercised by every spawn test.
+    "LiveTokenClaim>::drop|ProxyHandle::shutdown",
+
+    # OS resolver wrapper: the mutant returns a different Vec for the same
+    # host on the host's own stack; the wrapper's contract (pass through the
+    # resolver's answers) is only assertable against a fake lookup, which is
+    # already the seam the DNS tests use.
+    " in system_lookup$",
+
+    # Equivalent: the mutant widens the bracket flag `starts_with('[') &&
+    # ends_with(']')` to `||`. The flag is consumed only by
+    # `host.contains(':') && !bracketed`, and for every input the two
+    # compositions agree: when either flag form is true-but-should-be-false
+    # the host has no ':' left after the port split, so the guard that would
+    # use the lie never fires.
+    "replace && with \|\| in parse_connect_target$",
+
+    # Equivalent: the status line is never an empty line and never a
+    # hop-by-hop field name, so `index > 0` and `index >= 0` strip exactly the
+    # same lines for every response the head parser admits.
+    "replace > with >= in relayed_response_head$",
 ]

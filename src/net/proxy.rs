@@ -1719,33 +1719,7 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
         let allow = matches!(outcome, PromptOutcome::Decided(PromptResult::Allow { .. }));
         persisted = record_learned(ctx, host, scope, suffix.as_deref(), allow);
     }
-    let reason = match &outcome {
-        PromptOutcome::Decided(PromptResult::Deny { .. }) => Some("denied by user".into()),
-        PromptOutcome::Decided(PromptResult::NeedsIntent) => {
-            Some("user requested a fuller intent (explain more)".into())
-        }
-        // P2.1 review: the two pools are different facts, so the denial names
-        // which one ran out instead of reporting a concurrency limit for a
-        // session whose dialogs are merely unanswered.
-        PromptOutcome::Overloaded { cause } => Some(overload_reason(*cause).into()),
-        // P2.1: a spent budget and a backend that could not show a dialog are
-        // distinct reasons a reader can act on — the first says this session's
-        // prompt term was consumed (the supervisor budgets the container around
-        // it), the second says the machine has no dialog at all.
-        PromptOutcome::Unavailable {
-            allowed: false,
-            cause,
-        } => Some(match cause {
-            UnavailableCause::BudgetElapsed => PROMPT_TIMEOUT_REASON.into(),
-            // Item 8: the two arming causes keep their own strings. A suppressed
-            // budget is not a missing backend — the dialog was shown and nobody
-            // answered it — and an operator greps exactly this.
-            UnavailableCause::SuppressedAfterBudget => PROMPT_SUPPRESSED_REASON.into(),
-            UnavailableCause::NoDialogBackend => NO_DIALOG_BACKEND_REASON.into(),
-            UnavailableCause::CallerGone => "prompt unavailable (caller gone)".into(),
-        }),
-        _ => None,
-    };
+    let reason = outcome_reason(&outcome);
     Decision {
         allowed: audit.allowed,
         source: audit.source,
@@ -1753,6 +1727,28 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
         persisted,
         reason,
         intent_hint: matches!(outcome, PromptOutcome::Decided(PromptResult::NeedsIntent)),
+    }
+}
+
+/// The refusal `reason` an outcome carries, kept pure so the mapping is
+/// unit-testable: it lived inline in the 130-line `prompt_default`, behind the
+/// coordinator call and the learned-store write, where no test could reach it.
+/// `None` means "no reason to report" (an allowed request, or an outcome that
+/// carries its own audit fields instead).
+fn outcome_reason(outcome: &PromptOutcome) -> Option<String> {
+    match outcome {
+        PromptOutcome::Decided(PromptResult::Deny { .. }) => Some("denied by user".into()),
+        PromptOutcome::Decided(PromptResult::NeedsIntent) => {
+            Some("user requested a fuller intent (explain more)".into())
+        }
+        PromptOutcome::Overloaded { cause } => Some(overload_reason(*cause).into()),
+        PromptOutcome::Unavailable { allowed: false, cause } => Some(match cause {
+            UnavailableCause::BudgetElapsed => PROMPT_TIMEOUT_REASON.into(),
+            UnavailableCause::SuppressedAfterBudget => PROMPT_SUPPRESSED_REASON.into(),
+            UnavailableCause::NoDialogBackend => NO_DIALOG_BACKEND_REASON.into(),
+            UnavailableCause::CallerGone => "prompt unavailable (caller gone)".into(),
+        }),
+        _ => None,
     }
 }
 

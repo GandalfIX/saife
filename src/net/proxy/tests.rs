@@ -7424,3 +7424,91 @@
         assert_eq!(first, 1, "ids are 1-based");
         assert_eq!(second, 2, "ids increase by one: {first} then {second}");
     }
+    /// Discriminators for the framing variants: a trailing lone CR is the only
+    /// shape where `index + 1 < len` and its widened variants differ, and a
+    /// bracket with no port after `]` is where the default-port guard can lie.
+    #[test]
+    fn framing_variants_have_a_discriminating_input() {
+        // A trailing lone CR: the final iteration must see it as the remainder,
+        // never index past the buffer (the `<` and `<=` loop variants part here).
+        let lines = head_lines(b"A\r\n\r");
+        assert_eq!(lines.len(), 2, "the trailing lone CR is its own remainder line");
+        assert_eq!(String::from_utf8_lossy(lines[1]), "\r");
+
+        // `[::1]junk` has a bracket but the bytes after `]` are no port: the
+        // default-port branch must not claim them.
+        assert_eq!(split_authority("[::1]junk"), None);
+    }
+
+    /// The outcome-to-reason mapping is what an operator greps (the audit
+    /// `reason` field): each outcome class keeps its own string, and an
+    /// allowed request has none.
+    #[test]
+    fn every_outcome_class_keeps_its_reason() {
+        let deny = PromptOutcome::Decided(PromptResult::Deny {
+            persist: false,
+            scope: "host".into(),
+            suffix: None,
+        });
+        assert_eq!(outcome_reason(&deny).as_deref(), Some("denied by user"));
+
+        let explain = PromptOutcome::Decided(PromptResult::NeedsIntent);
+        assert_eq!(
+            outcome_reason(&explain).as_deref(),
+            Some("user requested a fuller intent (explain more)")
+        );
+
+        let allow = PromptOutcome::Decided(PromptResult::Allow {
+            persist: false,
+            scope: "host".into(),
+            suffix: None,
+        });
+        assert_eq!(outcome_reason(&allow), None, "an allow carries no refusal reason");
+
+        let budget = PromptOutcome::Unavailable {
+            allowed: false,
+            cause: UnavailableCause::BudgetElapsed,
+        };
+        assert_eq!(
+            outcome_reason(&budget).as_deref(),
+            Some(PROMPT_TIMEOUT_REASON),
+            "a spent budget names its own reason, not the no-dialog one"
+        );
+
+        let no_dialog = PromptOutcome::Unavailable {
+            allowed: false,
+            cause: UnavailableCause::NoDialogBackend,
+        };
+        assert_eq!(
+            outcome_reason(&no_dialog).as_deref(),
+            Some(NO_DIALOG_BACKEND_REASON)
+        );
+    }
+
+    /// A lookup that answers "no addresses" is a DNS FAILURE decision (audit
+    /// source `dns`), not a generic upstream failure: the empty result is
+    /// refused before any dial loop, so the session's leaf says what actually
+    /// happened.
+    #[tokio::test]
+    async fn dial_upstream_refuses_a_resolution_with_no_addresses() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::dial_upstream(None, "empty.example", 443, false, false, |_host, _port| {
+                async { Ok(Vec::<SocketAddr>::new()) }
+            }),
+        )
+        .await
+        .expect("the empty-answer refusal is decided without awaiting a dial");
+        match result {
+            Err(super::DialFailure::Denied(d)) => {
+                assert_eq!(d.source, "dns");
+                assert!(
+                    d.reason.as_deref().unwrap_or("").contains("no addresses"),
+                    "the reason names the empty answer: {:?}",
+                    d.reason
+                );
+            }
+            Err(_) => panic!("expected a Denied (dns) dial failure for an empty answer"),
+            Ok(_) => panic!("an empty answer must never reach a dial"),
+        }
+    }
