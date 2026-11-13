@@ -1,7 +1,39 @@
 # Mutation-testing triage: what the evidence says and what we do about it
 
-Status: **analysis complete, implementation in progress on `test/mutant-gaps`**
-(not merged; branch only). Evidence captured 2026-11-12 with cargo-mutants 27.1.0.
+Status: **re-baselined on `main`; first fixes landed on `test/mutant-gaps`**
+(branch only, no PR).
+
+## Correction: the first evidence was stale
+
+The 461-survivor figure came from a tree (`06b9d43`, branch
+`chore/teardown-scenarios`) that is 7 commits behind `main`. A fresh baseline on
+current `main` for the same lane (profile.rs + net glue, 106 mutants) gives
+**54 caught, 50 unviable, 1 missed, 1 timeout** - the 0.6.0 suite already kills
+almost all of it. Consequences for this document:
+
+- the old per-file counts below are kept only as a **hunting map**, not as truth;
+- every fix is proven by a scoped run on `main`, never by the old list;
+- the parallel-lane baseline run that produced "timeouts" of 3 hours did so under
+  four concurrent mutant runs on one CPU: **run mutation baselines sequentially**,
+  or timeouts become noise.
+
+Fresh, main-based baselines are running (audit subtree + proxy, one process) and
+overwrite this section when they finish.
+
+## Survivors fixed on this branch
+
+| Mutation (proven by scoped run only after the baseline completes) | Fix |
+|---|---|
+| `audit/mod.rs` iso8601 date arithmetic + `-> "xyzzy"` | `iso8601_utc` split into clock-free `iso8601_from_unix`; known-value test (epoch edges, leap days incl. the 2000 century one) |
+| `civil_from_days` arithmetic | table extended: pre-epoch, era boundary, non-leap century, month rollovers |
+| `AuditWriter::open_at` `seq > 0` -> `>=` | test: a NEW chain (`seq == 0`) must keep a stale `<sid>.root`; H5b only drops it for a continuation |
+| `Filter::parse` `idx + 1` -> `idx - 1` | test: `req_id=7` matches the number 7 (not `"=7"`) |
+| `ordered_match` `Op::Lte` arms / `!=` boundary | test: `<=`/`>=` include equality for `ts` and integers |
+| `show_profile_inner` `retain(!allow)` delete | step extracted as `drop_readonly_duplicated_by_allow`; test: an allow-listed group grant disappears from `read_only` |
+| `resolve_network_with` `name != "none"` -> `==` | **exclusion candidate**: the mutant only silences a stderr warning that cannot be reached for the "none" profile; an in-process test cannot observe stderr |
+
+Remaining from the re-baseline arrives with the running job, then the same
+test-or-exclude pass continues per file.
 
 ## The evidence and its limits
 
