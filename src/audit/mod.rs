@@ -592,6 +592,13 @@ fn scan_existing(path: &std::path::Path) -> Result<(Option<String>, u64)> {
 fn iso8601_utc() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    iso8601_from_unix(secs)
+}
+
+/// [`iso8601_utc`] with the clock taken out: the arithmetic is the part that can
+/// be wrong, and `now()` cannot be pinned in a test. A mutant in here corrupts
+/// every audit timestamp silently, so the split is what makes it testable.
+fn iso8601_from_unix(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let h = rem / 3600;
@@ -651,6 +658,56 @@ mod tests {
     fn civil_from_days_known() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(1), (1970, 1, 2));
+        // Boundaries the two-term version of the algorithm gets wrong: the
+        // pre-epoch branch, an era edge, a non-leap century and the month
+        // rollovers. Each of these is a distinct arithmetic site in the body.
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+        assert_eq!(civil_from_days(-719_467), (0, 3, 2));
+        assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+    }
+
+    #[test]
+    fn iso8601_from_unix_known_values() {
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_from_unix(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(iso8601_from_unix(86_400), "1970-01-02T00:00:00Z");
+        // 2024-01-01T02:03:04Z
+        assert_eq!(iso8601_from_unix(1_704_074_584), "2024-01-01T02:03:04Z");
+        // leap days, including the century one: 2024-02-29 and 2000-02-29
+        assert_eq!(iso8601_from_unix(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(iso8601_from_unix(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// H5b deletes a stale `<sid>.root`/`<sid>.sig` pair when a chain is
+    /// CONTINUED (`seq > 0`). At `seq == 0` the log is a new chain, and the pair
+    /// belongs to whoever wrote it - deleting it there would drop a root the run
+    /// did not invalidate.
+    #[test]
+    fn a_new_chain_keeps_a_stale_root_pair() {
+        let sid = format!(
+            "test-root-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+        // An existing but EMPTY log scans as (None, 0) - a new chain.
+        std::fs::write(&path, "").expect("write the empty log");
+        let root = path.with_extension("root");
+        std::fs::write(&root, "stale-root").expect("write the stale root");
+        let _writer = AuditWriter::open_at(path.clone(), true).expect("open a new chain");
+        assert!(
+            root.exists(),
+            "a new chain (seq == 0) must not delete the root pair; only a continuation does"
+        );
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

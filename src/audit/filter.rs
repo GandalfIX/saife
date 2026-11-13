@@ -679,4 +679,46 @@ mod tests {
         assert!(combined.matches(&leaf(&[("op", json!("CONNECT")), ("req_id", json!(17)),])));
         assert!(!combined.matches(&leaf(&[("op", json!("CONNECT")), ("req_id", json!(18)),])));
     }
+
+    /// `=` consumes exactly its own byte. Sliding the value one byte the wrong
+    /// way leaves the operator inside the comparison value, so `req_id=7` would
+    /// filter for `"=7"` - a filter that silently matches nothing.
+    #[test]
+    fn a_single_char_operator_slices_exactly_one_byte() {
+        let by_req = Filter::parse("req_id=7").expect("req_id=7 parses");
+        assert!(by_req.matches(&leaf(&[("req_id", json!(7))])));
+        assert!(!by_req.matches(&leaf(&[("req_id", json!(8))])));
+
+        let by_op = Filter::parse("op=CONNECT").expect("op=CONNECT parses");
+        assert!(by_op.matches(&leaf(&[("op", json!("CONNECT"))])));
+    }
+
+    /// `<=` includes equality and `>=` includes it from the other side; an
+    /// incident query that is off by one at the boundary either hides the event
+    /// the operator is looking for or shows one that was excluded.
+    #[test]
+    fn ordered_compare_includes_the_boundary() {
+        let ts = "2026-11-11T12:00:00Z";
+        let at = leaf(&[("ts", json!(ts))]);
+        let later = leaf(&[("ts", json!("2026-11-11T12:00:01Z"))]);
+        let earlier = leaf(&[("ts", json!("2026-11-11T11:59:59Z"))]);
+
+        let lte = Filter::parse(&format!("ts<={ts}")).expect("ts<= parses");
+        assert!(lte.matches(&at), "<= must include the equal timestamp");
+        assert!(lte.matches(&earlier));
+        assert!(!lte.matches(&later));
+
+        let gte = Filter::parse(&format!("ts>={ts}")).expect("ts>= parses");
+        assert!(gte.matches(&at), ">= must include the equal timestamp");
+        assert!(!gte.matches(&earlier));
+
+        let seq_lte = Filter::parse("seq<=12").expect("seq<= parses");
+        assert!(seq_lte.matches(&leaf(&[("seq", json!(12))])));
+        assert!(seq_lte.matches(&leaf(&[("seq", json!(11))])));
+        assert!(!seq_lte.matches(&leaf(&[("seq", json!(13))])));
+
+        let seq_gte = Filter::parse("seq>=12").expect("seq>= parses");
+        assert!(seq_gte.matches(&leaf(&[("seq", json!(12))])));
+        assert!(!seq_gte.matches(&leaf(&[("seq", json!(11))])));
+    }
 }
