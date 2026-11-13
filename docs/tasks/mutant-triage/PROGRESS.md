@@ -119,3 +119,34 @@ exclusions → prove kills → report per-file before/after counts.
 - gates: both feature states green, clippy 0, `cargo deny`/`cargo shear` green,
   and a fresh full-run kill-rate comparison on the branch as the closing
   measurement.
+
+## Proxy lane: named debt (batch 2 close-out, 2026-11-11)
+
+Scoped `--iterate` over `src/net/proxy.rs`: 320 tested, 266 caught, 19 unviable.
+Remaining, each inspected (testable mutants never go in the register):
+
+- **`find_head_end -> None` and the loop-arithmetic timeouts** (`+=` -> `*=` in
+  `percent_decode`, `head_framing_error`, `head_lines`, `handle_conn`): the
+  `*= 2` from zero arms hang forever. Product finding, not a test gap: those
+  scanners have no iteration bound, so a mutant can turn a bounded scan into an
+  unbounded one. Candidate hardening: an iteration/byte cap in the scan loops.
+- **`read_body` cap comparisons** (`body.len() < want` variants): needs a body
+  at the exact cap through a socket pair; the socket fixtures exist, the test
+  is just timing-shaped. Next batch.
+- **`read_upstream_head` `&&`/`<` variants**: same shape - reads past the head
+  only differ on a socket that sends a partial head and stalls.
+- **`handle_forward` content-length `>` -> `>=`**: boundary body at exactly
+  `MAX_FACADE_BODY`; heavy async fixture.
+- **`handle_non_connect` absolute-form `&&` -> `||`**: origin-form request must
+  survive the widened check; covered end-to-end only through the listener.
+- **`MAX_FACADE_RESPONSE_HEAD` / `RELAY_HEAD_TIMEOUT` constants**: observable
+  only by driving a >64 KiB sidecar head through the relay; clippy rejects
+  constant-vs-constant assertions (`assertions_on_constants`), so a pin would
+  be noise. Left as documented values.
+
+Register additions this batch (12 patterns total): intent object guards
+(subsumed by field validation), warn-once (stderr), `LaunchResetHook` Debug
+elision, `LiveTokenClaim::drop` / `ProxyHandle::shutdown` (lifecycle),
+`system_lookup` (OS resolver), and two argued equivalences
+(`parse_connect_target` bracket flag, `relayed_response_head` status-line
+index).

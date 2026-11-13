@@ -80,7 +80,7 @@ exclude_re = [
     # compositions agree: when either flag form is true-but-should-be-false
     # the host has no ':' left after the port split, so the guard that would
     # use the lie never fires.
-    "replace && with \|\| in parse_connect_target$",
+    "replace && with \\|\\| in parse_connect_target$",
 
     # Equivalent: the status line is never an empty line and never a
     # hop-by-hop field name, so `index > 0` and `index >= 0` strip exactly the
