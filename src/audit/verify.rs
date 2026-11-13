@@ -1000,4 +1000,127 @@ mod tests {
             "a leaf without `seq` must be Tampered, got {outcome:?}"
         );
     }
+
+    /// A two-leaf chain, committed the way `commit_audit_root` does: `.root` and
+    /// `.sig` pin the LAST leaf's hash. `tamper_parent` corrupts leaf 1's
+    /// `parent` link while leaving its (self-consistent) `hash` intact, so only
+    /// the LINKAGE check can catch it.
+    fn plant_two_leaf_chain(sid: &str, tamper_parent: bool) {
+        let key = signing::KeyMaterial::ensure().unwrap();
+        let path = audit_log_path(sid);
+
+        let mut first = chain_leaf(sid, true, true);
+        first.insert("ts".into(), json!("2026-11-12T00:00:00Z"));
+        let h0 = sha256_hex(&canonicalize(&first));
+        first.insert("hash".into(), json!(h0.clone()));
+        first.insert("parent".into(), json!(Value::Null));
+
+        let mut second = chain_leaf(sid, true, true);
+        second.insert("seq".into(), json!(1));
+        second.insert("ts".into(), json!("2026-11-12T00:00:01Z"));
+        let h1 = sha256_hex(&canonicalize(&second));
+        second.insert("hash".into(), json!(h1.clone()));
+        second.insert("parent".into(), json!(if tamper_parent { "0".repeat(64) } else { h0 }));
+
+        std::fs::write(
+            &path,
+            serde_json::to_string(&first).unwrap() + "\n" + &serde_json::to_string(&second).unwrap() + "\n",
+        )
+        .unwrap();
+        std::fs::write(path.with_extension("root"), &h1).unwrap();
+        let sig = {
+            use ed25519_dalek::Signer;
+            key.signing.sign(&decode_hex(&h1).unwrap()).to_bytes()
+        };
+        let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(path.with_extension("sig"), &sig_hex).unwrap();
+        std::fs::write(
+            path.with_extension("keyfp"),
+            signing::fingerprint_of(&key.signing),
+        )
+        .unwrap();
+    }
+
+    /// The `p == sp` linkage guard says "this leaf chains to the one before".
+    /// Forcing it true makes a re-parented middle leaf verify OK - the same
+    /// substitution attack the linkage check exists to refuse.
+    #[test]
+    fn a_tampered_parent_link_in_a_middle_leaf_is_tampered() {
+        let sid = fresh_sid("parent-link");
+        plant_two_leaf_chain(&sid, true);
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        match outcome {
+            VerifyOutcome::Tampered(r) => {
+                assert!(r.contains("parent mismatch"), "expected the parent verdict, got: {r}");
+            }
+            other => panic!("a re-parented middle leaf is Tampered, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_honest_two_leaf_chain_verifies_ok() {
+        let sid = fresh_sid("parent-ok");
+        plant_two_leaf_chain(&sid, false);
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        assert!(
+            matches!(outcome, VerifyOutcome::Ok),
+            "an honest two-leaf chain must be Ok, got {outcome:?}"
+        );
+    }
+
+    /// The torn-tail guard protects ONLY the last line: a truncated write can
+    /// only land at the end of the file. A parse error anywhere EARLIER is a
+    /// manipulated log, torn tail or not - and the guard mutants would call
+    /// it INCOMPLETE (guard => true) or, with `&&` widened to `||`, hide a
+    /// corrupted middle line behind a torn tail.
+    #[test]
+    fn a_parse_error_before_the_last_line_is_tampered_even_with_a_torn_tail() {
+        let sid = fresh_sid("mid-garbage");
+        plant_two_leaf_chain(&sid, false);
+        let path = audit_log_path(&sid);
+        let original = std::fs::read_to_string(&path).unwrap();
+        let first = original.lines().next().expect("one planted leaf").to_string();
+        // Two honest leaves become: one honest leaf, a corrupted MIDDLE line, and
+        // a torn fragment with no terminator - the shape the widened guard
+        // misreads as an interrupted write.
+        std::fs::write(
+            &path,
+            format!("{first}\nnot json at all\n{{\"op\": \"CONNECT\""),
+        )
+        .unwrap();
+        let outcome = verify_inner(&sid).unwrap();
+        cleanup(&sid);
+        match outcome {
+            VerifyOutcome::Tampered(r) => {
+                assert!(r.contains("invalid JSON"), "expected the parse verdict, got: {r}");
+            }
+            other => panic!(
+                "a corrupted middle line is Tampered even when the tail is torn, not {other:?}"
+            ),
+        }
+    }
+
+    /// `run_verify` is the CLI contract: OK exits 0, every verdict carries 1.
+    /// A constant-return mutant either mints 0 on a tampered chain or throws a
+    /// valid chain's exit code away.
+    #[test]
+    fn run_verify_exit_codes_convey_the_verdict() {
+        let good = fresh_sid("exit-ok");
+        plant_two_leaf_chain(&good, false);
+        assert_eq!(run_verify(&good), 0, "an honest chain exits 0");
+        cleanup(&good);
+
+        let bad = fresh_sid("exit-tampered");
+        plant_two_leaf_chain(&bad, true);
+        assert_eq!(run_verify(&bad), 1, "a tampered chain exits 1");
+        cleanup(&bad);
+
+        assert_eq!(
+            run_verify(&fresh_sid("exit-missing")),
+            1,
+            "a missing log is INCOMPLETE evidence, which exits 1"
+        );
+    }
 }

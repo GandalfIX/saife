@@ -711,6 +711,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_session_id_accepts_the_boundary_length_and_rejects_one_more() {
+        let longest = "a".repeat(64);
+        assert!(
+            validate_session_id(&longest).is_ok(),
+            "64 characters is the documented maximum, so it must be accepted"
+        );
+        let too_long = "a".repeat(65);
+        assert!(
+            validate_session_id(&too_long).is_err(),
+            "65 characters must be refused, or the id can overrun its file name"
+        );
+    }
+
+    /// `created == 0` means the holder could not read its own creation time; the
+    /// liveness check then falls back to a bare `OpenProcess` probe. Inverting
+    /// that comparison sends the record into the creation-time-exact check
+    /// instead, which can never match for 0 - so a LIVE holder reads as dead and
+    /// its chain is reaped out from under it.
+    #[test]
+    fn a_lock_record_without_a_creation_time_still_probes_the_process() {
+        let holder = LockRecord {
+            pid: std::process::id(),
+            created: 0,
+        };
+        assert!(
+            holder_is_alive(&holder),
+            "the current process is alive; a created == 0 record must still probe it"
+        );
+    }
+
+    #[test]
     fn emit_connect_produces_valid_json() {
         // Use a temp session id so we don't collide with real sessions.
         let sid = format!("test-{}-{}", std::process::id(), std::time::SystemTime::now()

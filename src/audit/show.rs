@@ -452,3 +452,139 @@ mod tests {
             "a credential-less refusal is never a contacted host: {out}"
         );
     }
+
+    /// `show` exits 0 on a readable log and 1 without one, and the error names
+    /// the session. The constant-return mutants claim success for a missing log
+    /// (or throw a good one's code away); the `!` mutant replaces the helpful
+    /// error with a bare io failure.
+    #[test]
+    fn show_exit_codes_and_errors_follow_the_session_state() {
+        let sid = "mutant-gaps-show-exit";
+        let path = crate::audit::audit_log_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(
+            &path,
+            "{\"op\":\"CONNECT\",\"host\":\"a.example\",\"port\":443,\"disposition\":\"allow\",\"ts\":\"2026-11-12T00:00:00Z\",\"seq\":0}\n",
+        )
+        .unwrap();
+        let ok = run_show(sid, false, None);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ok, 0, "a readable log exits 0");
+
+        let missing = "mutant-gaps-show-missing";
+        assert_eq!(run_show(missing, false, None), 1, "no log is an error exit");
+        let err = run_show_inner(missing, false, None)
+            .expect_err("a missing log is an error")
+            .to_string();
+        assert!(
+            err.contains("no audit log for session"),
+            "the error names the missing session: {err}"
+        );
+    }
+
+    /// The bound is a CHARACTER count and the marker is part of the contract: a
+    /// CI-injected payload must not pour an unbounded line into stderr, and a
+    /// multibyte line must not be cut mid-character.
+    #[test]
+    fn truncate_for_error_bounds_the_line_and_marks_it() {
+        let at_limit = "x".repeat(160);
+        assert_eq!(
+            truncate_for_error(&at_limit),
+            at_limit,
+            "a line at the limit is returned unchanged"
+        );
+
+        let over = "y".repeat(161);
+        let cut = truncate_for_error(&over);
+        assert!(
+            cut.ends_with("... (truncated)"),
+            "a cut line carries the marker: {cut}"
+        );
+        assert_eq!(
+            cut.chars().filter(|c| *c == 'y').count(),
+            160,
+            "exactly MAX characters survive"
+        );
+
+        let wide = "ä".repeat(200);
+        let cut_wide = truncate_for_error(&wide);
+        assert_eq!(
+            cut_wide.chars().filter(|c| *c == 'ä').count(),
+            160,
+            "chars, not bytes: multibyte lines are cut on a character boundary"
+        );
+    }
+
+    /// The summary's counts are the incident reader's first number: flipping the
+    /// `deny` comparison moves a denial into the allowed column. The denial list
+    /// must also keep its two shapes - a CONNECT denial names host:port, an fs
+    /// denial names the path.
+    #[test]
+    fn render_summary_counts_and_renders_both_denial_shapes() {
+        let allow = serde_json::json!({
+            "op": "CONNECT", "host": "ok.example", "port": 443, "disposition": "allow"
+        });
+        let deny_connect = serde_json::json!({
+            "op": "CONNECT", "host": "evil.example", "port": 8443,
+            "disposition": "deny", "reason": "domain_not_allowed"
+        });
+        let deny_fs = serde_json::json!({
+            "op": "fs.write", "path": "C:\\secret", "disposition": "deny",
+            "reason": "deny_rule"
+        });
+        let events: Vec<&serde_json::Value> = vec![&allow, &deny_connect, &deny_fs];
+        let out = render_summary("sid-render", &events);
+        assert!(out.contains("CONNECT"), "the summary lists the op: {out}");
+        assert!(
+            out.contains("2  (1 allowed, 1 denied)"),
+            "one allow and one deny for CONNECT: {out}"
+        );
+        assert!(
+            out.contains("evil.example:8443  reason=domain_not_allowed"),
+            "a CONNECT denial names host:port: {out}"
+        );
+        assert!(
+            out.contains("C:\\secret  reason=deny_rule"),
+            "a filesystem denial names the path: {out}"
+        );
+    }
+
+    /// A root without its signature is NOT a commit. Widening the two
+    /// `exists()` checks into `||` prints "PRESENT" for a half-committed pair -
+    /// a claim of integrity the files do not support.
+    #[test]
+    fn a_root_without_a_signature_is_reported_as_not_committed() {
+        let sid = "mutant-gaps-show-sig";
+        let path = crate::audit::audit_log_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(
+            &path,
+            "{\"op\":\"CONNECT\",\"host\":\"a.example\",\"hash\":\"abcdef0123456789\",\"seq\":0}\n",
+        )
+        .unwrap();
+        // Root present, signature absent.
+        std::fs::write(path.with_extension("root"), "root-hex").unwrap();
+        let event: serde_json::Value =
+            serde_json::json!({"op": "CONNECT", "host": "a.example", "hash": "abcdef0123456789"});
+        let out = render_summary(sid, &[&event]);
+        assert!(
+            out.contains("Sig     ABSENT"),
+            "a root without a signature must not claim PRESENT: {out}"
+        );
+        assert!(
+            out.contains("NOT COMMITTED"),
+            "the root line says the session did not end cleanly: {out}"
+        );
+
+        // With both files the pair is present - and still not verified by `show`.
+        std::fs::write(path.with_extension("sig"), "sig-hex").unwrap();
+        let out_both = render_summary(sid, &[&event]);
+        assert!(
+            out_both.contains("PRESENT (not verified"),
+            "a half-check never claims verification: {out_both}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("root"));
+        let _ = std::fs::remove_file(path.with_extension("sig"));
+    }
