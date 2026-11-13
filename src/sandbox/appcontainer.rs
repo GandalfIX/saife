@@ -374,6 +374,22 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry, journal: Option<&DaclJournal>) -> Re
         // kernel writes the DACL directly, no userspace tree propagation.
         // (Extracted as `apply_dacl_kernel` so the DACL-restore path uses the
         // identical write mechanism.)
+        // Snapshot which descendants carry a PROTECTED DACL BEFORE this
+        // parent write lands: the kernel marks the descendants of every
+        // direct Nt DACL write protected when the written ACL carries a new
+        // inheritable ACE (their inherited ACEs go stale until the security
+        // reference monitor recomputes them), and `prepare_child` has to tell
+        // that fresh marker apart from PROTECTION AN EARLIER SESSION DELIBERATELY
+        // LANDED (the `.sandbox` isolation tree): only the deliberate kind
+        // stays skipped. The snapshot is bounded by the same walk cap
+        // propagation uses, so its cost is the one walk this entry already
+        // pays.
+        let pre_protected = if should_propagate(e) {
+            snapshot_protected_descendants(&e.win32_path, PROPAGATE_MAX_OBJECTS)
+        } else {
+            std::collections::HashSet::new()
+        };
+
         apply_dacl_kernel(&path_str, new_acl, e.protected)?;
 
         // The kernel DOES propagate the inheritable ACE to pre-existing
@@ -385,7 +401,7 @@ fn grant_one(ac_sid: &PSID, e: &AllowEntry, journal: Option<&DaclJournal>) -> Re
         // onto every pre-existing descendant synchronously before the child
         // is spawned (propagate_grant).
         if should_propagate(e) {
-            let stats = propagate_grant(ac_sid, e, journal, PROPAGATE_MAX_OBJECTS);
+            let stats = propagate_grant(ac_sid, e, journal, PROPAGATE_MAX_OBJECTS, &pre_protected);
             if stats.truncated {
                 eprintln!(
                     "[saife] warning: grant propagation for {:?} truncated at {PROPAGATE_MAX_OBJECTS} objects; pre-existing files deeper in the tree may be unreadable inside the sandbox",
@@ -495,6 +511,7 @@ fn propagate_grant(
     e: &AllowEntry,
     journal: Option<&DaclJournal>,
     max_objects: usize,
+    pre_protected: &std::collections::HashSet<String>,
 ) -> PropagateStats {
     let mut stats = PropagateStats::default();
     let mut batch: Vec<PendingChild> = Vec::new();
@@ -516,7 +533,7 @@ fn propagate_grant(
             };
             let path = item.path();
             let mut descend = ft.is_dir() && !ft.is_symlink();
-            match prepare_child(ac_sid, &path, e, descend, &mut batch) {
+            match prepare_child(ac_sid, &path, e, descend, &mut batch, pre_protected) {
                 // Queued: the batch flush applies + journals it.
                 Ok(true) => {}
                 // Skipped (PROTECTED or null DACL): leave untouched and do
@@ -551,6 +568,7 @@ fn prepare_child(
     e: &AllowEntry,
     inheritable: bool,
     batch: &mut Vec<PendingChild>,
+    pre_protected: &std::collections::HashSet<String>,
 ) -> Result<bool> {
     let path_str = path.to_string_lossy().to_string();
     let path_w = HSTRING::from(&path_str);
@@ -575,7 +593,19 @@ fn prepare_child(
         let mut revision = 0u32;
         let dacl_protected = GetSecurityDescriptorControl(sd, &mut control, &mut revision).is_ok()
             && (control & SE_DACL_PROTECTED.0) != 0;
-        if dacl_protected || dacl_ptr.is_null() {
+        // PROTECTED handling after the parent's kernel write: a direct Nt
+        // write marks every descendant protected (their inherited ACEs are
+        // stale until recomputed), so protection alone no longer means
+        // "deliberately out of the grant". Only protection that ALREADY sat
+        // on the object before this entry's write (the pre-write snapshot)
+        // stays out of the grant — that is the `.sandbox` isolation tree and
+        // any explicit earlier decision. A descendant whose protection the
+        // THIS entry's write created is rewritten here like every other
+        // child: it gets the entry's ACE (which repairs its inherited
+        // staleness, `set_dacl_kernel` records the recompute request). A
+        // null DACL is still world-accessible and stays untouched.
+        let pre_held = pre_protected.contains(&path_str);
+        if dacl_ptr.is_null() || (dacl_protected && pre_held) {
             let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
             return Ok(false);
         }
@@ -620,6 +650,72 @@ fn prepare_child(
             acl: new_acl,
         });
         Ok(true)
+    }
+}
+
+/// Enumerate the descendants of `root` WITHOUT writing, recording which
+/// already sit under a PROTECTED DACL before this entry's write lands.
+/// Same walk rules as `propagate_grant` (reparse points are never followed,
+/// protected subtrees are not descended, cap bounded), so its cost is the
+/// other half of the one walk a propagate-able entry pays anyway.
+fn snapshot_protected_descendants(
+    root: &std::path::Path,
+    max_objects: usize,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in rd.flatten() {
+            if out.len() >= max_objects {
+                return out;
+            }
+            let Ok(ft) = item.file_type() else {
+                continue;
+            };
+            let path = item.path();
+            if is_protected_dacl(&path.to_string_lossy()) {
+                out.insert(path.to_string_lossy().to_string());
+                continue; // a protected subtree is not descended into
+            }
+            if ft.is_dir() && !ft.is_symlink() {
+                stack.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Does this object's DACL carry the PROTECTED control bit?
+fn is_protected_dacl(path_str: &str) -> bool {
+    unsafe {
+        let path_w = HSTRING::from(path_str);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+        let r = GetNamedSecurityInfoW(
+            &path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl_ptr),
+            None,
+            &mut sd,
+        );
+        if r.is_err() {
+            // Unreadable = unknown, not protected-held: propagation treats a
+            // read failure as a write failure later, so this only widens the
+            // rule the walker already had.
+            return false;
+        }
+        let mut control: u16 = 0;
+        let mut revision = 0u32;
+        let protected = GetSecurityDescriptorControl(sd, &mut control, &mut revision).is_ok()
+            && (control & SE_DACL_PROTECTED.0) != 0;
+        let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+        protected
     }
 }
 
@@ -671,20 +767,80 @@ fn set_dacl_kernel(path_str: &str, acl: *const ACL, protected: bool) -> Result<(
             None,
         );
         let handle = open_r?;
-        // call SetSecurityInfo (which uses the kernel) with the handle.
-        let flags = if protected {
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        // The write goes through ntdll, not advapi32's `SetSecurityInfo`:
+        // advapi (through ntmarta) recomputes the inherited-ACE merge from the
+        // parent chain on every write and stalls in that walk on some hosts
+        // (measured: `C:\Users\<user>\AppData\Local\Temp`, both DACL flags,
+        // supervisor hung before spawn while the same DACL through
+        // `NtSetSecurityObject` returned in 0.01 s). The kernel applies exactly
+        // the ACL it is handed - no userspace tree walk - and the ACL we hand it
+        // already carries every inherited ACE, because `SetEntriesInAclW` merged
+        // the DACL that `GetNamedSecurityInfoW` returned (inherited ACEs
+        // included). Effective access is therefore identical to the advapi
+        // write; the only difference is provenance bookkeeping: the
+        // SE_DACL_AUTO_INHERITED control bit is computed by the security
+        // reference monitor and this path cannot set it, while the ACE-level
+        // INHERITED_ACE flags in the ACL are preserved as read.
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        InitializeSecurityDescriptor(
+            PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void),
+            // SECURITY_DESCRIPTOR_REVISION; the crate does not re-export it.
+            1,
+        )?;
+        SetSecurityDescriptorDacl(
+            PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void),
+            true,
+            Some(acl),
+            false,
+        )?;
+        if protected {
+            SetSecurityDescriptorControl(
+                PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void),
+                SE_DACL_PROTECTED,
+                SE_DACL_PROTECTED,
+            )?;
         } else {
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION
-        };
-        let write_r = SetSecurityInfo(handle, SE_FILE_OBJECT, flags, None, None, Some(acl), None);
+            // Same semantics an UNPROTECTED advapi write carries: the security
+            // reference monitor must recompute the children's inherited ACEs
+            // from this write. Without the request bit the kernel leaves the
+            // descendants' stale inherited ACEs in place and their DACLs read
+            // as protected - the harness test caught exactly that shape. The
+            // recompute is a kernel operation, so the ntmarta walk (the hang)
+            // does not come back with it.
+            SetSecurityDescriptorControl(
+                PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void),
+                SE_DACL_AUTO_INHERIT_REQ,
+                SE_DACL_AUTO_INHERIT_REQ,
+            )?;
+            SetSecurityDescriptorControl(
+                PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void),
+                SE_DACL_AUTO_INHERITED,
+                SE_DACL_AUTO_INHERITED,
+            )?;
+        }
+        let write_r = NtSetSecurityObject(
+            handle,
+            DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void),
+        );
         let _ = CloseHandle(handle);
         if write_r.is_err() {
-            return Err(HRESULT::from_win32(write_r.0).into());
+            return Err(write_r.into());
         }
     }
     Ok(())
 }
+
+windows::core::link!(
+    "ntdll.dll" "system"
+    // The kernel DACL write. Declared directly because the `windows` crate
+    // feature that ships it (Wdk) would be enabled for one function.
+    fn NtSetSecurityObject(
+        handle: HANDLE,
+        securityinformation: OBJECT_SECURITY_INFORMATION,
+        securitydescriptor: PSECURITY_DESCRIPTOR,
+    ) -> NTSTATUS
+);
 
 /// `set_dacl_kernel` for an aclapi-allocated ACL (`SetEntriesInAclW`
 /// output): takes ownership and `LocalFree`s it afterwards.
@@ -1444,8 +1600,12 @@ mod propagation_tests {
         let dir = TempDir(tmp_tag("grantmissing"));
         std::fs::create_dir_all(&dir.0).unwrap();
         let sid = make_sid(TEST_SID);
-        grant_access(&sid, &[grant_entry(dir.0.join("not-yet"), "allow:test")], None)
-            .expect("a missing grant path is skipped, not fatal");
+        grant_access(
+            &sid,
+            &[grant_entry(dir.0.join("not-yet"), "allow:test")],
+            None,
+        )
+        .expect("a missing grant path is skipped, not fatal");
     }
 
     /// OS install trees are world-readable and their DACLs belong to
@@ -1456,15 +1616,17 @@ mod propagation_tests {
     fn a_failed_grant_under_an_os_install_tree_stays_a_warning() {
         let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let mut entries = vec![
-            grant_entry(std::path::PathBuf::from(&sysroot).join("System32"), "System32"),
+            grant_entry(
+                std::path::PathBuf::from(&sysroot).join("System32"),
+                "System32",
+            ),
             grant_entry(std::path::PathBuf::from(&sysroot), "SystemRoot"),
         ];
         if let Ok(pf) = std::env::var("ProgramFiles") {
             entries.push(grant_entry(std::path::PathBuf::from(pf), "java-runtime"));
         }
         let sid = make_sid(TEST_SID);
-        grant_access(&sid, &entries, None)
-            .expect("OS install trees are tolerated, not fatal");
+        grant_access(&sid, &entries, None).expect("OS install trees are tolerated, not fatal");
     }
 
     #[test]
@@ -1476,7 +1638,9 @@ mod propagation_tests {
         assert!(is_os_install_tree(&sysroot));
         assert!(!is_os_install_tree(&std::env::temp_dir()));
         if let Ok(pf) = std::env::var("ProgramFiles") {
-            assert!(is_os_install_tree(&std::path::PathBuf::from(pf).join("Java")));
+            assert!(is_os_install_tree(
+                &std::path::PathBuf::from(pf).join("Java")
+            ));
         }
     }
 
@@ -1491,8 +1655,12 @@ mod propagation_tests {
             return;
         }
         let sid = make_sid(TEST_SID);
-        let err = grant_access(&sid, &[grant_entry(probe.to_path_buf(), "allow:test")], None)
-            .expect_err("a grant the supervisor cannot apply must refuse the session");
+        let err = grant_access(
+            &sid,
+            &[grant_entry(probe.to_path_buf(), "allow:test")],
+            None,
+        )
+        .expect_err("a grant the supervisor cannot apply must refuse the session");
         assert!(
             format!("{err}").contains("refusing the session"),
             "the refusal must say so, got: {err}"
@@ -1739,7 +1907,13 @@ mod propagation_tests {
             })
             .collect();
 
-        let stats = propagate_grant(&sid, &test_entry(&root), None, 4);
+        let stats = propagate_grant(
+            &sid,
+            &test_entry(&root),
+            None,
+            4,
+            &std::collections::HashSet::new(),
+        );
         assert!(stats.truncated, "cap must report truncation: {stats:?}");
         assert_eq!(stats.applied, 4, "exactly the cap in applied writes");
         assert_eq!(stats.failed, 0);
@@ -2451,7 +2625,9 @@ fn private_network_capability_sid_is_s_1_15_3_7() {
 /// host left with session ACEs, and the journal is the only record of them.
 #[test]
 fn only_an_absent_path_is_treated_as_restored() {
-    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    };
 
     for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
         let e: windows::core::Error = HRESULT::from_win32(code.0).into();
