@@ -532,12 +532,13 @@ mod tests {
             "op": "fs.write", "path": "C:\\secret", "disposition": "deny",
             "reason": "deny_rule"
         });
-        let events: Vec<&serde_json::Value> = vec![&allow, &deny_connect, &deny_fs];
+        let allow2 = allow.clone(); // two served allows, one denial
+        let events: Vec<&serde_json::Value> = vec![&allow, &allow2, &deny_connect, &deny_fs];
         let out = render_summary("sid-render", &events);
         assert!(out.contains("CONNECT"), "the summary lists the op: {out}");
         assert!(
-            out.contains("2  (1 allowed, 1 denied)"),
-            "one allow and one deny for CONNECT: {out}"
+            out.contains("3  (2 allowed, 1 denied)"),
+            "two allows and one deny for CONNECT: {out}"
         );
         assert!(
             out.contains("evil.example:8443  reason=domain_not_allowed"),

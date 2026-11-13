@@ -1,0 +1,38 @@
+# cargo-mutants exclusion register - the mutants we deliberately do not test.
+#
+# cargo-mutants reads this file automatically (.cargo/mutants.toml). Every entry
+# is a regexp matched against the MUTANT NAME (e.g.
+# `src/audit/mod.rs:593:5: replace iso8601_utc -> String with String::new()`)
+# and carries a written reason in the comment above it. An exclusion without a
+# reason is rejected in review: the register's job is to keep the kill rate
+# honest, not to hide survivors. A mutant that only a unit test cannot observe
+# (needs a clock no test can pin, an unwritable directory, or the test process'
+# working directory) belongs here; everything else gets a test or stays on the
+# survivor list as named debt.
+exclude_re = [
+    # The now()-based wrapper of a clock-free core: a unit test cannot pin the
+    # clock, so any mutant of the wrapper is unobservable in-process. The pure
+    # core it delegates to (iso8601_from_unix) is fully covered by known-value
+    # tests - the arithmetic mutants are all killed there.
+    "^src/audit/mod.rs:593:5: ",
+
+    # This branch fires only for a log path WITHOUT any parent directory (a bare
+    # relative file name). Observing it requires changing the test process's
+    # working directory - a process-global side effect (and the "fix" behaviour
+    # would create the file in the caller's cwd. The real call sites always pass
+    # an absolute path.
+    "^src/audit/mod.rs:360:20: ",
+
+    # Killing this needs a MoveFileExW publish failure that is NOT
+    # ERROR_ALREADY_EXISTS - i.e. an unwritable audit directory on the host.
+    # Creating unwritable state is a host change, which unit tests must not do
+    # (VM-first rule). The mutant's effect is a wrong error MESSAGE, never a
+    # wrong verdict: a non-183 failure refuses the lock either way.
+    "^src/audit/mod.rs:222:27: ",
+
+    # `name != "none"` is unreachable for the "none" profile (it resolves to
+    # Blocked earlier and returns), so the mutant only silences a stderr
+    # WARNING for unknown network profile names - and stderr is not observable
+    # from an in-process unit test.
+    "^src/net/mod.rs:176:24: ",
+]

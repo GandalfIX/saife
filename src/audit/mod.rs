@@ -665,6 +665,11 @@ mod tests {
         assert_eq!(civil_from_days(-719_468), (0, 3, 1));
         assert_eq!(civil_from_days(-719_467), (0, 3, 2));
         assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+        // BEFORE the era seed (ISO year 0): the negative branch of the era
+        // computation. ISO year 0 is a leap year, so the day before 0000-03-01
+        // is its 29 February - the arithmetic the `z - 146_096` mutants break.
+        assert_eq!(civil_from_days(-719_469), (0, 2, 29));
+        assert_eq!(civil_from_days(-719_470), (0, 2, 28));
         assert_eq!(civil_from_days(11_017), (2000, 3, 1));
         assert_eq!(civil_from_days(31), (1970, 2, 1));
         assert_eq!(civil_from_days(365), (1971, 1, 1));
@@ -738,6 +743,63 @@ mod tests {
         assert!(
             holder_is_alive(&holder),
             "the current process is alive; a created == 0 record must still probe it"
+        );
+    }
+
+    /// `AuditWriter::open_at` removes a stale `<sid>.root`/`<sid>.sig` pair only
+    /// when the removal FAILS with something other than NotFound. Inverting that
+    /// comparison makes a MISSING pair a removal failure - continuations refuse
+    /// to open for no reason.
+    #[test]
+    fn a_continuation_without_a_root_pair_opens_cleanly() {
+        let sid = format!(
+            "test-cont-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+        // One leaf with seq 1: scan_existing reports (Some(hash), next 2) - a
+        // continuation, but no root/sig files exist to remove.
+        std::fs::write(&path, "{\"op\":\"CONNECT\",\"seq\":1,\"hash\":\"a\"}\n")
+            .expect("write the continued log");
+        let opened = AuditWriter::open_at(path.clone(), true);
+        let _ = std::fs::remove_file(&path);
+        assert!(opened.is_ok(), "a continuation without a root pair opens");
+    }
+
+    /// A stale pair that is a DIRECTORY fails removal with a NON-NotFound error.
+    /// Strict mode surfaces it instead of treating the pair as vanished - a
+    /// mutant that labels every error NotFound would open a writer over a state
+    /// it could not actually clear.
+    #[test]
+    fn a_stale_pair_that_cannot_be_removed_refuses_a_strict_continuation() {
+        let sid = format!(
+            "test-cont-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+        std::fs::write(&path, "{\"op\":\"CONNECT\",\"seq\":1,\"hash\":\"a\"}\n")
+            .expect("write the continued log");
+        let root = path.with_extension("root");
+        std::fs::create_dir(&root).expect("plant the root pair as a directory");
+        let result = AuditWriter::open_at(path.clone(), true);
+        let _ = std::fs::remove_dir(&root);
+        let _ = std::fs::remove_file(&path);
+        let err = match result {
+            Ok(_) => panic!("strict mode must surface the removal failure"),
+            Err(e) => e,
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("remove stale audit"),
+            "the error names the removal: {err:#}"
         );
     }
 
