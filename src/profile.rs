@@ -66,6 +66,20 @@ pub fn show_profile(name: &str, expanded: bool) -> i32 {
     }
 }
 
+/// A group's read-only grant that the profile ALREADY allow-lists stays an
+/// allow: otherwise `profile show --expanded` presents one tree under two
+/// postures. Compared case-insensitively on the lowercased path string, the
+/// same rule `resolve_filesystem` applies to its own duplicates.
+fn drop_readonly_duplicated_by_allow(fs: &mut FilesystemSlice) {
+    let allow_keys: std::collections::BTreeSet<String> = fs
+        .allow
+        .iter()
+        .map(|p| p.to_string_lossy().to_lowercase())
+        .collect();
+    fs.read_only
+        .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+}
+
 fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
     if expanded {
@@ -95,13 +109,7 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
                 fs.read_only.push(g.path);
             }
             fs.read_only = dedupe_paths(fs.read_only);
-            let allow_keys: std::collections::BTreeSet<String> = fs
-                .allow
-                .iter()
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .collect();
-            fs.read_only
-                .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+            drop_readonly_duplicated_by_allow(&mut fs);
         }
         let resolved = ResolvedProfile {
             name: resolved_name,
@@ -2649,6 +2657,28 @@ mod tests {
         assert_eq!(v["network"]["block"], false);
         assert_eq!(v["network"]["allow_domain"][0], "api.anthropic.com");
         assert_eq!(v["network"]["profile"], "minimal");
+    }
+
+    /// `--expanded` must not present one tree under two postures: a group grant
+    /// that the profile already allow-lists is dropped from `read_only`, while a
+    /// grant that is NOT allowed stays visible. Removing the `!` in the retain
+    /// keeps both listings and survived the suite.
+    #[test]
+    fn a_group_grant_already_allow_listed_is_not_listed_read_only() {
+        let mut fs = FilesystemSlice {
+            allow: vec![PathBuf::from(r"C:\Proj")],
+            read_only: vec![
+                PathBuf::from(r"C:\Proj"),
+                PathBuf::from(r"C:\Users\test\.gitconfig"),
+            ],
+            deny: vec![],
+        };
+        drop_readonly_duplicated_by_allow(&mut fs);
+        assert_eq!(
+            fs.read_only,
+            vec![PathBuf::from(r"C:\Users\test\.gitconfig")],
+            "the allow-listed tree must not also appear as read-only"
+        );
     }
 
     #[test]
