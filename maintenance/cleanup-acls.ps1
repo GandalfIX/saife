@@ -13,9 +13,9 @@
 .PARAMETER Paths
   Directories to clean. Defaults to the sandbox-relevant ancestor chain.
 .EXAMPLE
-  .\tests\cleanup-acls.ps1
+  .\maintenance\cleanup-acls.ps1
 .EXAMPLE
-  .\tests\cleanup-acls.ps1 -Paths "C:\Users\me\AppData\Local"
+  .\maintenance\cleanup-acls.ps1 -Paths "C:\Users\me\AppData\Local"
 #>
 [CmdletBinding()]
 param(

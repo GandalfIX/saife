@@ -2343,7 +2343,7 @@ function Invoke-Scenario-S73 {
 
 # S-74 (MXC F-C/F-D): crash leaves journal + ACE; next startup reaps the
 # orphan (restore + journal deletion). Rollback path: the pre-written
-# tests/cleanup-session-aces.ps1 recovers the host if this scenario fails.
+# maintenance/cleanup-session-aces.ps1 recovers the host if this scenario fails.
 function Invoke-Scenario-S74 {
     $d = New-ScenarioDir 74
     $journalDir = Get-DaclJournalDir

@@ -204,6 +204,13 @@ struct ConnCtx {
     upstream: Option<Arc<UpstreamDialer>>,
     /// M9: relaxed LAN deny on the direct path (`--allow-lan`).
     allow_lan: bool,
+    /// Fixture seam: `true` only for a listener built by [`spawn_loopback`],
+    /// which exists under `cfg(test)`. The forward-path fixtures serve their
+    /// stand-in origin on `127.0.0.1`, so both loopback legs (the host string in
+    /// [`decide`] and the pinned address in the dial) have to be open for them.
+    /// No production constructor can set it - [`spawn`] hardcodes `false`, so
+    /// [G-44] ("the proxy is never a tunnel to host services") is untouched.
+    permit_loopback: bool,
     /// M8: a per-listener counter that issues a unique id for every request.
     /// Each connection's leaves share the id so a reader can tell a request's
     /// terminal disposition from a pair that records both `allow` and `deny`.
@@ -1047,6 +1054,22 @@ impl Drop for ProxyHandle {
 /// process). The runtime is owned by the returned `ProxyHandle` and is
 /// shut down when the handle is dropped.
 pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
+    spawn_inner(cfg, false)
+}
+
+/// The listener the fixtures use: [`spawn`] with the loopback legs open.
+///
+/// The forward-path tests serve their origin on `127.0.0.1` instead of the
+/// host's LAN address. A LAN listener is what makes Windows Firewall ask
+/// whether to admit every new test binary (once per executable file, and every
+/// rebuild is a new file), and a test suite must not need a firewall decision
+/// to pass. `cfg(test)`-only on purpose: there is no product flag here.
+#[cfg(test)]
+pub fn spawn_loopback(cfg: ProxyConfig) -> Result<ProxyHandle> {
+    spawn_inner(cfg, true)
+}
+
+fn spawn_inner(cfg: ProxyConfig, permit_loopback: bool) -> Result<ProxyHandle> {
     // `session_id` is retained in ProxyConfig for diagnostics/future use but
     // is not threaded into handle_conn: the AuditWriter holds the log path.
     let ProxyConfig {
@@ -1081,6 +1104,7 @@ pub fn spawn(cfg: ProxyConfig) -> Result<ProxyHandle> {
         writer,
         upstream,
         allow_lan,
+        permit_loopback,
         next_request_id: AtomicU64::new(0),
         prompt,
         counters: Arc::clone(&counters),
@@ -1542,7 +1566,7 @@ async fn decide(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
     // host [G-44]. Dedicated `loopback_refused` reason so the audit can
     // distinguish it from the hard-deny IP set that also covers the
     // literal forms.
-    if is_loopback_host(host) {
+    if is_loopback_host(host) && !ctx.permit_loopback {
         return Decision {
             allowed: false,
             source: "hard-deny",
@@ -2078,9 +2102,10 @@ async fn dial_upstream<F, Fut>(
     host: &str,
     port: u16,
     // `false` in every production path: loopback and the unspecified address are
-    // refused so the proxy cannot become a tunnel to host services ([G-44]). The
-    // dial-mechanics tests pass `true` because their only upstream is a local
-    // stand-in server; that is a property of the test fixture, not of the product.
+    // refused so the proxy cannot become a tunnel to host services ([G-44]). It
+    // is `true` only for a listener from `spawn_loopback`, because the fixtures'
+    // only upstream is a stand-in server on 127.0.0.1 - a property of the
+    // fixture, and unreachable from a production constructor.
     permit_loopback: bool,
     // M9: `false` unless the operator passed `--allow-lan`. Same pattern as
     // `permit_loopback` - the test fixtures dial stand-in servers on the host's
@@ -2433,7 +2458,7 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<ConnCtx>) -> Result<()> {
         ctx.upstream.as_deref(),
         &host,
         port,
-        false,
+        ctx.permit_loopback,
         ctx.allow_lan,
         system_lookup,
     )
@@ -3819,7 +3844,7 @@ async fn handle_forward(
         ctx.upstream.as_deref(),
         &fwd.host,
         fwd.port,
-        false,
+        ctx.permit_loopback,
         ctx.allow_lan,
         system_lookup,
     )

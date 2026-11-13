@@ -53,6 +53,7 @@ The tool is bin-only: there is no library target, so every test run is
 | `tests/run-tests.ps1` | the integration suite (93 scenarios), `-Backend` switch |
 | `tests/vm/` | disposable-VM lane (stages the repo, runs the suite in a guest) |
 | `tests/Clear-HostTestArtifacts.ps1` | host cleanup gate (`HOST-CLEAN` / `HOST-DIRTY`) |
+| `maintenance/` | one-off host repairs that no build, test or release runs: stale AppContainer ACEs after a crash, stale Windows Firewall rules per test binary |
 | `packaging/` | dist/release assembly: `build-dist.ps1` assembles `dist/` and the archives, `release.ps1` uploads; `licenses/generate.ps1` generates `THIRD-PARTY-LICENSES.md` (cargo about) and the CycloneDX SBOMs (cargo cyclonedx) from `Cargo.lock` |
 | `docs/adr/`, `docs/plans/`, `docs/tasks/*/PROGRESS.md` | decisions, plan, per-task record |
 
