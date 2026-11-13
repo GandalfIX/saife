@@ -259,7 +259,7 @@ Practical consequences:
   SID that matches no live `saife` process is residue. A belt-and-braces
   sweep exists (`tests/Clear-HostTestArtifacts.ps1`; some paths need
   elevation — it names them instead of failing silently), and
-  `tests/cleanup-session-aces.ps1` handles the kernel-written session ACEs
+  `maintenance/cleanup-session-aces.ps1` handles the kernel-written session ACEs
   that `icacls /findsid` cannot match.
 - Live sessions look identical to residue: an ACE belongs to a live session
   while its supervisor (and the journal) exists. Two `saife` processes in

@@ -16,8 +16,10 @@ minor release may break the profile schema; the error message names the fix.
   answering it left an inbound rule per binary. The fixtures now serve the origin on `127.0.0.1`;
   the loopback legs are open only for a listener built by the `cfg(test)`-only `spawn_loopback`, so
   the product rule that refuses loopback targets is unchanged and still pinned by
-  `loopback_refused_even_when_allowlisted`. `maintenance/Remove-StaleSaifeFirewallRules.ps1`
-  removes the rules a host already accumulated.
+  `loopback_refused_even_when_allowlisted`. `maintenance/` is new: it holds
+  `Remove-StaleSaifeFirewallRules.ps1` (cleans up the rules a host already accumulated) and the
+  two AppContainer-ACE recovery scripts that used to sit in `tests/` - they are host repairs, not
+  tests, and nothing in the suite calls them.
 
 ## [0.6.0] - 2026-11-12
 
