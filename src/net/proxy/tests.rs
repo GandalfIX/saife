@@ -7170,3 +7170,257 @@
             "counted exactly once: {out}"
         );
     }
+    // ===== parser and utility survivors (mutation-testing follow-up) =====
+
+    /// `percent_decode` is what stamps CONNECT targets and intent paths into
+    /// audit values and routed hosts: a wrong digit site or a broken escape
+    /// guard silently rewrites the identity a leaf records. Table-driven over
+    /// the grammar: digits (both hex cases), `+` as space, verbatim retention
+    /// of non-hex, truncated and dangling escapes, adjacent escapes.
+    #[test]
+    fn percent_decode_follows_the_url_grammar() {
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("%41"), "A", "upper-hex digits");
+        assert_eq!(percent_decode("%2a"), "*", "lower-hex digits");
+        assert_eq!(percent_decode("%2A"), "*", "hex digits are case-insensitive");
+        assert_eq!(percent_decode("%2b"), "+", "%2b is a PLUS byte, not a space");
+        assert_eq!(percent_decode("a+b"), "a b", "+ inside the value means space");
+        assert_eq!(
+            percent_decode("%4%20"),
+            "%4 ",
+            "a truncated escape is kept verbatim (including its %), the next escape still decodes"
+        );
+        assert_eq!(percent_decode("%20%20"), "  ", "adjacent escapes decode independently");
+        assert_eq!(percent_decode("%zz"), "%zz", "non-hex escapes are kept verbatim");
+        assert_eq!(percent_decode("100%"), "100%", "a dangling percent is kept");
+        assert_eq!(percent_decode("%7f"), "\u{7f}", "control bytes survive");
+    }
+
+    /// A CONNECT target that does not parse is `None` (the caller answers 400),
+    /// never silently reinterpreted as 443 - `host:notaport`, `host:`, port 0
+    /// and port 65536+ are all refusals, an empty host is refused, userinfo is
+    /// refused, and the unbracketed-IPv6 rule keeps (host, port) splits
+    /// unambiguous.
+    #[test]
+    fn parse_connect_target_refuses_what_it_cannot_parse() {
+        assert_eq!(
+            parse_connect_target("a.example:443"),
+            Some(("a.example".into(), 443))
+        );
+        assert_eq!(
+            parse_connect_target("a.example"),
+            Some(("a.example".into(), 443)),
+            "a missing port means 443"
+        );
+        assert_eq!(
+            parse_connect_target("[::1]:443"),
+            Some(("[::1]".into(), 443)),
+            "bracketed IPv6 carries its port"
+        );
+        assert_eq!(parse_connect_target("a.example:notaport"), None);
+        assert_eq!(parse_connect_target("a.example:"), None);
+        assert_eq!(parse_connect_target("a.example:0"), None);
+        assert_eq!(
+            parse_connect_target("a.example:70000"),
+            None,
+            "65536+ overflows u16"
+        );
+        assert_eq!(
+            parse_connect_target(":443"),
+            None,
+            "an empty host is not a dial target"
+        );
+        assert_eq!(
+            parse_connect_target("user@a.example:443"),
+            None,
+            "userinfo is refused, not forwarded"
+        );
+        assert_ne!(
+            parse_connect_target("a.example:notaport"),
+            Some(("a.example".into(), 443)),
+            "a bad port is never reinterpreted as 443"
+        );
+    }
+
+    /// The absolute-form authority split: default port 80, bracketed IPv6 with
+    /// an optional port, and `None` for an unbracketed IPv6 literal (the
+    /// loopback refusal must see `::1` as a host, not as a host named `:`).
+    #[test]
+    fn split_authority_keeps_the_default_port_and_the_bracket_rule() {
+        assert_eq!(split_authority("a.example"), Some(("a.example".into(), 80)));
+        assert_eq!(
+            split_authority("a.example:8080"),
+            Some(("a.example".into(), 8080))
+        );
+        assert_eq!(
+            split_authority("[::1]:80"),
+            Some(("::1".into(), 80)),
+            "brackets are stripped from the host"
+        );
+        assert_eq!(
+            split_authority("[::1]"),
+            Some(("::1".into(), 80)),
+            "bracketed host without a port defaults to 80"
+        );
+        assert_eq!(split_authority(""), None);
+        assert_eq!(
+            split_authority("[::1]:notaport"),
+            None,
+            ":x after a bracket is not a default-port case"
+        );
+        assert_eq!(split_authority("::1"), None, "unbracketed IPv6 is not an authority");
+        assert_eq!(split_authority("a.example:70000"), None);
+    }
+
+    /// The head finder says where the request ends: the offset points JUST
+    /// past the CRLFCRLF, and anything before a complete head reads as `None`.
+    #[test]
+    fn find_head_end_reports_just_past_the_double_crlf() {
+        assert_eq!(
+            find_head_end(b"GET /x HTTP/1.1\r\nHost: b.example\r\n\r\nBODY"),
+            Some("GET /x HTTP/1.1\r\nHost: b.example\r\n\r\n".len())
+        );
+        assert_eq!(
+            find_head_end(b"GET /x HTTP/1.1\r\nHost: b.example\r\n"),
+            None,
+            "a single CRLF is not a complete head"
+        );
+        assert_eq!(find_head_end(b"abc"), None);
+        assert_eq!(find_head_end(b""), None);
+    }
+
+    /// The framing verdicts: a head that does not END in CRLFCRLF, a bare CR,
+    /// a bare LF and an obs-fold line each get their own refusal; a clean head
+    /// gets none. The bare-CR arm carries the second anti-bot condition: an
+    /// arm deleted or forced true turns a malformed head into a clean one (or
+    /// a clean one into "bare CR").
+    #[test]
+    fn head_framing_error_names_every_shape() {
+        let clean = "GET /x HTTP/1.1\r\nHost: b.example\r\n\r\n";
+        assert_eq!(head_framing_error(clean), None, "a clean head has no verdict");
+        assert_eq!(
+            head_framing_error("GET /x HTTP/1.1\r\nHost: b.example"),
+            Some("request head is not CRLF-terminated")
+        );
+        assert_eq!(
+            head_framing_error("GET /\r SP\r\n\r\n"),
+            Some("bare CR in the request head")
+        );
+        assert_eq!(
+            head_framing_error("GET /\nHost: b.example\r\n\r\n"),
+            Some("bare LF in the request head")
+        );
+        assert_eq!(
+            head_framing_error("GET /x HTTP/1.1\r\n Host: b.example\r\n\r\n"),
+            Some("obs-fold line in the request head")
+        );
+    }
+
+    /// `head_lines` splits on CRLF only, keeps every line including the empty
+    /// one before the final CRLFCRLF, indexes both bytes of the terminator,
+    /// and keeps the unterminated remainder. A line that only LOOKS
+    /// terminated by a bare LF never becomes its own field.
+    #[test]
+    fn head_lines_split_on_crlf_only() {
+        let head = b"GET /x HTTP/1.1\r\nHost: b.example\r\nX-Trail: keep\r\n\r\n";
+        let lines = head_lines(head);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["GET /x HTTP/1.1", "Host: b.example", "X-Trail: keep", ""]
+        );
+
+        let no_terminator = head_lines(b"GET /x HTTP/1.1\r\nHost: b.example");
+        assert_eq!(
+            no_terminator.len(),
+            2,
+            "the remainder after the last CRLF is still a line"
+        );
+        assert_eq!(String::from_utf8_lossy(no_terminator[1]), "Host: b.example");
+
+        let bare_lf = head_lines(b"GET / HTTP/1.1\nHost: b.example\n");
+        assert_eq!(
+            bare_lf.len(),
+            1,
+            "a bare LF never terminates a line: {}",
+            String::from_utf8_lossy(bare_lf[0])
+        );
+    }
+
+    /// The relayed upstream head keeps its STATUS LINE (the `index > 0`
+    /// guard), drops the proxy-hop fields (Connection, Proxy-Authenticate,
+    /// Proxy-Authentication-Info) and keeps unrelated fields, and always
+    /// appends its own `Connection: close` head terminator.
+    #[test]
+    fn relayed_response_head_strips_proxy_hop_fields_but_keeps_the_status_line() {
+        let head = concat!(
+            "HTTP/1.1 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"x\"\r\n",
+            "X-Keep: yes\r\n",
+            "Proxy-Authentication-Info: leak\r\n",
+            "Connection: close\r\n",
+            "Pragma: no-cache\r\n\r\n"
+        );
+        let out = String::from_utf8_lossy(&relayed_response_head(head.as_bytes())).into_owned();
+        assert!(
+            out.starts_with("HTTP/1.1 407"),
+            "the status line is never stripped: {out}"
+        );
+        let kept: Vec<&str> = out.lines().collect();
+        assert!(kept.contains(&"X-Keep: yes"), "unrelated fields survive: {out}");
+        assert!(
+            kept.iter().any(|l| l.starts_with("Pragma:")),
+            "a field after proxy-hop fields survives: {out}"
+        );
+        assert!(
+            !out.contains("Proxy-Authenticate") && !out.contains("Proxy-Authentication-Info"),
+            "proxy-hop fields are stripped: {out}"
+        );
+        assert!(
+            kept.iter().filter(|l| l.starts_with("Connection: ")).count() == 1,
+            "exactly one Connection line - the upstream's is stripped and the listener's own close replaced it: {out}"
+        );
+        assert!(
+            out.ends_with("Connection: close\r\n\r\n"),
+            "the listener appends its own close: {out}"
+        );
+    }
+
+    /// Happy Eyeballs alternates address families so a broken v6 path cannot
+    /// queue every v4 attempt behind it: the order is v6, v4, v6, v4 ... with
+    /// the longer family's tail following. A single-family list comes back
+    /// untouched.
+    #[test]
+    fn interleave_families_alternates_and_keeps_order() {
+        let v6 = |octets: [u16; 8]| SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)), 1);
+        let v4 = |octets: [u8; 4]| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)), 1);
+        let a4 = v4([10, 0, 0, 1]);
+        let b4 = v4([10, 0, 0, 2]);
+        let a6 = v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]);
+        let b6 = v6([0xfd00, 0, 0, 0, 0, 0, 0, 2]);
+
+        assert_eq!(
+            interleave_families(vec![a6, a4, b6, b4]),
+            vec![a6, a4, b6, b4]
+        );
+        assert_eq!(
+            interleave_families(vec![a6, b6, a4]),
+            vec![a6, a4, b6],
+            "the v6 tail follows after v4 runs out"
+        );
+        assert_eq!(interleave_families(vec![a4, b4]), vec![a4, b4]);
+    }
+
+    /// Request ids are monotonically unique per listener: 1, 2, 3 - never a
+    /// constant and never 0. They are what groups an audit log.
+    #[test]
+    fn request_ids_start_at_one_and_increase() {
+        let (ctx, _base) = tunnel_ctx("next-request-id", 1);
+        let first = ctx.next_request_id();
+        let second = ctx.next_request_id();
+        assert_eq!(first, 1, "ids are 1-based");
+        assert_eq!(second, 2, "ids increase by one: {first} then {second}");
+    }

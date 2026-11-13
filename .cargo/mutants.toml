@@ -35,4 +35,12 @@ exclude_re = [
     # WARNING for unknown network profile names - and stderr is not observable
     # from an in-process unit test.
     "^src/net/mod.rs:176:24: ",
+
+    # Equivalent by construction, not by test gap: widening the early return
+    # `v6.is_empty() || v4.is_empty()` to `&&` skips the shortcut but then runs
+    # the interleave loop with one iterator empty, and `Option`'s `extend`
+    # appends the other family in the same order - every input yields the same
+    # concatenation. The interleaving itself IS asserted by
+    # `interleave_families_alternates_and_keeps_order`.
+    "^src/net/proxy.rs:1286:22: ",
 ]
