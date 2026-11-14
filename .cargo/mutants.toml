@@ -144,9 +144,17 @@ exclude_re = [
     # dialog flags need an interactive desktop; a unit test cannot exercise
     # them, and the COM-init guard tolerates RPC_E_CHANGED_MODE, which only the
     # live apartment decides.
-    "run_task_dialog|show_task_dialog|in show_dialog$|in toast_channel$|toast_inner|spawn_toast",
+    "run_task_dialog|show_task_dialog|in show_dialog$|toast_channel|toast_inner|spawn_toast",
 
     # Equivalent: the delete-ID_DENY_ONCE arm falls through to the catch-all,
     # which returns the identical deny-once result by construction.
     "delete match arm ID_DENY_ONCE",
+
+    # Time-comparison: `armed_at.elapsed() < cooldown` and its widened variants
+    # differ only after the cooldown has actually elapsed (60 s in tests); a
+    # unit test cannot wait that out, and shortening the cooldown in a fixture
+    # only pins `elapsed < x` for x the mutant keeps - the comparison is the
+    # code under test, so only a clock seam would do, which is a product
+    # change (the iso8601 clock-wrapper class).
+    "in BackendStickiness::plan$",
 ]

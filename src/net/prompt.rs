@@ -1764,14 +1764,16 @@ mod tests {
     use super::*;
     /// A test outcome must arrive within a bounded wait. An unbounded await
     /// turns a coordinator mutant into a 49 s suite hang (a TIMEOUT verdict)
-    /// instead of a fast failure, so hangs read as "undetected" in the ledger.
+    /// instead of a fast failure, so hangs read as "undetected" in the
+    /// ledger. Five seconds: several of these waits run SEQUENTIALLY in
+    /// one test, and their sum must stay under the suite timeout.
     async fn bounded<F>(fut: F) -> F::Output
     where
         F: std::future::Future,
     {
-        tokio::time::timeout(Duration::from_secs(15), fut)
+        tokio::time::timeout(Duration::from_secs(5), fut)
             .await
-            .expect("test outcome must arrive within 15 s")
+            .expect("test outcome must arrive within 5 s")
     }
 
     use std::collections::VecDeque;
