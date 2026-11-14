@@ -1762,6 +1762,18 @@ fn unavailable_from(config: &PromptConfig, cause: UnavailableCause) -> PromptOut
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A test outcome must arrive within a bounded wait. An unbounded await
+    /// turns a coordinator mutant into a 49 s suite hang (a TIMEOUT verdict)
+    /// instead of a fast failure, so hangs read as "undetected" in the ledger.
+    async fn bounded<F>(fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        tokio::time::timeout(Duration::from_secs(15), fut)
+            .await
+            .expect("test outcome must arrive within 15 s")
+    }
+
     use std::collections::VecDeque;
 
     /// Regression (2026-10-23): every toast used to own its own STA thread and
@@ -2278,7 +2290,7 @@ mod tests {
         handle.wait_for_calls(1).await;
         handle.reply("session.example.com", Ok(session_allow()));
         assert_eq!(
-            first.await.unwrap(),
+            bounded(first).await.unwrap(),
             PromptOutcome::Decided(session_allow())
         );
 
@@ -2311,7 +2323,7 @@ mod tests {
         };
         handle.wait_for_calls(1).await;
         handle.reply("deny-me.example.com", Ok(session_deny()));
-        assert_eq!(first.await.unwrap(), PromptOutcome::Decided(session_deny()));
+        assert_eq!(bounded(first).await.unwrap(), PromptOutcome::Decided(session_deny()));
 
         let second = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2338,7 +2350,7 @@ mod tests {
         };
         handle.wait_for_calls(1).await;
         handle.reply("api.example.com", Ok(session_allow()));
-        first.await.unwrap();
+        bounded(first).await.unwrap();
 
         // A sibling host still asks, and so does a subdomain of the decided one.
         let sibling = {
@@ -2347,7 +2359,7 @@ mod tests {
         };
         handle.wait_for_calls(2).await;
         handle.reply("cdn.example.com", Ok(allow_once()));
-        assert_eq!(sibling.await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(bounded(sibling).await.unwrap(), PromptOutcome::Decided(allow_once()));
         assert_eq!(
             handle.calls().len(),
             2,
@@ -2370,7 +2382,7 @@ mod tests {
         };
         handle.wait_for_calls(1).await;
         handle.reply("launch.example.com", Ok(session_allow()));
-        first.await.unwrap();
+        bounded(first).await.unwrap();
 
         coord.begin_launch();
 
@@ -2380,7 +2392,7 @@ mod tests {
         };
         handle.wait_for_calls(2).await;
         handle.reply("launch.example.com", Ok(deny_once()));
-        assert_eq!(second.await.unwrap(), PromptOutcome::Decided(deny_once()));
+        assert_eq!(bounded(second).await.unwrap(), PromptOutcome::Decided(deny_once()));
         assert_eq!(
             handle.calls().len(),
             2,
@@ -2451,9 +2463,9 @@ mod tests {
         FakeHandle::wait_parked(&coord, "api.example.com", 1).await;
 
         handle.reply("api.example.com", Ok(allow_once()));
-        assert_eq!(leader.await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(bounded(leader).await.unwrap(), PromptOutcome::Decided(allow_once()));
         assert_eq!(
-            follower.await.unwrap(),
+            bounded(follower).await.unwrap(),
             PromptOutcome::Decided(allow_once())
         );
         assert_eq!(handle.calls().len(), 1, "port must not fork the dialog");
@@ -2480,8 +2492,8 @@ mod tests {
         handle.reply("a.example.com", Ok(allow_once()));
         handle.reply("b.example.com", Ok(deny_once()));
 
-        assert_eq!(a.await.unwrap(), PromptOutcome::Decided(allow_once()));
-        assert_eq!(b.await.unwrap(), PromptOutcome::Decided(deny_once()));
+        assert_eq!(bounded(a).await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(bounded(b).await.unwrap(), PromptOutcome::Decided(deny_once()));
         assert_eq!(handle.calls().len(), 2);
     }
 
@@ -2557,10 +2569,10 @@ mod tests {
             handle.reply(&format!("h{i}.example.com"), Ok(deny_once()));
         }
         for l in leaders {
-            assert_eq!(l.await.unwrap(), PromptOutcome::Decided(deny_once()));
+            assert_eq!(bounded(l).await.unwrap(), PromptOutcome::Decided(deny_once()));
         }
         assert_eq!(
-            rider.await.unwrap(),
+            bounded(rider).await.unwrap(),
             PromptOutcome::Decided(deny_once()),
             "same-host rider shares the leader's result"
         );
@@ -2650,7 +2662,7 @@ mod tests {
         // leader's 10s wait ([G-46]).
         let start = Instant::now();
         assert_eq!(
-            follower.await.unwrap(),
+            bounded(follower).await.unwrap(),
             PromptOutcome::Unavailable {
                 allowed: false,
                 cause: UnavailableCause::BudgetElapsed,
@@ -2661,7 +2673,7 @@ mod tests {
         // The leader later decides Allow; the timed-out follower is NOT
         // retroactively allowed.
         handle.reply("api.example.com", Ok(allow_once()));
-        assert_eq!(leader.await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(bounded(leader).await.unwrap(), PromptOutcome::Decided(allow_once()));
     }
 
     // ---- leader caller-drop safety (review blocking) -------------------
@@ -2743,7 +2755,7 @@ mod tests {
         // whichever reply it pops.
         handle.reply("api.example.com", Ok(allow_once()));
         handle.reply("api.example.com", Ok(allow_once()));
-        assert_eq!(second.await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(bounded(second).await.unwrap(), PromptOutcome::Decided(allow_once()));
 
         // [G-4] The dropped leader's blocking dialog task was NOT
         // aborted: it is still parked, it consumed the reply meant for
@@ -3102,12 +3114,12 @@ mod tests {
         tokio::time::sleep(DIALOG).await;
         handle.reply("credit.example.com", Ok(allow_once()));
 
-        let (out, leader_wait) = leader.await.unwrap();
+        let (out, leader_wait) = bounded(leader).await.unwrap();
         assert_eq!(out, PromptOutcome::Decided(allow_once()));
         let leader_wait = leader_wait.expect("the leader led the dialog and paid for it");
         let mut credited = leader_wait;
         for f in followers {
-            let (out, follower_wait) = f.await.unwrap();
+            let (out, follower_wait) = bounded(f).await.unwrap();
             assert_eq!(
                 out,
                 PromptOutcome::Decided(allow_once()),
@@ -3157,7 +3169,7 @@ mod tests {
             .collect();
         for t in pair {
             assert_eq!(
-                t.await.unwrap(),
+                bounded(t).await.unwrap(),
                 PromptOutcome::Unavailable {
                     allowed: false,
                     cause: UnavailableCause::BudgetElapsed,
@@ -3324,8 +3336,119 @@ mod tests {
     async fn futures_of(tasks: Vec<tokio::task::JoinHandle<PromptOutcome>>) -> Vec<PromptOutcome> {
         let mut out = Vec::with_capacity(tasks.len());
         for t in tasks {
-            out.push(t.await.unwrap());
+            out.push(bounded(t).await.unwrap());
         }
         out
     }
+
+    /// The CRLF collapse spends display budget like any other shown char: a
+    /// dialogue body built from CRLF-separated lines truncates at the same bound
+    /// as plain text - and the collapse branch's own budget step is exercised
+    /// through many line pairs (the `+=` mutants there only diverge when the
+    /// budget is crossed that way).
+    #[test]
+    fn display_safe_crlf_pairs_spend_the_budget() {
+        let body = "ab\r\n".repeat(1200);
+        let out = display_safe(&body);
+        assert_eq!(out.chars().count(), 1024, "the bound counts collapsed pairs too");
+        assert!(out.starts_with("ab ab ab"), "collapsed pairs render 'a b a b...'");
+        assert!(!out.contains('\r') && !out.contains('\n'), "no raw line break survives");
+    }
+
+    /// The fast-fail latch is a state machine over consultations: count
+    /// evidence-free outcomes, arm at the threshold naming the cause, skip
+    /// under the deny posture only, reset on a decision, and leave
+    /// overload/caller-gone alone.
+    #[tokio::test]
+    async fn backend_stickiness_counts_arms_and_resets() {
+        // after = 3: the latch arms on the third evidence-free consultation.
+        let stick = BackendStickiness::with_cooldown(3, Duration::from_secs(60));
+
+        stick.begin_launch();
+        for _ in 0..4 {
+            stick.observe(&PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::NoDialogBackend,
+            });
+        }
+        assert_eq!(
+            stick.plan(PromptPolicy::Deny),
+            StickyPlan::Skip(UnavailableCause::NoDialogBackend),
+            "three unanswerable consultations arm the skip"
+        );
+        assert_eq!(
+            stick.plan(PromptPolicy::Allow),
+            StickyPlan::Consult,
+            "the allow posture never skips: a skip would permit with no dialog"
+        );
+
+        stick.observe(&PromptOutcome::Decided(allow_once()));
+        assert_eq!(
+            stick.plan(PromptPolicy::Deny),
+            StickyPlan::Consult,
+            "a decision un-arms the latch"
+        );
+
+        stick.begin_launch();
+        for _ in 0..3 {
+            stick.observe(&PromptOutcome::Unavailable {
+                allowed: false,
+                cause: UnavailableCause::BudgetElapsed,
+            });
+        }
+        assert_eq!(
+            stick.plan(PromptPolicy::Deny),
+            StickyPlan::Skip(UnavailableCause::SuppressedAfterBudget),
+            "an elapsed budget arms with its own cause, in the SUPPRESSED skip form"
+        );
+
+        stick.begin_launch();
+        stick.observe(&PromptOutcome::Overloaded {
+            cause: OverloadCause::ConsultationsHeld,
+        });
+        stick.observe(&PromptOutcome::Unavailable {
+            allowed: false,
+            cause: UnavailableCause::CallerGone,
+        });
+        assert_eq!(
+            stick.plan(PromptPolicy::Deny),
+            StickyPlan::Consult,
+            "non-evidence outcomes never arm the latch"
+        );
+    }
+
+    /// `finish` clears the waiter entry and resolves every parked follower with
+    /// the outcome.
+    #[tokio::test]
+    async fn finish_resolves_parked_waiters_and_clears_the_key() {
+        let map: WaiterMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx_a, rx_a) = oneshot::channel();
+        let (tx_b, rx_b) = oneshot::channel();
+        let entry = Arc::new(StdMutex::new(vec![tx_a, tx_b]));
+        map.lock().await.insert("api.example.com".into(), entry.clone());
+
+        PromptCoordinator::finish(
+            &map,
+            "api.example.com",
+            &entry,
+            PromptOutcome::Decided(deny_once()),
+        )
+        .await;
+
+        assert!(
+            !map.lock().await.contains_key("api.example.com"),
+            "the finished key leaves the waiter map"
+        );
+        assert_eq!(
+            bounded(rx_a).await.expect("sender parked"),
+            PromptOutcome::Decided(deny_once()),
+            "every parked follower receives the outcome"
+        );
+        assert_eq!(
+            bounded(rx_b).await.expect("sender parked"),
+            PromptOutcome::Decided(deny_once()),
+            "two parked followers, two deliveries"
+        );
+    }
+
 }

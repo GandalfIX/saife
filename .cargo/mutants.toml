@@ -137,4 +137,16 @@ exclude_re = [
     # environment-dependent; the parse boundary it delegates to
     # (parse_current_build) is covered by tests.
     "os_build_number",
+
+    # --- src/net/prompt.rs: the Windows dialog/toast layer ------------------
+
+    # The TaskDialog runtime: a real dialog callback's HRESULT handling and the
+    # dialog flags need an interactive desktop; a unit test cannot exercise
+    # them, and the COM-init guard tolerates RPC_E_CHANGED_MODE, which only the
+    # live apartment decides.
+    "run_task_dialog|show_task_dialog|in show_dialog$|in toast_channel$|toast_inner|spawn_toast",
+
+    # Equivalent: the delete-ID_DENY_ONCE arm falls through to the catch-all,
+    # which returns the identical deny-once result by construction.
+    "delete match arm ID_DENY_ONCE",
 ]
