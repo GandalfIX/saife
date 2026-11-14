@@ -28,11 +28,19 @@ const ALL_RESTRICTED_APP_PACKAGES_RIDS: [u32; 2] = [2, 2]; // S-1-15-2-2
 /// this windows-rs version). The value is stable per the Win32 API.
 const DRIVE_FIXED: u32 = 3;
 
+/// Does this OS build support the AppContainer RuleSet (AC-1.9)?
+///
+/// Pure so the threshold decision is testable: the OS read that feeds it
+/// (`os_build_number`) cannot be pinned by a unit test, but the boundary can.
+fn build_supported(build: u32) -> bool {
+    build >= MIN_BUILD
+}
+
 /// Called from `run` before any spawning — fails fast with a clear error if
 /// the host is unsupported (AC-1.9).
 pub fn check_runtime() -> Result<()> {
     let build = os_build_number()?;
-    if build < MIN_BUILD {
+    if !build_supported(build) {
         bail!(
             "AppContainer RuleSet requires Windows 10 1709 (build {MIN_BUILD}) or later. \
              Detected build {build}."
@@ -86,7 +94,7 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
     println!("Minimum supported build   : {MIN_BUILD} (Windows 10 1709)");
     println!(
         "AppContainer + RuleSet     : {}",
-        if build >= MIN_BUILD { "available" } else { "MISSING" }
+        if build_supported(build) { "available" } else { "MISSING" }
     );
     println!("Job Object                 : available (always, Win9x+)");
     for line in network_report_lines(build) { println!("{line}"); }
@@ -101,7 +109,7 @@ pub fn check(check_only: bool, grant_drive_root: bool, enable_loopback: bool) ->
         }
     );
 
-    if build < MIN_BUILD {
+    if !build_supported(build) {
         bail!("host build {build} is below minimum {MIN_BUILD} (AppContainer RuleSet unavailable)");
     }
     Ok(())
@@ -538,20 +546,28 @@ fn os_build_number() -> Result<u32> {
             return Err(anyhow::anyhow!("RegQueryValueExW failed: 0x{:x}", r.0));
         }
 
-        let utf16: Vec<u16> = buf[..len as usize]
-            .as_chunks::<2>().0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
-        let s = String::from_utf16_lossy(&utf16)
-            .trim_end_matches('\0')
-            .to_string();
-        let build: u32 = s
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("could not parse CurrentBuild `{s}` as u32"))?;
-        Ok(build)
+        parse_current_build(&buf[..len as usize])
     }
+}
+
+/// Parse the `CurrentBuild` registry bytes (UTF-16LE, possibly NUL-padded).
+///
+/// Pure so the decode-and-parse boundary is testable: the typed value is a
+/// string ("26100"), a DWORD on some builds, and the buffer arrives as raw
+/// bytes from `RegQueryValueExW`.
+fn parse_current_build(raw: &[u8]) -> Result<u32> {
+    let utf16: Vec<u16> = raw
+        .as_chunks::<2>().0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let s = String::from_utf16_lossy(&utf16);
+    let s = s.trim_end_matches('\0').to_string();
+    let build: u32 = s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("could not parse CurrentBuild `{s}` as u32"))?;
+    Ok(build)
 }
 
 #[cfg(test)]
@@ -616,5 +632,35 @@ mod tests {
         assert!(line.contains("no tier reported"), "{line}");
         assert!(line.contains("tier_source `unavailable`"), "{line}");
         assert!(line.contains("--backend appcontainer"), "{line}");
+    }
+
+    /// The build gate is the AC-1.9 contract: 1709 (16299) and up is
+    /// supported, one build below is not.
+    #[test]
+    fn the_build_gate_includes_the_minimum() {
+        assert!(!build_supported(MIN_BUILD - 1), "one below the minimum is not supported");
+        assert!(build_supported(MIN_BUILD), "the minimum itself is supported");
+        assert!(build_supported(19045), "Windows 10 22H2");
+        assert!(build_supported(26100), "Windows 11 24H2");
+    }
+
+    /// The registry value arrives as raw UTF-16LE bytes: the parser must trim
+    /// the NUL padding, accept surrounding whitespace, and refuse junk.
+    #[test]
+    fn the_current_build_value_parses_from_raw_registry_bytes() {
+        fn utf16(s: &str) -> Vec<u8> {
+            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+        }
+        assert_eq!(parse_current_build(&utf16("26100")).unwrap(), 26100);
+        assert_eq!(parse_current_build(&utf16("16299\0")).unwrap(), 16299);
+        assert_eq!(parse_current_build(&utf16(" 19045 ")).unwrap(), 19045);
+        assert!(
+            parse_current_build(&utf16("not-a-build")).is_err(),
+            "junk is refused, not defaulted"
+        );
+        assert!(
+            parse_current_build(&utf16("")).is_err(),
+            "an empty value is refused, not defaulted"
+        );
     }
 }

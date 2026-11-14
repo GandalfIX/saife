@@ -86,4 +86,55 @@ exclude_re = [
     # hop-by-hop field name, so `index > 0` and `index >= 0` strip exactly the
     # same lines for every response the head parser admits.
     "replace > with >= in relayed_response_head$",
+
+    # --- src/setup.rs: the host-introspection layer -----------------------
+    # The whole file's survivors come from one class: functions whose input is
+    # the LIVE Windows host (registry, ACLs, process token, volume table,
+    # current_exe). A unit test cannot pin host state without changing the host
+    # (the VM-first rule forbids that), so each gets its reason here. The file's
+    # decision cores are extracted and tested beside them: network_report_lines
+    # and now build_supported + parse_current_build.
+
+    # Needs a host whose OS build is BELOW the 1709 minimum - the mutation only
+    # changes the refusal path of a call that a modern machine never takes.
+    "check_runtime",
+
+    # The `setup` report: shells out to CheckNetIsolation and prints the live
+    # OS state (build, MXC tier, drive-root grant). Its stdout/stderr shaping
+    # mutants are only observable against a real host; the build gate it uses
+    # is tested via build_supported.
+    "replace check -> | in check$",
+
+    # Probes current_exe + the sidecar's mxc dispatch on the live machine.
+    "mxc_tier_line",
+
+    # Requires elevation and WRITE_DAC on TrustedInstaller-owned volume roots.
+    "grant_drive_roots",
+
+    # LocalFree of a SID allocated by ConvertStringSidToSidW: the leak it
+    # guards is only observable through the OS allocator.
+    "OwnedSid",
+
+    # Writes an ACE onto real volume roots (SetEntriesInAcl + SetNamedSecurityInfo).
+    "grant_read_attributes",
+
+    # GetLogicalDriveStringsW over the host's actual volumes; the DRIVE_FIXED
+    # filter depends on which drives are attached.
+    "fixed_drive_roots",
+
+    # The process token's elevation state is an environment property: asserting
+    # either polarity makes the suite fail for a developer who runs cargo test
+    # from an elevated shell.
+    "is_elevated",
+
+    # Reads SystemDrive from the environment plus a real ACL probe.
+    "drive_root_status",
+
+    # Real ACL read on a volume root (GetNamedSecurityInfoW).
+    "check_root_has_grant",
+
+    # Reads HKLM\...\CurrentVersion\CurrentBuild. The value-moving mutants are
+    # environment-dependent; the parse boundary it delegates to
+    # (parse_current_build) is covered by tests.
+    "os_build_number",
 ]
