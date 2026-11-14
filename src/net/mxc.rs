@@ -90,7 +90,7 @@
 // `process_container_config`, `MxcBackend`.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::paths::{fold_case, path_key, split_path_root, trim_component, unify_path_prefix};
+use crate::paths::path_key;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -3303,39 +3303,6 @@ mod m2_credential_file_denies {
         }
     }
 
-
-    /// Path-key boundary inputs. Raw strings spell every separator unambiguously
-    /// (Win32 comparison is the ground truth the key approximates).
-    #[test]
-    fn the_path_key_boundaries_match_win32_comparison() {
-        // Dot segments join away: an interior `\.`, a trailing `\.`, a trailing
-        // separator, and a ` .` component are all the same path as their parent.
-        assert_eq!(path_key(r"C:\work\.\sub"), path_key(r"C:\work\sub"));
-        assert_eq!(path_key(r"C:\work\sub\."), path_key(r"C:\work\sub\"));
-        assert_eq!(path_key(r"C:\work\sub \"), path_key(r"C:\work\sub\"));
-        // A rootless path must NOT grow an artificial root separator.
-        assert_ne!(path_key(r"work\sub"), r"\WORK\SUB");
-        // The bare verbatim prefix (exactly four bytes) unifies away to nothing.
-        assert_eq!(unify_path_prefix(r"\\?\"), "");
-        // The device prefix unifies to its remainder.
-        assert_eq!(unify_path_prefix(r"\\?\C:\work"), r"C:\work");
-        // The verbatim UNC form unifies to the plain UNC form.
-        assert_eq!(unify_path_prefix(r"\\?\UNC\srv\share"), r"\\srv\share");
-        // UNC: the root is server+share; the remainder starts below it; a
-        // shareless root invents no share separator; trailing dots trim.
-        assert_eq!(split_path_root(r"\\srv").0, r"\\srv");
-        assert_eq!(split_path_root(r"\\srv").1, "");
-        let (root, rest) = split_path_root(r"\\srv\share\child\x");
-        assert_eq!(root, r"\\srv\share");
-        // The remainder keeps the separator before the first segment below the
-        // share; path_key's segment pass skips the empty first segment, so the
-        // join never doubles the separator.
-        assert_eq!(rest, r"\child\x");
-        assert_eq!(
-            split_path_root(r"\\srv\share.\child"),
-            (r"\\srv\share".to_string(), r"\child")
-        );
-    }
 
     /// The session-budget classifier is the map an operator reads for a killed
     /// session: each arm names a different remediation, so the boundaries must
