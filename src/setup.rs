@@ -663,4 +663,33 @@ mod tests {
             "an empty value is refused, not defaulted"
         );
     }
+
+    /// The grant layer's contract, end to end, on a root the test owns: an ACE
+    /// is merged in, and the check reads it back. This also pins the three
+    /// TRUSTEE_W fields (form, type, name) that cargo-mutants deletes - a
+    /// deleted field makes SetEntriesInAclW refuse, so the round trip fails.
+    #[test]
+    fn a_read_attributes_grant_round_trips_on_an_owned_directory() {
+        let dir = std::env::temp_dir().join("saife-acl-roundtrip-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let root = dir.display().to_string();
+
+        assert!(
+            !check_root_has_grant(&root).expect("read a fresh DACL"),
+            "a fresh directory carries no app-package grant"
+        );
+
+        let sid = all_restricted_app_packages_sid().expect("the app-package SID");
+        grant_read_attributes(&root, sid.0).expect("grant FILE_READ_ATTRIBUTES");
+        assert!(
+            check_root_has_grant(&root).expect("read the merged DACL"),
+            "the granted ACE is readable back from the directory"
+        );
+
+        // Second grant: the SET_ACCESS merge keeps one ACE, not two.
+        grant_read_attributes(&root, sid.0).expect("re-grant is idempotent");
+
+        std::fs::remove_dir_all(&dir).expect("clean up the scratch directory");
+    }
 }

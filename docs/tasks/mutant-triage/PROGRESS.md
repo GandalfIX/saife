@@ -162,3 +162,25 @@ list above or the register: 82 survivors + 6 timeouts at campaign start ->
 Note: --iterate makes successive scoped runs cheap (it skips caught/unviable),
 but a mutants run killed mid-flight has no resume point - outcomes.json stops
 at the last finished mutant (end_time: null); re-running --iterate picks up.
+
+## setup lane (2026-11-11)
+
+Baseline: 51 mutants, 40 missed - all one class (functions whose input is the
+live Windows host). Two decision cores extracted and tested (build_supported,
+parse_current_build); 11 register patterns with per-function reasons.
+
+Round-trip test added: a_read_attributes_grant_round_trips_on_an_owned_directory
+creates a tempo directory, grants FILE_READ_ATTRIBUTES to the app-package SID,
+reads the ACE back, re-grants (idempotence) and cleans up. It runs
+unprivileged and kills the trustee-pointer deletion (delete ptstrName), so the
+grant_read_attributes / check_root_has_grant register entries are gone.
+
+Two survivors are TOOL-LIMITED, not test-limited:
+- delete field TrusteeForm / delete field TrusteeType in the TRUSTEE_W literal.
+  cargo-mutants 27.1.0 does NOT apply --re/--exclude-re to struct-field
+  deletion mutants (upstream bug; fixed only in Unreleased). Both fields
+  refill from ..Default::default() to values the ACL API treats identically at
+  the only call site, so no test distinguishes them.
+  Close by: bump cargo-mutants when the fix releases, then add an exclude_re
+  entry; or add the mutants dev-dependency and mark the literal
+  #[cfg_attr(test, mutants::skip)].

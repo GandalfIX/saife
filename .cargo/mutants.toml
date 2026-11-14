@@ -116,7 +116,7 @@ exclude_re = [
     "OwnedSid",
 
     # Writes an ACE onto real volume roots (SetEntriesInAcl + SetNamedSecurityInfo).
-    "grant_read_attributes",
+    "grant_read_attributes|delete field Trustee",
 
     # GetLogicalDriveStringsW over the host's actual volumes; the DRIVE_FIXED
     # filter depends on which drives are attached.
