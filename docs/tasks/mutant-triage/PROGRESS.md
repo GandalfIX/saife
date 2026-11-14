@@ -210,3 +210,26 @@ Residue:
   as a documented value (same treatment as the proxy relay constants).
 - Register: dialog/toast layer (TaskDialog HRESULT handling, flags, COM
   apartment incl. RPC_E_CHANGED_MODE), and the equivalent ID_DENY_ONCE arm.
+
+## backend + mxc lane (2026-11-14)
+
+Baseline: 284 tested, 51 missed, 187 caught, 46 unviable. Closing proof:
+**0 missed** (248 caught/unviable skipped by iteration; every residue batch
+re-proven).
+
+The lane's survivors were mostly the launch layer (AppContainer session, the
+mxc SDK session driver, the timed child wait) - registered as one class. The
+decision cores underneath them are now directly tested:
+
+- SessionBudget::classify: every arm boundary, twice over - the deprivation
+  check exists twice (handshake 2b, teardown 2c) and each arm's equality edge
+  needs its OWN input, because the earlier guard short-circuits the other one
+  (first fixture reached the handshake edges; a second budget with a lower
+  combined floor reaches the teardown twin and the deprived-at-equality cases
+  the first cannot produce).
+- path_key/split_path_root/unify_path_prefix: Win32 comparison boundaries
+  (dot segments, rootless paths, bare verbatim prefix, UNC server+share roots
+  with trailing dots).
+- RequestError/MxcError renderings + source chain, TimeoutReason Display,
+  the launch counters' prompt delta through the ProxyProofSource trait.
+- filesystem_policy folds a repeated writable grant.
