@@ -7428,6 +7428,15 @@
     /// shape where `index + 1 < len` and its widened variants differ, and a
     /// bracket with no port after `]` is where the default-port guard can lie.
     #[test]
+    /// A percent escape cut off after ONE hex digit at the very end is kept
+    /// verbatim: the guard must not read the byte past the buffer (the only
+    /// shape where `i + 2 < len` and `<=` diverge).
+    #[test]
+    fn percent_decode_keeps_a_one_digit_escape_at_the_end() {
+        // ab%4: the trailing "%4" has no second hex digit and no byte to read.
+        assert_eq!(percent_decode("ab%4"), "ab%4");
+    }
+
     fn framing_variants_have_a_discriminating_input() {
         // A trailing lone CR: the final iteration must see it as the remainder,
         // never index past the buffer (the `<` and `<=` loop variants part here).

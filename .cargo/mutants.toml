@@ -54,7 +54,7 @@ exclude_re = [
     # fires (once vs not at all). stderr is not observable from an
     # in-process unit test, and the audit event the warning accompanies is
     # asserted separately.
-    " in warn_(no_dialog|prompt_budget)_once$",
+    "replace warn_(no_dialog|prompt_budget)_once with",
 
     # Diagnostic Debug impl: it deliberately elides the closure (`(..)`), so
     # its only contract is "prints something"; asserting a diagnostic
@@ -72,7 +72,7 @@ exclude_re = [
     # host on the host's own stack; the wrapper's contract (pass through the
     # resolver's answers) is only assertable against a fake lookup, which is
     # already the seam the DNS tests use.
-    " in system_lookup$",
+    "replace system_lookup",
 
     # Equivalent: the mutant widens the bracket flag `starts_with('[') &&
     # ends_with(']')` to `||`. The flag is consumed only by
