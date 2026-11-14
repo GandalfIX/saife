@@ -3446,4 +3446,198 @@ mod m2_credential_file_denies {
             );
         }
     }
+    /// Path-key boundary inputs. Raw strings spell every separator unambiguously
+    /// (Win32 comparison is the ground truth the key approximates).
+    #[test]
+    fn the_path_key_boundaries_match_win32_comparison() {
+        // Dot segments join away: an interior `\.`, a trailing `\.`, a trailing
+        // separator, and a ` .` component are all the same path as their parent.
+        assert_eq!(path_key(r"C:\work\.\sub"), path_key(r"C:\work\sub"));
+        assert_eq!(path_key(r"C:\work\sub\."), path_key(r"C:\work\sub\"));
+        assert_eq!(path_key(r"C:\work\sub \"), path_key(r"C:\work\sub\"));
+        // A rootless path must NOT grow an artificial root separator.
+        assert_ne!(path_key(r"work\sub"), r"\WORK\SUB");
+        // The bare verbatim prefix (exactly four bytes) unifies away to nothing.
+        assert_eq!(unify_path_prefix(r"\\?\"), "");
+        // The device prefix unifies to its remainder.
+        assert_eq!(unify_path_prefix(r"\\?\C:\work"), r"C:\work");
+        // The verbatim UNC form unifies to the plain UNC form.
+        assert_eq!(unify_path_prefix(r"\\?\UNC\srv\share"), r"\\srv\share");
+        // UNC: the root is server+share; the remainder starts below it; a
+        // shareless root invents no share separator; trailing dots trim.
+        assert_eq!(split_path_root(r"\\srv").0, r"\\srv");
+        assert_eq!(split_path_root(r"\\srv").1, "");
+        let (root, rest) = split_path_root(r"\\srv\share\child\x");
+        assert_eq!(root, r"\\srv\share");
+        // The remainder keeps the separator before the first segment below the
+        // share; path_key's segment pass skips the empty first segment, so the
+        // join never doubles the separator.
+        assert_eq!(rest, r"\child\x");
+        assert_eq!(
+            split_path_root(r"\\srv\share.\child"),
+            (r"\\srv\share".to_string(), r"\child")
+        );
+    }
+
+    /// The session-budget classifier is the map an operator reads for a killed
+    /// session: each arm names a different remediation, so the boundaries must
+    /// not move between arms (the comparison mutants of each stage).
+    #[test]
+    fn session_budget_classify_names_each_arm_at_its_boundary() {
+        use std::time::Duration;
+
+        let budget = SessionBudget {
+            prompt: Duration::from_secs(10),
+            workload: Duration::from_secs(10),
+            slack: Duration::from_secs(5),
+        };
+        // (2a) below the combined floor: the supervisor explains it.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(19),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::SessionHandshake
+        );
+        // Exactly AT the combined floor the session is not case (2a): both terms
+        // could have been spent and nothing was taken from the workload.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(20),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // (2b) handshake deprivation beyond slack: the container never got ready.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(30),
+                handshake_elapsed: Duration::from_secs(25),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::SessionHandshake
+        );
+        // At the slack surface the rule stays strict: slack IS the tolerance, so
+        // a create that used it plus a full-term workload is the workload run.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(30),
+                handshake_elapsed: Duration::from_secs(5),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // (2c) teardown evasion works the same way beyond slack.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(30),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::from_secs(25),
+            }),
+            TimeoutReason::SessionTeardown
+        );
+        // (1a) the clamp: an aggregate claiming the whole session as prompt time
+        // supports no prompt claim - the workload term wins the attribution.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(30),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::from_secs(30),
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // (1b) the boundary: the workload got EXACTLY its term - `<` stays strict.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(20),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::from_secs(10),
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // One second less is deprivation: the dialog ate the workload's term.
+        // (The session outlived both terms - case (2a) needs elapsed below
+        // prompt+workload, so 25 s here, not 19.)
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(25),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::from_secs(16),
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::PromptBudgetExhausted
+        );
+    }
+
+    /// A request refusal spells the path it names for a non-empty path; the
+    /// empty-path arm fires for a genuinely empty spelling (where the standard
+    /// arm would print nothing usable). The source chain survives the wrapper.
+    #[test]
+    fn request_errors_name_their_path_and_wrap_their_source() {
+        use std::error::Error as _;
+
+        let spelled = MxcError::Request(RequestError::PathNotAbsolute {
+            what: "workdir",
+            path: r"C:\work\repo".into(),
+        });
+        let text = spelled.to_string();
+        assert!(text.contains(r"C:\work\repo"), "the path is spelled: {text}");
+        assert!(text.contains("workdir"), "the 'what' is spelled: {text}");
+
+        let empty = MxcError::Request(RequestError::PathNotAbsolute {
+            what: "workdir",
+            path: String::new(),
+        });
+        assert!(
+            empty.to_string().contains("empty"),
+            "only an empty spelling takes the empty-path arm: {empty}"
+        );
+        assert!(empty.source().is_some(), "the request error is the source");
+    }
+
+    /// The timeout reason is what the audit leaf carries: the four reasons are
+    /// deliberately distinct strings, so Display must render nonempty text.
+    #[test]
+    fn a_timeout_reason_renders_as_something() {
+        for reason in [
+            TimeoutReason::SessionHandshake,
+            TimeoutReason::SessionTeardown,
+            TimeoutReason::PromptBudgetExhausted,
+            TimeoutReason::WorkloadBudgetExceeded,
+        ] {
+            assert!(!format!("{reason}").is_empty(), "{reason:?} must render");
+        }
+    }
+
+    /// A source that is not the proxy listener has no prompt path (the trait's
+    /// default zero); the real listener's counters report their own delta
+    /// through the trait - it must not silence a live counter.
+    #[test]
+    fn the_trait_prompt_wait_reports_the_listener_counters() {
+        let counters = crate::net::proxy::LaunchCounters::new();
+        counters.note_prompt_wait(std::time::Duration::from_millis(1500));
+        assert_eq!(
+            super::ProxyProofSource::prompt_wait(counters.as_ref()),
+            std::time::Duration::from_millis(1500),
+            "the trait delegates to the listener's own clock"
+        );
+    }
+
 }

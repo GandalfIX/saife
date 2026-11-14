@@ -157,4 +157,42 @@ exclude_re = [
     # code under test, so only a clock seam would do, which is a product
     # change (the iso8601 clock-wrapper class).
     "in BackendStickiness::plan$",
+
+    # --- src/backend/** and src/net/mxc.rs: the launch layer ---------------
+    # One class again: the functions whose input is a live container, a child
+    # process or the Win32 security stack. Their decision cores are extracted
+    # and tested beside them (session_budget classify, path_key/split/unify,
+    # the error renderings, the launch counters' prompt delta); what remains
+    # needs the host itself.
+
+    # AppContainer session: CreateAppContainer + the restricted token and the
+    # real child spawn; the exit code is the child's.
+    "appcontainer",
+
+    # The mxc session driver: allocates the container through the SDK and
+    # spawns the workload. Its guards shape the request before the spawn, so a
+    # unit test cannot observe them without a live backend.
+    "run_mxc_session",
+
+    # The timed child-process wait and its capture join: real process handles
+    # and wall-clock timings (run_timed, map_wait, join_capture).
+    "run_timed|map_wait|join_capture",
+
+    # The launch path's deadline arithmetic on `Instant` and its argv guard
+    # (MxcBackend::launch).
+    "MxcBackend<'a>::launch",
+
+    # Printing the child's streamed output and the unavailable-backend hint:
+    # stdout/stderr text, not observable in-process.
+    "emit_child_output|emit_mxc_unavailable_hint",
+
+    # Equivalent: the non-listener proof source's default IS zero prompt time
+    # (nothing consulted a dialog), and Default::default() for Duration is
+    # zero - the two spellings are the same value.
+    "^src/net/mxc.rs:1462:9: ",
+
+    # The probe VIEW is a field copy out of the SDK detector's output (21
+    # fields, no Default); it carries no decision. The tier mapping it feeds
+    # has its own tests.
+    "ProbeView::from_probe",
 ]
