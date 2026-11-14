@@ -1597,4 +1597,35 @@ mod tests {
             }
         );
     }
+    /// The engine request/response plumbing has no engine: the response parser,
+    /// the header lookup, the JSON body decode, the URL-encoding of a filter
+    /// and the digest-pin gate are all testable in-process.
+    #[test]
+    fn the_engine_http_plumbing_is_engine_free() {
+        // urlencode: unreserved characters pass; everything else is %-escaped
+        // UPPER-CASE hex, two digits always (%02X - e.g. SP is "%20", not "% ".
+        assert_eq!(urlencode("npipe"), "npipe");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("~._-"), "~._-");
+        assert_eq!(urlencode("\u{e4}"), "%C3%A4");
+
+        // A digest-pinned image passes; a tag refuses (a tag can move).
+        require_digest("repo@sha256:abc").unwrap();
+        let err = require_digest("repo:latest").expect_err("a tag must be refused");
+        assert!(format!("{err:#}").contains("digest-pinned"), "{err:#}");
+
+        // header(): the parser lowercases names, so lookups are lowercase and
+        // the first matching one wins.
+        let response = parse_response(b"HTTP/1.1 204 No Content\r\nX-Runner: one\r\nX-Runner: two\r\n\r\n").unwrap();
+        assert_eq!(response.header("x-runner"), Some("one"));
+        assert_eq!(response.header("X-Runner"), None, "names are folded at parse");
+        assert_eq!(response.header("missing"), None);
+
+        // json(): the body decodes; a non-JSON body names the status.
+        let j = parse_response(b"HTTP/1.1 200 OK\r\n\r\n{\"a\":1}").unwrap();
+        assert_eq!(j.json().unwrap()["a"], 1);
+        let bad = parse_response(b"HTTP/1.1 500 Err\r\n\r\nnot json").unwrap();
+        assert!(format!("{:#}", bad.json().unwrap_err()).contains("non-JSON (500)"));
+    }
+
 }
