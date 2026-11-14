@@ -2283,7 +2283,7 @@ mod tests {
     async fn a_session_allow_answers_the_next_request_without_a_dialog() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let first = {
             let c = Arc::clone(&coord);
@@ -2317,7 +2317,7 @@ mod tests {
     async fn a_session_deny_answers_the_next_request_without_a_dialog() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let first = {
             let c = Arc::clone(&coord);
@@ -2344,7 +2344,7 @@ mod tests {
     async fn session_memory_covers_one_host_and_not_its_siblings() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let first = {
             let c = Arc::clone(&coord);
@@ -2376,7 +2376,7 @@ mod tests {
     async fn a_new_launch_forgets_session_decisions() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let first = {
             let c = Arc::clone(&coord);
@@ -2408,7 +2408,7 @@ mod tests {
     async fn coalesce_concurrent_same_host_shares_one_dialog() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let tasks: Vec<_> = (0..5)
             .map(|i| {
@@ -2450,7 +2450,7 @@ mod tests {
         // of the same host coalesce onto one leader.
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let leader = {
             let c = Arc::clone(&coord);
@@ -2477,7 +2477,7 @@ mod tests {
     async fn distinct_hosts_do_not_coalesce() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let a = {
             let c = Arc::clone(&coord);
@@ -2505,7 +2505,7 @@ mod tests {
         // so a *later* request (not concurrent) prompts afresh.
         let (handle, dialog) = fake_dialog();
         let coord = PromptCoordinator::with_dialog(dialog);
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         handle.reply("api.example.com", Ok(allow_once()));
         handle.reply("api.example.com", Ok(deny_once()));
@@ -2527,7 +2527,7 @@ mod tests {
     async fn overload_ninth_new_host_denied_immediately() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         // 8 distinct hosts, each parked inside its own dialog → all 8
         // permits are held by leaders.
@@ -2720,7 +2720,7 @@ mod tests {
     async fn dropped_leader_future_does_not_strand_the_coalescing_entry() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         // A leader is elected; the fake dialog parks on its reply
         // queue.
@@ -2784,7 +2784,7 @@ mod tests {
                 "api.example.com",
                 443,
                 None,
-                cfg(Duration::from_secs(60), PromptPolicy::Deny),
+                cfg(Duration::from_secs(2), PromptPolicy::Deny),
             )
             .await;
         assert_eq!(
@@ -2802,7 +2802,7 @@ mod tests {
                 "api.example.com",
                 443,
                 None,
-                cfg(Duration::from_secs(60), PromptPolicy::Allow),
+                cfg(Duration::from_secs(2), PromptPolicy::Allow),
             )
             .await;
         assert_eq!(
@@ -2965,7 +2965,7 @@ mod tests {
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
         // A budget long enough that nothing here is a timeout: these are backend
         // failures, not elapsed budgets.
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
         // A failing reply for every host: if the fast-fail does not arrive, the
         // later dialogs park (and the test says so) instead of being fed.
         for i in 0..5 {
@@ -3008,7 +3008,7 @@ mod tests {
     async fn a_dialog_that_succeeds_resets_the_no_backend_streak() {
         let (handle, dialog) = fake_dialog();
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         handle.reply("resets-0.example.com", Err(DialogUnavailable));
         handle.reply("resets-1.example.com", Ok(deny_once()));
@@ -3048,7 +3048,7 @@ mod tests {
         let coord = Arc::new(PromptCoordinator::with_dialog(dialog));
         // A budget the dialogs cannot outlive: nothing here is abandoned, every
         // dialog is one the coordinator is still waiting on.
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
 
         let leaders: Vec<_> = (0..MAX_CONCURRENT_PROMPTS)
             .map(|i| {
@@ -3254,7 +3254,7 @@ mod tests {
             NO_BACKEND_STICKY_AFTER,
             COOLDOWN,
         ));
-        let cfg = cfg(Duration::from_secs(60), PromptPolicy::Deny);
+        let cfg = cfg(Duration::from_secs(2), PromptPolicy::Deny);
         for i in 0..NO_BACKEND_STICKY_AFTER {
             handle.reply(&format!("armed-{i}.example.com"), Err(DialogUnavailable));
         }
