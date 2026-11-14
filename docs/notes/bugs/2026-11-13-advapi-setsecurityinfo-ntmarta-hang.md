@@ -58,12 +58,30 @@ and sibling directories returns instantly; the identity call on
   inherited flags are preserved, effective access is unchanged, and the suite's
   protected-DACL tests (`M5`, `teardown`) pin both halves.
 
+## Host findings (elevated pass, 2026-11-14)
+
+- Build: Windows 10 Pro 26H2, `26300.9974` — an Insider flight, not a released
+  servicing build.
+- Filesystem filter stack (`fltmc filters`, highest altitudes first):
+  `bindflt 409800`, `FsDepends 407000`, `UCPD 385250.5`, `WdFilter 328010`
+  (Defender), `storqosflt`, `wcifs`, `gameflt`, `CldFlt`, `bfs` (BitLocker),
+  `FileCrypt`, `luafv`, `UnionFS`, `npsvctrig`, `Wof`, `FileInfo`.
+- Defender: real-time protection on, no exclusions, **tamper protection ON**.
+  `Set-MpPreference -DisableRealtimeMonitoring $true` is silently ignored under
+  tamper protection (`RealTimeProtectionEnabled` stays `True`), so a true
+  Defender-off A/B cannot be run without disabling tamper protection itself —
+  a machine-wide protection change nobody should make to take a measurement.
+- A/B with the filter stack as found, session from a Temp workspace:
+  unfixed base binary **hangs** (killed at the 60 s harness bound, twice);
+  fixed binary completes in **0.3 s**.
+
 ## What remains open (host-level)
 
-No machine-side remediation was attempted: the hang is reachable from any
-process that drives advapi's ACL write on the affected object, so an
-exclusion does not address the walk. Candidates for a host-level diagnosis:
-the Insider flight (26300 + filter stack), the mix of filter drivers
-(`fltmc filters` needs an elevated shell), and a repro for Microsoft with a
-minimal test identity-write hung. The saife fix removes the only known victim
-path on this machine.
+The stall owner is not yet named. Candidates, in order of likelihood: `WdFilter`
+(Defender's scan on the object the inheritance walk touches), `UCPD` (26H2's
+user-consent protection driver, new in this flight), or the flight's own
+`ntmarta`/SRM changes. A minimal repro (identity DACL write through
+`SetSecurityInfo` on `%LOCALAPPDATA%\Temp`, hang; the same write through
+`NtSetSecurityObject`, 0.01 s) plus the minidump stack
+(`ntmarta!AccGetInheritanceSource → NtClose`) is ready for a Microsoft report.
+
