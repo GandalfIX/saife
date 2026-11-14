@@ -54,7 +54,7 @@ exclude_re = [
     # fires (once vs not at all). stderr is not observable from an
     # in-process unit test, and the audit event the warning accompanies is
     # asserted separately.
-    "replace warn_(no_dialog|prompt_budget)_once with",
+    " in warn_(no_dialog|prompt_budget)_once$|replace warn_(no_dialog|prompt_budget)_once with",
 
     # Diagnostic Debug impl: it deliberately elides the closure (`(..)`), so
     # its only contract is "prints something"; asserting a diagnostic
