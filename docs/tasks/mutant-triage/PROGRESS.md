@@ -150,3 +150,15 @@ elision, `LiveTokenClaim::drop` / `ProxyHandle::shutdown` (lifecycle),
 `system_lookup` (OS resolver), and two argued equivalences
 (`parse_connect_target` bracket flag, `relayed_response_head` status-line
 index).
+
+## Proxy lane: closed (2026-11-11)
+
+Closing scoped proof (cargo mutants --file src/net/proxy.rs --iterate):
+**17 tested, 7 missed, 9 timeouts, 1 unviable**; 1335 previously caught or
+unviable mutants were skipped by the iteration. Every survivor is in the debt
+list above or the register: 82 survivors + 6 timeouts at campaign start ->
+7 misses + 9 argued hang-mutants.
+
+Note: --iterate makes successive scoped runs cheap (it skips caught/unviable),
+but a mutants run killed mid-flight has no resume point - outcomes.json stops
+at the last finished mutant (end_time: null); re-running --iterate picks up.
