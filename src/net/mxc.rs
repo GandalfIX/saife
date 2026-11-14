@@ -3640,4 +3640,124 @@ mod m2_credential_file_denies {
         );
     }
 
+
+    /// The second budget fixture reaches the arms' equalities the first one
+    /// cannot: with prompt 1 s, the combined floor (11 s) sits BELOW the
+    /// deprivation window, so elapsed can satisfy both "outlived both terms"
+    /// and "the dialog took the workload's term" at the same time. The
+    /// amendment boundaries stay strict (`>` and `<`).
+    #[test]
+    fn session_budget_reaches_the_equality_edges_of_the_amendments() {
+        use std::time::Duration;
+
+        let budget = SessionBudget {
+            prompt: Duration::from_secs(1),
+            workload: Duration::from_secs(10),
+            slack: Duration::from_secs(5),
+        };
+        // Stage ownership at exactly slack: 5 s of create is the tolerance
+        // budget, not deprivation - the workload still had 7 s of its term.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(12),
+                handshake_elapsed: Duration::from_secs(5),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // Same for the teardown stage: 5 s of cleanup is tolerance, so the
+        // stage arm stays shut. But the arm order still SUBTRACTS teardown from
+        // the workload's available term (12 - 5 = 7 < 10), so the shot lands on
+        // the prompt term - a teardown inside tolerance still ate time.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(12),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::from_secs(5),
+            }),
+            TimeoutReason::PromptBudgetExhausted
+        );
+        // One second beyond slack the stage DID take the workload's term
+        // (elapsed - stage = 6 < 10): the shot names the container, not the
+        // command.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(12),
+                handshake_elapsed: Duration::from_secs(6),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::SessionHandshake
+        );
+        // A big create that did NOT deprive: 30 s spent, 24 s of workload -
+        // that is the command's own overrun even though the handshake passed
+        // slack.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(30),
+                handshake_elapsed: Duration::from_secs(6),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // The dialog took the term at the EXACT boundary: available == workload
+        // is not deprivation (`<` stays strict).
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(16),
+                handshake_elapsed: Duration::from_secs(6),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
+        // One second less: deprivation.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(15),
+                handshake_elapsed: Duration::from_secs(6),
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::ZERO,
+            }),
+            TimeoutReason::SessionHandshake
+        );
+    }
+
+    /// A duplicate writable grant is folded away: the request's read-write list
+    /// never says the same tree twice (the second spelling would be a second
+    /// ACE saying the same thing).
+    #[test]
+    fn filesystem_policy_folds_a_repeated_writable_grant() {
+        let duplicates = [
+            PathBuf::from(r"C:\data"),
+            PathBuf::from(r"C:\data"),
+            PathBuf::from(r"C:\data"),
+        ];
+        let fs = filesystem_policy(
+            Path::new(r"C:\work\repo"),
+            &duplicates,
+            &[],
+            &[],
+            None,
+            Path::new(r"C:\tools\sandbox\saife-launch.exe"),
+            &[],
+        )
+        .expect("neither tree carries a credential deny");
+        let count = fs
+            .readwrite_paths
+            .iter()
+            .filter(|p| path_key(p) == path_key(r"C:\data"))
+            .count();
+        assert_eq!(count, 1, "the repeated grant is folded: {:?}", fs.readwrite_paths);
+    }
+
 }

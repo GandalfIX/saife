@@ -195,4 +195,15 @@ exclude_re = [
     # fields, no Default); it carries no decision. The tier mapping it feeds
     # has its own tests.
     "ProbeView::from_probe",
+
+    # The mxc backend's own trait impl (its `run` shells into the SDK): the
+    # span's mutants belong to the launch class above, but the impl's name
+    # form differs from the standalone fn.
+    "for MxcBackend>::run",
+
+    # Equivalent: `is_empty() || == "."` widened to `&&` - no input separates
+    # the two: for a segment that trips exactly one side, the continuation
+    # (trim to an empty name, then refuse to push) ends the same way the
+    # `continue` would.
+    "^src/net/mxc.rs:266:31: ",
 ]
