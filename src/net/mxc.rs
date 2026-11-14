@@ -3730,6 +3730,18 @@ mod m2_credential_file_denies {
             }),
             TimeoutReason::SessionHandshake
         );
+        // The teardown twin of the same edge: available == workload is not
+        // deprivation on the teardown arm either.
+        assert_eq!(
+            budget.classify(&SessionClock {
+                budget,
+                elapsed: Duration::from_secs(16),
+                handshake_elapsed: Duration::ZERO,
+                prompt_wait: Duration::ZERO,
+                teardown_elapsed: Duration::from_secs(6),
+            }),
+            TimeoutReason::WorkloadBudgetExceeded
+        );
     }
 
     /// A duplicate writable grant is folded away: the request's read-write list
