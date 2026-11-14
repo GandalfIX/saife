@@ -7427,7 +7427,6 @@
     /// Discriminators for the framing variants: a trailing lone CR is the only
     /// shape where `index + 1 < len` and its widened variants differ, and a
     /// bracket with no port after `]` is where the default-port guard can lie.
-    #[test]
     /// A percent escape cut off after ONE hex digit at the very end is kept
     /// verbatim: the guard must not read the byte past the buffer (the only
     /// shape where `i + 2 < len` and `<=` diverge).
@@ -7437,6 +7436,7 @@
         assert_eq!(percent_decode("ab%4"), "ab%4");
     }
 
+    #[test]
     fn framing_variants_have_a_discriminating_input() {
         // A trailing lone CR: the final iteration must see it as the remainder,
         // never index past the buffer (the `<` and `<=` loop variants part here).
