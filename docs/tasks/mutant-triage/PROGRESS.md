@@ -184,3 +184,29 @@ Two survivors are TOOL-LIMITED, not test-limited:
   Close by: bump cargo-mutants when the fix releases, then add an exclude_re
   entry; or add the mutants dev-dependency and mark the literal
   #[cfg_attr(test, mutants::skip)].
+
+## prompt lane (2026-11-11)
+
+Baseline: 118 tested, 18 missed, 7 timeouts, 56 caught, 37 unviable. Closing
+proof: **1 missed, 4 caught, 0 timeouts** (95 caught/unviable skipped).
+
+The lane taught the campaign's most transferable lesson: a TIMEOUT verdict is
+usually a TEST-INFRASTRUCTURE property, not a product property. Two hang
+sources had to go before the divergence mutants could fail:
+
+1. Unbounded outcome awaits in tests (19 sites now through a bounded helper).
+2. Per-item bounds SUMMED in loop tests (eight leaders, follower batches,
+   futures_of): each collection takes ONE bound now.
+3. Test configs inherited the production 60 s prompt timeout: a mutant that
+   breaks the flow before the dialog is consulted waited the whole term
+   (60 s) before failing - longer than the 49 s suite cap. Sixteen test
+   configs use 2 s.
+
+With those fixed, the four latch/coordinator divergence mutants
+(ArmingCause::of, observe, plan, finish) are caught by direct tests.
+
+Residue:
+- MAX_ABANDONED_PROMPTS = 2 * MAX_CONCURRENT_PROMPTS: constant value, pinned
+  as a documented value (same treatment as the proxy relay constants).
+- Register: dialog/toast layer (TaskDialog HRESULT handling, flags, COM
+  apartment incl. RPC_E_CHANGED_MODE), and the equivalent ID_DENY_ONCE arm.
