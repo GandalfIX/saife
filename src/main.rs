@@ -8,6 +8,7 @@ mod net;
 // build that uses it.
 #[cfg_attr(not(feature = "mxc-backend"), allow(dead_code))]
 mod plugin;
+mod paths;
 mod profile;
 mod runner;
 mod sandbox;

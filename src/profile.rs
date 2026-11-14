@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use crate::paths::path_key;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -783,102 +784,6 @@ pub fn path_covers(outer: &std::path::Path, inner: &std::path::Path) -> bool {
             || inner
                 .strip_prefix(&outer)
                 .is_some_and(|rest| rest.starts_with('\\')))
-}
-
-/// Normalized comparison key for a Windows path — a faithful mirror of
-/// [`crate::net::mxc::path_key`]. See that function's docs for the full list of
-/// spellings this unifies; the short version is: separators become `\\`, a
-/// verbatim/device prefix is dropped, each component loses its trailing dots
-/// and spaces (before the `.`/`..` tests), `.` is dropped and `..` collapses,
-/// and the whole key is upper-cased. Nothing here touches the filesystem.
-fn path_key(path: &str) -> String {
-    let unified = unify_path_prefix(path);
-    let (root, rest) = split_path_root(&unified);
-
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in rest.split('\\') {
-        // Trailing spaces first, then the `.`/`..` tests, then the dots: Windows
-        // ignores a component's trailing dots and spaces *before* deciding what
-        // the component means, so `.. ` is the parent directory. Doing it in any
-        // other order dropped `.. ` (it trimmed to nothing).
-        let segment = segment.trim_end_matches(' ');
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            segments.pop();
-            continue;
-        }
-        let segment = trim_component(segment);
-        if !segment.is_empty() {
-            segments.push(segment);
-        }
-    }
-
-    let mut key = fold_case(&root);
-    for segment in segments {
-        if !key.is_empty() && !key.ends_with('\\') {
-            key.push('\\');
-        }
-        key.push_str(&fold_case(segment));
-    }
-    key
-}
-
-/// Separator unification plus verbatim/device-prefix removal. Mirror of
-/// `mxc::unify_path_prefix`.
-fn unify_path_prefix(path: &str) -> String {
-    let raw = path.trim().replace('/', "\\");
-    let bytes = raw.as_bytes();
-    if bytes.len() < 4
-        || !(bytes[..4].eq_ignore_ascii_case(br"\\?\")
-            || bytes[..4].eq_ignore_ascii_case(br"\\.\\"))
-    {
-        return raw;
-    }
-    let rest = &raw[4..];
-    let rest_bytes = rest.as_bytes();
-    if rest_bytes.len() >= 4 && rest_bytes[..4].eq_ignore_ascii_case(br"UNC\") {
-        return format!("\\\\{}", &rest[4..]);
-    }
-    rest.to_string()
-}
-
-/// Split a unified path into its root (`C:`, `\\server\share`, `\`, or `""`)
-/// and the part below it. Mirror of `mxc::split_path_root`.
-fn split_path_root(path: &str) -> (String, &str) {
-    let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
-        let mut parts = path[2..].splitn(3, '\\');
-        let server = parts.next().unwrap_or_default();
-        let share = parts.next().unwrap_or_default();
-        let end = 2 + server.len() + usize::from(!share.is_empty()) + share.len();
-        let root = if share.is_empty() {
-            format!("\\\\{}", trim_component(server))
-        } else {
-            format!("\\\\{}\\{}", trim_component(server), trim_component(share))
-        };
-        return (root, &path[end..]);
-    }
-    if bytes.len() >= 2 && bytes[1] == b':' {
-        return (path[..2].to_string(), &path[2..]);
-    }
-    if bytes.first() == Some(&b'\\') {
-        return ("\\".to_string(), &path[1..]);
-    }
-    (String::new(), path)
-}
-
-/// One path component as Win32 compares it: trailing dots and spaces are not
-/// part of the name. Mirror of `mxc::trim_component`.
-fn trim_component(component: &str) -> &str {
-    component.trim_end_matches(['.', ' '])
-}
-
-/// Win32's case fold, as closely as `std` approximates it: Unicode uppercase.
-/// Mirror of `mxc::fold_case`.
-fn fold_case(text: &str) -> String {
-    text.to_uppercase()
 }
 
 /// Ceiling for both `limits` terms: 7 days
