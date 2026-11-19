@@ -1371,10 +1371,18 @@ fn new_session_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
-    let seq = (nanos ^ pid.rotate_left(16)) % 100_000;
+    let seq = session_seq(nanos, pid);
     let secs = now;
     let dt = chrono_from_unix(secs);
     format!("{dt}-{seq:05}")
+}
+
+/// The session id's per-second sequence: nanosecond noise XOR the rotated PID,
+/// folded into five digits. Pure so the mix has a tested shape: distinct PIDs
+/// separate collisions inside the same nanosecond, and the fold always yields a
+/// five-digit value.
+fn session_seq(nanos: u64, pid: u64) -> u64 {
+    (nanos ^ pid.rotate_left(16)) % 100_000
 }
 
 /// Format the unix timestamp as YYYYMMDD-HHMMSS (UTC). Avoids pulling chrono by
@@ -1386,17 +1394,10 @@ fn chrono_from_unix(secs: u64) -> String {
     let minute = (rem % 3600) / 60;
     let second = rem % 60;
 
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    // The civil-date inverse lives once, in the audit's clock-free core
+    // (boundary-tested there); a second copy is only a place for verified
+    // behaviour to rot.
+    let (y, m, d) = crate::audit::civil_from_days(days);
 
     format!("{y:04}{m:02}{d:02}-{hour:02}{minute:02}{second:02}")
 }

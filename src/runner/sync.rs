@@ -706,4 +706,64 @@ mod tests {
         assert!(msg.contains("loot"), "the refusal names the entry: {msg}");
         assert!(!msg.contains("exfil"), "no external content: {msg}");
     }
+    /// A header whose path field is written raw: the archive WRITER refuses
+    /// `..` and empty names, so a hostile archive can only be built by setting
+    /// the name bytes directly - which is also how an attacker ships one.
+    fn raw_named(name: &str, body: &[u8]) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        let field = &mut header.as_old_mut().name;
+        field.fill(0);
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(field.len());
+        field[..n].copy_from_slice(&bytes[..n]);
+        header.set_cksum();
+        header
+    }
+
+    /// The unpack guard is the tar-slip boundary: a member that escapes the
+    /// destination (`..`, absolute) is dropped, never joined - the `||`-widen
+    /// mutants write the escape and fail the outside checks.
+    #[test]
+    fn unpack_drops_members_that_escape_the_destination() {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append_data(&mut {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_cksum();
+            h
+        }, "ok1.txt", &b"one"[..]).unwrap();
+        builder.append_data(&mut {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_cksum();
+            h
+        }, "ok2.txt", &b"two"[..]).unwrap();
+        builder.append(&raw_named("../escape.txt", b"nope"), &b"nope"[..]).unwrap();
+        builder.append(&raw_named("sub/../../escape2.txt", b"nope"), &b"nope"[..]).unwrap();
+        builder.append(&raw_named("/abs-escape.txt", b"nope"), &b"nope"[..]).unwrap();
+        let tar = builder.into_inner().unwrap();
+
+        let dest = std::env::temp_dir().join("saife-sync-slips-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let written = super::unpack_into(&tar, &dest, &|_p| true).expect("the safe members unpack");
+
+        assert_eq!(written, 2, "only the two members inside the root land");
+        assert!(dest.join("ok1.txt").exists());
+        assert!(dest.join("ok2.txt").exists());
+        let parent = dest.parent().unwrap().to_path_buf();
+        assert!(
+            !parent.join("escape.txt").exists() && !parent.join("escape2.txt").exists(),
+            "a `..` member must never reach the parent"
+        );
+        assert!(!std::path::Path::new("/abs-escape.txt").exists());
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
 }

@@ -1144,4 +1144,26 @@ mod tests {
             me.idle_since_iso().unwrap_or_default()
         );
     }
+
+    /// The stop-vs-deadline gate: an armed stop returns immediately and FALSE;
+    /// an unarmed one waits out the deadline and returns TRUE. Both spellings
+    /// matter - a caller that keeps going after a stop would run the next step.
+    #[test]
+    fn wait_or_stop_honours_the_stop_flag_and_the_deadline() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let stop = AtomicBool::new(false);
+        assert!(
+            super::wait_or_stop(&stop, Duration::from_millis(10)),
+            "an unarmed stop waits out the deadline and reports it"
+        );
+
+        let stop = AtomicBool::new(true);
+        assert!(
+            !super::wait_or_stop(&stop, Duration::from_secs(30)),
+            "an armed stop returns at once and reports the stop"
+        );
+    }
+
 }

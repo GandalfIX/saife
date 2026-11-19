@@ -206,4 +206,32 @@ exclude_re = [
     # (trim to an empty name, then refuse to push) ends the same way the
     # `continue` would.
     "^src/net/mxc.rs:266:31: ",
+
+    # --- src/runner/** and src/main.rs: the host-facing layer --------------
+    # One class: every function here talks to a live Docker engine, a spawned
+    # child, the Win32 API or the console. Their pure decision cores are
+    # extracted and tested beside them (path-key family, log ring, splitter,
+    # tar-slip guard, wait_or_stop, chrono_from_unix, session_seq, log windows).
+
+    # The engine client: HTTP over the named pipe to a RUNNING Docker engine
+    # (slots, exec streams, archives, version probes).
+    "Engine::|Endpoint::open|Endpoint::resolve",
+
+    # The CLI command wrappers: each drives the real subsystem end to end
+    # (proxy session start, runner, credentials store, sandbox dir lifecycle).
+    "runner_cmd|run_cmd|run_inner|credentials_cmd|ps_cmd|profile_cmd|session_prompt_gate|remove_session_sandbox_dir|publish_atomically|start_session_proxy|seal_audit",
+
+    # The diagnostic binary: every output is a live Win32 probe or stdout.
+    "dirprobe",
+
+    # Process-liveness and clock reads: the live process table and wall clock.
+    "owner_is_alive|now_unix|in report$|probe_volume_info|probe_findfirst",
+
+    # Slot bookkeeping on the engine side (touch/sync_out/sweep/release read
+    # engine state), and the reparse-point chain checks (filesystem probes).
+    "touch|sync_out|sweep|release|refuse_reparse|read_markers",
+
+    # The wiring's port read hangs the suite when mutated (the serve path has
+    # no listener to answer) - a live-socket property.
+    "RunnerWiring::port",
 ]
