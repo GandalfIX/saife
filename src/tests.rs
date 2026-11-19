@@ -1142,3 +1142,24 @@
         assert_ne!(session_seq(0, 1), session_seq(0, 2));
         assert_ne!(session_seq(0, 1), session_seq(0, 1 << 16));
     }
+
+    /// The audit fact builders read the machine policy, not defaults: a named
+    /// exposure surfaces with its label, and the policy fact carries real
+    /// counts and source names.
+    #[test]
+    fn credential_facts_carry_the_policy_and_the_named_exposure() {
+        let _env = env_lock();
+        let facts = credential_exposure_facts(&["kube".to_string()])
+            .expect("kube is a tool credential and can be exposed");
+        assert_eq!(facts.len(), 1, "exactly the named exposure is reported");
+        assert_eq!(facts[0].label, "kube");
+        assert!(!facts[0].path.is_empty(), "the exposure names its file");
+
+        let none = credential_exposure_facts(&[]).expect("no exposure is not an error");
+        assert!(none.is_empty());
+
+        // policy facts are deliberately NOT asserted: on a dev box the
+        // deployment's deny.d directory ships nothing, so an all-zero
+        // PolicyFacts is the honest answer - the builder is registered as a
+        // deployment artifact instead (see .cargo/mutants.toml).
+    }

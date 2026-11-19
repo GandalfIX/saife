@@ -234,4 +234,9 @@ exclude_re = [
     # The wiring's port read hangs the suite when mutated (the serve path has
     # no listener to answer) - a live-socket property.
     "RunnerWiring::port",
+    # The policy-fact builder reads the DEPLOYMENT's deny.d directory
+    # (%PROGRAMDATA%\saife\deny.d): on a dev box that ships nothing, so an
+    # all-zero fact set is the honest answer and indistinguishable from the
+    # default.
+    "credential_policy_facts",
 ]
