@@ -1,7 +1,20 @@
 # Mutation-testing triage: what the evidence says and what we do about it
 
-Status: **re-baselined on `main`; first fixes landed on `test/mutant-gaps`**
-(branch only, no PR).
+## Campaign scoreboard (after the orchestration lane's dedup round)
+
+| Lane | Result |
+|---|---|
+| audit + signing + security_groups + cli | **0 missed** (proof: 6 caught, 4 excluded) |
+| net glue + proxy | 7 named-debt + 9 argued hang-mutants; 1335 caught/unviable proven |
+| setup | **2 tool-limited** (delete-field mutants cargo-mutants 27.1.0 cannot name-filter; both refill to API-equivalent defaults) |
+| prompt | **1** (constant pinned as a documented value) |
+| backend + mxc | **0 missed** (proof: 248 caught/unviable skipped, residue batches re-proven) |
+| orchestration + bins + profile | in progress: baseline 980 tested / 348 missed -> dedup round killed 22 structurally; docker plumbing, log ring, splitter, member kinds tested; host classes next |
+| closing whole-crate run | after the orchestration residue |
+
+Register: 36 patterns, each with a written class argument. Every residual
+class is one of: named debt, tool-limitation (argued), host/process-bound
+(argued), or still-open work in the orchestration lane.
 
 ## Correction: the first evidence was stale
 
