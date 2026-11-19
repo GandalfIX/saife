@@ -239,4 +239,8 @@ exclude_re = [
     # all-zero fact set is the honest answer and indistinguishable from the
     # default.
     "credential_policy_facts",
+    # Group expansion for `show_profile --expanded`: resolves each group's
+    # concrete paths through security_groups::HostEnv (live filesystem probes),
+    # so the returned path set is the HOST's, not a value a fixture names.
+    "expand_groups_for_show",
 ]
