@@ -400,4 +400,32 @@ mod tests {
         let _ = child.wait();
         assert!(exited, "a terminated pid must exit within 10 s");
     }
+
+    /// Real job adoption: nothing else can put this child in the job, so a job
+    /// terminate is what proves the pid landed. The blast radius is the child and
+    /// the job this test created.
+    #[test]
+    fn adopt_puts_the_pid_in_the_job_so_terminating_the_job_ends_it() {
+        let job = Job::create().expect("a job object for this test's child");
+        let mut child = idle_child(60);
+        let ops = Win32ProcOps;
+
+        ops.adopt(&job, child.id());
+        job.terminate().expect("terminate the job");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if child.try_wait().expect("query the child").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !exited {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        assert!(exited, "an adopted pid must die with its job");
+    }
 }
