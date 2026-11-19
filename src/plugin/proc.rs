@@ -46,6 +46,14 @@ pub(super) fn descendants(root: u32, table: &[(u32, u32)]) -> Vec<u32> {
                 frontier.push(*child);
             }
         }
+        // A walk over N rows cannot legitimately name more than N pids, so a list
+        // that outgrew its table is already wrong. The cap turns a filter that
+        // re-adds a pid into a short wrong answer instead of a spin: that mutant
+        // then fails a fixture's assertion in milliseconds, where an unbounded
+        // walk burns the suite's whole timeout and reports TIMEOUT.
+        if found.len() > table.len() {
+            break;
+        }
     }
     found.sort_unstable();
     found
