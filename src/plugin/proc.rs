@@ -126,6 +126,27 @@ impl ProcOps for Win32ProcOps {
     }
 }
 
+/// `ProcOps` for a caller that must run the real spawn path without a
+/// process-table sweep.
+///
+/// It sees no processes and terminates nothing, so the sidecar's tree is ended by
+/// its job and by the direct child instead. That is the cleanup a spawn-path test
+/// needs, and it keeps a mutated walk away from the live process table: the job
+/// holds only what the test itself started.
+#[cfg(test)]
+pub(super) struct NoProcOps;
+
+#[cfg(test)]
+impl ProcOps for NoProcOps {
+    fn snapshot(&self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+
+    fn terminate(&self, _pid: u32) {}
+
+    fn adopt(&self, _job: &Job, _pid: u32) {}
+}
+
 /// Open `pid` with exactly `rights`, or `None` when it is already gone.
 ///
 /// One helper for every by-pid use keeps the "a process that exited is not an

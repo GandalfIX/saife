@@ -81,9 +81,22 @@ impl Sidecar {
     /// `sidecar_log_unavailable`, `sidecar_command_not_found`,
     /// `sidecar_command_not_exe`, `sidecar_spawn_failed`, `sidecar_unhealthy{mount}`.
     pub fn start(plugin_dir: &Path, manifest: &PluginManifest, sid: &str) -> Result<Self> {
-        // The only place a real process-table implementation is created. Every
-        // test path supplies its own `ProcOps` instead.
-        let ops: Box<dyn ProcOps> = Box::new(Win32ProcOps);
+        // The only place a real process-table implementation is created.
+        Self::spawn_with(plugin_dir, manifest, sid, Box::new(Win32ProcOps))
+    }
+
+    /// `start` with the process-table effects supplied by the caller.
+    ///
+    /// A spawn-path test passes [`NoProcOps`]: it exercises spawn and the health
+    /// gate, and the teardown sweep then sees no processes, so a mutated walk
+    /// cannot reach the live process table. The sidecar's job and its direct child
+    /// still end the tree. Production has exactly one caller, `start`.
+    fn spawn_with(
+        plugin_dir: &Path,
+        manifest: &PluginManifest,
+        sid: &str,
+        ops: Box<dyn ProcOps>,
+    ) -> Result<Self> {
         let port = free_loopback_port()?;
         let token = facade_token()?;
         let log_path = sidecar_log_path(sid, &manifest.mount)?;
@@ -416,6 +429,7 @@ fn probe_health(port: u16, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::proc::NoProcOps;
     use std::sync::Arc;
 
     fn nanos() -> u128 {
@@ -544,8 +558,13 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         let sentinel = format!("SAIFE_H3_SENTINEL_{}", nanos());
         unsafe { std::env::set_var(&sentinel, "must-not-reach-the-sidecar") };
 
-        let sidecar = Sidecar::start(&dir, &manifest, &format!("h3-env-{}", nanos()))
-            .expect("the fixture sidecar must answer its health probe");
+        let sidecar = Sidecar::spawn_with(
+            &dir,
+            &manifest,
+            &format!("h3-env-{}", nanos()),
+            Box::new(NoProcOps),
+        )
+        .expect("the fixture sidecar must answer its health probe");
         drop(sidecar); // end the tree before reading what it recorded
 
         let env: std::collections::HashMap<String, String> = serde_json::from_str(
