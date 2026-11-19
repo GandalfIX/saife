@@ -243,4 +243,14 @@ exclude_re = [
     # concrete paths through security_groups::HostEnv (live filesystem probes),
     # so the returned path set is the HOST's, not a value a fixture names.
     "expand_groups_for_show",
+
+    # The pid walk's row budget is a DEFENSIVE bound: no legitimate walk names
+    # more pids than the table has rows, so `>` is only reached by a corrupted
+    # filter. `>=` breaks one pass earlier, at exact equality - and at that point
+    # every row's pid is already in the list, so no later pop can add anything;
+    # `==` never fires on a legitimate table and the walk ends by itself. Both
+    # return the same list as the correct comparison for every input the function
+    # can be handed. `>` -> `<` IS caught (it truncates a chain), so only these
+    # two equivalents are registered.
+    "replace > with (==|>=) in descendants",
 ]
