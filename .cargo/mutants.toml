@@ -244,13 +244,3 @@ exclude_re = [
     # so the returned path set is the HOST's, not a value a fixture names.
     "expand_groups_for_show",
 ]
-
-# Mutants of the sidecar's process-control layer are not run on a workstation.
-# `descendant_pids` is the filter that decides which PIDs `Sidecar::drop` may
-# terminate. Widening its `&&` to `||` makes the walk return nearly every PID on
-# the machine, and the `terminate_pid` loop then kills every process the test
-# user can open: the shell, the per-user services, the editor and the campaign's
-# own console. A workstation run therefore destroys the session it runs in and
-# reads as a logoff. These mutants belong in a throwaway VM, so the whole file
-# stays out of the register here until the suite runs inside one.
-exclude_globs = ["src/plugin/sidecar.rs"]
