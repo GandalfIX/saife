@@ -243,11 +243,44 @@ impl Drop for Sidecar {
 
 /// Every live process whose parent chain reaches `root`; `root` is never in it.
 ///
+/// One snapshot per call, so a caller that must not miss a new process calls
+/// again.
+fn descendant_pids(root: u32) -> Vec<u32> {
+    descendants(root, &process_table())
+}
+
+/// The walk itself, over one `(pid, parent_pid)` snapshot.
+///
 /// Windows does not re-parent, so the recorded parent id still names the original
 /// parent after it exits: this walk finds an orphaned grandchild, which is
-/// exactly what a launcher leaves behind. One snapshot per call, so a caller that
-/// must not miss a new process calls again.
-fn descendant_pids(root: u32) -> Vec<u32> {
+/// exactly what a launcher leaves behind.
+///
+/// The snapshot is a PARAMETER on purpose. A walk that reads the live process
+/// table can only be tested by spawning real processes and terminating what it
+/// returns — which makes the test's safety depend on the very filter it is
+/// testing. As data it is tested with a table, and no `TerminateProcess` is ever
+/// handed a walked list.
+///
+/// `found` doubles as the cycle guard: a parent loop (impossible in a live
+/// snapshot, trivial in a fixture) ends instead of spinning. Sorted, so callers
+/// and tests read one order.
+fn descendants(root: u32, table: &[(u32, u32)]) -> Vec<u32> {
+    let mut found: Vec<u32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        for (child, parent) in table {
+            if *parent == pid && *child != root && !found.contains(child) {
+                found.push(*child);
+                frontier.push(*child);
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// Live `(pid, parent_pid)` pairs, one ToolHelp snapshot.
+fn process_table() -> Vec<(u32, u32)> {
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     // SAFETY: the snapshot handle is closed on every path; each entry is filled
     // into a live `PROCESSENTRY32W` that outlives the call, and the loop stops on
@@ -270,18 +303,7 @@ fn descendant_pids(root: u32) -> Vec<u32> {
         }
         let _ = CloseHandle(snapshot);
     }
-
-    let mut found: Vec<u32> = Vec::new();
-    let mut frontier = vec![root];
-    while let Some(pid) = frontier.pop() {
-        for (child, parent) in &pairs {
-            if *parent == pid && *child != root && !found.contains(child) {
-                found.push(*child);
-                frontier.push(*child);
-            }
-        }
-    }
-    found
+    pairs
 }
 
 /// Terminate one process by id, best-effort.
@@ -562,6 +584,42 @@ mod tests {
     fn log_file_names_cannot_address_another_directory() {
         assert_eq!(sanitize("../../x"), "______x");
         assert_eq!(sanitize("20261023-011500-00042"), "20261023-011500-00042");
+    }
+
+    /// The walk's filter, pinned on a table: the grandchild is named, and a
+    /// process hanging off another parent is not.
+    #[test]
+    fn the_walk_names_a_grandchild_and_never_a_sibling() {
+        let table = [
+            (100, 0),
+            (101, 100),
+            (102, 100),
+            (103, 101),
+            (200, 1),
+            (104, 200),
+        ];
+        assert_eq!(descendants(100, &table), vec![101, 102, 103]);
+    }
+
+    /// The root is a boundary, not a member: a process that names itself as its
+    /// own parent must not enter the list.
+    #[test]
+    fn the_walk_never_names_its_root() {
+        assert_eq!(descendants(100, &[(100, 100), (101, 100)]), vec![101]);
+    }
+
+    /// A parent loop ends instead of spinning. `found` is the guard, and a
+    /// fixture can express what a live snapshot cannot.
+    #[test]
+    fn the_walk_ends_on_a_parent_cycle() {
+        let table = [(100, 0), (101, 100), (102, 101), (101, 102)];
+        assert_eq!(descendants(100, &table), vec![101, 102]);
+    }
+
+    /// A root with no children and an empty table give the same answer.
+    #[test]
+    fn a_root_with_no_children_names_nothing() {
+        assert_eq!(descendants(100, &[(101, 102)]), Vec::<u32>::new());
     }
 
     #[test]
