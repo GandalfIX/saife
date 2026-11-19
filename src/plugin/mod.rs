@@ -52,6 +52,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+mod proc;
 /// The sidecar supervisor: spawn, health gate, teardown.
 pub mod sidecar;
 
