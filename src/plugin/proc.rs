@@ -225,4 +225,150 @@ mod tests {
     fn a_root_with_no_children_names_nothing() {
         assert_eq!(descendants(100, &[(101, 102)]), Vec::<u32>::new());
     }
+
+    use std::cell::RefCell;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// A `ProcOps` that answers from a table and records the effects.
+    ///
+    /// `terminate` also drops the pid from the table, because that is what a real
+    /// kill looks like to the next snapshot: without it `tear_down`'s eight passes
+    /// would report the same tree eight times and the recorder would be the only
+    /// thing under test.
+    #[derive(Default)]
+    struct FakeOps {
+        table: RefCell<Vec<(u32, u32)>>,
+        killed: RefCell<Vec<u32>>,
+        adopted: RefCell<Vec<u32>>,
+    }
+
+    impl FakeOps {
+        fn with_table(table: Vec<(u32, u32)>) -> Self {
+            Self {
+                table: RefCell::new(table),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl ProcOps for FakeOps {
+        fn snapshot(&self) -> Vec<(u32, u32)> {
+            self.table.borrow().clone()
+        }
+
+        fn terminate(&self, pid: u32) {
+            self.killed.borrow_mut().push(pid);
+            self.table.borrow_mut().retain(|(child, _)| *child != pid);
+        }
+
+        fn adopt(&self, _job: &Job, pid: u32) {
+            self.adopted.borrow_mut().push(pid);
+        }
+    }
+
+    /// A child that stays alive without touching the network, so a test can hand
+    /// its pid to one real operation and nothing else.
+    fn idle_child(seconds: u32) -> Child {
+        Command::new("cmd")
+            .args(["/c", &format!("ping -n {seconds} 127.0.0.1 >nul")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn an idle child")
+    }
+
+    /// The teardown order on a fake: the walked descendants are terminated, the
+    /// child is reaped, and no pid reaches the OS.
+    #[test]
+    fn tear_down_kills_the_walked_tree_then_reaps_the_child() {
+        let mut child = idle_child(60);
+        let root = child.id();
+        let ops = FakeOps::with_table(vec![(root, 0), (root + 1, root), (root + 2, root + 1)]);
+
+        tear_down(&mut child, None, &ops);
+
+        assert_eq!(*ops.killed.borrow(), vec![root + 1, root + 2]);
+        assert!(
+            child.try_wait().expect("query the child").is_some(),
+            "tear_down must reap the child it was given"
+        );
+    }
+
+    /// Adoption covers every descendant once. The second pass finds the same pids
+    /// and adds nothing, which is what `seen` is for.
+    #[test]
+    fn join_tree_adopts_each_descendant_once() {
+        let job = Job::create().expect("a job object with no members");
+        let ops = FakeOps::with_table(vec![(100, 0), (101, 100), (102, 100), (103, 101)]);
+
+        join_tree(&ops, &job, 100);
+
+        assert_eq!(*ops.adopted.borrow(), vec![101, 102, 103]);
+    }
+
+    /// The real snapshot really names a launcher's grandchild. The tree is ended
+    /// by the job this test created, never by a pid the walk returned: that is
+    /// the rule that keeps a mutated filter harmless.
+    #[test]
+    fn a_real_snapshot_names_the_launchers_grandchild() {
+        let job = Job::create().expect("a job object for this test's own tree");
+        let mut outer = Command::new("cmd")
+            .args(["/c", "cmd /c ping -n 30 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the launcher");
+        job.assign(HANDLE(outer.as_raw_handle()))
+            .expect("adopt the launcher, so the job owns its tree");
+
+        // Two entries means the walk followed the chain (inner `cmd` + `ping`); a
+        // walk that stopped at direct children reports one.
+        let ops = Win32ProcOps;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut tree = Vec::new();
+        while Instant::now() < deadline {
+            tree = ops.descendants(outer.id());
+            if tree.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            tree.len() >= 2,
+            "the walk must name the launcher's child AND its grandchild, got {tree:?}"
+        );
+
+        // KILL_ON_JOB_CLOSE ends the launcher and everything it started, and the
+        // job holds only what this test spawned.
+        drop(job);
+        outer.wait().expect("the launcher must be reaped");
+    }
+
+    /// One real `TerminateProcess`, on the one pid this test spawned.
+    #[test]
+    fn terminate_ends_the_one_process_it_is_given() {
+        let mut child = idle_child(60);
+        let ops = Win32ProcOps;
+
+        ops.terminate(child.id());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if child.try_wait().expect("query the child").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !exited {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        assert!(exited, "a terminated pid must exit within 10 s");
+    }
 }

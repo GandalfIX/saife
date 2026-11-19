@@ -463,63 +463,6 @@ mod tests {
         );
     }
 
-    /// A launcher and the process it started are ONE tree: the walk names both
-    /// (recursively, not just the direct child) and terminating them ends both.
-    ///
-    /// Hermetic on purpose. The live leg below needs an installed plugin and the
-    /// internet, so the MECHANISM it depends on — "the process owning the socket
-    /// is a descendant, not the child we spawned" — is pinned here, where it can
-    /// fail in milliseconds.
-    #[test]
-    fn the_tree_walk_names_a_launchers_grandchild_and_terminating_ends_both() {
-        // A `cmd` that starts a second `cmd` is a launcher with a live child, and
-        // `ping` keeps the inner one alive without touching the network (loopback
-        // is not egress; nothing leaves the host).
-        let ops = Win32ProcOps;
-        let mut outer = Command::new("cmd")
-            .args(["/c", "cmd /c ping -n 30 127.0.0.1 >nul"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the launcher");
-
-        // Two entries means the walk followed the chain (inner `cmd` + `ping`); a
-        // walk that stopped at direct children reports one.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut tree = Vec::new();
-        while Instant::now() < deadline {
-            tree = ops.descendants(outer.id());
-            if tree.len() >= 2 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(
-            tree.len() >= 2,
-            "the walk must name the launcher's child AND its grandchild, got {tree:?}"
-        );
-
-        for pid in &tree {
-            ops.terminate(*pid);
-        }
-        let _ = outer.kill();
-        let _ = outer.wait();
-
-        // Nothing that the launcher started is still running: a terminated
-        // process disappears from the snapshot once its last handle closes.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut left = ops.descendants(outer.id());
-        while !left.is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
-            left = ops.descendants(outer.id());
-        }
-        assert!(
-            left.is_empty(),
-            "terminating the tree must leave no process behind, still live: {left:?}"
-        );
-    }
-
     #[test]
     fn a_batch_entry_point_is_refused_rather_than_run_through_a_shell() {
         let dir =
