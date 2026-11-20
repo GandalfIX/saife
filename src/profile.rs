@@ -4120,6 +4120,34 @@ mod tests {
     }
 
 
+    /// Inside ONE policy file, a narrower FILE entry is folded into the wider
+    /// one - and with no credential entry in the picture the LOADER is the only
+    /// step that can do it (`&&`-narrowing keeps only mutually covering paths,
+    /// so the loader adds the narrower entry and the set grows).
+    #[test]
+    fn the_loader_folds_a_narrow_file_entry_into_the_wider_one() {
+        let dir = temp_dir("policy-files-fold");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wide = dir.join("tree").join("f");
+        let narrow = wide.join("deeper");
+        std::fs::write(
+            dir.join("01-fold.json"),
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":[],"files":["{}","{}"]}}}}"#,
+                json_escaped(&wide),
+                json_escaped(&narrow)
+            ),
+        )
+        .unwrap();
+        let got = policy_denies_in(&dir).expect("the policy loads");
+        assert_eq!(
+            got.files,
+            vec![wide.clone()],
+            "only the wider entry survives the fold: {:?}",
+            got.files
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
     /// A policy entry that names a FILE already denied (or already inside a
     /// denied tree) is not added twice, and inside one policy the narrower
     /// FILE entry is folded into the wider one - the loaders keep one copy each.
