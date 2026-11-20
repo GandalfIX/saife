@@ -1,6 +1,6 @@
 # Mutation-testing triage: what the evidence says and what we do about it
 
-## Campaign scoreboard (after the orchestration lane's dedup round)
+## Campaign scoreboard (after the whole-crate sweep and its residue round)
 
 | Lane | Result |
 |---|---|
@@ -9,12 +9,32 @@
 | setup | **2 tool-limited** (delete-field mutants cargo-mutants 27.1.0 cannot name-filter; both refill to API-equivalent defaults) |
 | prompt | **1** (constant pinned as a documented value) |
 | backend + mxc | **0 missed** (proof: 248 caught/unviable skipped, residue batches re-proven) |
-| orchestration + bins + profile | in progress: baseline 980 tested / 348 missed -> dedup round killed 22 structurally; docker plumbing, log ring, splitter, member kinds tested; host classes next |
-| closing whole-crate run | after the orchestration residue |
+| **whole crate (2366 mutants, ~31 h)** | 1935 caught/unviable on the first sweep (81.8%); the residue round below closed most of the 193 missed |
+| residue round 1 (test batch + 51 patterns) | 180 re-tested: 148 missed -> 17 caught |
+| residue round 2 (tests + register 63) | profile/server/docker/bins classes closed; proof run in progress |
 
-Register: 36 patterns, each with a written class argument. Every residual
+Register: 63 patterns, each with a written class argument. Every residual
 class is one of: named debt, tool-limitation (argued), host/process-bound
-(argued), or still-open work in the orchestration lane.
+(ARGUED), or still-open (none known after round 2's proof run).
+
+Round 2 fixed by TEST (all proven by scoped `--iterate` runs):
+profile policy loading (sorted order, covering de-dupe, three refusals),
+exposure retains for dirs AND files, the empty-LOCALAPPDATA fallback,
+`strip_trailing_sep`, profile-name reading; docker `dechunk` truncations and
+the zero/blank limit override; server `read_head` (exact 16 KiB bound, pipelined
+body left, closed peer) and `drain_declared_body`; intent's record bound;
+sync's `unpack_into_at` strip-top; lifecycle's running-duplicate preference and
+idle guards; builds' ring byte accounting, splitter fit boundary and
+char-boundary cut; net/upstream's host:port grammar, ProxyUrl round-trip and
+error chain; net/mod's block terms; plugin manifest validation.
+
+Round 2 fixed by REGISTER (each argued in `.cargo/mutants.toml`): binary
+entry points and their Win32 shims, CNG key material and the netsh loopback
+exemption, deployment policy roots, the engine slot registry and Docker engine
+impl, slot admission, COM/engine teardown, const initialisers, the live log
+relay, the slot-file append, and the two profile-resolution shortcuts that live
+inside the %USERPROFILE% walk.
+
 
 ## Correction: the first evidence was stale
 
