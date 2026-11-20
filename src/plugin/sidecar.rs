@@ -930,4 +930,31 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+    /// A bare `tool.exe` (an extension, no separator) is looked up as itself:
+    /// the extension alone selects the exact-name attempt (`&&` with the
+    /// separator test would append .exe again and miss the real program).
+    #[test]
+    fn a_bare_exe_name_is_looked_up_as_itself() {
+        let dir = std::env::temp_dir().join(format!("saife-sidecar-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("probe.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let prev = std::env::var_os("PATH");
+        let mut path = dir.display().to_string();
+        if let Some(old) = &prev {
+            path.push(';');
+            path.push_str(&old.to_string_lossy());
+        }
+        unsafe { std::env::set_var("PATH", &path) };
+        let got = resolve_program("probe.exe");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.expect("probe.exe resolves"), exe);
+    }
 }

@@ -1610,4 +1610,21 @@ mod tests {
         assert!(src.to_string().contains("dial refused"), "{src}");
         assert!(UpstreamError::BadResponse("no host").source().is_none());
         assert!(UpstreamError::Non200(407).source().is_none());
+    
+}
+
+    /// The host refusal is OR-ed: a whitespace-only host and a control-only
+    /// host are each refused on their own (&& would accept both).
+    #[test]
+    fn a_host_with_a_space_or_a_control_character_is_refused() {
+        for bad in [
+            "http://ba d:8080",
+            "http://h\u{1}st:8080",
+        ] {
+            let err = ProxyUrl::parse(bad).expect_err(bad);
+            assert!(
+                format!("{err:#}").contains("invalid upstream proxy host"),
+                "the refusal names the host ({bad}): {err:#}"
+            );
+        }
     }

@@ -1433,4 +1433,33 @@ mod tests {
         assert_eq!(log.bytes, 2, "the accounting subtracts the dropped line exactly");
     }
 
+
+    /// Bytes at EXACTLY the budget are not over it: a ring holding two lines
+    /// that add up to the budget keeps both (`>=` evicts the head).
+    #[test]
+    fn a_ring_at_exactly_the_byte_budget_keeps_both_lines() {
+        let mut log = BoundedLog::new();
+        let first = "a".repeat(LOG_BYTE_BUDGET - 2);
+        log.push(first);
+        log.push("bc".to_string());
+        assert_eq!(log.bytes, LOG_BYTE_BUDGET, "the fixture sits on the bound");
+        assert_eq!(log.lines.len(), 2, "a full ring at the bound evicts nothing");
+    }
+
+    /// A line that FITS carries no truncation marker: only a line OVER the cap
+    /// is cut and marked (`>=` marks a line of exactly the cap).
+    #[test]
+    fn a_fitting_line_carries_no_marker() {
+        let mut splitter = LineSplitter::new();
+        let mut lines: Vec<String> = Vec::new();
+        let mut input = vec![b'k'; LOG_PARTIAL_CAP - 1];
+        input.push(b'\n');
+        splitter.feed(&input, &mut |l| lines.push(l));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !lines[0].contains(crate::runner::builds::LOG_TRUNCATED_MARKER),
+            "a fitting line is not marked: {:?}",
+            lines[0]
+        );
+    }
 }

@@ -1220,4 +1220,36 @@ mod tests {
             Decision::Create => panic!("a running duplicate exists: Create is wrong"),
         }
     }
+
+    /// Two RUNNING duplicates: the FIRST one in the table is kept (the later
+    /// one only wins if it is running and the kept one is not).
+    #[test]
+    fn the_first_running_duplicate_is_kept() {
+        let spec = spec("s-two-running");
+        let first = mine(&spec);
+        let mut second = mine(&spec);
+        second.slot_id = "id-second".to_string();
+        second.name = "slot-second".to_string();
+        match decide(&[first, second], &spec, &policy(), NOW, &alive).expect("reuse") {
+            Decision::Reuse(slot) | Decision::Recycle { slot, .. } => {
+                assert_eq!(slot.name, spec.name, "the first running entry is kept");
+            }
+            Decision::Create => panic!("a running duplicate exists"),
+        }
+    }
+
+    /// The wait builds its deadline from the clock and the duration: it waits
+    /// out a short term and returns true, and returns false immediately when
+    /// the stop flag is already set.
+    #[test]
+    fn wait_or_stop_honours_the_deadline_and_the_flag() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let began = std::time::Instant::now();
+        assert!(wait_or_stop(&stop, std::time::Duration::from_millis(30)));
+        assert!(began.elapsed() >= std::time::Duration::from_millis(25));
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let began = std::time::Instant::now();
+        assert!(!wait_or_stop(&stop, std::time::Duration::from_secs(5)));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1), "the flag ends the wait");
+    }
 }

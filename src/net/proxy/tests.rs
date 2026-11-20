@@ -7520,4 +7520,58 @@
             Err(_) => panic!("expected a Denied (dns) dial failure for an empty answer"),
             Ok(_) => panic!("an empty answer must never reach a dial"),
         }
+    
+
+    }
+    // ---- body/head readers on a live socket -------------------------------
+    //
+    // Both are socket readers with a bounded read; a mutant that stops at the
+    // wrong comparison either returns an EMPTY body or keeps waiting for bytes
+    // no peer will send - the second case needs a bound in the TEST as well, or
+    // the suite hangs instead of failing.
+
+    async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let (l, a) = local_listener().await;
+        let client = tokio::net::TcpStream::connect(a).await.unwrap();
+        let (server, _) = l.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn read_body_takes_the_declared_bytes_and_a_leftover_as_its_seed() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut sock) = connected_pair().await;
+        client.write_all(b"BODY").await.unwrap();
+        let head = "POST /x HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let body = read_body(&mut sock, head, b"").await;
+        assert_eq!(body, b"BODY".to_vec(), "the declared four bytes are read");
+        let seeded = read_body(&mut sock, head, b"ABCD").await;
+        assert_eq!(seeded, b"ABCD".to_vec(), "a leftover seeds the body, no read");
+    }
+
+    /// A complete head shorter than the cap returns AT ONCE: the loop must not
+    /// wait for bytes past the terminator (`||` -widening keeps reading while
+    /// there is room, and `<=` reads past the cap when no head was found).
+    #[tokio::test]
+    async fn read_upstream_head_returns_promptly_and_bounds_its_read() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::timeout;
+
+        let (mut client, mut upstream) = connected_pair().await;
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let got = timeout(Duration::from_secs(3), read_upstream_head(&mut upstream))
+            .await
+            .expect("a complete head must not wait for more bytes");
+        assert!(got.is_some(), "a complete head parses");
+
+        let (mut client, mut upstream) = connected_pair().await;
+        client.write_all(&vec![b'j'; 8192]).await.unwrap();
+        let bounded = timeout(Duration::from_secs(3), read_upstream_head(&mut upstream)).await;
+        assert!(
+            bounded.is_ok(),
+            "with no terminator at the cap the read must stop, not wait"
+        );
     }
