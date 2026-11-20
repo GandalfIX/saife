@@ -354,4 +354,16 @@ exclude_re = [
     # its stem, an empty group list adds nothing) are inside that walk, and a
     # fixture would have to ship a whole machine tree to reach them.
     "^src/profile.rs:(1253|1269):",
+
+    # The drain's loop extrema (`got < want`): at the equality edge the mutant
+    # spends ONE more read, which a closed fixture ends at EOF - the drain
+    # result (the declared body consumed, the socket quiescent) is identical.
+    # `<=` keeps reading until the body timeout on every drain, and `+=` -> *=
+    # never advances `got`: both are hang classes, not behaviours.
+    "^src/runner/server.rs:(487|490):",
+
+    # The expansion scan's `+ 1` indexes the character after `$`; `*` makes the
+    # scan stand still (an infinite loop), so the mutant is a hang class: no
+    # input reaches a different result, the test run is just cut off.
+    "^src/profile.rs:1802:30:",
 ]

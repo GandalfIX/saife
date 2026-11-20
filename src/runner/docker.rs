@@ -1649,6 +1649,13 @@ mod tests {
         );
         assert!(dechunk(b"4").is_err(), "a header without CRLF is refused");
         assert!(dechunk(b"zz\r\nxx\r\n").is_err(), "a non-hex size is refused");
+        // A body of EXACTLY the declared size is complete: the refusal is for a
+        // SHORT body, so what follows is a complaint about the NEXT header.
+        let err = format!("{:#}", dechunk(b"4\r\nWiki").unwrap_err());
+        assert!(
+            err.contains("header"),
+            "an exactly-sized body is not truncated: {err}"
+        );
     }
 
     /// A limit override of 0 (or blank / unparsable) is NOT a limit: falling

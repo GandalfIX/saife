@@ -4096,6 +4096,9 @@ mod tests {
         assert_eq!(strip_trailing_sep("C:\\Java\\"), "C:\\Java");
         assert_eq!(strip_trailing_sep("C:/Java/"), "C:/Java");
         assert_eq!(strip_trailing_sep("C:\\Java"), "C:\\Java");
+        // Only a TWO-CHAR drive root keeps its separator: a longer string that
+        // merely ends with a colon is not a root and loses the separator.
+        assert_eq!(strip_trailing_sep("ab:\\"), "ab:");
     }
 
     /// A profile file's `meta.name` is the display name; an empty one means the
