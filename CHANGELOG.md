@@ -6,6 +6,21 @@ follow `docs/design/versioning.md`: SemVer adapted to a containment product, whe
 a change that loosens a default is never a patch. While the project is 0.x, a
 minor release may break the profile schema; the error message names the fix.
 
+## [Unreleased]
+
+### Changed
+
+- **The test suite no longer listens on a non-loopback address.** The forward-path fixtures served
+  their stand-in origin on the host's LAN address, and Windows Firewall asks once per executable
+  *file* - so every rebuild (and every `cargo-mutants` copy of the tree) produced a new prompt, and
+  answering it left an inbound rule per binary. The fixtures now serve the origin on `127.0.0.1`;
+  the loopback legs are open only for a listener built by the `cfg(test)`-only `spawn_loopback`, so
+  the product rule that refuses loopback targets is unchanged and still pinned by
+  `loopback_refused_even_when_allowlisted`. `maintenance/` is new: it holds
+  `Remove-StaleSaifeFirewallRules.ps1` (cleans up the rules a host already accumulated) and the
+  two AppContainer-ACE recovery scripts that used to sit in `tests/` - they are host repairs, not
+  tests, and nothing in the suite calls them.
+
 ## [0.6.0] - 2026-11-12
 
 The release that turns the credential deny list from one hard-coded opinion into a **classified

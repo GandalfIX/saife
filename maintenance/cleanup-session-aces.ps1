@@ -2,7 +2,7 @@
 # (any S-1-15-2-* EXCEPT the intentional persistent S-1-15-2-2 drive-root
 # grant) from the harness temp root, $env:TEMP, and AppData\Local ancestors.
 # Run after a killed test run:
-#   pwsh -ExecutionPolicy Bypass -File tests\cleanup-session-aces.ps1
+#   pwsh -ExecutionPolicy Bypass -File maintenance\cleanup-session-aces.ps1
 # Review before deleting; prints everything it removes.
 param([string[]]$Paths = @($env:TEMP, "$env:LOCALAPPDATA"))
 

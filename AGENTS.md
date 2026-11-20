@@ -173,12 +173,12 @@ afterwards. Two complementary mechanisms:
    (AppContainer) ACEs that the run added to `$env:TEMP`, `AppData\Local`, and
    the user profile root. The cleanup runs in a `finally` block so it executes
    even if the harness is killed with Ctrl-C. A standalone cleanup script
-   (`tests/cleanup-acls.ps1`) is also provided so a user can manually recover
-   from a killed run.
+   (`maintenance/cleanup-acls.ps1`) is also provided so a user can manually
+   recover from a killed run.
 
 **Before running the test harness**, verify the ancestor ACLs are not already
 bloated:
 ```powershell
 (icacls $env:TEMP | Select-String "S-1-15-2").Count
 ```
-If the count is > 10, run `.\tests\cleanup-acls.ps1` first.
+If the count is > 10, run `.\maintenance\cleanup-acls.ps1` first.

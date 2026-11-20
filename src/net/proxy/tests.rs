@@ -1270,6 +1270,76 @@
         )
     }
 
+    /// [`t36_setup`] for a test whose stand-in origin listens on `127.0.0.1`.
+    ///
+    /// Every forward-path fixture serves its own origin, and serving it on the
+    /// host's LAN address is what made Windows Firewall ask about each new test
+    /// binary. The loopback legs are therefore open for these listeners - and
+    /// closed for every other fixture, which is what keeps
+    /// `loopback_refused_even_when_allowlisted` a statement about the product.
+    fn t36_setup_loopback(label: &str, allow: &[&str], deny: &[&str], dialog: DialogFn) -> T36 {
+        t36_setup_loopback_cfg(
+            label,
+            allow,
+            deny,
+            dialog,
+            true,
+            Duration::from_secs(60),
+            PromptPolicy::Deny,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn t36_setup_loopback_cfg(
+        label: &str,
+        allow: &[&str],
+        deny: &[&str],
+        dialog: DialogFn,
+        enabled: bool,
+        timeout: Duration,
+        policy: PromptPolicy,
+        upstream: Option<Arc<UpstreamDialer>>,
+    ) -> T36 {
+        try_t36_token_cfg_inner(
+            label,
+            allow,
+            deny,
+            dialog,
+            enabled,
+            timeout,
+            policy,
+            upstream,
+            unique_test_token(),
+            false,
+            false,
+            true,
+        )
+        .expect("spawn the fixture listener")
+    }
+
+    /// The fixture listener: same as [`try_t36_token_cfg_inner`] with the loopback
+    /// legs CLOSED, which is what every production listener has.
+    #[allow(clippy::too_many_arguments)]
+    fn try_t36_token_cfg(
+        label: &str,
+        allow: &[&str],
+        deny: &[&str],
+        dialog: DialogFn,
+        enabled: bool,
+        timeout: Duration,
+        policy: PromptPolicy,
+        upstream: Option<Arc<UpstreamDialer>>,
+        token: RunToken,
+        blocked: bool,
+        allow_lan: bool,
+    ) -> Result<T36> {
+        try_t36_token_cfg_inner(
+            label, allow, deny, dialog, enabled, timeout, policy, upstream, token, blocked,
+            allow_lan, false,
+        )
+    }
+
     /// The same listener, with a run token of its own: what P1.4's two-run tests
     /// need to show that a listener refuses every credential but its own.
     #[allow(clippy::too_many_arguments)]
@@ -1295,7 +1365,7 @@
     /// error, and every other caller wants it unwrapped. A failed attempt leaves
     /// nothing behind: the scratch state it created is removed here.
     #[allow(clippy::too_many_arguments)]
-    fn try_t36_token_cfg(
+    fn try_t36_token_cfg_inner(
         label: &str,
         allow: &[&str],
         deny: &[&str],
@@ -1306,11 +1376,16 @@
         upstream: Option<Arc<UpstreamDialer>>,
         token: RunToken,
         blocked: bool,
-        // M9: `true` in every existing fixture (their stand-in origins and
-        // upstreams are local listeners on the host's own LAN address - a
-        // property of the fixture, not of the product). The tests that pin the
-        // production LAN denial pass `false`.
+        // M9: `true` where the fixture's stand-in origin is a local listener on
+        // the host's own LAN address - a property of the fixture, not of the
+        // product. The tests that pin the production LAN denial pass `false`.
         allow_lan: bool,
+        // `true` only for the fixtures whose stand-in origin is a listener on
+        // 127.0.0.1 (all of them today): a test must never need the Windows
+        // firewall to admit its binary, and a LAN bind asks for exactly that.
+        // `spawn_loopback` is the only way to open the loopback legs, and it
+        // exists under `cfg(test)`.
+        permit_loopback: bool,
     ) -> Result<T36> {
         let token_value = token.value().to_string();
         let learned_base = std::env::temp_dir().join(format!(
@@ -1342,7 +1417,7 @@
         // registers its mount on `t.handle.ctx.facade` after spawn, which is the
         // order the supervisor uses (bind, then plugins).
         let facade = Arc::new(FacadeRegistry::new());
-        let handle = match super::spawn(super::ProxyConfig {
+        let cfg = super::ProxyConfig {
             session_id: sid.clone(),
             token,
             allow_domain: allow.iter().map(|s| s.to_string()).collect(),
@@ -1353,7 +1428,12 @@
             prompt: gate,
             facade,
             blocked,
-        }) {
+        };
+        let handle = match if permit_loopback {
+            super::spawn_loopback(cfg)
+        } else {
+            super::spawn(cfg)
+        } {
             Ok(handle) => handle,
             Err(e) => {
                 let _ = std::fs::remove_file(crate::audit::audit_log_path(&sid));
@@ -4538,7 +4618,7 @@
     fn transfer_encoding_is_a_400_and_reaches_no_origin() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-te", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-te", &[origin.host.as_str()], &[], dialog);
         let extra = "Transfer-Encoding: chunked\r\n";
         let resp = exchange(
             t.port,
@@ -4565,7 +4645,7 @@
     fn conflicting_content_length_is_a_400_and_reaches_no_origin() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-cl", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-cl", &[origin.host.as_str()], &[], dialog);
         let extra = "Content-Length: 5\r\nContent-Length: 6\r\n";
         let resp = exchange(
             t.port,
@@ -4594,7 +4674,7 @@
     fn body_followed_by_trailing_bytes_is_a_400_and_nothing_is_forwarded() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-trailing", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-trailing", &[origin.host.as_str()], &[], dialog);
         let smuggled = "GET http://origin.example/second HTTP/1.1\r\nHost: origin.example\r\n\r\n";
         let resp = exchange(
             t.port,
@@ -4621,7 +4701,7 @@
     fn post_body_is_forwarded_byte_exact_with_the_admitted_host() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-post", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-post", &[origin.host.as_str()], &[], dialog);
         let body = "{\"hello\":\"world\"}";
         let authority = origin.authority();
         let extra = format!(
@@ -4675,7 +4755,7 @@
             "\r\n",
         ));
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-407", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-407", &[origin.host.as_str()], &[], dialog);
         let resp = exchange(
             t.port,
             &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
@@ -4900,7 +4980,7 @@
             "\r\n",
         ));
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-103", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-103", &[origin.host.as_str()], &[], dialog);
         let resp = exchange(
             t.port,
             &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
@@ -4938,7 +5018,7 @@
             "\r\n",
         ));
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-crlf", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-crlf", &[origin.host.as_str()], &[], dialog);
         let resp = exchange(
             t.port,
             &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
@@ -4962,7 +5042,7 @@
     fn connection_naming_a_framing_field_is_a_400_and_reaches_no_origin() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, calls) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-conn-framing", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-conn-framing", &[origin.host.as_str()], &[], dialog);
         let smuggled =
             "GET http://victim.internal/second HTTP/1.1\r\nHost: victim.internal\r\n\r\n";
         for (listed, token) in [
@@ -5012,7 +5092,7 @@
     fn whitespace_in_a_field_name_is_a_400_and_a_valid_one_still_forwards() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, calls) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-field-name", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-field-name", &[origin.host.as_str()], &[], dialog);
         let resp = exchange(
             t.port,
             &fwd_req(
@@ -5062,7 +5142,7 @@
     fn expect_header_is_refused_before_admission() {
         let origin = FakeOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         let (dialog, calls) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-expect", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-expect", &[origin.host.as_str()], &[], dialog);
         let resp = exchange(
             t.port,
             &fwd_req(
@@ -5103,7 +5183,7 @@
             "ok",
         ));
         let (dialog, _c) = recording_dialog(Ok(allow_once()));
-        let t = t36_setup("fwd-close", &[origin.host.as_str()], &[], dialog);
+        let t = t36_setup_loopback("fwd-close", &[origin.host.as_str()], &[], dialog);
         let resp = exchange(
             t.port,
             &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
@@ -5152,15 +5232,6 @@
 
     /// The host's non-loopback IPv4: the forward path refuses loopback targets by
     /// design, so a forwardable origin has to live on a real interface.
-    fn route_ipv4() -> std::net::Ipv4Addr {
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("route probe socket");
-        probe.connect("1.1.1.1:80").expect("route probe");
-        match probe.local_addr().expect("route probe address").ip() {
-            std::net::IpAddr::V4(v4) if !v4.is_loopback() => v4,
-            other => panic!("this host has no non-loopback IPv4 (probe {other})"),
-        }
-    }
-
     /// A local origin the forward path can actually reach, recording the exact
     /// bytes of every request it is sent and answering with a canned response.
     struct FakeOrigin {
@@ -5175,8 +5246,12 @@
         fn start(response: &str) -> FakeOrigin {
             use std::io::Write;
             use std::sync::atomic::Ordering;
-            let ip = route_ipv4();
-            let listener = std::net::TcpListener::bind((ip, 0)).expect("bind fake origin");
+            // Loopback, never the host's LAN address: a listener on a routable
+            // address makes Windows Firewall ask about every new test binary
+            // (once per executable FILE, and every rebuild is a new one), so the
+            // suite would need a firewall decision to pass. The loopback legs
+            // are open for this fixture through `t36_setup_loopback`.
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind fake origin");
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).unwrap();
             let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -5200,7 +5275,7 @@
                 }
             });
             FakeOrigin {
-                host: ip.to_string(),
+                host: "127.0.0.1".to_string(),
                 port,
                 seen,
                 stop,
@@ -5853,6 +5928,9 @@
             writer,
             upstream: Some(dialer(&format!("http://127.0.0.1:{upstream_port}"), &[])),
             allow_lan: true,
+            // This context drives the chained-tunnel tests against a stand-in
+            // upstream on 127.0.0.1, so the loopback legs are open for it.
+            permit_loopback: true,
             next_request_id: std::sync::atomic::AtomicU64::new(0),
             prompt,
             counters: LaunchCounters::new(),
@@ -6779,7 +6857,7 @@
         ] {
             let origin = FakeOrigin::start(head);
             let (dialog, _c) = recording_dialog(Ok(allow_once()));
-            let t = t36_setup("lb-challenge", &[origin.host.as_str()], &[], dialog);
+            let t = t36_setup_loopback("lb-challenge", &[origin.host.as_str()], &[], dialog);
             let resp = exchange(
                 t.port,
                 &fwd_req("GET", &format!("http://{}/x", origin.authority()), "", ""),
