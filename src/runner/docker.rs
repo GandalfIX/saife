@@ -1628,4 +1628,44 @@ mod tests {
         assert!(format!("{:#}", bad.json().unwrap_err()).contains("non-JSON (500)"));
     }
 
+
+    /// The chunked decoder: chunks reassembled, extensions ignored, and the
+    /// three truncation shapes refused (a short body is an error, not a
+    /// shorter result - the `>` comparison decides that).
+    #[test]
+    fn dechunk_reassembles_chunks_and_refuses_every_truncation() {
+        assert_eq!(
+            dechunk(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap(),
+            b"Wikipedia".to_vec()
+        );
+        assert_eq!(
+            dechunk(b"4;ext=1\r\nWiki\r\n0\r\n\r\n").unwrap(),
+            b"Wiki".to_vec(),
+            "a chunk extension is not part of the size"
+        );
+        assert!(
+            dechunk(b"9\r\nWiki\r\n0\r\n\r\n").is_err(),
+            "a body shorter than the declared size is refused"
+        );
+        assert!(dechunk(b"4").is_err(), "a header without CRLF is refused");
+        assert!(dechunk(b"zz\r\nxx\r\n").is_err(), "a non-hex size is refused");
+    }
+
+    /// A limit override of 0 (or blank / unparsable) is NOT a limit: falling
+    /// through to `Some(0)` would give every slot an empty memory budget.
+    #[test]
+    fn a_zero_or_blank_limit_override_is_not_a_limit() {
+        let name = "SAIFE_TEST_LIMIT_OVERRIDE";
+        unsafe { std::env::set_var(name, "0") };
+        assert_eq!(limit_override(name), None, "zero is refused");
+        unsafe { std::env::set_var(name, " 16 ") };
+        assert_eq!(limit_override(name), Some(16), "whitespace is trimmed");
+        unsafe { std::env::set_var(name, "") };
+        assert_eq!(limit_override(name), None, "blank is refused");
+        unsafe { std::env::set_var(name, "abc") };
+        assert_eq!(limit_override(name), None, "garbage is refused");
+        unsafe { std::env::remove_var(name) };
+        assert_eq!(limit_override(name), None, "unset is None");
+    }
+
 }

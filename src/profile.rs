@@ -3913,4 +3913,207 @@ mod tests {
         assert_eq!(CredentialClass::ToolCredential.as_str(), "tool-credential");
     }
 
+
+    /// One policy file per deny kind, loaded in file order, de-duplicated by
+    /// COVERING: the second file's narrower path is already inside the first's
+    /// tree, so it is not added twice - and a non-JSON neighbour is not policy.
+    #[test]
+    fn policy_denies_in_loads_in_order_and_dedupes_by_covering() {
+        let dir = temp_dir("policy-order");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tree = dir.join("tree");
+        let sub = tree.join("sub");
+        let a = dir.join("01-base.json");
+        let b = dir.join("02-sub.json");
+        std::fs::write(dir.join("README.txt"), "prose, not policy").unwrap();
+        std::fs::write(
+            &a,
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                json_escaped(&tree)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                json_escaped(&sub)
+            ),
+        )
+        .unwrap();
+        let got = policy_denies_in(&dir).expect("two valid files load");
+        assert_eq!(
+            got.dirs.len(),
+            1,
+            "the covered entry is not added twice: {:?}",
+            got.dirs
+        );
+        assert_eq!(got.sources.len(), 2, "both files were read and recorded");
+        assert!(
+            got.sources[0].ends_with("01-base.json"),
+            "files load in sorted order: {:?}",
+            got.sources
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The three refusals the loader must make: an empty file (a deployment
+    /// mistake, not a no-op), a schema this build does not speak, and a
+    /// per-session variable (a policy denies a real path, not a cwd).
+    #[test]
+    fn policy_denies_in_refuses_empty_foreign_and_session_scoped_files() {
+        let dir = temp_dir("policy-refusals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("01.x.json");
+
+        std::fs::write(
+            &file,
+            r#"{"schema_version":1,"deny":{"dirs":[],"files":[]}}"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", policy_denies_in(&dir).expect_err("empty is refused"));
+        assert!(err.contains("adds no deny entry"), "{err}");
+
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"schema_version":2,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                json_escaped(&dir.join("tree"))
+            ),
+        )
+        .unwrap();
+        let err = format!("{:#}", policy_denies_in(&dir).expect_err("schema 2 refused"));
+        assert!(err.contains("not supported"), "{err}");
+
+        for bad in ["$CWD\\x", "$SID\\x"] {
+            std::fs::write(
+                &file,
+                format!(
+                    r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                    bad.replace('\\', "\\\\")
+                ),
+            )
+            .unwrap();
+            let err = format!("{:#}", policy_denies_in(&dir).expect_err(bad));
+            assert!(
+                err.contains("per-session"),
+                "each session variable is refused on its own ({bad}): {err}"
+            );
+        }
+
+        for bad in ["relative\\tree", "C:\\a\\..\\tree"] {
+            std::fs::write(
+                &file,
+                format!(
+                    r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                    bad.replace('\\', "\\\\")
+                ),
+            )
+            .unwrap();
+            let err = format!("{:#}", policy_denies_in(&dir).expect_err(bad));
+            assert!(err.contains("absolute") || err.contains(".."), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Exposure REMOVES the covered entry from the deny set: the retained set is
+    /// the builtin one minus what the operator asked to reach (the inverted
+    /// retain keeps exactly the exposed path - the opposite of a grant).
+    #[test]
+    fn exposure_removes_the_named_credential_and_keeps_the_rest() {
+        let home = std::path::PathBuf::from(r"C:\Users\fixture");
+        let lad = home.join("AppData").join("Local");
+        let ad = home.join("AppData").join("Roaming");
+        let full = effective_denies_with(&[], Some(&home), Some(&lad), Some(&ad), None)
+            .expect("builtin set resolves");
+        let gh = home.join(".config").join("gh");
+        let kube = home.join(".kube").join("config");
+        assert!(full.dirs.contains(&gh), "precondition: gh is a denied DIR: {:?}", full.dirs);
+        assert!(full.files.contains(&kube), "precondition: kube is a denied FILE: {:?}", full.files);
+
+        let exposed = effective_denies_with(
+            &["gh".to_string(), "kube".to_string()],
+            Some(&home),
+            Some(&lad),
+            Some(&ad),
+            None,
+        )
+        .expect("both are exposable tool credentials");
+        assert!(!exposed.dirs.contains(&gh), "the exposed DIR is removed: {:?}", exposed.dirs);
+        assert!(!exposed.files.contains(&kube), "the exposed FILE is removed: {:?}", exposed.files);
+        assert!(
+            exposed.dirs.iter().any(|d| d.ends_with(".gnupg")),
+            "every other dir stays denied: {:?}",
+            exposed.dirs
+        );
+        assert_eq!(exposed.dirs.len() + 1, full.dirs.len(), "exactly one dir moved out");
+        assert_eq!(exposed.files.len() + 1, full.files.len(), "exactly one file moved out");
+    }
+
+    /// An EMPTY LOCALAPPDATA is not a value: the documented fallback to
+    /// `%USERPROFILE%\AppData\Local` applies (accepting "" would make
+    /// `$LOCALAPPDATA\x` the RELATIVE path `\x`, resolved against the session cwd).
+    #[test]
+    fn an_empty_local_appdata_expands_through_the_home_fallback() {
+        let cwd = std::path::Path::new("C:\\work");
+        let prev_lad = std::env::var_os("LOCALAPPDATA");
+        let prev_ad = std::env::var_os("APPDATA");
+        let prev_home = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", "");
+            std::env::set_var("APPDATA", "C:\\Users\\fixture\\AppData\\Roaming");
+            std::env::set_var("USERPROFILE", "C:\\Users\\fixture");
+        }
+        let got = expand_vars("$LOCALAPPDATA\\x", cwd);
+        unsafe {
+            match prev_lad {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+            match prev_ad {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+        let got = got.expect("the fallback resolves without the variable");
+        assert_eq!(
+            got, "C:\\Users\\fixture\\AppData\\Local\\x",
+            "Local falls back to the conventional path under the home dir, not to Roaming"
+        );
+    }
+
+    /// Installer-set roots arrive WITH a trailing separator; the expansion must
+    /// not turn `$JAVA_HOME\bin` into `...\\bin`. A bare drive root keeps its
+    /// separator - `C:` is not a directory.
+    #[test]
+    fn strip_trailing_sep_keeps_drive_roots_and_drops_a_lone_separator() {
+        assert_eq!(strip_trailing_sep("C:\\"), "C:\\");
+        assert_eq!(strip_trailing_sep("C:\\Java\\"), "C:\\Java");
+        assert_eq!(strip_trailing_sep("C:/Java/"), "C:/Java");
+        assert_eq!(strip_trailing_sep("C:\\Java"), "C:\\Java");
+    }
+
+    /// A profile file's `meta.name` is the display name; an empty one means the
+    /// file has none, and the caller falls back to the file stem.
+    #[test]
+    fn name_from_profile_file_reads_the_documented_name_only() {
+        let dir = temp_dir("name-from-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("named.json");
+        std::fs::write(&named, r#"{"meta":{"name":"alpha","schema_version":1}}"#).unwrap();
+        assert_eq!(name_from_profile_file(&named), Some("alpha".to_string()));
+        let blank = dir.join("blank.json");
+        std::fs::write(&blank, r#"{"meta":{"name":"","schema_version":1}}"#).unwrap();
+        assert_eq!(name_from_profile_file(&blank), None);
+        let garbage = dir.join("garbage.json");
+        std::fs::write(&garbage, "not json").unwrap();
+        assert_eq!(name_from_profile_file(&garbage), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }

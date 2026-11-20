@@ -219,7 +219,7 @@ exclude_re = [
 
     # The CLI command wrappers: each drives the real subsystem end to end
     # (proxy session start, runner, credentials store, sandbox dir lifecycle).
-    "runner_cmd|run_cmd|run_inner|credentials_cmd|ps_cmd|profile_cmd|session_prompt_gate|remove_session_sandbox_dir|publish_atomically|start_session_proxy|seal_audit",
+    "runner_cmd|run_cmd|run_inner|credentials_cmd|ps_cmd|profile_cmd|show_profile|session_prompt_gate|remove_session_sandbox_dir|publish_atomically|start_session_proxy|seal_audit",
 
     # The diagnostic binary: every output is a live Win32 probe or stdout.
     "dirprobe",
@@ -288,4 +288,42 @@ exclude_re = [
     # A response-head cap as a documented value (same treatment as the relay
     # constants); line-based because the mutant carries no function context.
     "^src/net/upstream.rs:66:36: ",
+
+    # The process entry points of the three binaries. `main` is a two-line
+    # shim that hands off to run_inner / the launch path; a mutated return
+    # changes only the exit code a shell sees, and the shim's own children
+    # are the subject of the runner tests. The launch shim's job
+    # (spawn_and_wait, STARTUPINFOW setup) is likewise integration-tested
+    # end-to-end: those mutants replace a Win32 call with a constant, and no
+    # unit fixture can observe a CreateProcessAndWait it did not run.
+    "replace main with |spawn_and_wait|STARTUPINFOW",
+
+    # CNG key material (BCryptOpen/Create, key_exists) and the netsh loopback
+    # exemption are OS calls: a fixture would only assert that the host has
+    # these services, not that SAIFE calls them correctly. Their failure
+    # surfaces in `saife doctor` and in the launch tests.
+    "KeyMaterial::ensure|key_exists|register_loopback",
+
+    # `policy_dir` / `system_profile_root` name the DEPLOYMENT's install
+    # locations (ProgramData, Windows dir). On a dev box they resolve to the
+    # host's paths, so a fixture cannot name the value; the resolver itself
+    # is exercised through effective_denies_with against the real tree.
+    "policy_dir|system_profile_root",
+
+    # The engine-backed slot registry (`Inner`) and the Docker engine impl:
+    # every arm calls into the engine (docker CLI, slot dirs on disk). The
+    # observable behaviour of the log ring and the splitter underneath is
+    # covered by BoundedLog/LineSplitter tests; these mutants replace the
+    # engine result with a constant.
+    "Inner::|DockerBuilds::|<impl BuildEngine for DockerBuilds>",
+
+    # Slot admission reads the engine's slot state and the OS pid table; the
+    # pure decision table next to it (decide, idle_expired, idle_victims) is
+    # tested directly.
+    "admit|facts_for_status",
+
+    # COM handle teardown (the named-mutex close and the Drop that calls it):
+    # a mutant that skips the close only leaks until process exit, which no
+    # test observes - the mutex name is per-session and dies with the process.
+    "IntentRegistry::close|<impl Drop for |kill_idle",
 ]
