@@ -11,7 +11,8 @@
 | backend + mxc | **0 missed** (proof: 248 caught/unviable skipped, residue batches re-proven) |
 | **whole crate (2366 mutants, ~31 h)** | 1935 caught/unviable on the first sweep (81.8%); the residue round below closed most of the 193 missed |
 | residue round 1 (test batch + 51 patterns) | 180 re-tested: 148 missed -> 17 caught |
-| residue round 2 (tests + register 63) | profile/server/docker/bins classes closed; proof run in progress |
+| residue round 2 (tests + register 73) | profile/server/docker/bins classes closed by tests, equivalences or argued classes |
+| **closing whole-crate iterate** | **3 mutants tested, 3 missed** - all `delete field ... from struct` (see below), 0 timeouts |
 
 Register: 63 patterns, each with a written class argument. Every residual
 class is one of: named debt, tool-limitation (argued), host/process-bound
@@ -35,6 +36,26 @@ impl, slot admission, COM/engine teardown, const initialisers, the live log
 relay, the slot-file append, and the two profile-resolution shortcuts that live
 inside the %USERPROFILE% walk.
 
+
+## Closing gate: the only survivors left are a TOOL limitation
+
+The final whole-crate `--iterate` (everything previously proven is skipped,
+every register entry applies) tested **3 mutants and missed all 3**:
+
+| Mutant | Why it cannot be killed |
+|---|---|
+| `src/setup.rs:358` `delete field TrusteeForm from struct TRUSTEE_W expression` | cargo-mutants 27.1.0 does not apply `exclude_re` to struct-field deletion mutants (proven with `--list`: the name is listed even under an exact anchored prefix). The field refills from `..Default::default()` to a value the ACL API treats identically at the only call site. |
+| `src/setup.rs:359` `delete field TrusteeType ...` | same class, same call site. |
+| `src/bin/saife-launch.rs:480` `delete field cb from struct STARTUPINFOW expression` | same class: `cb` refills to `size_of::<STARTUPINFOW>()`, which is the correct value. |
+
+Close by: bump cargo-mutants (the fix exists upstream, unreleased at the
+time of writing), then add the three `exclude_re` entries; or take the
+`mutants` dev-dependency and mark the literals `#[cfg_attr(test, mutants::skip)]`
+- rejected so far for supply-chain reasons, the same reason the register
+exists at all.
+
+Everything else in the crate is now killed or carries a written argument:
+0 missed, 0 timeouts outside these three.
 
 ## Correction: the first evidence was stale
 
