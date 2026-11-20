@@ -774,4 +774,34 @@ mod tests {
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
+
+    /// `unpack_into_at` with strip_top rewrites the engine's parent-relative
+    /// path (`out/art.txt`) to the file under `dest`; without the flag the first
+    /// component stays a directory. The count is the entries actually written -
+    /// a constant return hides a tar that never landed.
+    #[test]
+    fn unpack_into_at_strips_the_engine_top_component_on_request() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "out/art.txt", &b"art"[..]).unwrap();
+            b.finish().unwrap();
+        }
+
+        let dest = scratch("strip-top");
+        let n = unpack_into_at(&buf, &dest, true, &|_| true).expect("unpack strip");
+        assert_eq!(n, 1, "one file entry written");
+        assert_eq!(std::fs::read(dest.join("art.txt")).unwrap(), b"art");
+        assert!(!dest.join("out").exists(), "the top component is dropped");
+
+        let dest = scratch("keep-top");
+        let n = unpack_into_at(&buf, &dest, false, &|_| true).expect("unpack keep");
+        assert_eq!(n, 1);
+        assert_eq!(std::fs::read(dest.join("out/art.txt")).unwrap(), b"art");
+    }
+
 }

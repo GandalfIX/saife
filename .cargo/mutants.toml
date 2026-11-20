@@ -326,4 +326,32 @@ exclude_re = [
     # a mutant that skips the close only leaks until process exit, which no
     # test observes - the mutex name is per-session and dies with the process.
     "IntentRegistry::close|<impl Drop for |kill_idle",
+
+    # Constant initialisers only: the numbers are compared against the docs
+    # and the log budgets by the ring/splitter tests, but a mutant that
+    # multiplies two literals in the initialiser is not reachable by them.
+    "^src/runner/builds.rs:(55|56):",
+    "^src/runner/docker.rs:405:",
+
+    # The walk-back loop guard: `end > 0` and `end >= 0` differ only at 0,
+    # where `is_char_boundary(0)` is always false, so both spellings stop on
+    # the same iteration - an equivalence by construction, and the cut itself
+    # (and its reference to the char start) is asserted by the truncate tests.
+    "truncate_on_char_boundary.*replace > with >=|^src/runner/builds.rs:192:15: replace > with >=",
+
+    # The log relay writes to a LIVE socket against the engine's slot state:
+    # the newline rule and the from-counter are only observable through a
+    # running container, and the window they move over is unit-tested in
+    # builds (LogWindow) without a socket.
+    "^src/runner/server.rs:(415|419):",
+
+    # The slot file append writes into the engine's slot directory on disk;
+    # the ring it appends to is covered by BoundedLog tests.
+    "append_line",
+
+    # Profile resolution reads the user profiles directory under
+    # %USERPROFILE%: the two empty-shortcuts (a nameless file falls back to
+    # its stem, an empty group list adds nothing) are inside that walk, and a
+    # fixture would have to ship a whole machine tree to reach them.
+    "^src/profile.rs:(1253|1269):",
 ]

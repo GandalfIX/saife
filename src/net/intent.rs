@@ -653,4 +653,26 @@ mod tests {
         assert_eq!(MAX_ENTRIES, 500);
         assert_eq!(MAX_REASON_CHARS, 500);
     }
+
+    /// The table never exceeds MAX_ENTRIES: the bound is `>` (evict AFTER the
+    /// insert that overflowed), so the oldest record goes out and the newest
+    /// stays - `>=` evicts one entry too early and `==` lets it grow to 501.
+    #[tokio::test]
+    async fn record_evicts_at_the_bound_and_never_exceeds_it() {
+        let reg = IntentRegistry::new(Duration::from_secs(600));
+        for i in 0..MAX_ENTRIES + 3 {
+            reg.record(&format!("h{i}.example.com"), "r").await;
+        }
+        let newest = format!("h{}.example.com", MAX_ENTRIES + 2);
+        let oldest = "h0.example.com";
+        assert!(reg.lookup_host(&newest).await.is_some(), "the newest record stays");
+        assert!(reg.lookup_host(oldest).await.is_none(), "the oldest record was evicted");
+        let st = reg.state.lock().await;
+        assert!(
+            st.entries.len() <= MAX_ENTRIES,
+            "the table is capped at {MAX_ENTRIES}, got {}",
+            st.entries.len()
+        );
+    }
+
 }

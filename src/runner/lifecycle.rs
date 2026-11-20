@@ -1199,4 +1199,25 @@ mod tests {
         assert!(format!("{err:#}").contains("runner_slot_owned_elsewhere"), "{err:#}");
     }
 
+    /// A crash between create and remove leaves a stopped duplicate beside the
+    /// running slot; the RUNNING one is the slot a build lands in, whichever
+    /// order the table lists them (`&&`-widening of the running test accepts the
+    /// stopped one instead).
+    #[test]
+    fn the_running_duplicate_wins_over_a_stopped_one() {
+        let spec = spec("s-dup");
+        let mut stopped = mine(&spec);
+        stopped.slot_id = "id-stopped".to_string();
+        stopped.name = "slot-stopped".to_string();
+        stopped.running = false;
+        let running = mine(&spec); // name = spec.name, running
+        let got = decide(&[running, stopped], &spec, &policy(), NOW, &alive)
+            .expect("the running duplicate is reuseable");
+        match got {
+            Decision::Reuse(slot) | Decision::Recycle { slot, .. } => {
+                assert_eq!(slot.name, spec.name, "the RUNNING slot is chosen: {slot:?}");
+            }
+            Decision::Create => panic!("a running duplicate exists: Create is wrong"),
+        }
+    }
 }
