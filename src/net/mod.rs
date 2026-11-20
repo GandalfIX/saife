@@ -584,4 +584,80 @@ mod tests {
             "no-prompt + deny-only must be Blocked"
         );
     }
+    /// Every term of the block decision blocks ON ITS OWN: a widening of the
+    /// `||` chain (`a && b || c`) silently permits a session one flag asked to
+    /// block.
+    #[test]
+    fn each_block_term_blocks_alone() {
+        use crate::profile::NetworkSlice;
+
+        let empty = NetworkSlice::default();
+        let resolve = |slice: &NetworkSlice, cli_block: bool, profile: Option<&str>| {
+            super::resolve_network_with(slice, cli_block, &[], &[], true, profile, false)
+        };
+
+        // 1. --block-net alone.
+        assert!(resolve(&empty, true, None).is_blocked(), "--block-net blocks");
+        // 2. The profile's own block_net alone.
+        let prof = NetworkSlice {
+            block_net: true,
+            ..Default::default()
+        };
+        assert!(resolve(&prof, false, None).is_blocked(), "profile block_net blocks");
+        // 3. --network-profile none alone.
+        assert!(resolve(&empty, false, Some("none")).is_blocked(), "CLI `none` blocks");
+        // 4. The profile's name "none" alone.
+        let prof = NetworkSlice {
+            profile_name: Some("none".into()),
+            ..Default::default()
+        };
+        assert!(resolve(&prof, false, None).is_blocked(), "profile `none` blocks");
+    }
+
+    /// The two predicate forms the supervisor dispatches on: blocked is exactly
+    /// Blocked, needs_proxy exactly Allow.
+    #[test]
+    fn the_network_predicates_match_their_variants() {
+        let allowed = NetworkConfig::Allow {
+            allow_domain: vec!["a.example".into()],
+            deny_domain: Vec::new(),
+            prompt_enabled: true,
+            on_unavailable: "deny".into(),
+            upstream_proxy: None,
+            profile_name: None,
+            proxy_port: None,
+            token: None,
+        };
+        assert!(!allowed.is_blocked());
+        assert!(allowed.needs_proxy());
+        assert!(NetworkConfig::Blocked.is_blocked());
+        assert!(!NetworkConfig::Blocked.needs_proxy());
+    }
+
+    /// The onUnavailable whitelist: both valid spellings pass through, an
+    /// invalid one degrades to deny (with a warning the test does not read).
+    /// The guard-widening mutants drop one of the two valid spellings onto the
+    /// invalid path.
+    #[test]
+    fn on_unavailable_keeps_both_valid_spellings() {
+        use crate::profile::NetworkSlice;
+
+        let resolve = |value: &str| {
+            let prof = NetworkSlice {
+                on_unavailable: Some(value.to_string()),
+                ..Default::default()
+            };
+            // One allow entry: a fully empty slice is deny-by-default Blocked.
+            let allows = ["a.example".to_string()];
+            match super::resolve_network_with(&prof, false, &allows, &[], true, None, false) {
+                super::NetworkConfig::Allow { on_unavailable, .. } => on_unavailable,
+                super::NetworkConfig::Blocked => panic!("an allow entry resolves to Allow"),
+            }
+        };
+        assert_eq!(resolve("deny"), "deny");
+        assert_eq!(resolve("allow"), "allow");
+        assert_eq!(resolve("denie"), "deny", "an invalid value degrades to deny");
+        assert_eq!(resolve(""), "deny", "an empty value degrades to deny");
+    }
+
 }

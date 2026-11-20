@@ -748,7 +748,15 @@ mod tests {
         builder.append(&raw_named("/abs-escape.txt", b"nope"), &b"nope"[..]).unwrap();
         let tar = builder.into_inner().unwrap();
 
+        // The sweep's mutant run may have written the escape probes before this
+        // test existed; clear them so the checks test THIS run.
         let dest = std::env::temp_dir().join("saife-sync-slips-test");
+        let _ = std::fs::remove_file("C:\\abs-escape.txt");
+        for leftover in ["escape.txt", "escape2.txt"] {
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::remove_file(parent.join(leftover));
+            }
+        }
         let _ = std::fs::remove_dir_all(&dest);
         std::fs::create_dir_all(&dest).unwrap();
 

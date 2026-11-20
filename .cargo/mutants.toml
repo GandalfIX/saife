@@ -253,4 +253,39 @@ exclude_re = [
     # can be handed. `>` -> `<` IS caught (it truncates a chain), so only these
     # two equivalents are registered.
     "replace > with (==|>=) in descendants",
+
+    # --- plugin, upstream, security_groups: residue after the 2026-11-20 sweep --
+    # The pure cores of these modules are tested now (manifest validation,
+    # plugin-name grammar, program lookup incl. the .exe.cmd lookalike, the
+    # host:port grammar, ProxyUrl parse/Display, the error chain, onUnavailable's
+    # whitelist, the block-decision terms). What remains needs a live thing.
+
+    # The plugin roots are read from the machine (install dirs, env): an empty
+    # vector is the honest answer on a host without an install.
+    "plugin_roots",
+
+    # The shadowing warning block of load_plugin_from: eprintln only, and the
+    # load behaviour behind it is unchanged by any of these mutants (asserted by
+    # the manifest tests).
+    "in load_plugin_from$",
+
+    # The sidecar process: accessors over the spawned child (mount label, pid,
+    # port), its generated bearer token, the health probe over a live socket and
+    # the Drop that kills the child.
+    "Sidecar::mount|Sidecar::pid|Sidecar::port|facade_token|Drop for Sidecar|probe_health",
+
+    # Diagnostic Debug impls that deliberately elide their inner state.
+    "Debug for ProxyUrl|Debug for UpstreamDialer|Debug for FacadeTarget",
+
+    # The windows_common group arm is a documented no-op: deleting it falls to
+    # the unknown-group arm, which warns on stderr and returns the same empty
+    # grant list.
+    "windows_common",
+
+    # The host EnvProbe: env vars, existence and PATH are the machine's.
+    "EnvProbe for HostEnv",
+
+    # A response-head cap as a documented value (same treatment as the relay
+    # constants); line-based because the mutant carries no function context.
+    "^src/net/upstream.rs:66:36: ",
 ]

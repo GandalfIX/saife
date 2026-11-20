@@ -900,4 +900,34 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(crate::audit::audit_log_path(&sid));
     }
+    /// The program lookup keeps the shell-adjacent extensions in a fixed order
+    /// WITHOUT appending them to a name that already has one: a PATH that
+    /// carries both `p.exe` and `p.exe.cmd` must resolve `p.exe`, never the
+    /// `.cmd` lookalike (`||` -> `&&` widening picks the lookalike).
+    #[test]
+    fn resolve_program_prefers_the_exact_name_over_a_lookalike() {
+        let dir = std::env::temp_dir().join("saife-resolve-program-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.exe"), b"bin").unwrap();
+        std::fs::write(dir.join("p.exe.cmd"), b"bin").unwrap();
+        std::fs::write(dir.join("q.exe"), b"bin").unwrap();
+
+        let _env = crate::env_lock();
+        let old = std::env::var_os("PATH");
+        // SAFETY: the env lock serializes this with every other PATH reader.
+        unsafe { std::env::set_var("PATH", &dir) };
+
+        let resolved = resolve_program("p.exe").expect("p.exe resolves");
+        assert_eq!(resolved, dir.join("p.exe"), "the exact name wins, not the .cmd lookalike");
+        let by_name = resolve_program("q").expect("q resolves through the extension list");
+        assert_eq!(by_name, dir.join("q.exe"));
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }
