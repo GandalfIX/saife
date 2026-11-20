@@ -1166,4 +1166,37 @@ mod tests {
         );
     }
 
+
+    /// A marker from the FUTURE is a clock problem, not idleness: the guard
+    /// `now >= used` keeps it false (the widened `true` guard would kill it),
+    /// and an undatable slot is never idle.
+    #[test]
+    fn idle_expired_refuses_future_markers_and_undatable_slots() {
+        let window = std::time::Duration::from_secs(60);
+        assert!(!idle_expired(None, NOW, window), "undatable is not idle");
+        assert!(
+            !idle_expired(Some(NOW + 1), NOW, window),
+            "a marker from the future is a clock problem, not idleness"
+        );
+        assert!(
+            idle_expired(Some(NOW - 60), NOW, window),
+            "exactly the window is expired"
+        );
+        assert!(!idle_expired(Some(NOW - 59), NOW, window));
+    }
+
+    /// A slot labelled with this session whose PID matches but whose creation
+    /// stamp differs belongs to ANOTHER process instance: while that owner is
+    /// alive the slot is refused, not adopted (`&&`-widening of the pair lets it
+    /// through when only one field differs).
+    #[test]
+    fn a_same_pid_different_creation_owner_is_refused_while_alive() {
+        let spec = spec("s-pid-created");
+        let mut facts = mine(&spec);
+        facts.owner_created = spec.owner_created + 1;
+        let err = decide(&[facts], &spec, &policy(), NOW, &alive)
+            .expect_err("a live owner from another instance owns the slot");
+        assert!(format!("{err:#}").contains("runner_slot_owned_elsewhere"), "{err:#}");
+    }
+
 }

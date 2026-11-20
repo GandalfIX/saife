@@ -1389,4 +1389,48 @@ mod tests {
         assert_eq!(kind_name(tar::EntryType::Regular), "non-regular");
     }
 
+
+    /// The char-boundary cut with the cap INSIDE a multi-byte character: the
+    /// cut walks back to the last boundary and drops the torn character whole -
+    /// never leaving half a code point in the string.
+    #[test]
+    fn truncate_on_char_boundary_walks_back_out_of_a_character() {
+        let mut s = String::from("aÄb"); // bytes: a(1) Ä(2) b(1)
+        truncate_on_char_boundary(&mut s, 2); // 2 is INSIDE the Ä: walks back to 1
+        assert_eq!(s, "a", "the cut back off the two-byte char leaves the ASCII head");
+        let mut s = String::from("aÄb");
+        truncate_on_char_boundary(&mut s, 3); // at the boundary after the Ä
+        assert_eq!(s, "aÄ");
+        let mut s = String::from("abc");
+        truncate_on_char_boundary(&mut s, 3); // len == cap: untouched
+        assert_eq!(s, "abc");
+    }
+
+    /// A partial line at EXACTLY the cap is not "over" it: the marker must not
+    /// fire for a line that fits (the `>`-to-`>=` widening marks a fit line).
+    #[test]
+    fn a_line_at_exactly_the_cap_is_not_marked() {
+        let mut splitter = LineSplitter::new();
+        let mut lines: Vec<String> = Vec::new();
+        // A fitting LINE: the newline is part of the line, so one byte under
+        // the cap of content still fits.
+        splitter.feed(&vec![b'x'; LOG_PARTIAL_CAP - 1], &mut |l| lines.push(l));
+        splitter.feed(b"\n", &mut |l| lines.push(l));
+        assert_eq!(lines.len(), 1, "a fitting line emits no marker: {lines:?}");
+        assert_eq!(lines[0].len(), LOG_PARTIAL_CAP);
+    }
+
+    /// The ring's byte accounting after an eviction is exact: pushing a monster
+    /// then a small line evicts the monster and leaves the small one's bytes.
+    #[test]
+    fn the_ring_byte_budget_stays_exact_after_eviction() {
+        let mut log = BoundedLog::new();
+        log.push("m".repeat(LOG_BYTE_BUDGET));
+        log.push("ok".to_string());
+        // bytes = budget + 2 > budget: the monster is evicted, its bytes subtracted.
+        assert_eq!(log.lines.len(), 1, "the eviction drops the monster");
+        assert_eq!(log.lines[0], "ok");
+        assert_eq!(log.bytes, 2, "the accounting subtracts the dropped line exactly");
+    }
+
 }

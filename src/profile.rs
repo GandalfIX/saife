@@ -3902,4 +3902,15 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The two classification strings are the vocabulary of the deny.d files
+    /// AND of the audit: a mutant that renames either breaks the file contract.
+    #[test]
+    fn the_kind_and_class_names_are_the_file_vocabulary() {
+        assert_eq!(DenyKind::Dir.as_str(), "dir");
+        assert_eq!(DenyKind::File.as_str(), "file");
+        assert_eq!(CredentialClass::Secret.as_str(), "secret");
+        assert_eq!(CredentialClass::ToolCredential.as_str(), "tool-credential");
+    }
+
 }
