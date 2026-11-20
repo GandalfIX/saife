@@ -366,4 +366,10 @@ exclude_re = [
     # scan stand still (an infinite loop), so the mutant is a hang class: no
     # input reaches a different result, the test run is just cut off.
     "^src/profile.rs:1802:30:",
+
+    # read_head's size guard is MONOTONE: the head only grows, so `==` and `>=`
+    # refuse one byte earlier than `>` and reach the SAME TooLarge verdict for
+    # every input (a head that completes at or under 16 KiB is under the guard
+    # for all three spellings; one that crosses it is refused by all three).
+    "^src/runner/server.rs:215:23: replace > with (==|>=)",
 ]

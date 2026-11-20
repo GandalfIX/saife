@@ -250,6 +250,21 @@ impl Engine {
     }
 }
 
+/// The request head for one engine call: a `GET` carries NO body headers (the
+/// engine rejects a framed empty body on some versions), a call with a body
+/// carries `Content-Type` and the exact `Content-Length`.
+fn request_head(method: &str, path: &str, body: &[u8], content_type: &str) -> String {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if !body.is_empty() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    head
+}
+
 /// One request on its own connection, extracted so it can run under a timeout.
 fn one_request(
     endpoint: &Endpoint,
@@ -261,14 +276,7 @@ fn one_request(
     let mut file = endpoint.open()?;
     // One request per connection: `Connection: close` makes the response
     // end-delimited, which is what the engine supports on a pipe.
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
-    );
-    if !body.is_empty() {
-        head.push_str(&format!("Content-Type: {content_type}\r\n"));
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    head.push_str("\r\n");
+    let head = request_head(method, path, body, content_type);
     file.write_all(head.as_bytes())
         .context("runner: write the request head to the engine")?;
     if !body.is_empty() {
@@ -1675,4 +1683,25 @@ mod tests {
         assert_eq!(limit_override(name), None, "unset is None");
     }
 
+
+    /// A GET must not name a body: some engine versions reject a framed empty
+    /// body, and a Content-Length: 0 changes nothing about what is sent.
+    #[test]
+    fn request_head_frames_a_body_only_when_there_is_one() {
+        let get = request_head("GET", "/info", b"", "application/json");
+        assert!(get.ends_with("\r\n\r\n"), "the head ends at the blank line");
+        assert!(!get.contains("Content-Length"), "a GET frames no body: {get}");
+        assert!(!get.contains("Content-Type"), "a GET names no body type: {get}");
+        assert!(get.starts_with("GET /info HTTP/1.1\r\n"));
+        assert!(get.contains("Connection: close\r\n"));
+
+        let body = b"{\"Image\":\"x\"}";
+        let post = request_head("POST", "/containers/create", body, "application/json");
+        assert!(post.contains("Content-Type: application/json\r\n"), "{post}");
+        assert!(
+            post.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "the length is the real body length: {post}"
+        );
+        assert!(post.ends_with("\r\n\r\n"), "one blank line, then the body");
+    }
 }

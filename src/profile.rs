@@ -4119,4 +4119,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+
+    /// A policy entry that names a FILE already denied (or already inside a
+    /// denied tree) is not added twice, and inside one policy the narrower
+    /// FILE entry is folded into the wider one - the loaders keep one copy each.
+    #[test]
+    fn policy_file_entries_are_deduped_against_credentials_and_each_other() {
+        let dir = temp_dir("policy-files-dedupe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = std::path::PathBuf::from(r"C:\Users\fixture");
+        let kube = home.join(".kube").join("config");
+        let wide = home.join(".kube").join("config").join("deeper");
+        std::fs::write(
+            dir.join("01-kube.json"),
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":[],"files":["{}","{}"]}}}}"#,
+                json_escaped(&kube),
+                json_escaped(&wide)
+            ),
+        )
+        .unwrap();
+        let eff = effective_denies_with(
+            &[],
+            Some(&home),
+            Some(&home.join("AppData").join("Local")),
+            Some(&home.join("AppData").join("Roaming")),
+            Some(&dir),
+        )
+        .expect("the policy loads");
+        let kube_hits = eff.files.iter().filter(|f| **f == kube).count();
+        assert_eq!(kube_hits, 1, "the credential copy and the policy copy are one: {:?}", eff.files);
+        assert!(
+            !eff.files.contains(&wide),
+            "the narrower policy entry is covered by the wider one: {:?}",
+            eff.files
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
