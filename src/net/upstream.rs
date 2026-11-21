@@ -1489,7 +1489,6 @@ mod tests {
         );
         assert!(!shown.contains("proxy"), "message blames a proxy: {shown}");
     }
-}
 
     // ------------------------------------------------------------------
     // H2 (security review 2026-11-09): the loopback-bridge warning.
@@ -1527,7 +1526,10 @@ mod tests {
                 "it must say who owns the policy: {w}"
             );
             // [G-30]: never the userinfo.
-            assert!(!w.contains("pass"), "the warning must not echo credentials: {w}");
+            assert!(
+                !w.contains("pass"),
+                "the warning must not echo credentials: {w}"
+            );
         }
     }
 
@@ -1554,27 +1556,54 @@ mod tests {
     /// of the dial endpoint.
     #[test]
     fn split_host_port_covers_the_grammar() {
-        assert_eq!(split_host_port("proxy.example:3128").unwrap(), ("proxy.example".to_string(), 3128));
+        assert_eq!(
+            split_host_port("proxy.example:3128").unwrap(),
+            ("proxy.example".to_string(), 3128)
+        );
         assert_eq!(
             split_host_port("proxy.example").unwrap(),
             ("proxy.example".to_string(), 8080),
             "no port spelled takes the default 8080"
         );
-        assert_eq!(split_host_port("[::1]:8080").unwrap(), ("::1".to_string(), 8080));
+        assert_eq!(
+            split_host_port("[::1]:8080").unwrap(),
+            ("::1".to_string(), 8080)
+        );
         assert_eq!(
             split_host_port("[::1]").unwrap(),
             ("::1".to_string(), 8080),
             "a bracketed literal without a port takes the default"
         );
         assert!(split_host_port("").is_err(), "an empty host is refused");
-        assert!(split_host_port(":3128").is_err(), "an empty host before the port is refused");
-        assert!(split_host_port("[::1").is_err(), "an unterminated bracket is refused");
-        assert!(split_host_port("[::1]junk").is_err(), "bytes after the bracket are refused");
-        assert!(split_host_port("a:b:c").is_err(), "unbracketed IPv6 is refused, not guessed");
+        assert!(
+            split_host_port(":3128").is_err(),
+            "an empty host before the port is refused"
+        );
+        assert!(
+            split_host_port("[::1").is_err(),
+            "an unterminated bracket is refused"
+        );
+        assert!(
+            split_host_port("[::1]junk").is_err(),
+            "bytes after the bracket are refused"
+        );
+        assert!(
+            split_host_port("a:b:c").is_err(),
+            "unbracketed IPv6 is refused, not guessed"
+        );
         assert!(split_host_port("host:0").is_err(), "port 0 is refused");
-        assert!(split_host_port("host:65536").is_err(), "an out-of-range port is refused");
-        assert!(split_host_port("host:").is_err(), "an empty port is refused");
-        assert!(split_host_port("host:12a").is_err(), "a non-numeric port is refused");
+        assert!(
+            split_host_port("host:65536").is_err(),
+            "an out-of-range port is refused"
+        );
+        assert!(
+            split_host_port("host:").is_err(),
+            "an empty port is refused"
+        );
+        assert!(
+            split_host_port("host:12a").is_err(),
+            "a non-numeric port is refused"
+        );
     }
 
     /// The URL's own forms: the scheme is optional and http-only, userinfo is
@@ -1586,16 +1615,27 @@ mod tests {
         assert_eq!(a.port, 3128);
         assert!(a.user.is_none() && a.password.is_none());
         let b = ProxyUrl::parse("proxy.example:3128").expect("bare host:port");
-        assert_eq!(format!("{a}"), format!("{b}"), "both spellings print the same endpoint");
+        assert_eq!(
+            format!("{a}"),
+            format!("{b}"),
+            "both spellings print the same endpoint"
+        );
         assert!(format!("{a}").contains("proxy.example"));
         assert!(format!("{a}").contains("3128"));
 
-        let with_user = ProxyUrl::parse("http://alice:s3cret@proxy.example:3128").expect("userinfo");
+        let with_user =
+            ProxyUrl::parse("http://alice:s3cret@proxy.example:3128").expect("userinfo");
         assert_eq!(with_user.user.as_deref(), Some("alice"));
         assert_eq!(with_user.password.as_deref(), Some("s3cret"));
 
-        assert!(ProxyUrl::parse("https://proxy.example:3128").is_err(), "the scheme set is http only");
-        assert!(ProxyUrl::parse("http://proxy.example:3128/path").is_err(), "a path is refused");
+        assert!(
+            ProxyUrl::parse("https://proxy.example:3128").is_err(),
+            "the scheme set is http only"
+        );
+        assert!(
+            ProxyUrl::parse("http://proxy.example:3128/path").is_err(),
+            "a path is refused"
+        );
         assert!(ProxyUrl::parse("   ").is_err(), "a blank URL is refused");
     }
 
@@ -1610,17 +1650,13 @@ mod tests {
         assert!(src.to_string().contains("dial refused"), "{src}");
         assert!(UpstreamError::BadResponse("no host").source().is_none());
         assert!(UpstreamError::Non200(407).source().is_none());
-    
-}
+    }
 
     /// The host refusal is OR-ed: a whitespace-only host and a control-only
     /// host are each refused on their own (&& would accept both).
     #[test]
     fn a_host_with_a_space_or_a_control_character_is_refused() {
-        for bad in [
-            "http://ba d:8080",
-            "http://h\u{1}st:8080",
-        ] {
+        for bad in ["http://ba d:8080", "http://h\u{1}st:8080"] {
             let err = ProxyUrl::parse(bad).expect_err(bad);
             assert!(
                 format!("{err:#}").contains("invalid upstream proxy host"),
@@ -1628,3 +1664,4 @@ mod tests {
             );
         }
     }
+}
