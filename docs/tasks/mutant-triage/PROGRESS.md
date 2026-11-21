@@ -78,14 +78,17 @@ Fixed in the same branch:
   function-scoped. They matched 181, 15 and 39 mutants across files the reason
   never argued about.
 
-Effect on the numbers above: the register now excludes 671 of 2901 mutants and
-leaves 2253 to test. Forty of those 2253 were hidden by the three bare words
-(`cli::appcontainer_retry_command` 9, the intent registry's sweeper 14, eight
-`Drop` impls the register never argued, `MxcError::suggests_appcontainer` 2,
-`TierFacts::appcontainer_dacl` 2, `release_live_token`, and two `ChainLock`
-guards). The next
-whole-crate sweep must re-baseline them; until it runs, this document must not
-be read as "0 missed" for the crate.
+Effect on the numbers above: the register now excludes 671 of 2897 mutants.
+`cargo mutants --list` leaves 2249 - the 2226 the patterns let through plus the
+23 `delete field ...` mutants the tool never applies `exclude_re` to, which is
+the limitation the gate above is about.
+
+Forty of those mutants were hidden by the three bare words: 9 in
+`cli::appcontainer_retry_command`, 14 in the intent registry's sweeper, 8
+`Drop` impls the register never argued, 2 `MxcError::suggests_appcontainer`, 2
+`TierFacts::appcontainer_dacl`, `release_live_token`, and 2 `ChainLock` guards.
+The next whole-crate sweep must re-baseline them; until it runs, this document
+must not be read as "0 missed" for the crate.
 
 ## Correction: the first evidence was stale
 
