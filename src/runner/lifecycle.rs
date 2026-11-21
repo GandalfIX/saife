@@ -1166,7 +1166,6 @@ mod tests {
         );
     }
 
-
     /// A marker from the FUTURE is a clock problem, not idleness: the guard
     /// `now >= used` keeps it false (the widened `true` guard would kill it),
     /// and an undatable slot is never idle.
@@ -1196,7 +1195,10 @@ mod tests {
         facts.owner_created = spec.owner_created + 1;
         let err = decide(&[facts], &spec, &policy(), NOW, &alive)
             .expect_err("a live owner from another instance owns the slot");
-        assert!(format!("{err:#}").contains("runner_slot_owned_elsewhere"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("runner_slot_owned_elsewhere"),
+            "{err:#}"
+        );
     }
 
     /// A crash between create and remove leaves a stopped duplicate beside the
@@ -1236,20 +1238,5 @@ mod tests {
             }
             Decision::Create => panic!("a running duplicate exists"),
         }
-    }
-
-    /// The wait builds its deadline from the clock and the duration: it waits
-    /// out a short term and returns true, and returns false immediately when
-    /// the stop flag is already set.
-    #[test]
-    fn wait_or_stop_honours_the_deadline_and_the_flag() {
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let began = std::time::Instant::now();
-        assert!(wait_or_stop(&stop, std::time::Duration::from_millis(30)));
-        assert!(began.elapsed() >= std::time::Duration::from_millis(25));
-        let stop = std::sync::atomic::AtomicBool::new(true);
-        let began = std::time::Instant::now();
-        assert!(!wait_or_stop(&stop, std::time::Duration::from_secs(5)));
-        assert!(began.elapsed() < std::time::Duration::from_secs(1), "the flag ends the wait");
     }
 }

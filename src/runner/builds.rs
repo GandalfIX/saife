@@ -1322,9 +1322,21 @@ mod tests {
         let total = log.total;
         let w = log.window(0);
         assert!(w.gap, "an evicted follower learns its gap");
-        assert_eq!(w.first, total - log.lines.len(), "the absolute numbering stays stable");
-        assert_eq!(log.lines.len(), LOG_LINE_CAP, "the window is capped at the line budget");
-        assert_eq!(w.lines.first().cloned(), Some(format!("line-{}", w.first)), "the window content matches its anchor");
+        assert_eq!(
+            w.first,
+            total - log.lines.len(),
+            "the absolute numbering stays stable"
+        );
+        assert_eq!(
+            log.lines.len(),
+            LOG_LINE_CAP,
+            "the window is capped at the line budget"
+        );
+        assert_eq!(
+            w.lines.first().cloned(),
+            Some(format!("line-{}", w.first)),
+            "the window content matches its anchor"
+        );
 
         // One monster line survives even beyond the byte budget.
         let mut log = BoundedLog::new();
@@ -1342,7 +1354,18 @@ mod tests {
         let w = log.window(3);
         assert!(!w.gap, "an in-range follower sees no gap");
         assert_eq!(w.first, 3, "the first returned line IS the requested index");
-        assert_eq!(w.lines, vec!["l3".to_string(), "l4".into(), "l5".into(), "l6".into(), "l7".into(), "l8".into(), "l9".into()]);
+        assert_eq!(
+            w.lines,
+            vec![
+                "l3".to_string(),
+                "l4".into(),
+                "l5".into(),
+                "l6".into(),
+                "l7".into(),
+                "l8".into(),
+                "l9".into()
+            ]
+        );
     }
 
     /// The splitter caps a built-up line on a CHAR boundary and marks the cut,
@@ -1358,17 +1381,34 @@ mod tests {
             let n = LOG_PARTIAL_CAP / 2 + 4;
             splitter.feed("Ä".repeat(n).as_bytes(), &mut sink);
         }
-        assert!(lines.is_empty(), "no newline: the capped partial stays buffered");
-        assert_eq!(splitter.partial.len(), LOG_PARTIAL_CAP, "the partial is bounded in bytes");
+        assert!(
+            lines.is_empty(),
+            "no newline: the capped partial stays buffered"
+        );
+        assert_eq!(
+            splitter.partial.len(),
+            LOG_PARTIAL_CAP,
+            "the partial is bounded in bytes"
+        );
         assert!(splitter.partial.is_char_boundary(splitter.partial.len()));
 
         {
             let mut sink = |l: String| lines.push(l);
             splitter.feed(b"\n", &mut sink);
         }
-        assert_eq!(lines.len(), 2, "the cut is marked, then the (shortened) line");
-        assert_eq!(lines[0], LOG_TRUNCATED_MARKER, "the marker announces the cut");
-        assert!(lines[1].chars().all(|c| c == 'Ä'), "no torn character: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "the cut is marked, then the (shortened) line"
+        );
+        assert_eq!(
+            lines[0], LOG_TRUNCATED_MARKER,
+            "the marker announces the cut"
+        );
+        assert!(
+            lines[1].chars().all(|c| c == 'Ä'),
+            "no torn character: {lines:?}"
+        );
 
         // finish() on an empty splitter emits nothing.
         let mut s = LineSplitter::new();
@@ -1389,7 +1429,6 @@ mod tests {
         assert_eq!(kind_name(tar::EntryType::Regular), "non-regular");
     }
 
-
     /// The char-boundary cut with the cap INSIDE a multi-byte character: the
     /// cut walks back to the last boundary and drops the torn character whole -
     /// never leaving half a code point in the string.
@@ -1397,7 +1436,10 @@ mod tests {
     fn truncate_on_char_boundary_walks_back_out_of_a_character() {
         let mut s = String::from("aÄb"); // bytes: a(1) Ä(2) b(1)
         truncate_on_char_boundary(&mut s, 2); // 2 is INSIDE the Ä: walks back to 1
-        assert_eq!(s, "a", "the cut back off the two-byte char leaves the ASCII head");
+        assert_eq!(
+            s, "a",
+            "the cut back off the two-byte char leaves the ASCII head"
+        );
         let mut s = String::from("aÄb");
         truncate_on_char_boundary(&mut s, 3); // at the boundary after the Ä
         assert_eq!(s, "aÄ");
@@ -1418,6 +1460,11 @@ mod tests {
         splitter.feed(b"\n", &mut |l| lines.push(l));
         assert_eq!(lines.len(), 1, "a fitting line emits no marker: {lines:?}");
         assert_eq!(lines[0].len(), LOG_PARTIAL_CAP);
+        assert!(
+            !lines[0].contains(LOG_TRUNCATED_MARKER),
+            "a fitting line carries no marker: {:?}",
+            lines[0]
+        );
     }
 
     /// The ring's byte accounting after an eviction is exact: pushing a monster
@@ -1430,9 +1477,11 @@ mod tests {
         // bytes = budget + 2 > budget: the monster is evicted, its bytes subtracted.
         assert_eq!(log.lines.len(), 1, "the eviction drops the monster");
         assert_eq!(log.lines[0], "ok");
-        assert_eq!(log.bytes, 2, "the accounting subtracts the dropped line exactly");
+        assert_eq!(
+            log.bytes, 2,
+            "the accounting subtracts the dropped line exactly"
+        );
     }
-
 
     /// Bytes at EXACTLY the budget are not over it: a ring holding two lines
     /// that add up to the budget keeps both (`>=` evicts the head).
@@ -1443,23 +1492,10 @@ mod tests {
         log.push(first);
         log.push("bc".to_string());
         assert_eq!(log.bytes, LOG_BYTE_BUDGET, "the fixture sits on the bound");
-        assert_eq!(log.lines.len(), 2, "a full ring at the bound evicts nothing");
-    }
-
-    /// A line that FITS carries no truncation marker: only a line OVER the cap
-    /// is cut and marked (`>=` marks a line of exactly the cap).
-    #[test]
-    fn a_fitting_line_carries_no_marker() {
-        let mut splitter = LineSplitter::new();
-        let mut lines: Vec<String> = Vec::new();
-        let mut input = vec![b'k'; LOG_PARTIAL_CAP - 1];
-        input.push(b'\n');
-        splitter.feed(&input, &mut |l| lines.push(l));
-        assert_eq!(lines.len(), 1);
-        assert!(
-            !lines[0].contains(crate::runner::builds::LOG_TRUNCATED_MARKER),
-            "a fitting line is not marked: {:?}",
-            lines[0]
+        assert_eq!(
+            log.lines.len(),
+            2,
+            "a full ring at the bound evicts nothing"
         );
     }
 }

@@ -1048,7 +1048,9 @@ mod tests {
     /// A connected pair on loopback: the read helpers take a real TcpStream, and
     /// a duplex would not exercise the one-byte read they are written for.
     async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
@@ -1067,6 +1069,7 @@ mod tests {
     #[test]
     fn read_head_stops_at_the_terminator_and_leaves_the_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
         runtime().block_on(async {
             let (mut client, mut server) = loopback_pair().await;
             client
@@ -1080,7 +1083,13 @@ mod tests {
                 _other => panic!("expected a complete head, got a non-complete result"),
             }
             let mut rest = [0u8; 16];
-            let n = server.read(&mut rest).await.unwrap();
+            // Bounded: a head reader that swallowed the body leaves nothing to
+            // read, and an unbounded read would HANG the suite instead of
+            // failing it - the fixture must fail, not wait.
+            let n = timeout(Duration::from_millis(500), server.read(&mut rest))
+                .await
+                .expect("the body must still be on the socket")
+                .unwrap();
             assert_eq!(&rest[..n], b"BODY", "the body is still on the socket");
         });
     }
@@ -1129,11 +1138,18 @@ mod tests {
         runtime().block_on(async {
             let (mut client, mut server) = loopback_pair().await;
             client.write_all(b"ABCD").await.unwrap();
-            drain_declared_body(&mut server, "POST /build HTTP/1.0\r\nContent-Length: 4\r\n\r\n").await;
+            drain_declared_body(
+                &mut server,
+                "POST /build HTTP/1.0\r\nContent-Length: 4\r\n\r\n",
+            )
+            .await;
             let mut rest = [0u8; 8];
             match timeout(Duration::from_millis(200), server.read(&mut rest)).await {
                 Err(_) => {}
-                Ok(Ok(n)) => panic!("the framed body must be drained, {n} bytes left: {:?}", &rest[..n]),
+                Ok(Ok(n)) => panic!(
+                    "the framed body must be drained, {n} bytes left: {:?}",
+                    &rest[..n]
+                ),
                 Ok(Err(e)) => panic!("read failed: {e}"),
             }
 
@@ -1148,5 +1164,4 @@ mod tests {
             assert_eq!(&rest[..n], b"0123456789", "no header, nothing drained");
         });
     }
-
 }
