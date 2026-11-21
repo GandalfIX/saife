@@ -339,25 +339,18 @@
 
     // ---- RFC3339 formatter (D-4 `ts` field) ------------------------------
 
+    /// The clock read is the only fallible step here: a timestamp before the
+    /// epoch clamps to it instead of panicking, never rendering a negative
+    /// year. The date-and-time rendering itself is covered once, by
+    /// `audit::iso8601_from_unix_known_values` - the function this one calls.
     #[test]
-    fn rfc3339_utc_known_values() {
+    fn rfc3339_utc_clamps_a_clock_before_the_epoch() {
         use std::time::{Duration as StdDuration, UNIX_EPOCH};
-        assert_eq!(super::rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        // 2024-01-01 00:00:00 UTC == 1704067200.
-        assert_eq!(
-            super::rfc3339_utc(UNIX_EPOCH + StdDuration::from_secs(1_704_067_200)),
-            "2024-01-01T00:00:00Z"
-        );
-        // Hour/minute/second rendering.
-        assert_eq!(
-            super::rfc3339_utc(UNIX_EPOCH + StdDuration::from_secs(1_704_067_200 + 3661)),
-            "2024-01-01T01:01:01Z"
-        );
-        // Pre-epoch clamps to the epoch — never panics, never negative.
         assert_eq!(
             super::rfc3339_utc(UNIX_EPOCH - StdDuration::from_secs(5)),
             "1970-01-01T00:00:00Z"
         );
+        assert_eq!(super::rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
     }
 
     // ---- Happy Eyeballs dial (D-1, [G-12]) -------------------------------
@@ -7246,5 +7239,417 @@
         assert!(
             out.contains("allowed.example:443  x1"),
             "counted exactly once: {out}"
+        );
+    }
+    // ===== parser and utility survivors (mutation-testing follow-up) =====
+
+    /// `percent_decode` is what stamps CONNECT targets and intent paths into
+    /// audit values and routed hosts: a wrong digit site or a broken escape
+    /// guard silently rewrites the identity a leaf records. Table-driven over
+    /// the grammar: digits (both hex cases), `+` as space, verbatim retention
+    /// of non-hex, truncated and dangling escapes, adjacent escapes.
+    #[test]
+    fn percent_decode_follows_the_url_grammar() {
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("%41"), "A", "upper-hex digits");
+        assert_eq!(percent_decode("%2a"), "*", "lower-hex digits");
+        assert_eq!(percent_decode("%2A"), "*", "hex digits are case-insensitive");
+        assert_eq!(percent_decode("%2b"), "+", "%2b is a PLUS byte, not a space");
+        assert_eq!(percent_decode("a+b"), "a b", "+ inside the value means space");
+        assert_eq!(
+            percent_decode("%4%20"),
+            "%4 ",
+            "a truncated escape is kept verbatim (including its %), the next escape still decodes"
+        );
+        assert_eq!(percent_decode("%20%20"), "  ", "adjacent escapes decode independently");
+        assert_eq!(percent_decode("%zz"), "%zz", "non-hex escapes are kept verbatim");
+        assert_eq!(percent_decode("100%"), "100%", "a dangling percent is kept");
+        assert_eq!(percent_decode("%7f"), "\u{7f}", "control bytes survive");
+    }
+
+    /// A CONNECT target that does not parse is `None` (the caller answers 400),
+    /// never silently reinterpreted as 443 - `host:notaport`, `host:`, port 0
+    /// and port 65536+ are all refusals, an empty host is refused, userinfo is
+    /// refused, and the unbracketed-IPv6 rule keeps (host, port) splits
+    /// unambiguous.
+    #[test]
+    fn parse_connect_target_refuses_what_it_cannot_parse() {
+        assert_eq!(
+            parse_connect_target("a.example:443"),
+            Some(("a.example".into(), 443))
+        );
+        assert_eq!(
+            parse_connect_target("a.example"),
+            Some(("a.example".into(), 443)),
+            "a missing port means 443"
+        );
+        assert_eq!(
+            parse_connect_target("[::1]:443"),
+            Some(("[::1]".into(), 443)),
+            "bracketed IPv6 carries its port"
+        );
+        assert_eq!(parse_connect_target("a.example:notaport"), None);
+        assert_eq!(parse_connect_target("a.example:"), None);
+        assert_eq!(parse_connect_target("a.example:0"), None);
+        assert_eq!(
+            parse_connect_target("a.example:70000"),
+            None,
+            "65536+ overflows u16"
+        );
+        assert_eq!(
+            parse_connect_target(":443"),
+            None,
+            "an empty host is not a dial target"
+        );
+        assert_eq!(
+            parse_connect_target("user@a.example:443"),
+            None,
+            "userinfo is refused, not forwarded"
+        );
+        assert_ne!(
+            parse_connect_target("a.example:notaport"),
+            Some(("a.example".into(), 443)),
+            "a bad port is never reinterpreted as 443"
+        );
+    }
+
+    /// The absolute-form authority split: default port 80, bracketed IPv6 with
+    /// an optional port, and `None` for an unbracketed IPv6 literal (the
+    /// loopback refusal must see `::1` as a host, not as a host named `:`).
+    #[test]
+    fn split_authority_keeps_the_default_port_and_the_bracket_rule() {
+        assert_eq!(split_authority("a.example"), Some(("a.example".into(), 80)));
+        assert_eq!(
+            split_authority("a.example:8080"),
+            Some(("a.example".into(), 8080))
+        );
+        assert_eq!(
+            split_authority("[::1]:80"),
+            Some(("::1".into(), 80)),
+            "brackets are stripped from the host"
+        );
+        assert_eq!(
+            split_authority("[::1]"),
+            Some(("::1".into(), 80)),
+            "bracketed host without a port defaults to 80"
+        );
+        assert_eq!(split_authority(""), None);
+        assert_eq!(
+            split_authority("[::1]:notaport"),
+            None,
+            ":x after a bracket is not a default-port case"
+        );
+        assert_eq!(split_authority("::1"), None, "unbracketed IPv6 is not an authority");
+        assert_eq!(split_authority("a.example:70000"), None);
+    }
+
+    /// The head finder says where the request ends: the offset points JUST
+    /// past the CRLFCRLF, and anything before a complete head reads as `None`.
+    #[test]
+    fn find_head_end_reports_just_past_the_double_crlf() {
+        assert_eq!(
+            find_head_end(b"GET /x HTTP/1.1\r\nHost: b.example\r\n\r\nBODY"),
+            Some("GET /x HTTP/1.1\r\nHost: b.example\r\n\r\n".len())
+        );
+        assert_eq!(
+            find_head_end(b"GET /x HTTP/1.1\r\nHost: b.example\r\n"),
+            None,
+            "a single CRLF is not a complete head"
+        );
+        assert_eq!(find_head_end(b"abc"), None);
+        assert_eq!(find_head_end(b""), None);
+    }
+
+    /// The framing verdicts: a head that does not END in CRLFCRLF, a bare CR,
+    /// a bare LF and an obs-fold line each get their own refusal; a clean head
+    /// gets none. The bare-CR arm carries the second anti-bot condition: an
+    /// arm deleted or forced true turns a malformed head into a clean one (or
+    /// a clean one into "bare CR").
+    #[test]
+    fn head_framing_error_names_every_shape() {
+        let clean = "GET /x HTTP/1.1\r\nHost: b.example\r\n\r\n";
+        assert_eq!(head_framing_error(clean), None, "a clean head has no verdict");
+        assert_eq!(
+            head_framing_error("GET /x HTTP/1.1\r\nHost: b.example"),
+            Some("request head is not CRLF-terminated")
+        );
+        assert_eq!(
+            head_framing_error("GET /\r SP\r\n\r\n"),
+            Some("bare CR in the request head")
+        );
+        assert_eq!(
+            head_framing_error("GET /\nHost: b.example\r\n\r\n"),
+            Some("bare LF in the request head")
+        );
+        assert_eq!(
+            head_framing_error("GET /x HTTP/1.1\r\n Host: b.example\r\n\r\n"),
+            Some("obs-fold line in the request head")
+        );
+    }
+
+    /// `head_lines` splits on CRLF only, keeps every line including the empty
+    /// one before the final CRLFCRLF, indexes both bytes of the terminator,
+    /// and keeps the unterminated remainder. A line that only LOOKS
+    /// terminated by a bare LF never becomes its own field.
+    #[test]
+    fn head_lines_split_on_crlf_only() {
+        let head = b"GET /x HTTP/1.1\r\nHost: b.example\r\nX-Trail: keep\r\n\r\n";
+        let lines = head_lines(head);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["GET /x HTTP/1.1", "Host: b.example", "X-Trail: keep", ""]
+        );
+
+        let no_terminator = head_lines(b"GET /x HTTP/1.1\r\nHost: b.example");
+        assert_eq!(
+            no_terminator.len(),
+            2,
+            "the remainder after the last CRLF is still a line"
+        );
+        assert_eq!(String::from_utf8_lossy(no_terminator[1]), "Host: b.example");
+
+        let bare_lf = head_lines(b"GET / HTTP/1.1\nHost: b.example\n");
+        assert_eq!(
+            bare_lf.len(),
+            1,
+            "a bare LF never terminates a line: {}",
+            String::from_utf8_lossy(bare_lf[0])
+        );
+    }
+
+    /// The relayed upstream head keeps its STATUS LINE (the `index > 0`
+    /// guard), drops the proxy-hop fields (Connection, Proxy-Authenticate,
+    /// Proxy-Authentication-Info) and keeps unrelated fields, and always
+    /// appends its own `Connection: close` head terminator.
+    #[test]
+    fn relayed_response_head_strips_proxy_hop_fields_but_keeps_the_status_line() {
+        let head = concat!(
+            "HTTP/1.1 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"x\"\r\n",
+            "X-Keep: yes\r\n",
+            "Proxy-Authentication-Info: leak\r\n",
+            "Connection: close\r\n",
+            "Pragma: no-cache\r\n\r\n"
+        );
+        let out = String::from_utf8_lossy(&relayed_response_head(head.as_bytes())).into_owned();
+        assert!(
+            out.starts_with("HTTP/1.1 407"),
+            "the status line is never stripped: {out}"
+        );
+        let kept: Vec<&str> = out.lines().collect();
+        assert!(kept.contains(&"X-Keep: yes"), "unrelated fields survive: {out}");
+        assert!(
+            kept.iter().any(|l| l.starts_with("Pragma:")),
+            "a field after proxy-hop fields survives: {out}"
+        );
+        assert!(
+            !out.contains("Proxy-Authenticate") && !out.contains("Proxy-Authentication-Info"),
+            "proxy-hop fields are stripped: {out}"
+        );
+        assert!(
+            kept.iter().filter(|l| l.starts_with("Connection: ")).count() == 1,
+            "exactly one Connection line - the upstream's is stripped and the listener's own close replaced it: {out}"
+        );
+        assert!(
+            out.ends_with("Connection: close\r\n\r\n"),
+            "the listener appends its own close: {out}"
+        );
+    }
+
+    /// Happy Eyeballs alternates address families so a broken v6 path cannot
+    /// queue every v4 attempt behind it: the order is v6, v4, v6, v4 ... with
+    /// the longer family's tail following. A single-family list comes back
+    /// untouched.
+    #[test]
+    fn interleave_families_alternates_and_keeps_order() {
+        let v6 = |octets: [u16; 8]| SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)), 1);
+        let v4 = |octets: [u8; 4]| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)), 1);
+        let a4 = v4([10, 0, 0, 1]);
+        let b4 = v4([10, 0, 0, 2]);
+        let a6 = v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]);
+        let b6 = v6([0xfd00, 0, 0, 0, 0, 0, 0, 2]);
+
+        assert_eq!(
+            interleave_families(vec![a6, a4, b6, b4]),
+            vec![a6, a4, b6, b4]
+        );
+        assert_eq!(
+            interleave_families(vec![a6, b6, a4]),
+            vec![a6, a4, b6],
+            "the v6 tail follows after v4 runs out"
+        );
+        assert_eq!(interleave_families(vec![a4, b4]), vec![a4, b4]);
+    }
+
+    /// Request ids are monotonically unique per listener: 1, 2, 3 - never a
+    /// constant and never 0. They are what groups an audit log.
+    #[test]
+    fn request_ids_start_at_one_and_increase() {
+        let (ctx, _base) = tunnel_ctx("next-request-id", 1);
+        let first = ctx.next_request_id();
+        let second = ctx.next_request_id();
+        assert_eq!(first, 1, "ids are 1-based");
+        assert_eq!(second, 2, "ids increase by one: {first} then {second}");
+    }
+    /// Discriminators for the framing variants: a trailing lone CR is the only
+    /// shape where `index + 1 < len` and its widened variants differ, and a
+    /// bracket with no port after `]` is where the default-port guard can lie.
+    /// A percent escape cut off after ONE hex digit at the very end is kept
+    /// verbatim: the guard must not read the byte past the buffer (the only
+    /// shape where `i + 2 < len` and `<=` diverge).
+    #[test]
+    fn percent_decode_keeps_a_one_digit_escape_at_the_end() {
+        // ab%4: the trailing "%4" has no second hex digit and no byte to read.
+        assert_eq!(percent_decode("ab%4"), "ab%4");
+    }
+
+    #[test]
+    fn framing_variants_have_a_discriminating_input() {
+        // A trailing lone CR: the final iteration must see it as the remainder,
+        // never index past the buffer (the `<` and `<=` loop variants part here).
+        let lines = head_lines(b"A\r\n\r");
+        assert_eq!(lines.len(), 2, "the trailing lone CR is its own remainder line");
+        assert_eq!(String::from_utf8_lossy(lines[1]), "\r");
+
+        // `[::1]junk` has a bracket but the bytes after `]` are no port: the
+        // default-port branch must not claim them.
+        assert_eq!(split_authority("[::1]junk"), None);
+    }
+
+    /// The outcome-to-reason mapping is what an operator greps (the audit
+    /// `reason` field): each outcome class keeps its own string, and an
+    /// allowed request has none.
+    #[test]
+    fn every_outcome_class_keeps_its_reason() {
+        let deny = PromptOutcome::Decided(PromptResult::Deny {
+            persist: false,
+            scope: "host".into(),
+            suffix: None,
+        });
+        assert_eq!(outcome_reason(&deny).as_deref(), Some("denied by user"));
+
+        let explain = PromptOutcome::Decided(PromptResult::NeedsIntent);
+        assert_eq!(
+            outcome_reason(&explain).as_deref(),
+            Some("user requested a fuller intent (explain more)")
+        );
+
+        let allow = PromptOutcome::Decided(PromptResult::Allow {
+            persist: false,
+            scope: "host".into(),
+            suffix: None,
+        });
+        assert_eq!(outcome_reason(&allow), None, "an allow carries no refusal reason");
+
+        let budget = PromptOutcome::Unavailable {
+            allowed: false,
+            cause: UnavailableCause::BudgetElapsed,
+        };
+        assert_eq!(
+            outcome_reason(&budget).as_deref(),
+            Some(PROMPT_TIMEOUT_REASON),
+            "a spent budget names its own reason, not the no-dialog one"
+        );
+
+        let no_dialog = PromptOutcome::Unavailable {
+            allowed: false,
+            cause: UnavailableCause::NoDialogBackend,
+        };
+        assert_eq!(
+            outcome_reason(&no_dialog).as_deref(),
+            Some(NO_DIALOG_BACKEND_REASON)
+        );
+    }
+
+    /// A lookup that answers "no addresses" is a DNS FAILURE decision (audit
+    /// source `dns`), not a generic upstream failure: the empty result is
+    /// refused before any dial loop, so the session's leaf says what actually
+    /// happened.
+    #[tokio::test]
+    async fn dial_upstream_refuses_a_resolution_with_no_addresses() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::dial_upstream(None, "empty.example", 443, false, false, |_host, _port| {
+                async { Ok(Vec::<SocketAddr>::new()) }
+            }),
+        )
+        .await
+        .expect("the empty-answer refusal is decided without awaiting a dial");
+        match result {
+            Err(super::DialFailure::Denied(d)) => {
+                assert_eq!(d.source, "dns");
+                assert!(
+                    d.reason.as_deref().unwrap_or("").contains("no addresses"),
+                    "the reason names the empty answer: {:?}",
+                    d.reason
+                );
+            }
+            Err(_) => panic!("expected a Denied (dns) dial failure for an empty answer"),
+            Ok(_) => panic!("an empty answer must never reach a dial"),
+        }
+    
+
+    }
+    // ---- body/head readers on a live socket -------------------------------
+    //
+    // Both are socket readers with a bounded read; a mutant that stops at the
+    // wrong comparison either returns an EMPTY body or keeps waiting for bytes
+    // no peer will send - the second case needs a bound in the TEST as well, or
+    // the suite hangs instead of failing.
+
+    async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let (l, a) = local_listener().await;
+        let client = tokio::net::TcpStream::connect(a).await.unwrap();
+        let (server, _) = l.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn read_body_takes_the_declared_bytes_and_a_leftover_as_its_seed() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::timeout;
+        let (mut client, mut sock) = connected_pair().await;
+        client.write_all(b"BODY").await.unwrap();
+        let head = "POST /x HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        // Bounded like the sibling below: a reader that keeps waiting for bytes
+        // past the declared body must fail the test, not hang the suite.
+        let body = timeout(Duration::from_secs(2), read_body(&mut sock, head, b""))
+            .await
+            .expect("the declared four bytes must be read without waiting");
+        assert_eq!(body, b"BODY".to_vec(), "the declared four bytes are read");
+        let seeded = timeout(Duration::from_secs(2), read_body(&mut sock, head, b"ABCD"))
+            .await
+            .expect("a leftover seeds the body; no read happens");
+        assert_eq!(seeded, b"ABCD".to_vec(), "a leftover seeds the body, no read");
+    }
+
+    /// A complete head shorter than the cap returns AT ONCE: the loop must not
+    /// wait for bytes past the terminator (`||` -widening keeps reading while
+    /// there is room, and `<=` reads past the cap when no head was found).
+    #[tokio::test]
+    async fn read_upstream_head_returns_promptly_and_bounds_its_read() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::timeout;
+
+        let (mut client, mut upstream) = connected_pair().await;
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let got = timeout(Duration::from_secs(3), read_upstream_head(&mut upstream))
+            .await
+            .expect("a complete head must not wait for more bytes");
+        assert!(got.is_some(), "a complete head parses");
+
+        let (mut client, mut upstream) = connected_pair().await;
+        client.write_all(&vec![b'j'; 8192]).await.unwrap();
+        let bounded = timeout(Duration::from_secs(3), read_upstream_head(&mut upstream)).await;
+        assert!(
+            bounded.is_ok(),
+            "with no terminator at the cap the read must stop, not wait"
         );
     }

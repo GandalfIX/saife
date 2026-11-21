@@ -41,15 +41,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_SET_QUOTA, PROCESS_TERMINATE, TerminateProcess,
-};
 
+use super::proc::{ProcOps, Win32ProcOps, join_tree, tear_down};
 use super::{FacadeTarget, HealthSpec, PluginManifest};
 use crate::sandbox::Job;
 
@@ -72,6 +67,10 @@ pub struct Sidecar {
     /// The manifest's declared `(method, path)` pairs, carried into the facade
     /// target so the proxy can refuse anything the operator did not review.
     operations: Vec<crate::plugin::Operation>,
+    /// The process-table effects: `Win32ProcOps` in production, a recorder in a
+    /// test. The seam is what keeps a walked pid list away from the real
+    /// `TerminateProcess`.
+    ops: Box<dyn ProcOps>,
 }
 
 impl Sidecar {
@@ -82,6 +81,22 @@ impl Sidecar {
     /// `sidecar_log_unavailable`, `sidecar_command_not_found`,
     /// `sidecar_command_not_exe`, `sidecar_spawn_failed`, `sidecar_unhealthy{mount}`.
     pub fn start(plugin_dir: &Path, manifest: &PluginManifest, sid: &str) -> Result<Self> {
+        // The only place a real process-table implementation is created.
+        Self::spawn_with(plugin_dir, manifest, sid, Box::new(Win32ProcOps))
+    }
+
+    /// `start` with the process-table effects supplied by the caller.
+    ///
+    /// A spawn-path test passes [`NoProcOps`]: it exercises spawn and the health
+    /// gate, and the teardown sweep then sees no processes, so a mutated walk
+    /// cannot reach the live process table. The sidecar's job and its direct child
+    /// still end the tree. Production has exactly one caller, `start`.
+    fn spawn_with(
+        plugin_dir: &Path,
+        manifest: &PluginManifest,
+        sid: &str,
+        ops: Box<dyn ProcOps>,
+    ) -> Result<Self> {
         let port = free_loopback_port()?;
         let token = facade_token()?;
         let log_path = sidecar_log_path(sid, &manifest.mount)?;
@@ -162,7 +177,7 @@ impl Sidecar {
             // the interpreter a trampoline forked in the instant before this
             // assignment landed — which is the one case membership misses.
             let _ = job.assign(HANDLE(child.as_raw_handle()));
-            join_tree(job, child.id());
+            join_tree(ops.as_ref(), job, child.id());
         }
         let sidecar = Self {
             mount: manifest.mount.clone(),
@@ -172,6 +187,7 @@ impl Sidecar {
             job,
             log_path,
             operations: manifest.operations.clone(),
+            ops,
         };
         // A gate that fails drops `sidecar`, whose `Drop` ends the whole tree: a
         // sidecar never survives a refused session.
@@ -209,132 +225,16 @@ impl Sidecar {
 }
 
 impl Drop for Sidecar {
-    /// Terminate the whole tree, then kill and reap the child.
+    /// End the tree, then kill and reap the child.
     ///
-    /// The order is the invariant. The parent chain is walked while the child is
-    /// still alive, so its pid cannot have been recycled into someone else's
-    /// process in the meantime; descendants go first because `TerminateProcess`
-    /// never cascades on Windows; the job is terminated next for anything
-    /// created inside that window; and `wait` is what makes "no orphan" true
-    /// rather than likely — `kill` only requests termination, and a sidecar that
-    /// outlived its session would still be holding a facade token nobody can
-    /// revoke.
+    /// The order and its reasoning live in `proc::tear_down`. This impl is what
+    /// makes a sidecar unable to outlive the supervisor that routes to it,
+    /// including on every early return between spawn and the workload's exit.
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let root = child.id();
-        for _ in 0..8 {
-            let live = descendant_pids(root);
-            if live.is_empty() {
-                break;
-            }
-            for pid in live {
-                terminate_pid(pid);
-            }
-        }
-        if let Some(job) = self.job.take() {
-            let _ = job.terminate();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-/// Every live process whose parent chain reaches `root`; `root` is never in it.
-///
-/// Windows does not re-parent, so the recorded parent id still names the original
-/// parent after it exits: this walk finds an orphaned grandchild, which is
-/// exactly what a launcher leaves behind. One snapshot per call, so a caller that
-/// must not miss a new process calls again.
-fn descendant_pids(root: u32) -> Vec<u32> {
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
-    // SAFETY: the snapshot handle is closed on every path; each entry is filled
-    // into a live `PROCESSENTRY32W` that outlives the call, and the loop stops on
-    // the first error (which is how the API reports the end of the enumeration).
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return Vec::new();
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
-    }
-
-    let mut found: Vec<u32> = Vec::new();
-    let mut frontier = vec![root];
-    while let Some(pid) = frontier.pop() {
-        for (child, parent) in &pairs {
-            if *parent == pid && *child != root && !found.contains(child) {
-                found.push(*child);
-                frontier.push(*child);
-            }
-        }
-    }
-    found
-}
-
-/// Terminate one process by id, best-effort.
-///
-/// A process that exited between the snapshot and this call makes `OpenProcess`
-/// fail, and that is a success for the property under test: the goal is "gone",
-/// not "we killed it".
-fn terminate_pid(pid: u32) {
-    if let Some(handle) = open_pid(pid, PROCESS_TERMINATE) {
-        // SAFETY: `open_pid` returned a live handle opened with the right
-        // `TerminateProcess` requires; it is closed immediately after.
-        unsafe {
-            let _ = TerminateProcess(handle, 1);
-            let _ = CloseHandle(handle);
-        }
-    }
-}
-
-/// Open `pid` with exactly `rights`, or `None` when it is already gone.
-///
-/// The caller owns the handle. One helper for every by-pid use keeps the
-/// "a process that exited is not an error" rule in a single place.
-fn open_pid(pid: u32, rights: PROCESS_ACCESS_RIGHTS) -> Option<HANDLE> {
-    // SAFETY: no inheritance is requested and the result is either a live handle
-    // the caller closes or an error that is discarded.
-    unsafe { OpenProcess(rights, false, pid).ok() }
-}
-
-/// Adopt a launcher's own children into `job`, until a pass finds nothing new.
-///
-/// Best-effort by design: the fallback for a refusal is the `Drop` walk, and a
-/// sidecar that refuses to start because the OS would not nest a job would be a
-/// worse trade than one whose crash-durability is weaker.
-fn join_tree(job: &Job, root: u32) {
-    let mut seen: Vec<u32> = Vec::new();
-    for _ in 0..4 {
-        let fresh: Vec<u32> = descendant_pids(root)
-            .into_iter()
-            .filter(|pid| !seen.contains(pid))
-            .collect();
-        if fresh.is_empty() {
-            break;
-        }
-        for pid in &fresh {
-            if let Some(handle) = open_pid(*pid, PROCESS_SET_QUOTA | PROCESS_TERMINATE) {
-                let _ = job.assign(handle);
-                // SAFETY: the handle came from `open_pid` and is not used again.
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-            }
-        }
-        seen.extend(fresh);
+        tear_down(&mut child, self.job.take(), self.ops.as_ref());
     }
 }
 
@@ -529,6 +429,7 @@ fn probe_health(port: u16, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::proc::NoProcOps;
     use std::sync::Arc;
 
     fn nanos() -> u128 {
@@ -573,62 +474,6 @@ mod tests {
                 .ends_with("cmd.exe"),
             "got {}",
             exe.display()
-        );
-    }
-
-    /// A launcher and the process it started are ONE tree: the walk names both
-    /// (recursively, not just the direct child) and terminating them ends both.
-    ///
-    /// Hermetic on purpose. The live leg below needs an installed plugin and the
-    /// internet, so the MECHANISM it depends on — "the process owning the socket
-    /// is a descendant, not the child we spawned" — is pinned here, where it can
-    /// fail in milliseconds.
-    #[test]
-    fn the_tree_walk_names_a_launchers_grandchild_and_terminating_ends_both() {
-        // A `cmd` that starts a second `cmd` is a launcher with a live child, and
-        // `ping` keeps the inner one alive without touching the network (loopback
-        // is not egress; nothing leaves the host).
-        let mut outer = Command::new("cmd")
-            .args(["/c", "cmd /c ping -n 30 127.0.0.1 >nul"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the launcher");
-
-        // Two entries means the walk followed the chain (inner `cmd` + `ping`); a
-        // walk that stopped at direct children reports one.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut tree = Vec::new();
-        while Instant::now() < deadline {
-            tree = descendant_pids(outer.id());
-            if tree.len() >= 2 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(
-            tree.len() >= 2,
-            "the walk must name the launcher's child AND its grandchild, got {tree:?}"
-        );
-
-        for pid in &tree {
-            terminate_pid(*pid);
-        }
-        let _ = outer.kill();
-        let _ = outer.wait();
-
-        // Nothing that the launcher started is still running: a terminated
-        // process disappears from the snapshot once its last handle closes.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut left = descendant_pids(outer.id());
-        while !left.is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
-            left = descendant_pids(outer.id());
-        }
-        assert!(
-            left.is_empty(),
-            "terminating the tree must leave no process behind, still live: {left:?}"
         );
     }
 
@@ -713,8 +558,13 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         let sentinel = format!("SAIFE_H3_SENTINEL_{}", nanos());
         unsafe { std::env::set_var(&sentinel, "must-not-reach-the-sidecar") };
 
-        let sidecar = Sidecar::start(&dir, &manifest, &format!("h3-env-{}", nanos()))
-            .expect("the fixture sidecar must answer its health probe");
+        let sidecar = Sidecar::spawn_with(
+            &dir,
+            &manifest,
+            &format!("h3-env-{}", nanos()),
+            Box::new(NoProcOps),
+        )
+        .expect("the fixture sidecar must answer its health probe");
         drop(sidecar); // end the tree before reading what it recorded
 
         let env: std::collections::HashMap<String, String> = serde_json::from_str(
@@ -1049,5 +899,67 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         drop(sidecar);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(crate::audit::audit_log_path(&sid));
+    }
+    /// The program lookup keeps the shell-adjacent extensions in a fixed order
+    /// WITHOUT appending them to a name that already has one: a PATH that
+    /// carries both `p.exe` and `p.exe.cmd` must resolve `p.exe`, never the
+    /// `.cmd` lookalike (`||` -> `&&` widening picks the lookalike).
+    #[test]
+    fn resolve_program_prefers_the_exact_name_over_a_lookalike() {
+        // Per-process name: %TEMP% is shared with every other test binary.
+        let dir =
+            std::env::temp_dir().join(format!("saife-resolve-program-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.exe"), b"bin").unwrap();
+        std::fs::write(dir.join("p.exe.cmd"), b"bin").unwrap();
+        std::fs::write(dir.join("q.exe"), b"bin").unwrap();
+
+        let _env = crate::env_lock();
+        let old = std::env::var_os("PATH");
+        // SAFETY: the env lock serializes this with every other PATH reader.
+        unsafe { std::env::set_var("PATH", &dir) };
+
+        let resolved = resolve_program("p.exe").expect("p.exe resolves");
+        assert_eq!(
+            resolved,
+            dir.join("p.exe"),
+            "the exact name wins, not the .cmd lookalike"
+        );
+        let by_name = resolve_program("q").expect("q resolves through the extension list");
+        assert_eq!(by_name, dir.join("q.exe"));
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A bare `tool.exe` (an extension, no separator) is looked up as itself:
+    /// the extension alone selects the exact-name attempt (`&&` with the
+    /// separator test would append .exe again and miss the real program).
+    #[test]
+    fn a_bare_exe_name_is_looked_up_as_itself() {
+        let dir = std::env::temp_dir().join(format!("saife-sidecar-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("probe.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let prev = std::env::var_os("PATH");
+        let mut path = dir.display().to_string();
+        if let Some(old) = &prev {
+            path.push(';');
+            path.push_str(&old.to_string_lossy());
+        }
+        unsafe { std::env::set_var("PATH", &path) };
+        let got = resolve_program("probe.exe");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.expect("probe.exe resolves"), exe);
     }
 }

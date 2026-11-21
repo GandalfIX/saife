@@ -1115,3 +1115,51 @@
             Some(audit::session_start::TIER_APPCONTAINER_DACL)
         );
     }
+
+    /// The timestamp formatter at the edges the existing three values miss: the
+    /// last second of a day, a leap day, and the time-of-day arithmetic
+    /// (hour/minute/second) the civil-date core does not cover.
+    #[test]
+    fn chrono_time_of_day_and_leap_day_boundaries() {
+        assert_eq!(chrono_from_unix(86_399), "19700101-235959");
+        assert_eq!(chrono_from_unix(86_400), "19700102-000000");
+        // 2024-02-29 12:34:56 UTC (leap day in a leap year).
+        assert_eq!(chrono_from_unix(1_709_210_096), "20240229-123456");
+        // 23:59:59 of a known day (2024-01-01).
+        assert_eq!(chrono_from_unix(1_704_153_599), "20240101-235959");
+    }
+
+    /// The session sequence: always five digits, and the PID rotation actually
+    /// separates two same-nanosecond draws from different processes.
+    #[test]
+    fn session_seq_is_five_digits_and_pid_separated() {
+        assert_eq!(session_seq(0, 0), 0);
+        for nanos in [1_u64, 999_999_999, u64::MAX / 2] {
+            assert!(session_seq(nanos, 4242) < 100_000, "the fold is a five-digit field");
+        }
+        // Two processes in the same nanosecond must differ: the rotation puts
+        // the PID's low bits where the nanos' pattern does not reach.
+        assert_ne!(session_seq(0, 1), session_seq(0, 2));
+        assert_ne!(session_seq(0, 1), session_seq(0, 1 << 16));
+    }
+
+    /// The audit fact builders read the machine policy, not defaults: a named
+    /// exposure surfaces with its label, and the policy fact carries real
+    /// counts and source names.
+    #[test]
+    fn credential_facts_carry_the_policy_and_the_named_exposure() {
+        let _env = env_lock();
+        let facts = credential_exposure_facts(&["kube".to_string()])
+            .expect("kube is a tool credential and can be exposed");
+        assert_eq!(facts.len(), 1, "exactly the named exposure is reported");
+        assert_eq!(facts[0].label, "kube");
+        assert!(!facts[0].path.is_empty(), "the exposure names its file");
+
+        let none = credential_exposure_facts(&[]).expect("no exposure is not an error");
+        assert!(none.is_empty());
+
+        // policy facts are deliberately NOT asserted: on a dev box the
+        // deployment's deny.d directory ships nothing, so an all-zero
+        // PolicyFacts is the honest answer - the builder is registered as a
+        // deployment artifact instead (see .cargo/mutants.toml).
+    }

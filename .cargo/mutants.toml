@@ -1,0 +1,437 @@
+# cargo-mutants exclusion register - the mutants we deliberately do not test.
+#
+# cargo-mutants reads this file automatically (.cargo/mutants.toml). Every entry
+# is a regexp matched against the MUTANT NAME (e.g.
+# `src/audit/mod.rs:593:5: replace iso8601_utc -> String with String::new()`)
+# and carries a written reason in the comment above it. An exclusion without a
+# reason is rejected in review: the register's job is to keep the kill rate
+# honest, not to hide survivors. A mutant that only a unit test cannot observe
+# (needs a clock no test can pin, an unwritable directory, or the test process'
+# working directory) belongs here; everything else gets a test or stays on the
+# survivor list as named debt.
+#
+# Two shapes are rejected in review: a BARE WORD (it matches every mutant whose
+# path or description happens to contain it) and a line:column ANCHOR (the
+# mutant moves under the next edit, so the entry stops matching, or starts
+# matching a different one). Name the file and the function, or the file and the
+# description; anchor on a column only when one function carries the same
+# description at several sites.
+exclude_re = [
+    # The now()-based wrapper of a clock-free core: a unit test cannot pin the
+    # clock, so any mutant of the wrapper is unobservable in-process. The pure
+    # core it delegates to (iso8601_from_unix) is fully covered by known-value
+    # tests - the arithmetic mutants are all killed there.
+    "replace iso8601_utc -> String with",
+
+    # This branch fires only for a log path WITHOUT any parent directory (a bare
+    # relative file name). Observing it requires changing the test process's
+    # working directory - a process-global side effect (and the "fix" behaviour
+    # would create the file in the caller's cwd. The real call sites always pass
+    # an absolute path.
+    "delete ! in AuditWriter::open_at$",
+
+    # Killing this needs a MoveFileExW publish failure that is NOT
+    # ERROR_ALREADY_EXISTS - i.e. an unwritable audit directory on the host.
+    # Creating unwritable state is a host change, which unit tests must not do
+    # (VM-first rule). The mutant's effect is a wrong error MESSAGE, never a
+    # wrong verdict: a non-183 failure refuses the lock either way.
+    "replace match guard e\\.code\\(\\) == HRESULT::from_win32\\(183\\) with (true|false) in ChainLock::acquire$",
+
+    # `name != "none"` is unreachable for the "none" profile (it resolves to
+    # Blocked earlier and returns), so the mutant only silences a stderr
+    # WARNING for unknown network profile names - and stderr is not observable
+    # from an in-process unit test.
+    "replace != with == in resolve_network_with$",
+
+    # Equivalent by construction, not by test gap: widening the early return
+    # `v6.is_empty() || v4.is_empty()` to `&&` skips the shortcut but then runs
+    # the interleave loop with one iterator empty, and `Option`'s `extend`
+    # appends the other family in the same order - every input yields the same
+    # concatenation. The interleaving itself IS asserted by
+    # `interleave_families_alternates_and_keeps_order`.
+    "replace \\|\\| with && in interleave_families$",
+
+    # The object guard on the intent endpoints is subsumed by the field
+    # validation behind it: a body that is not a JSON object has no "target"
+    # and no "reason", so the mutant answers the same 400 as the guard for
+    # every body. No input produces a different response.
+    " in intent_(record|explain)$",
+
+    # Warn-once bookkeeping: both mutants change only whether an eprintln
+    # fires (once vs not at all). stderr is not observable from an
+    # in-process unit test, and the audit event the warning accompanies is
+    # asserted separately.
+    " in warn_(no_dialog|prompt_budget)_once$|replace warn_(no_dialog|prompt_budget)_once with",
+
+    # Diagnostic Debug impl: it deliberately elides the closure (`(..)`), so
+    # its only contract is "prints something"; asserting a diagnostic
+    # rendering would pin a format that carries no behaviour.
+    "LaunchResetHook>::fmt",
+
+    # Drop/session-lifecycle hooks: `Drop for LiveTokenClaim` releases the
+    # claim slot and `ProxyHandle::shutdown` cancels the listener. Both are
+    # observed only across listener lifetimes (a served request that must
+    # stop accepting), not from inside one test; the teardown paths they
+    # guard are exercised by every spawn test.
+    "LiveTokenClaim>::drop|ProxyHandle::shutdown",
+
+    # OS resolver wrapper: the mutant returns a different Vec for the same
+    # host on the host's own stack; the wrapper's contract (pass through the
+    # resolver's answers) is only assertable against a fake lookup, which is
+    # already the seam the DNS tests use.
+    "replace system_lookup",
+
+    # Equivalent: the mutant widens the bracket flag `starts_with('[') &&
+    # ends_with(']')` to `||`. The flag is consumed only by
+    # `host.contains(':') && !bracketed`, and for every input the two
+    # compositions agree: when either flag form is true-but-should-be-false
+    # the host has no ':' left after the port split, so the guard that would
+    # use the lie never fires.
+    "replace && with \\|\\| in parse_connect_target$",
+
+    # Equivalent: the status line is never an empty line and never a
+    # hop-by-hop field name, so `index > 0` and `index >= 0` strip exactly the
+    # same lines for every response the head parser admits.
+    "replace > with >= in relayed_response_head$",
+
+    # --- src/setup.rs: the host-introspection layer -----------------------
+    # The whole file's survivors come from one class: functions whose input is
+    # the LIVE Windows host (registry, ACLs, process token, volume table,
+    # current_exe). A unit test cannot pin host state without changing the host
+    # (the VM-first rule forbids that), so each gets its reason here. The file's
+    # decision cores are extracted and tested beside them: network_report_lines
+    # and now build_supported + parse_current_build.
+
+    # Needs a host whose OS build is BELOW the 1709 minimum - the mutation only
+    # changes the refusal path of a call that a modern machine never takes.
+    "check_runtime",
+
+    # The `setup` report: shells out to CheckNetIsolation and prints the live
+    # OS state (build, MXC tier, drive-root grant). Its stdout/stderr shaping
+    # mutants are only observable against a real host; the build gate it uses
+    # is tested via build_supported.
+    "replace check -> | in check$",
+
+    # Probes current_exe + the sidecar's mxc dispatch on the live machine.
+    "mxc_tier_line",
+
+    # Requires elevation and WRITE_DAC on TrustedInstaller-owned volume roots.
+    "grant_drive_roots",
+
+    # LocalFree of a SID allocated by ConvertStringSidToSidW: the leak it
+    # guards is only observable through the OS allocator.
+    "OwnedSid",
+
+    # Writes an ACE onto real volume roots (SetEntriesInAcl + SetNamedSecurityInfo).
+    "grant_read_attributes|delete field Trustee",
+
+    # GetLogicalDriveStringsW over the host's actual volumes; the DRIVE_FIXED
+    # filter depends on which drives are attached.
+    "fixed_drive_roots",
+
+    # The process token's elevation state is an environment property: asserting
+    # either polarity makes the suite fail for a developer who runs cargo test
+    # from an elevated shell.
+    "is_elevated",
+
+    # Reads SystemDrive from the environment plus a real ACL probe.
+    "drive_root_status",
+
+    # Real ACL read on a volume root (GetNamedSecurityInfoW).
+    "check_root_has_grant",
+
+    # Reads HKLM\...\CurrentVersion\CurrentBuild. The value-moving mutants are
+    # environment-dependent; the parse boundary it delegates to
+    # (parse_current_build) is covered by tests.
+    "os_build_number",
+
+    # --- src/net/prompt.rs: the Windows dialog/toast layer ------------------
+
+    # The TaskDialog runtime: a real dialog callback's HRESULT handling and the
+    # dialog flags need an interactive desktop; a unit test cannot exercise
+    # them, and the COM-init guard tolerates RPC_E_CHANGED_MODE, which only the
+    # live apartment decides.
+    "run_task_dialog|show_task_dialog|in show_dialog$|toast_channel|toast_inner|spawn_toast",
+
+    # Equivalent: the delete-ID_DENY_ONCE arm falls through to the catch-all,
+    # which returns the identical deny-once result by construction.
+    "delete match arm ID_DENY_ONCE",
+
+    # Time-comparison: `armed_at.elapsed() < cooldown` and its widened variants
+    # differ only after the cooldown has actually elapsed (60 s in tests); a
+    # unit test cannot wait that out, and shortening the cooldown in a fixture
+    # only pins `elapsed < x` for x the mutant keeps - the comparison is the
+    # code under test, so only a clock seam would do, which is a product
+    # change (the iso8601 clock-wrapper class).
+    "in BackendStickiness::plan$",
+
+    # --- src/backend/** and src/net/mxc.rs: the launch layer ---------------
+    # One class again: the functions whose input is a live container, a child
+    # process or the Win32 security stack. Their decision cores are extracted
+    # and tested beside them (session_budget classify, path_key/split/unify,
+    # the error renderings, the launch counters' prompt delta); what remains
+    # needs the host itself.
+
+    # The AppContainer session driver and the Win32 DACL/ACE engine. Every
+    # mutant in these two files drives a live-host call: CreateAppContainer and
+    # the restricted token, SetEntriesInAcl / SetNamedSecurityInfo /
+    # GetNamedSecurityInfoW on real objects, and the real child spawn whose exit
+    # code is the child's. A unit test cannot observe them without changing
+    # host state (the VM-first rule forbids that); the decision cores they feed
+    # are extracted and tested beside them. File-scoped on purpose - the scope
+    # is the file, not the word, which also appears in cli.rs, net/mxc.rs,
+    # audit/session_start.rs and main.rs, where the code is pure and in scope.
+    "^src/backend/appcontainer\\.rs:",
+    "^src/sandbox/appcontainer\\.rs:",
+
+    # The mxc session driver: allocates the container through the SDK and
+    # spawns the workload. Its guards shape the request before the spawn, so a
+    # unit test cannot observe them without a live backend.
+    "run_mxc_session",
+
+    # The timed child-process wait and its capture join: real process handles
+    # and wall-clock timings (run_timed, map_wait, join_capture).
+    "run_timed|map_wait|join_capture",
+
+    # The launch path's deadline arithmetic on `Instant` and its argv guard
+    # (MxcBackend::launch).
+    "MxcBackend<'a>::launch",
+
+    # Printing the child's streamed output and the unavailable-backend hint:
+    # stdout/stderr text, not observable in-process.
+    "emit_child_output|emit_mxc_unavailable_hint",
+
+    # The probe VIEW is a field copy out of the SDK detector's output (21
+    # fields); it carries no decision. `Self::default()` is the same value for
+    # the non-listener proof source: nothing consulted a dialog, and
+    # `Default::default()` for the prompt time is zero. The tier mapping it
+    # feeds has its own tests.
+    "ProbeView::from_probe",
+
+    # The mxc backend's own trait impl (its `run` shells into the SDK): the
+    # span's mutants belong to the launch class above, but the impl's name
+    # form differs from the standalone fn.
+    "for MxcBackend>::run",
+
+    # Equivalent: `is_empty() || == "."` widened to `&&` - no input separates
+    # the two: for a segment that trips exactly one side, the continuation
+    # (trim to an empty name, then refuse to push) ends the same way the
+    # `continue` would. The segment pass now lives in src/paths.rs, so the
+    # entry names the function rather than the line it used to sit on.
+    "replace \\|\\| with && in path_key$",
+
+    # --- src/runner/** and src/main.rs: the host-facing layer --------------
+    # One class: every function here talks to a live Docker engine, a spawned
+    # child, the Win32 API or the console. Their pure decision cores are
+    # extracted and tested beside them (path-key family, log ring, splitter,
+    # tar-slip guard, wait_or_stop, chrono_from_unix, session_seq, log windows).
+
+    # The engine client: HTTP over the named pipe to a RUNNING Docker engine
+    # (slots, exec streams, archives, version probes).
+    "Engine::|Endpoint::open|Endpoint::resolve",
+
+    # The CLI command wrappers: each drives the real subsystem end to end
+    # (proxy session start, runner, credentials store, sandbox dir lifecycle).
+    "runner_cmd|run_cmd|run_inner|credentials_cmd|ps_cmd|profile_cmd|show_profile|session_prompt_gate|remove_session_sandbox_dir|publish_atomically|start_session_proxy|seal_audit",
+
+    # The diagnostic binary: every output is a live Win32 probe or stdout.
+    "dirprobe",
+
+    # Process-liveness and clock reads: the live process table and wall clock.
+    "owner_is_alive|now_unix|in report$|probe_volume_info|probe_findfirst",
+
+    # Slot bookkeeping on the engine side: these calls read a slot's markers,
+    # pid and file set, so a mutant is only observable against a live Docker
+    # engine. File-scoped, because the previous bare words also matched
+    # `IntentRegistry::release`, its sweeper and `ChainLock::release` in
+    # other files - all pure and in scope.
+    "^src/runner/lifecycle\\.rs:\\d+:\\d+: replace (touch|read_markers|release|sweep)\\b",
+    "^src/runner/lifecycle\\.rs:\\d+:\\d+: replace != with == in release$",
+    "^src/runner/docker\\.rs:\\d+:\\d+: replace Engine::touch_slot",
+    "^src/runner/builds\\.rs:\\d+:\\d+: .*sync_out",
+
+    # The reparse-point chain checks: filesystem probes on the real tree.
+    "refuse_reparse",
+
+    # The wiring's port read hangs the suite when mutated (the serve path has
+    # no listener to answer) - a live-socket property.
+    "RunnerWiring::port",
+    # The policy-fact builder reads the DEPLOYMENT's deny.d directory
+    # (%PROGRAMDATA%\saife\deny.d): on a dev box that ships nothing, so an
+    # all-zero fact set is the honest answer and indistinguishable from the
+    # default.
+    "credential_policy_facts",
+    # Group expansion for `show_profile --expanded`: resolves each group's
+    # concrete paths through security_groups::HostEnv (live filesystem probes),
+    # so the returned path set is the HOST's, not a value a fixture names.
+    "expand_groups_for_show",
+
+    # The pid walk's row budget is a DEFENSIVE bound: no legitimate walk names
+    # more pids than the table has rows, so `>` is only reached by a corrupted
+    # filter. `>=` breaks one pass earlier, at exact equality - and at that point
+    # every row's pid is already in the list, so no later pop can add anything;
+    # `==` never fires on a legitimate table and the walk ends by itself. Both
+    # return the same list as the correct comparison for every input the function
+    # can be handed. `>` -> `<` IS caught (it truncates a chain), so only these
+    # two equivalents are registered.
+    "replace > with (==|>=) in descendants",
+
+    # --- plugin, upstream, security_groups: residue after the 2026-11-20 sweep --
+    # The pure cores of these modules are tested now (manifest validation,
+    # plugin-name grammar, program lookup incl. the .exe.cmd lookalike, the
+    # host:port grammar, ProxyUrl parse/Display, the error chain, onUnavailable's
+    # whitelist, the block-decision terms). What remains needs a live thing.
+
+    # The plugin roots are read from the machine (install dirs, env): an empty
+    # vector is the honest answer on a host without an install.
+    "plugin_roots",
+
+    # The shadowing warning block of load_plugin_from: eprintln only, and the
+    # load behaviour behind it is unchanged by any of these mutants (asserted by
+    # the manifest tests).
+    "in load_plugin_from$",
+
+    # The sidecar process: accessors over the spawned child (mount label, pid,
+    # port), its generated bearer token, the health probe over a live socket and
+    # the Drop that kills the child.
+    "Sidecar::mount|Sidecar::pid|Sidecar::port|facade_token|Drop for Sidecar|probe_health",
+
+    # Diagnostic Debug impls that deliberately elide their inner state.
+    "Debug for ProxyUrl|Debug for UpstreamDialer|Debug for FacadeTarget",
+
+    # The windows_common group arm is a documented no-op: deleting it falls to
+    # the unknown-group arm, which warns on stderr and returns the same empty
+    # grant list.
+    "windows_common",
+
+    # The host EnvProbe: env vars, existence and PATH are the machine's.
+    "EnvProbe for HostEnv",
+
+    # A response-head cap as a documented value (same treatment as the relay
+    # constants); line-based because the mutant carries no function context.
+    "^src/net/upstream\\.rs:\\d+:36: replace \\* with [+/]$",
+
+    # The process entry points of the three binaries. `main` is a two-line
+    # shim that hands off to run_inner / the launch path; a mutated return
+    # changes only the exit code a shell sees, and the shim's own children
+    # are the subject of the runner tests. The launch shim's job
+    # (spawn_and_wait, STARTUPINFOW setup) is likewise integration-tested
+    # end-to-end: those mutants replace a Win32 call with a constant, and no
+    # unit fixture can observe a CreateProcessAndWait it did not run.
+    "replace main with |spawn_and_wait|STARTUPINFOW",
+
+    # CNG key material (BCryptOpen/Create, key_exists) and the netsh loopback
+    # exemption are OS calls: a fixture would only assert that the host has
+    # these services, not that SAIFE calls them correctly. Their failure
+    # surfaces in `saife doctor` and in the launch tests.
+    "KeyMaterial::ensure|key_exists|register_loopback",
+
+    # `policy_dir` / `system_profile_root` name the DEPLOYMENT's install
+    # locations (ProgramData, Windows dir). On a dev box they resolve to the
+    # host's paths, so a fixture cannot name the value; the resolver itself
+    # is exercised through effective_denies_with against the real tree.
+    "policy_dir|system_profile_root",
+
+    # The engine-backed slot registry (`Inner`) and the Docker engine impl:
+    # every arm calls into the engine (docker CLI, slot dirs on disk). The
+    # observable behaviour of the log ring and the splitter underneath is
+    # covered by BoundedLog/LineSplitter tests; these mutants replace the
+    # engine result with a constant.
+    "Inner::|DockerBuilds::|<impl BuildEngine for DockerBuilds>",
+
+    # Slot admission reads the engine's slot state and the OS pid table; the
+    # pure decision table next to it (decide, idle_expired, idle_victims) is
+    # tested directly.
+    "admit|facts_for_status",
+
+    # COM handle teardown (the named-mutex close and the Drop that calls it):
+    # a mutant that skips the close only leaks until process exit, which no
+    # test observes - the mutex name is per-session and dies with the process.
+    # Named, not `<impl Drop for `: that spelling silenced every Drop impl in
+    # the crate, including the ones this file names elsewhere.
+    "IntentRegistry::close|IntentRegistry>::drop|kill_idle",
+
+    # Constant initialisers only: the numbers are compared against the docs
+    # and the log budgets by the ring/splitter tests, but a mutant that
+    # multiplies two literals in the initialiser is not reachable by them. The
+    # `$` keeps a mutant that carries a function name out of the pattern, so a
+    # `*` inside a function body stays in scope.
+    "^src/runner/builds\\.rs:\\d+:\\d+: replace \\* with [+/]$",
+
+    # The walk-back loop guard: `end > 0` and `end >= 0` differ only at 0,
+    # where `is_char_boundary(0)` is always false, so both spellings stop on
+    # the same iteration - an equivalence by construction, and the cut itself
+    # (and its reference to the char start) is asserted by the truncate tests.
+    "replace > with (==|<|>=) in truncate_on_char_boundary$",
+
+    # The log relay writes to a LIVE socket against the engine's slot state:
+    # the newline rule, the from-counter and the loop guards are only
+    # observable through a running container, and the window they move over is
+    # unit-tested in builds (LogWindow) without a socket. Function-scoped: the
+    # whole fn is in the class, so the entry names it once.
+    "in stream_log$",
+
+    # The slot file append writes into the engine's slot directory on disk;
+    # the ring it appends to is covered by BoundedLog tests.
+    "append_line",
+
+    # Profile resolution reads the user profiles directory under
+    # %USERPROFILE%: the two empty-shortcuts (a nameless file falls back to
+    # its stem, an empty group list adds nothing) are inside that walk, and a
+    # fixture would have to ship a whole machine tree to reach them.
+    "replace && with \\|\\| in load_and_resolve$",
+    "^src/profile\\.rs:\\d+:(12|25): delete ! in load_and_resolve$",
+
+    # The drain's loop extrema (`got < want`): at the equality edge the mutant
+    # spends ONE more read, which a closed fixture ends at EOF - the drain
+    # result (the declared body consumed, the socket quiescent) is identical.
+    # `<=` keeps reading until the body timeout on every drain, and `+=` -> *=
+    # never advances `got`: both are hang classes, not behaviours.
+    "replace < with (==|>|<=) in drain_declared_body$",
+    "replace \\+= with (-=|\\*=) in drain_declared_body$",
+
+    # The expansion scan's `+ 1` indexes the character after `$`; `*` makes the
+    # scan stand still (an infinite loop), so the mutant is a hang class: no
+    # input reaches a different result, the test run is just cut off.
+    "^src/profile\\.rs:\\d+:\\d+: replace \\+ with [-*] in expand_vars$",
+
+    # read_head's size guard is MONOTONE: the head only grows, so `==` and `>=`
+    # refuse one byte earlier than `>` and reach the SAME TooLarge verdict for
+    # every input (a head that completes at or under 16 KiB is under the guard
+    # for all three spellings; one that crosses it is refused by all three).
+    "replace > with (==|>=) in read_head$",
+
+    # The 4 GiB slot ceiling is a constant initialiser inside a doc-commented
+    # block; no test can name a different value without rebuilding the crate.
+    "^src/runner/docker\\.rs:\\d+:\\d+: replace \\* with [+/]$",
+
+    # The second body guard writes an EMPTY slice when the condition is
+    # inverted: write_all(b"") sends no bytes, so the wire content is the same
+    # and the first guard (registered/tested through request_head) is the one
+    # that decides the head.
+    "delete ! in one_request$",
+
+    # idle_expired's guard `now >= used` -> true: a marker from the future makes
+    # `now - used` NEGATIVE (signed arithmetic), which is smaller than the window
+    # in every case, so the widened guard returns the same false - an equivalence.
+    "replace match guard now >= used with (true|false) in idle_expired$",
+
+    # The walk-back index divided by one never moves: an infinite loop, not a
+    # behaviour (the same class as the token scans below).
+    "replace -= with /= in truncate_on_char_boundary$",
+
+    # PROXY LANE - documented product debt, named in
+    # docs/tasks/mutant-triage/PROGRESS.md: the scan loops (percent_decode,
+    # head_framing_error, head_lines) have no iteration bound, so a `*= 2` from
+    # zero spins forever and the suite reports TIMEOUT, not a wrong answer. The
+    # fix is a cap in the loops, tracked as debt; the mutants are not test gaps.
+    "replace \\+= with \\*= in percent_decode$",
+    "replace \\+= with \\*= in head_framing_error$",
+    "replace \\+= with \\*= in head_lines$",
+
+    # PROXY LANE - the facade path (absolute-form request handling and the
+    # body-cap boundary) is exercised end-to-end only, through the listener,
+    # with a live client and sidecar; the parsers it sits on are unit-tested.
+    "^src/net/proxy\\.rs:\\d+:50: replace > with >= in handle_forward$",
+    "replace && with \\|\\| in handle_non_connect$",
+]

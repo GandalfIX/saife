@@ -1044,4 +1044,124 @@ mod tests {
             );
         }
     }
+
+    /// A connected pair on loopback: the read helpers take a real TcpStream, and
+    /// a duplex would not exercise the one-byte read they are written for.
+    async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The head ends at CRLFCRLF and NOTHING of the body is consumed: a pipelined
+    /// body must stay readable for the next reader.
+    #[test]
+    fn read_head_stops_at_the_terminator_and_leaves_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        runtime().block_on(async {
+            let (mut client, mut server) = loopback_pair().await;
+            client
+                .write_all(b"POST /build HTTP/1.0\r\nX-A: 1\r\n\r\nBODY")
+                .await
+                .unwrap();
+            match read_head(&mut server).await {
+                HeadRead::Complete(h) => {
+                    assert_eq!(h, b"POST /build HTTP/1.0\r\nX-A: 1\r\n\r\n".to_vec());
+                }
+                _other => panic!("expected a complete head, got a non-complete result"),
+            }
+            let mut rest = [0u8; 16];
+            // Bounded: a head reader that swallowed the body leaves nothing to
+            // read, and an unbounded read would HANG the suite instead of
+            // failing it - the fixture must fail, not wait.
+            let n = timeout(Duration::from_millis(500), server.read(&mut rest))
+                .await
+                .expect("the body must still be on the socket")
+                .unwrap();
+            assert_eq!(&rest[..n], b"BODY", "the body is still on the socket");
+        });
+    }
+
+    /// The size bound is 16 KiB of head; a head of EXACTLY that size still
+    /// completes (a `>=` bound refuses a legal head), while one junk byte more
+    /// is refused, and a peer that leaves without the terminator reads Closed.
+    #[test]
+    fn read_head_bounds_the_head_at_16k_and_reports_a_closed_peer() {
+        use tokio::io::AsyncWriteExt;
+        runtime().block_on(async {
+            let (mut client, mut server) = loopback_pair().await;
+            let mut exact = vec![b'x'; 16 * 1024 - 4];
+            exact.extend_from_slice(b"\r\n\r\n");
+            client.write_all(&exact).await.unwrap();
+            match read_head(&mut server).await {
+                HeadRead::Complete(h) => assert_eq!(h.len(), 16 * 1024),
+                _other => panic!("a head of exactly the bound must complete, got too-large/closed"),
+            }
+
+            let (mut client, mut server) = loopback_pair().await;
+
+            let big = vec![b'y'; 16 * 1024 + 2];
+            client.write_all(&big).await.unwrap();
+            match read_head(&mut server).await {
+                HeadRead::TooLarge => {}
+                _other => panic!("16 KiB + 2 bytes must be refused, got complete/closed"),
+            }
+
+            let (client, mut server) = loopback_pair().await;
+            drop(client);
+            match read_head(&mut server).await {
+                HeadRead::Closed => {}
+                _other => panic!("a vanished peer is Closed, got complete/too-large"),
+            }
+        });
+    }
+
+    /// The drain consumes the declared body so closing the socket cannot RST the
+    /// response: after it, a peer that framed a body has nothing pending - a
+    /// drain that skipped the header leaves the whole body unread.
+    #[test]
+    fn drain_declared_body_consumes_the_framed_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        runtime().block_on(async {
+            let (mut client, mut server) = loopback_pair().await;
+            client.write_all(b"ABCD").await.unwrap();
+            drain_declared_body(
+                &mut server,
+                "POST /build HTTP/1.0\r\nContent-Length: 4\r\n\r\n",
+            )
+            .await;
+            let mut rest = [0u8; 8];
+            match timeout(Duration::from_millis(200), server.read(&mut rest)).await {
+                Err(_) => {}
+                Ok(Ok(n)) => panic!(
+                    "the framed body must be drained, {n} bytes left: {:?}",
+                    &rest[..n]
+                ),
+                Ok(Err(e)) => panic!("read failed: {e}"),
+            }
+
+            let (mut client, mut server) = loopback_pair().await;
+            client.write_all(b"0123456789").await.unwrap();
+            drain_declared_body(&mut server, "POST /build HTTP/1.0\r\n\r\n").await;
+            let mut rest = [0u8; 32];
+            let n = timeout(Duration::from_millis(500), server.read(&mut rest))
+                .await
+                .expect("an unframed body stays readable")
+                .unwrap();
+            assert_eq!(&rest[..n], b"0123456789", "no header, nothing drained");
+        });
+    }
 }

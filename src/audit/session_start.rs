@@ -1267,4 +1267,37 @@ mod tests {
             "a session with no exposure omits both keys: {root}"
         );
     }
+
+    /// The read-only accessors return what the builder recorded. They are the
+    /// only path the wiring and the tests have into the facts, so a constant
+    /// return would silently misreport a live session (elevated, loopback reach)
+    /// to every later reader.
+    #[test]
+    fn the_accessors_report_what_was_recorded() {
+        let measured = SessionStartFacts::measured(TierFacts::default(), Some(true))
+            .with_loopback(LOOPBACK_OPEN_UNSCOPED);
+        assert_eq!(
+            measured.elevated(),
+            Some(true),
+            "elevated returns the recorded value"
+        );
+        assert_eq!(
+            measured.loopback(),
+            Some(LOOPBACK_OPEN_UNSCOPED),
+            "loopback returns the recorded reach"
+        );
+        assert_eq!(
+            measured.proxy_endpoint().map(|e| e.port()),
+            None,
+            "no endpoint was recorded"
+        );
+
+        let unrecorded = SessionStartFacts::measured(TierFacts::default(), None);
+        assert_eq!(
+            unrecorded.loopback(),
+            None,
+            "'not recorded' stays distinguishable from a recorded reach"
+        );
+        assert_eq!(unrecorded.elevated(), None);
+    }
 }

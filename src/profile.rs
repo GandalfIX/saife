@@ -1,3 +1,4 @@
+use crate::paths::path_key;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,6 +67,20 @@ pub fn show_profile(name: &str, expanded: bool) -> i32 {
     }
 }
 
+/// A group's read-only grant that the profile ALREADY allow-lists stays an
+/// allow: otherwise `profile show --expanded` presents one tree under two
+/// postures. Compared case-insensitively on the lowercased path string, the
+/// same rule `resolve_filesystem` applies to its own duplicates.
+fn drop_readonly_duplicated_by_allow(fs: &mut FilesystemSlice) {
+    let allow_keys: std::collections::BTreeSet<String> = fs
+        .allow
+        .iter()
+        .map(|p| p.to_string_lossy().to_lowercase())
+        .collect();
+    fs.read_only
+        .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+}
+
 fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("get current directory")?;
     if expanded {
@@ -95,13 +110,7 @@ fn show_profile_inner(name: &str, expanded: bool) -> Result<i32> {
                 fs.read_only.push(g.path);
             }
             fs.read_only = dedupe_paths(fs.read_only);
-            let allow_keys: std::collections::BTreeSet<String> = fs
-                .allow
-                .iter()
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .collect();
-            fs.read_only
-                .retain(|p| !allow_keys.contains(&p.to_string_lossy().to_lowercase()));
+            drop_readonly_duplicated_by_allow(&mut fs);
         }
         let resolved = ResolvedProfile {
             name: resolved_name,
@@ -775,102 +784,6 @@ pub fn path_covers(outer: &std::path::Path, inner: &std::path::Path) -> bool {
             || inner
                 .strip_prefix(&outer)
                 .is_some_and(|rest| rest.starts_with('\\')))
-}
-
-/// Normalized comparison key for a Windows path — a faithful mirror of
-/// [`crate::net::mxc::path_key`]. See that function's docs for the full list of
-/// spellings this unifies; the short version is: separators become `\\`, a
-/// verbatim/device prefix is dropped, each component loses its trailing dots
-/// and spaces (before the `.`/`..` tests), `.` is dropped and `..` collapses,
-/// and the whole key is upper-cased. Nothing here touches the filesystem.
-fn path_key(path: &str) -> String {
-    let unified = unify_path_prefix(path);
-    let (root, rest) = split_path_root(&unified);
-
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in rest.split('\\') {
-        // Trailing spaces first, then the `.`/`..` tests, then the dots: Windows
-        // ignores a component's trailing dots and spaces *before* deciding what
-        // the component means, so `.. ` is the parent directory. Doing it in any
-        // other order dropped `.. ` (it trimmed to nothing).
-        let segment = segment.trim_end_matches(' ');
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            segments.pop();
-            continue;
-        }
-        let segment = trim_component(segment);
-        if !segment.is_empty() {
-            segments.push(segment);
-        }
-    }
-
-    let mut key = fold_case(&root);
-    for segment in segments {
-        if !key.is_empty() && !key.ends_with('\\') {
-            key.push('\\');
-        }
-        key.push_str(&fold_case(segment));
-    }
-    key
-}
-
-/// Separator unification plus verbatim/device-prefix removal. Mirror of
-/// `mxc::unify_path_prefix`.
-fn unify_path_prefix(path: &str) -> String {
-    let raw = path.trim().replace('/', "\\");
-    let bytes = raw.as_bytes();
-    if bytes.len() < 4
-        || !(bytes[..4].eq_ignore_ascii_case(br"\\?\")
-            || bytes[..4].eq_ignore_ascii_case(br"\\.\\"))
-    {
-        return raw;
-    }
-    let rest = &raw[4..];
-    let rest_bytes = rest.as_bytes();
-    if rest_bytes.len() >= 4 && rest_bytes[..4].eq_ignore_ascii_case(br"UNC\") {
-        return format!("\\\\{}", &rest[4..]);
-    }
-    rest.to_string()
-}
-
-/// Split a unified path into its root (`C:`, `\\server\share`, `\`, or `""`)
-/// and the part below it. Mirror of `mxc::split_path_root`.
-fn split_path_root(path: &str) -> (String, &str) {
-    let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
-        let mut parts = path[2..].splitn(3, '\\');
-        let server = parts.next().unwrap_or_default();
-        let share = parts.next().unwrap_or_default();
-        let end = 2 + server.len() + usize::from(!share.is_empty()) + share.len();
-        let root = if share.is_empty() {
-            format!("\\\\{}", trim_component(server))
-        } else {
-            format!("\\\\{}\\{}", trim_component(server), trim_component(share))
-        };
-        return (root, &path[end..]);
-    }
-    if bytes.len() >= 2 && bytes[1] == b':' {
-        return (path[..2].to_string(), &path[2..]);
-    }
-    if bytes.first() == Some(&b'\\') {
-        return ("\\".to_string(), &path[1..]);
-    }
-    (String::new(), path)
-}
-
-/// One path component as Win32 compares it: trailing dots and spaces are not
-/// part of the name. Mirror of `mxc::trim_component`.
-fn trim_component(component: &str) -> &str {
-    component.trim_end_matches(['.', ' '])
-}
-
-/// Win32's case fold, as closely as `std` approximates it: Unicode uppercase.
-/// Mirror of `mxc::fold_case`.
-fn fold_case(text: &str) -> String {
-    text.to_uppercase()
 }
 
 /// Ceiling for both `limits` terms: 7 days
@@ -2651,6 +2564,28 @@ mod tests {
         assert_eq!(v["network"]["profile"], "minimal");
     }
 
+    /// `--expanded` must not present one tree under two postures: a group grant
+    /// that the profile already allow-lists is dropped from `read_only`, while a
+    /// grant that is NOT allowed stays visible. Removing the `!` in the retain
+    /// keeps both listings and survived the suite.
+    #[test]
+    fn a_group_grant_already_allow_listed_is_not_listed_read_only() {
+        let mut fs = FilesystemSlice {
+            allow: vec![PathBuf::from(r"C:\Proj")],
+            read_only: vec![
+                PathBuf::from(r"C:\Proj"),
+                PathBuf::from(r"C:\Users\test\.gitconfig"),
+            ],
+            deny: vec![],
+        };
+        drop_readonly_duplicated_by_allow(&mut fs);
+        assert_eq!(
+            fs.read_only,
+            vec![PathBuf::from(r"C:\Users\test\.gitconfig")],
+            "the allow-listed tree must not also appear as read-only"
+        );
+    }
+
     #[test]
     fn raw_network_parses_camel_case_prompt_fields() {
         let raw = r#"{"meta":{"name":"x","schema_version":1},"network":{"allowDomain":["a.com"],"denyDomain":["*.evil.com"],"promptEnabled":false,"onUnavailable":"allow","upstreamProxy":"http://corp:8080"}}"#;
@@ -3966,5 +3901,319 @@ mod tests {
                 .contains(&PathBuf::from("C:/ProgramData/Corp/secrets"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two classification strings are the vocabulary of the deny.d files
+    /// AND of the audit: a mutant that renames either breaks the file contract.
+    #[test]
+    fn the_kind_and_class_names_are_the_file_vocabulary() {
+        assert_eq!(DenyKind::Dir.as_str(), "dir");
+        assert_eq!(DenyKind::File.as_str(), "file");
+        assert_eq!(CredentialClass::Secret.as_str(), "secret");
+        assert_eq!(CredentialClass::ToolCredential.as_str(), "tool-credential");
+    }
+
+    /// One policy file per deny kind, loaded in file order, de-duplicated by
+    /// COVERING: the second file's narrower path is already inside the first's
+    /// tree, so it is not added twice - and a non-JSON neighbour is not policy.
+    #[test]
+    fn policy_denies_in_loads_in_order_and_dedupes_by_covering() {
+        let dir = temp_dir("policy-order");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tree = dir.join("tree");
+        let sub = tree.join("sub");
+        let a = dir.join("01-base.json");
+        let b = dir.join("02-sub.json");
+        std::fs::write(dir.join("README.txt"), "prose, not policy").unwrap();
+        std::fs::write(
+            &a,
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                json_escaped(&tree)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                json_escaped(&sub)
+            ),
+        )
+        .unwrap();
+        let got = policy_denies_in(&dir).expect("two valid files load");
+        assert_eq!(
+            got.dirs.len(),
+            1,
+            "the covered entry is not added twice: {:?}",
+            got.dirs
+        );
+        assert_eq!(got.sources.len(), 2, "both files were read and recorded");
+        assert!(
+            got.sources[0].ends_with("01-base.json"),
+            "files load in sorted order: {:?}",
+            got.sources
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The three refusals the loader must make: an empty file (a deployment
+    /// mistake, not a no-op), a schema this build does not speak, and a
+    /// per-session variable (a policy denies a real path, not a cwd).
+    #[test]
+    fn policy_denies_in_refuses_empty_foreign_and_session_scoped_files() {
+        let dir = temp_dir("policy-refusals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("01.x.json");
+
+        std::fs::write(
+            &file,
+            r#"{"schema_version":1,"deny":{"dirs":[],"files":[]}}"#,
+        )
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            policy_denies_in(&dir).expect_err("empty is refused")
+        );
+        assert!(err.contains("adds no deny entry"), "{err}");
+
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"schema_version":2,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                json_escaped(&dir.join("tree"))
+            ),
+        )
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            policy_denies_in(&dir).expect_err("schema 2 refused")
+        );
+        assert!(err.contains("not supported"), "{err}");
+
+        for bad in ["$CWD\\x", "$SID\\x"] {
+            std::fs::write(
+                &file,
+                format!(
+                    r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                    bad.replace('\\', "\\\\")
+                ),
+            )
+            .unwrap();
+            let err = format!("{:#}", policy_denies_in(&dir).expect_err(bad));
+            assert!(
+                err.contains("per-session"),
+                "each session variable is refused on its own ({bad}): {err}"
+            );
+        }
+
+        for bad in ["relative\\tree", "C:\\a\\..\\tree"] {
+            std::fs::write(
+                &file,
+                format!(
+                    r#"{{"schema_version":1,"deny":{{"dirs":["{}"],"files":[]}}}}"#,
+                    bad.replace('\\', "\\\\")
+                ),
+            )
+            .unwrap();
+            let err = format!("{:#}", policy_denies_in(&dir).expect_err(bad));
+            assert!(err.contains("absolute") || err.contains(".."), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Exposure REMOVES the covered entry from the deny set: the retained set is
+    /// the builtin one minus what the operator asked to reach (the inverted
+    /// retain keeps exactly the exposed path - the opposite of a grant).
+    #[test]
+    fn exposure_removes_the_named_credential_and_keeps_the_rest() {
+        let home = std::path::PathBuf::from(r"C:\Users\fixture");
+        let lad = home.join("AppData").join("Local");
+        let ad = home.join("AppData").join("Roaming");
+        let full = effective_denies_with(&[], Some(&home), Some(&lad), Some(&ad), None)
+            .expect("builtin set resolves");
+        let gh = home.join(".config").join("gh");
+        let kube = home.join(".kube").join("config");
+        assert!(
+            full.dirs.contains(&gh),
+            "precondition: gh is a denied DIR: {:?}",
+            full.dirs
+        );
+        assert!(
+            full.files.contains(&kube),
+            "precondition: kube is a denied FILE: {:?}",
+            full.files
+        );
+
+        let exposed = effective_denies_with(
+            &["gh".to_string(), "kube".to_string()],
+            Some(&home),
+            Some(&lad),
+            Some(&ad),
+            None,
+        )
+        .expect("both are exposable tool credentials");
+        assert!(
+            !exposed.dirs.contains(&gh),
+            "the exposed DIR is removed: {:?}",
+            exposed.dirs
+        );
+        assert!(
+            !exposed.files.contains(&kube),
+            "the exposed FILE is removed: {:?}",
+            exposed.files
+        );
+        assert!(
+            exposed.dirs.iter().any(|d| d.ends_with(".gnupg")),
+            "every other dir stays denied: {:?}",
+            exposed.dirs
+        );
+        assert_eq!(
+            exposed.dirs.len() + 1,
+            full.dirs.len(),
+            "exactly one dir moved out"
+        );
+        assert_eq!(
+            exposed.files.len() + 1,
+            full.files.len(),
+            "exactly one file moved out"
+        );
+    }
+
+    /// An EMPTY LOCALAPPDATA is not a value: the documented fallback to
+    /// `%USERPROFILE%\AppData\Local` applies (accepting "" would make
+    /// `$LOCALAPPDATA\x` the RELATIVE path `\x`, resolved against the session cwd).
+    #[test]
+    fn an_empty_local_appdata_expands_through_the_home_fallback() {
+        let cwd = std::path::Path::new("C:\\work");
+        let prev_lad = std::env::var_os("LOCALAPPDATA");
+        let prev_ad = std::env::var_os("APPDATA");
+        let prev_home = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", "");
+            std::env::set_var("APPDATA", "C:\\Users\\fixture\\AppData\\Roaming");
+            std::env::set_var("USERPROFILE", "C:\\Users\\fixture");
+        }
+        let got = expand_vars("$LOCALAPPDATA\\x", cwd);
+        unsafe {
+            match prev_lad {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+            match prev_ad {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+        let got = got.expect("the fallback resolves without the variable");
+        assert_eq!(
+            got, "C:\\Users\\fixture\\AppData\\Local\\x",
+            "Local falls back to the conventional path under the home dir, not to Roaming"
+        );
+    }
+
+    /// Installer-set roots arrive WITH a trailing separator; the expansion must
+    /// not turn `$JAVA_HOME\bin` into `...\\bin`. A bare drive root keeps its
+    /// separator - `C:` is not a directory.
+    #[test]
+    fn strip_trailing_sep_keeps_drive_roots_and_drops_a_lone_separator() {
+        assert_eq!(strip_trailing_sep("C:\\"), "C:\\");
+        assert_eq!(strip_trailing_sep("C:\\Java\\"), "C:\\Java");
+        assert_eq!(strip_trailing_sep("C:/Java/"), "C:/Java");
+        assert_eq!(strip_trailing_sep("C:\\Java"), "C:\\Java");
+        // Only a TWO-CHAR drive root keeps its separator: a longer string that
+        // merely ends with a colon is not a root and loses the separator.
+        assert_eq!(strip_trailing_sep("ab:\\"), "ab:");
+    }
+
+    /// A profile file's `meta.name` is the display name; an empty one means the
+    /// file has none, and the caller falls back to the file stem.
+    #[test]
+    fn name_from_profile_file_reads_the_documented_name_only() {
+        let dir = temp_dir("name-from-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("named.json");
+        std::fs::write(&named, r#"{"meta":{"name":"alpha","schema_version":1}}"#).unwrap();
+        assert_eq!(name_from_profile_file(&named), Some("alpha".to_string()));
+        let blank = dir.join("blank.json");
+        std::fs::write(&blank, r#"{"meta":{"name":"","schema_version":1}}"#).unwrap();
+        assert_eq!(name_from_profile_file(&blank), None);
+        let garbage = dir.join("garbage.json");
+        std::fs::write(&garbage, "not json").unwrap();
+        assert_eq!(name_from_profile_file(&garbage), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Inside ONE policy file, a narrower FILE entry is folded into the wider
+    /// one - and with no credential entry in the picture the LOADER is the only
+    /// step that can do it (`&&`-narrowing keeps only mutually covering paths,
+    /// so the loader adds the narrower entry and the set grows).
+    #[test]
+    fn the_loader_folds_a_narrow_file_entry_into_the_wider_one() {
+        let dir = temp_dir("policy-files-fold");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wide = dir.join("tree").join("f");
+        let narrow = wide.join("deeper");
+        std::fs::write(
+            dir.join("01-fold.json"),
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":[],"files":["{}","{}"]}}}}"#,
+                json_escaped(&wide),
+                json_escaped(&narrow)
+            ),
+        )
+        .unwrap();
+        let got = policy_denies_in(&dir).expect("the policy loads");
+        assert_eq!(
+            got.files,
+            vec![wide.clone()],
+            "only the wider entry survives the fold: {:?}",
+            got.files
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    /// A policy entry that names a FILE already denied (or already inside a
+    /// denied tree) is not added twice, and inside one policy the narrower
+    /// FILE entry is folded into the wider one - the loaders keep one copy each.
+    #[test]
+    fn policy_file_entries_are_deduped_against_credentials_and_each_other() {
+        let dir = temp_dir("policy-files-dedupe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = std::path::PathBuf::from(r"C:\Users\fixture");
+        let kube = home.join(".kube").join("config");
+        let wide = home.join(".kube").join("config").join("deeper");
+        std::fs::write(
+            dir.join("01-kube.json"),
+            format!(
+                r#"{{"schema_version":1,"deny":{{"dirs":[],"files":["{}","{}"]}}}}"#,
+                json_escaped(&kube),
+                json_escaped(&wide)
+            ),
+        )
+        .unwrap();
+        let eff = effective_denies_with(
+            &[],
+            Some(&home),
+            Some(&home.join("AppData").join("Local")),
+            Some(&home.join("AppData").join("Roaming")),
+            Some(&dir),
+        )
+        .expect("the policy loads");
+        let kube_hits = eff.files.iter().filter(|f| **f == kube).count();
+        assert_eq!(
+            kube_hits, 1,
+            "the credential copy and the policy copy are one: {:?}",
+            eff.files
+        );
+        assert!(
+            !eff.files.contains(&wide),
+            "the narrower policy entry is covered by the wider one: {:?}",
+            eff.files
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

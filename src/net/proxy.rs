@@ -1399,30 +1399,16 @@ where
 /// stores wall-clock times and sub-second precision adds nothing for an
 /// advisory reason's age. Pre-epoch inputs clamp to the epoch.
 pub(crate) fn rfc3339_utc(ts: std::time::SystemTime) -> String {
+    // The clock read is the only step this module owns: `duration_since` is
+    // what can fail, and a machine whose clock sits before the epoch clamps to
+    // it instead of panicking. The date-and-time rendering is the audit
+    // timestamp's own formatter, so one known-value table covers both - a
+    // second copy of the arithmetic is only a place for it to rot.
     let secs = ts
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // Civil date from days since 1970-01-01 (Howard Hinnant's
-    // days_from_civil inverse, same algorithm as the session-id date).
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let (y, m) = if m <= 2 { (y + 1, m) } else { (y, m) };
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
+    crate::audit::iso8601_from_unix(secs)
 }
 
 /// The audit-side view of a coordinator outcome: disposition, D-5
@@ -1749,33 +1735,7 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
         let allow = matches!(outcome, PromptOutcome::Decided(PromptResult::Allow { .. }));
         persisted = record_learned(ctx, host, scope, suffix.as_deref(), allow);
     }
-    let reason = match &outcome {
-        PromptOutcome::Decided(PromptResult::Deny { .. }) => Some("denied by user".into()),
-        PromptOutcome::Decided(PromptResult::NeedsIntent) => {
-            Some("user requested a fuller intent (explain more)".into())
-        }
-        // P2.1 review: the two pools are different facts, so the denial names
-        // which one ran out instead of reporting a concurrency limit for a
-        // session whose dialogs are merely unanswered.
-        PromptOutcome::Overloaded { cause } => Some(overload_reason(*cause).into()),
-        // P2.1: a spent budget and a backend that could not show a dialog are
-        // distinct reasons a reader can act on — the first says this session's
-        // prompt term was consumed (the supervisor budgets the container around
-        // it), the second says the machine has no dialog at all.
-        PromptOutcome::Unavailable {
-            allowed: false,
-            cause,
-        } => Some(match cause {
-            UnavailableCause::BudgetElapsed => PROMPT_TIMEOUT_REASON.into(),
-            // Item 8: the two arming causes keep their own strings. A suppressed
-            // budget is not a missing backend — the dialog was shown and nobody
-            // answered it — and an operator greps exactly this.
-            UnavailableCause::SuppressedAfterBudget => PROMPT_SUPPRESSED_REASON.into(),
-            UnavailableCause::NoDialogBackend => NO_DIALOG_BACKEND_REASON.into(),
-            UnavailableCause::CallerGone => "prompt unavailable (caller gone)".into(),
-        }),
-        _ => None,
-    };
+    let reason = outcome_reason(&outcome);
     Decision {
         allowed: audit.allowed,
         source: audit.source,
@@ -1783,6 +1743,28 @@ async fn prompt_default(ctx: &ConnCtx, host: &str, port: u16) -> Decision {
         persisted,
         reason,
         intent_hint: matches!(outcome, PromptOutcome::Decided(PromptResult::NeedsIntent)),
+    }
+}
+
+/// The refusal `reason` an outcome carries, kept pure so the mapping is
+/// unit-testable: it lived inline in the 130-line `prompt_default`, behind the
+/// coordinator call and the learned-store write, where no test could reach it.
+/// `None` means "no reason to report" (an allowed request, or an outcome that
+/// carries its own audit fields instead).
+fn outcome_reason(outcome: &PromptOutcome) -> Option<String> {
+    match outcome {
+        PromptOutcome::Decided(PromptResult::Deny { .. }) => Some("denied by user".into()),
+        PromptOutcome::Decided(PromptResult::NeedsIntent) => {
+            Some("user requested a fuller intent (explain more)".into())
+        }
+        PromptOutcome::Overloaded { cause } => Some(overload_reason(*cause).into()),
+        PromptOutcome::Unavailable { allowed: false, cause } => Some(match cause {
+            UnavailableCause::BudgetElapsed => PROMPT_TIMEOUT_REASON.into(),
+            UnavailableCause::SuppressedAfterBudget => PROMPT_SUPPRESSED_REASON.into(),
+            UnavailableCause::NoDialogBackend => NO_DIALOG_BACKEND_REASON.into(),
+            UnavailableCause::CallerGone => "prompt unavailable (caller gone)".into(),
+        }),
+        _ => None,
     }
 }
 

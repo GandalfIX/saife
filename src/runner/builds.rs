@@ -1310,4 +1310,192 @@ mod tests {
             "the artifact must land in build/libs"
         );
     }
+    /// The log ring's two budgets and the absolute-numbering contract: eviction
+    /// drops from the FRONT so `total - len` stays the first retained index
+    /// through any burst, and one monster line survives (never below one).
+    #[test]
+    fn the_log_window_evicts_from_the_front_and_keeps_one_line() {
+        let mut log = BoundedLog::new();
+        for i in 0..(LOG_LINE_CAP as u32 + 5) {
+            log.push(format!("line-{i}"));
+        }
+        let total = log.total;
+        let w = log.window(0);
+        assert!(w.gap, "an evicted follower learns its gap");
+        assert_eq!(
+            w.first,
+            total - log.lines.len(),
+            "the absolute numbering stays stable"
+        );
+        assert_eq!(
+            log.lines.len(),
+            LOG_LINE_CAP,
+            "the window is capped at the line budget"
+        );
+        assert_eq!(
+            w.lines.first().cloned(),
+            Some(format!("line-{}", w.first)),
+            "the window content matches its anchor"
+        );
+
+        // One monster line survives even beyond the byte budget.
+        let mut log = BoundedLog::new();
+        let monster = "x".repeat(LOG_BYTE_BUDGET * 2);
+        log.push(monster.clone());
+        assert_eq!(log.lines.len(), 1, "never evict below one line");
+        assert_eq!(log.bytes, monster.len());
+
+        // A window inside the retained range is exactly anchored: no gap, the
+        // lines from the absolute index onwards.
+        let mut log = BoundedLog::new();
+        for i in 0..10 {
+            log.push(format!("l{i}"));
+        }
+        let w = log.window(3);
+        assert!(!w.gap, "an in-range follower sees no gap");
+        assert_eq!(w.first, 3, "the first returned line IS the requested index");
+        assert_eq!(
+            w.lines,
+            vec![
+                "l3".to_string(),
+                "l4".into(),
+                "l5".into(),
+                "l6".into(),
+                "l7".into(),
+                "l8".into(),
+                "l9".into()
+            ]
+        );
+    }
+
+    /// The splitter caps a built-up line on a CHAR boundary and marks the cut,
+    /// never splitting a code point; finish() releases the tail once.
+    #[test]
+    fn the_splitter_caps_a_built_up_line_without_splitting_a_character() {
+        let mut splitter = LineSplitter::new();
+        let mut lines: Vec<String> = Vec::new();
+        {
+            let mut sink = |l: String| lines.push(l);
+            // A partial just over the cap: per-char 2 bytes, so the cut lands
+            // on the cap and must not split the char there.
+            let n = LOG_PARTIAL_CAP / 2 + 4;
+            splitter.feed("Ä".repeat(n).as_bytes(), &mut sink);
+        }
+        assert!(
+            lines.is_empty(),
+            "no newline: the capped partial stays buffered"
+        );
+        assert_eq!(
+            splitter.partial.len(),
+            LOG_PARTIAL_CAP,
+            "the partial is bounded in bytes"
+        );
+        assert!(splitter.partial.is_char_boundary(splitter.partial.len()));
+
+        {
+            let mut sink = |l: String| lines.push(l);
+            splitter.feed(b"\n", &mut sink);
+        }
+        assert_eq!(
+            lines.len(),
+            2,
+            "the cut is marked, then the (shortened) line"
+        );
+        assert_eq!(
+            lines[0], LOG_TRUNCATED_MARKER,
+            "the marker announces the cut"
+        );
+        assert!(
+            lines[1].chars().all(|c| c == 'Ä'),
+            "no torn character: {lines:?}"
+        );
+
+        // finish() on an empty splitter emits nothing.
+        let mut s = LineSplitter::new();
+        let mut out: Vec<String> = Vec::new();
+        s.finish(&mut |l| out.push(l));
+        assert!(out.is_empty());
+    }
+
+    /// The non-regular member kinds get their own names when the extraction
+    /// refuses them: the log names the kind, not a generic blob.
+    #[test]
+    fn nonregular_tar_members_name_their_kind() {
+        assert_eq!(kind_name(tar::EntryType::Symlink), "symlink");
+        assert_eq!(kind_name(tar::EntryType::Link), "hardlink");
+        assert_eq!(kind_name(tar::EntryType::Char), "character-device");
+        assert_eq!(kind_name(tar::EntryType::Block), "block-device");
+        assert_eq!(kind_name(tar::EntryType::Fifo), "fifo");
+        assert_eq!(kind_name(tar::EntryType::Regular), "non-regular");
+    }
+
+    /// The char-boundary cut with the cap INSIDE a multi-byte character: the
+    /// cut walks back to the last boundary and drops the torn character whole -
+    /// never leaving half a code point in the string.
+    #[test]
+    fn truncate_on_char_boundary_walks_back_out_of_a_character() {
+        let mut s = String::from("aÄb"); // bytes: a(1) Ä(2) b(1)
+        truncate_on_char_boundary(&mut s, 2); // 2 is INSIDE the Ä: walks back to 1
+        assert_eq!(
+            s, "a",
+            "the cut back off the two-byte char leaves the ASCII head"
+        );
+        let mut s = String::from("aÄb");
+        truncate_on_char_boundary(&mut s, 3); // at the boundary after the Ä
+        assert_eq!(s, "aÄ");
+        let mut s = String::from("abc");
+        truncate_on_char_boundary(&mut s, 3); // len == cap: untouched
+        assert_eq!(s, "abc");
+    }
+
+    /// A partial line at EXACTLY the cap is not "over" it: the marker must not
+    /// fire for a line that fits (the `>`-to-`>=` widening marks a fit line).
+    #[test]
+    fn a_line_at_exactly_the_cap_is_not_marked() {
+        let mut splitter = LineSplitter::new();
+        let mut lines: Vec<String> = Vec::new();
+        // A fitting LINE: the newline is part of the line, so one byte under
+        // the cap of content still fits.
+        splitter.feed(&vec![b'x'; LOG_PARTIAL_CAP - 1], &mut |l| lines.push(l));
+        splitter.feed(b"\n", &mut |l| lines.push(l));
+        assert_eq!(lines.len(), 1, "a fitting line emits no marker: {lines:?}");
+        assert_eq!(lines[0].len(), LOG_PARTIAL_CAP);
+        assert!(
+            !lines[0].contains(LOG_TRUNCATED_MARKER),
+            "a fitting line carries no marker: {:?}",
+            lines[0]
+        );
+    }
+
+    /// The ring's byte accounting after an eviction is exact: pushing a monster
+    /// then a small line evicts the monster and leaves the small one's bytes.
+    #[test]
+    fn the_ring_byte_budget_stays_exact_after_eviction() {
+        let mut log = BoundedLog::new();
+        log.push("m".repeat(LOG_BYTE_BUDGET));
+        log.push("ok".to_string());
+        // bytes = budget + 2 > budget: the monster is evicted, its bytes subtracted.
+        assert_eq!(log.lines.len(), 1, "the eviction drops the monster");
+        assert_eq!(log.lines[0], "ok");
+        assert_eq!(
+            log.bytes, 2,
+            "the accounting subtracts the dropped line exactly"
+        );
+    }
+
+    /// Bytes at EXACTLY the budget are not over it: a ring holding two lines
+    /// that add up to the budget keeps both (`>=` evicts the head).
+    #[test]
+    fn a_ring_at_exactly_the_byte_budget_keeps_both_lines() {
+        let mut log = BoundedLog::new();
+        let first = "a".repeat(LOG_BYTE_BUDGET - 2);
+        log.push(first);
+        log.push("bc".to_string());
+        assert_eq!(log.bytes, LOG_BYTE_BUDGET, "the fixture sits on the bound");
+        assert_eq!(
+            log.lines.len(),
+            2,
+            "a full ring at the bound evicts nothing"
+        );
+    }
 }

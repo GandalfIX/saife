@@ -52,6 +52,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+mod proc;
 /// The sidecar supervisor: spawn, health gate, teardown.
 pub mod sidecar;
 
@@ -853,4 +854,71 @@ mod tests {
         assert_eq!(facade_mount(".sandbox.invalid"), None, "no label");
         assert_eq!(facade_mount("api.example.com"), None);
     }
+    /// The plugin name grammar: one directory label - lowercase, digits, `-`,
+    /// `_`, at most 64 characters. Every refusal keeps a path traversal or a
+    /// case mismatch out of a directory join.
+    #[test]
+    fn validate_plugin_name_is_one_lowercase_label() {
+        for ok in ["saife-stats", "a1_b", "x", &"a".repeat(64)] {
+            validate_plugin_name(ok).unwrap_or_else(|e| panic!("`{ok}` must pass: {e}"));
+        }
+        for bad in ["", "UPPER", "dot.ted", "sp ace", "sl/ash", "back\\slash", "..", "\u{e4}"] {
+            assert!(validate_plugin_name(bad).is_err(), "`{bad}` must be refused");
+        }
+        let long = "a".repeat(65);
+        assert!(validate_plugin_name(&long).is_err(), "65 characters is one too many");
+    }
+
+    /// A manifest is validated on load, and each refusal is named: the name must
+    /// match its directory, the program must be spelled, the health path
+    /// absolute, and both health terms non-zero. The `||`-widen mutants let a
+    /// half-broken manifest through.
+    #[test]
+    fn a_manifest_is_validated_field_by_field() {
+        // Per-process name: two test binaries (a parallel worktree, a
+        // `cargo-mutants` copy of the tree) share %TEMP%, and a fixed name
+        // lets one run delete the other's fixture mid-test.
+        let dir = std::env::temp_dir().join(format!("saife-plugin-manifest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write = |file: &std::path::Path, body: &str| std::fs::write(file, body).unwrap();
+        let valid = |name: &str, extra: &str| {
+            format!(
+                r#"{{"schema_version":1,"name":"{name}","mount":"m","command":["prog"{extra}],
+                    "health":{{"path":"/healthz","timeout_ms":1000,"interval_ms":100}}}}"#
+            )
+        };
+
+        let ok = dir.join("ok.json");
+        write(&ok, &valid("ok", ""));
+        let m = read_manifest(&ok, "ok").expect("a complete manifest loads");
+        assert_eq!(m.name, "ok");
+        assert_eq!(m.command, vec!["prog".to_string()]);
+
+        // The name must equal the requested one (the directory it lives in).
+        let wrong_name = dir.join("wrong.json");
+        write(&wrong_name, &valid("other", ""));
+        assert!(read_manifest(&wrong_name, "ok").is_err(), "a name mismatch is refused");
+
+        // A blank program in a non-empty command list is refused: the `||`
+        // widening would accept it.
+        let blank = dir.join("blank.json");
+        write(&blank, &valid("blank", "").replace(r#"["prog"]"#, r#"["  "]"#));
+        assert!(read_manifest(&blank, "blank").is_err(), "a blank program is refused");
+
+        // A relative health path is refused.
+        let rel = dir.join("rel.json");
+        write(&rel, &valid("rel", "").replace("/healthz", "healthz"));
+        assert!(read_manifest(&rel, "rel").is_err(), "a relative health path is refused");
+
+        // Either zero health term is refused (the `||` widening would accept
+        // one zero when the other is set).
+        let zero = dir.join("zero.json");
+        write(&zero, &valid("zero", "").replace("\"interval_ms\":100", "\"interval_ms\":0"));
+        assert!(read_manifest(&zero, "zero").is_err(), "a zero interval is refused");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

@@ -250,6 +250,21 @@ impl Engine {
     }
 }
 
+/// The request head for one engine call: a `GET` carries NO body headers (the
+/// engine rejects a framed empty body on some versions), a call with a body
+/// carries `Content-Type` and the exact `Content-Length`.
+fn request_head(method: &str, path: &str, body: &[u8], content_type: &str) -> String {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if !body.is_empty() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    head
+}
+
 /// One request on its own connection, extracted so it can run under a timeout.
 fn one_request(
     endpoint: &Endpoint,
@@ -261,14 +276,7 @@ fn one_request(
     let mut file = endpoint.open()?;
     // One request per connection: `Connection: close` makes the response
     // end-delimited, which is what the engine supports on a pipe.
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nAccept: application/json\r\n"
-    );
-    if !body.is_empty() {
-        head.push_str(&format!("Content-Type: {content_type}\r\n"));
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    head.push_str("\r\n");
+    let head = request_head(method, path, body, content_type);
     file.write_all(head.as_bytes())
         .context("runner: write the request head to the engine")?;
     if !body.is_empty() {
@@ -1596,5 +1604,120 @@ mod tests {
                 name: "saife-runner-s1".to_string()
             }
         );
+    }
+    /// The engine request/response plumbing has no engine: the response parser,
+    /// the header lookup, the JSON body decode, the URL-encoding of a filter
+    /// and the digest-pin gate are all testable in-process.
+    #[test]
+    fn the_engine_http_plumbing_is_engine_free() {
+        // urlencode: unreserved characters pass; everything else is %-escaped
+        // UPPER-CASE hex, two digits always (%02X - e.g. SP is "%20", not "% ".
+        assert_eq!(urlencode("npipe"), "npipe");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("~._-"), "~._-");
+        assert_eq!(urlencode("\u{e4}"), "%C3%A4");
+
+        // A digest-pinned image passes; a tag refuses (a tag can move).
+        require_digest("repo@sha256:abc").unwrap();
+        let err = require_digest("repo:latest").expect_err("a tag must be refused");
+        assert!(format!("{err:#}").contains("digest-pinned"), "{err:#}");
+
+        // header(): the parser lowercases names, so lookups are lowercase and
+        // the first matching one wins.
+        let response =
+            parse_response(b"HTTP/1.1 204 No Content\r\nX-Runner: one\r\nX-Runner: two\r\n\r\n")
+                .unwrap();
+        assert_eq!(response.header("x-runner"), Some("one"));
+        assert_eq!(
+            response.header("X-Runner"),
+            None,
+            "names are folded at parse"
+        );
+        assert_eq!(response.header("missing"), None);
+
+        // json(): the body decodes; a non-JSON body names the status.
+        let j = parse_response(b"HTTP/1.1 200 OK\r\n\r\n{\"a\":1}").unwrap();
+        assert_eq!(j.json().unwrap()["a"], 1);
+        let bad = parse_response(b"HTTP/1.1 500 Err\r\n\r\nnot json").unwrap();
+        assert!(format!("{:#}", bad.json().unwrap_err()).contains("non-JSON (500)"));
+    }
+
+    /// The chunked decoder: chunks reassembled, extensions ignored, and the
+    /// three truncation shapes refused (a short body is an error, not a
+    /// shorter result - the `>` comparison decides that).
+    #[test]
+    fn dechunk_reassembles_chunks_and_refuses_every_truncation() {
+        assert_eq!(
+            dechunk(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap(),
+            b"Wikipedia".to_vec()
+        );
+        assert_eq!(
+            dechunk(b"4;ext=1\r\nWiki\r\n0\r\n\r\n").unwrap(),
+            b"Wiki".to_vec(),
+            "a chunk extension is not part of the size"
+        );
+        assert!(
+            dechunk(b"9\r\nWiki\r\n0\r\n\r\n").is_err(),
+            "a body shorter than the declared size is refused"
+        );
+        assert!(dechunk(b"4").is_err(), "a header without CRLF is refused");
+        assert!(
+            dechunk(b"zz\r\nxx\r\n").is_err(),
+            "a non-hex size is refused"
+        );
+        // A body of EXACTLY the declared size is complete: the refusal is for a
+        // SHORT body, so what follows is a complaint about the NEXT header.
+        let err = format!("{:#}", dechunk(b"4\r\nWiki").unwrap_err());
+        assert!(
+            err.contains("header"),
+            "an exactly-sized body is not truncated: {err}"
+        );
+    }
+
+    /// A limit override of 0 (or blank / unparsable) is NOT a limit: falling
+    /// through to `Some(0)` would give every slot an empty memory budget.
+    #[test]
+    fn a_zero_or_blank_limit_override_is_not_a_limit() {
+        let name = "SAIFE_TEST_LIMIT_OVERRIDE";
+        unsafe { std::env::set_var(name, "0") };
+        assert_eq!(limit_override(name), None, "zero is refused");
+        unsafe { std::env::set_var(name, " 16 ") };
+        assert_eq!(limit_override(name), Some(16), "whitespace is trimmed");
+        unsafe { std::env::set_var(name, "") };
+        assert_eq!(limit_override(name), None, "blank is refused");
+        unsafe { std::env::set_var(name, "abc") };
+        assert_eq!(limit_override(name), None, "garbage is refused");
+        unsafe { std::env::remove_var(name) };
+        assert_eq!(limit_override(name), None, "unset is None");
+    }
+
+    /// A GET must not name a body: some engine versions reject a framed empty
+    /// body, and a Content-Length: 0 changes nothing about what is sent.
+    #[test]
+    fn request_head_frames_a_body_only_when_there_is_one() {
+        let get = request_head("GET", "/info", b"", "application/json");
+        assert!(get.ends_with("\r\n\r\n"), "the head ends at the blank line");
+        assert!(
+            !get.contains("Content-Length"),
+            "a GET frames no body: {get}"
+        );
+        assert!(
+            !get.contains("Content-Type"),
+            "a GET names no body type: {get}"
+        );
+        assert!(get.starts_with("GET /info HTTP/1.1\r\n"));
+        assert!(get.contains("Connection: close\r\n"));
+
+        let body = b"{\"Image\":\"x\"}";
+        let post = request_head("POST", "/containers/create", body, "application/json");
+        assert!(
+            post.contains("Content-Type: application/json\r\n"),
+            "{post}"
+        );
+        assert!(
+            post.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "the length is the real body length: {post}"
+        );
+        assert!(post.ends_with("\r\n\r\n"), "one blank line, then the body");
     }
 }

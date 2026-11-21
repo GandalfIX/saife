@@ -592,6 +592,13 @@ fn scan_existing(path: &std::path::Path) -> Result<(Option<String>, u64)> {
 fn iso8601_utc() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    iso8601_from_unix(secs)
+}
+
+/// [`iso8601_utc`] with the clock taken out: the arithmetic is the part that can
+/// be wrong, and `now()` cannot be pinned in a test. A mutant in here corrupts
+/// every audit timestamp silently, so the split is what makes it testable.
+pub(crate) fn iso8601_from_unix(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let h = rem / 3600;
@@ -601,7 +608,7 @@ fn iso8601_utc() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-fn civil_from_days(z_off: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z_off: i64) -> (i64, u32, u32) {
     let z = z_off + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -651,6 +658,149 @@ mod tests {
     fn civil_from_days_known() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(1), (1970, 1, 2));
+        // Boundaries the two-term version of the algorithm gets wrong: the
+        // pre-epoch branch, an era edge, a non-leap century and the month
+        // rollovers. Each of these is a distinct arithmetic site in the body.
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+        assert_eq!(civil_from_days(-719_467), (0, 3, 2));
+        assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+        // BEFORE the era seed (ISO year 0): the negative branch of the era
+        // computation. ISO year 0 is a leap year, so the day before 0000-03-01
+        // is its 29 February - the arithmetic the `z - 146_096` mutants break.
+        assert_eq!(civil_from_days(-719_469), (0, 2, 29));
+        assert_eq!(civil_from_days(-719_470), (0, 2, 28));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+    }
+
+    #[test]
+    fn iso8601_from_unix_known_values() {
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_from_unix(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(iso8601_from_unix(86_400), "1970-01-02T00:00:00Z");
+        // 2024-01-01T02:03:04Z
+        assert_eq!(iso8601_from_unix(1_704_074_584), "2024-01-01T02:03:04Z");
+        // leap days, including the century one: 2024-02-29 and 2000-02-29
+        assert_eq!(iso8601_from_unix(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(iso8601_from_unix(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// H5b deletes a stale `<sid>.root`/`<sid>.sig` pair when a chain is
+    /// CONTINUED (`seq > 0`). At `seq == 0` the log is a new chain, and the pair
+    /// belongs to whoever wrote it - deleting it there would drop a root the run
+    /// did not invalidate.
+    #[test]
+    fn a_new_chain_keeps_a_stale_root_pair() {
+        let sid = format!(
+            "test-root-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+        // An existing but EMPTY log scans as (None, 0) - a new chain.
+        std::fs::write(&path, "").expect("write the empty log");
+        let root = path.with_extension("root");
+        std::fs::write(&root, "stale-root").expect("write the stale root");
+        let _writer = AuditWriter::open_at(path.clone(), true).expect("open a new chain");
+        assert!(
+            root.exists(),
+            "a new chain (seq == 0) must not delete the root pair; only a continuation does"
+        );
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_session_id_accepts_the_boundary_length_and_rejects_one_more() {
+        let longest = "a".repeat(64);
+        assert!(
+            validate_session_id(&longest).is_ok(),
+            "64 characters is the documented maximum, so it must be accepted"
+        );
+        let too_long = "a".repeat(65);
+        assert!(
+            validate_session_id(&too_long).is_err(),
+            "65 characters must be refused, or the id can overrun its file name"
+        );
+    }
+
+    /// `created == 0` means the holder could not read its own creation time; the
+    /// liveness check then falls back to a bare `OpenProcess` probe. Inverting
+    /// that comparison sends the record into the creation-time-exact check
+    /// instead, which can never match for 0 - so a LIVE holder reads as dead and
+    /// its chain is reaped out from under it.
+    #[test]
+    fn a_lock_record_without_a_creation_time_still_probes_the_process() {
+        let holder = LockRecord {
+            pid: std::process::id(),
+            created: 0,
+        };
+        assert!(
+            holder_is_alive(&holder),
+            "the current process is alive; a created == 0 record must still probe it"
+        );
+    }
+
+    /// `AuditWriter::open_at` removes a stale `<sid>.root`/`<sid>.sig` pair only
+    /// when the removal FAILS with something other than NotFound. Inverting that
+    /// comparison makes a MISSING pair a removal failure - continuations refuse
+    /// to open for no reason.
+    #[test]
+    fn a_continuation_without_a_root_pair_opens_cleanly() {
+        let sid = format!(
+            "test-cont-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+        // One leaf with seq 1: scan_existing reports (Some(hash), next 2) - a
+        // continuation, but no root/sig files exist to remove.
+        std::fs::write(&path, "{\"op\":\"CONNECT\",\"seq\":1,\"hash\":\"a\"}\n")
+            .expect("write the continued log");
+        let opened = AuditWriter::open_at(path.clone(), true);
+        let _ = std::fs::remove_file(&path);
+        assert!(opened.is_ok(), "a continuation without a root pair opens");
+    }
+
+    /// A stale pair that is a DIRECTORY fails removal with a NON-NotFound error.
+    /// Strict mode surfaces it instead of treating the pair as vanished - a
+    /// mutant that labels every error NotFound would open a writer over a state
+    /// it could not actually clear.
+    #[test]
+    fn a_stale_pair_that_cannot_be_removed_refuses_a_strict_continuation() {
+        let sid = format!(
+            "test-cont-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = audit_log_path(&sid);
+        std::fs::write(&path, "{\"op\":\"CONNECT\",\"seq\":1,\"hash\":\"a\"}\n")
+            .expect("write the continued log");
+        let root = path.with_extension("root");
+        std::fs::create_dir(&root).expect("plant the root pair as a directory");
+        let result = AuditWriter::open_at(path.clone(), true);
+        let _ = std::fs::remove_dir(&root);
+        let _ = std::fs::remove_file(&path);
+        let err = match result {
+            Ok(_) => panic!("strict mode must surface the removal failure"),
+            Err(e) => e,
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("remove stale audit"),
+            "the error names the removal: {err:#}"
+        );
     }
 
     #[test]
