@@ -14,7 +14,7 @@
 | residue round 2 (tests + register 73) | profile/server/docker/bins classes closed by tests, equivalences or argued classes |
 | **closing whole-crate iterate** | **3 mutants tested, 3 missed** - all `delete field ... from struct` (see below), 0 timeouts |
 
-Register: 63 patterns, each with a written class argument. Every residual
+Register: 80 patterns, each with a written class argument. Every residual
 class is one of: named debt, tool-limitation (argued), host/process-bound
 (ARGUED), or still-open (none known after round 2's proof run).
 
@@ -56,6 +56,36 @@ exists at all.
 
 Everything else in the crate is now killed or carries a written argument:
 0 missed, 0 timeouts outside these three.
+
+### Correction: the closing gate ran against a register that hid the crate
+
+The gate above is evidence only for the class cargo-mutants cannot exclude. The
+register it ran with held one entry whose unescaped `||` was a regex
+alternation with an empty branch: `^src/net/proxy.rs:3963:33: replace && with ||
+in handle_non_connect$` matched EVERY mutant name, so `exclude_re` silenced the
+whole crate and only the `delete field ...` mutants (which the tool never
+applies `exclude_re` to) reached the runner. `cargo mutants --list` said 29;
+without that entry it says 2227.
+
+Fixed in the same branch:
+
+- the entry is escaped (`\|\|`) and names the function, not the line;
+- every line:column anchor is gone. Six of them already matched nothing - the
+  mutants they were written for had moved - so the register had stopped
+  excluding what it claimed;
+- the three bare-word entries (`appcontainer`, `<impl Drop for `, and the
+  `touch|sync_out|sweep|release|read_markers` group) are file- or
+  function-scoped. They matched 181, 15 and 39 mutants across files the reason
+  never argued about.
+
+Effect on the numbers above: the register now excludes 671 of 2901 mutants and
+leaves 2253 to test. Forty of those 2253 were hidden by the three bare words
+(`cli::appcontainer_retry_command` 9, the intent registry's sweeper 14, eight
+`Drop` impls the register never argued, `MxcError::suggests_appcontainer` 2,
+`TierFacts::appcontainer_dacl` 2, `release_live_token`, and two `ChainLock`
+guards). The next
+whole-crate sweep must re-baseline them; until it runs, this document must not
+be read as "0 missed" for the crate.
 
 ## Correction: the first evidence was stale
 
