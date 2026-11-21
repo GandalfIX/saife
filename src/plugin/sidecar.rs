@@ -906,7 +906,9 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
     /// `.cmd` lookalike (`||` -> `&&` widening picks the lookalike).
     #[test]
     fn resolve_program_prefers_the_exact_name_over_a_lookalike() {
-        let dir = std::env::temp_dir().join("saife-resolve-program-test");
+        // Per-process name: %TEMP% is shared with every other test binary.
+        let dir =
+            std::env::temp_dir().join(format!("saife-resolve-program-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("p.exe"), b"bin").unwrap();
@@ -919,7 +921,11 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         unsafe { std::env::set_var("PATH", &dir) };
 
         let resolved = resolve_program("p.exe").expect("p.exe resolves");
-        assert_eq!(resolved, dir.join("p.exe"), "the exact name wins, not the .cmd lookalike");
+        assert_eq!(
+            resolved,
+            dir.join("p.exe"),
+            "the exact name wins, not the .cmd lookalike"
+        );
         let by_name = resolve_program("q").expect("q resolves through the extension list");
         assert_eq!(by_name, dir.join("q.exe"));
 
@@ -929,7 +935,6 @@ HTTPServer(("127.0.0.1", int(os.environ["SIDECAR_PORT"])), H).serve_forever()
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
 
     /// A bare `tool.exe` (an extension, no separator) is looked up as itself:
     /// the extension alone selects the exact-name attempt (`&&` with the

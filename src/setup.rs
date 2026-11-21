@@ -670,7 +670,8 @@ mod tests {
     /// deleted field makes SetEntriesInAclW refuse, so the round trip fails.
     #[test]
     fn a_read_attributes_grant_round_trips_on_an_owned_directory() {
-        let dir = std::env::temp_dir().join("saife-acl-roundtrip-test");
+        // Per-process name: %TEMP% is shared with every other test binary.
+        let dir = std::env::temp_dir().join(format!("saife-acl-roundtrip-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the scratch directory");
         let root = dir.display().to_string();

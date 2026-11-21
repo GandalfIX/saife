@@ -729,28 +729,48 @@ mod tests {
     #[test]
     fn unpack_drops_members_that_escape_the_destination() {
         let mut builder = tar::Builder::new(Vec::new());
-        builder.append_data(&mut {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(3);
-            h.set_mode(0o644);
-            h.set_cksum();
-            h
-        }, "ok1.txt", &b"one"[..]).unwrap();
-        builder.append_data(&mut {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(3);
-            h.set_mode(0o644);
-            h.set_cksum();
-            h
-        }, "ok2.txt", &b"two"[..]).unwrap();
-        builder.append(&raw_named("../escape.txt", b"nope"), &b"nope"[..]).unwrap();
-        builder.append(&raw_named("sub/../../escape2.txt", b"nope"), &b"nope"[..]).unwrap();
-        builder.append(&raw_named("/abs-escape.txt", b"nope"), &b"nope"[..]).unwrap();
+        builder
+            .append_data(
+                &mut {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(3);
+                    h.set_mode(0o644);
+                    h.set_cksum();
+                    h
+                },
+                "ok1.txt",
+                &b"one"[..],
+            )
+            .unwrap();
+        builder
+            .append_data(
+                &mut {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(3);
+                    h.set_mode(0o644);
+                    h.set_cksum();
+                    h
+                },
+                "ok2.txt",
+                &b"two"[..],
+            )
+            .unwrap();
+        builder
+            .append(&raw_named("../escape.txt", b"nope"), &b"nope"[..])
+            .unwrap();
+        builder
+            .append(&raw_named("sub/../../escape2.txt", b"nope"), &b"nope"[..])
+            .unwrap();
+        builder
+            .append(&raw_named("/abs-escape.txt", b"nope"), &b"nope"[..])
+            .unwrap();
         let tar = builder.into_inner().unwrap();
 
         // The sweep's mutant run may have written the escape probes before this
         // test existed; clear them so the checks test THIS run.
-        let dest = std::env::temp_dir().join("saife-sync-slips-test");
+        // Per-process name: %TEMP% is shared with every other test binary.
+        let dest =
+            std::env::temp_dir().join(format!("saife-sync-slips-test-{}", std::process::id()));
         let _ = std::fs::remove_file("C:\\abs-escape.txt");
         for leftover in ["escape.txt", "escape2.txt"] {
             if let Some(parent) = dest.parent() {
@@ -773,7 +793,6 @@ mod tests {
         assert!(!std::path::Path::new("/abs-escape.txt").exists());
         std::fs::remove_dir_all(&dest).unwrap();
     }
-
 
     /// `unpack_into_at` with strip_top rewrites the engine's parent-relative
     /// path (`out/art.txt`) to the file under `dest`; without the flag the first
@@ -803,5 +822,4 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(std::fs::read(dest.join("out/art.txt")).unwrap(), b"art");
     }
-
 }

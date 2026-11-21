@@ -875,7 +875,10 @@ mod tests {
     /// half-broken manifest through.
     #[test]
     fn a_manifest_is_validated_field_by_field() {
-        let dir = std::env::temp_dir().join("saife-plugin-manifest-test");
+        // Per-process name: two test binaries (a parallel worktree, a
+        // `cargo-mutants` copy of the tree) share %TEMP%, and a fixed name
+        // lets one run delete the other's fixture mid-test.
+        let dir = std::env::temp_dir().join(format!("saife-plugin-manifest-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
