@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, bail};
 use crate::paths::path_key;
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -3913,7 +3913,6 @@ mod tests {
         assert_eq!(CredentialClass::ToolCredential.as_str(), "tool-credential");
     }
 
-
     /// One policy file per deny kind, loaded in file order, de-duplicated by
     /// COVERING: the second file's narrower path is already inside the first's
     /// tree, so it is not added twice - and a non-JSON neighbour is not policy.
@@ -3972,7 +3971,10 @@ mod tests {
             r#"{"schema_version":1,"deny":{"dirs":[],"files":[]}}"#,
         )
         .unwrap();
-        let err = format!("{:#}", policy_denies_in(&dir).expect_err("empty is refused"));
+        let err = format!(
+            "{:#}",
+            policy_denies_in(&dir).expect_err("empty is refused")
+        );
         assert!(err.contains("adds no deny entry"), "{err}");
 
         std::fs::write(
@@ -3983,7 +3985,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let err = format!("{:#}", policy_denies_in(&dir).expect_err("schema 2 refused"));
+        let err = format!(
+            "{:#}",
+            policy_denies_in(&dir).expect_err("schema 2 refused")
+        );
         assert!(err.contains("not supported"), "{err}");
 
         for bad in ["$CWD\\x", "$SID\\x"] {
@@ -4029,8 +4034,16 @@ mod tests {
             .expect("builtin set resolves");
         let gh = home.join(".config").join("gh");
         let kube = home.join(".kube").join("config");
-        assert!(full.dirs.contains(&gh), "precondition: gh is a denied DIR: {:?}", full.dirs);
-        assert!(full.files.contains(&kube), "precondition: kube is a denied FILE: {:?}", full.files);
+        assert!(
+            full.dirs.contains(&gh),
+            "precondition: gh is a denied DIR: {:?}",
+            full.dirs
+        );
+        assert!(
+            full.files.contains(&kube),
+            "precondition: kube is a denied FILE: {:?}",
+            full.files
+        );
 
         let exposed = effective_denies_with(
             &["gh".to_string(), "kube".to_string()],
@@ -4040,15 +4053,31 @@ mod tests {
             None,
         )
         .expect("both are exposable tool credentials");
-        assert!(!exposed.dirs.contains(&gh), "the exposed DIR is removed: {:?}", exposed.dirs);
-        assert!(!exposed.files.contains(&kube), "the exposed FILE is removed: {:?}", exposed.files);
+        assert!(
+            !exposed.dirs.contains(&gh),
+            "the exposed DIR is removed: {:?}",
+            exposed.dirs
+        );
+        assert!(
+            !exposed.files.contains(&kube),
+            "the exposed FILE is removed: {:?}",
+            exposed.files
+        );
         assert!(
             exposed.dirs.iter().any(|d| d.ends_with(".gnupg")),
             "every other dir stays denied: {:?}",
             exposed.dirs
         );
-        assert_eq!(exposed.dirs.len() + 1, full.dirs.len(), "exactly one dir moved out");
-        assert_eq!(exposed.files.len() + 1, full.files.len(), "exactly one file moved out");
+        assert_eq!(
+            exposed.dirs.len() + 1,
+            full.dirs.len(),
+            "exactly one dir moved out"
+        );
+        assert_eq!(
+            exposed.files.len() + 1,
+            full.files.len(),
+            "exactly one file moved out"
+        );
     }
 
     /// An EMPTY LOCALAPPDATA is not a value: the documented fallback to
@@ -4119,7 +4148,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-
     /// Inside ONE policy file, a narrower FILE entry is folded into the wider
     /// one - and with no credential entry in the picture the LOADER is the only
     /// step that can do it (`&&`-narrowing keeps only mutually covering paths,
@@ -4176,7 +4204,11 @@ mod tests {
         )
         .expect("the policy loads");
         let kube_hits = eff.files.iter().filter(|f| **f == kube).count();
-        assert_eq!(kube_hits, 1, "the credential copy and the policy copy are one: {:?}", eff.files);
+        assert_eq!(
+            kube_hits, 1,
+            "the credential copy and the policy copy are one: {:?}",
+            eff.files
+        );
         assert!(
             !eff.files.contains(&wide),
             "the narrower policy entry is covered by the wider one: {:?}",

@@ -1624,9 +1624,15 @@ mod tests {
 
         // header(): the parser lowercases names, so lookups are lowercase and
         // the first matching one wins.
-        let response = parse_response(b"HTTP/1.1 204 No Content\r\nX-Runner: one\r\nX-Runner: two\r\n\r\n").unwrap();
+        let response =
+            parse_response(b"HTTP/1.1 204 No Content\r\nX-Runner: one\r\nX-Runner: two\r\n\r\n")
+                .unwrap();
         assert_eq!(response.header("x-runner"), Some("one"));
-        assert_eq!(response.header("X-Runner"), None, "names are folded at parse");
+        assert_eq!(
+            response.header("X-Runner"),
+            None,
+            "names are folded at parse"
+        );
         assert_eq!(response.header("missing"), None);
 
         // json(): the body decodes; a non-JSON body names the status.
@@ -1635,7 +1641,6 @@ mod tests {
         let bad = parse_response(b"HTTP/1.1 500 Err\r\n\r\nnot json").unwrap();
         assert!(format!("{:#}", bad.json().unwrap_err()).contains("non-JSON (500)"));
     }
-
 
     /// The chunked decoder: chunks reassembled, extensions ignored, and the
     /// three truncation shapes refused (a short body is an error, not a
@@ -1656,7 +1661,10 @@ mod tests {
             "a body shorter than the declared size is refused"
         );
         assert!(dechunk(b"4").is_err(), "a header without CRLF is refused");
-        assert!(dechunk(b"zz\r\nxx\r\n").is_err(), "a non-hex size is refused");
+        assert!(
+            dechunk(b"zz\r\nxx\r\n").is_err(),
+            "a non-hex size is refused"
+        );
         // A body of EXACTLY the declared size is complete: the refusal is for a
         // SHORT body, so what follows is a complaint about the NEXT header.
         let err = format!("{:#}", dechunk(b"4\r\nWiki").unwrap_err());
@@ -1683,21 +1691,29 @@ mod tests {
         assert_eq!(limit_override(name), None, "unset is None");
     }
 
-
     /// A GET must not name a body: some engine versions reject a framed empty
     /// body, and a Content-Length: 0 changes nothing about what is sent.
     #[test]
     fn request_head_frames_a_body_only_when_there_is_one() {
         let get = request_head("GET", "/info", b"", "application/json");
         assert!(get.ends_with("\r\n\r\n"), "the head ends at the blank line");
-        assert!(!get.contains("Content-Length"), "a GET frames no body: {get}");
-        assert!(!get.contains("Content-Type"), "a GET names no body type: {get}");
+        assert!(
+            !get.contains("Content-Length"),
+            "a GET frames no body: {get}"
+        );
+        assert!(
+            !get.contains("Content-Type"),
+            "a GET names no body type: {get}"
+        );
         assert!(get.starts_with("GET /info HTTP/1.1\r\n"));
         assert!(get.contains("Connection: close\r\n"));
 
         let body = b"{\"Image\":\"x\"}";
         let post = request_head("POST", "/containers/create", body, "application/json");
-        assert!(post.contains("Content-Type: application/json\r\n"), "{post}");
+        assert!(
+            post.contains("Content-Type: application/json\r\n"),
+            "{post}"
+        );
         assert!(
             post.contains(&format!("Content-Length: {}\r\n", body.len())),
             "the length is the real body length: {post}"

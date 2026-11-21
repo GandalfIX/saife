@@ -2325,7 +2325,10 @@ mod tests {
         };
         handle.wait_for_calls(1).await;
         handle.reply("deny-me.example.com", Ok(session_deny()));
-        assert_eq!(bounded(first).await.unwrap(), PromptOutcome::Decided(session_deny()));
+        assert_eq!(
+            bounded(first).await.unwrap(),
+            PromptOutcome::Decided(session_deny())
+        );
 
         let second = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2361,7 +2364,10 @@ mod tests {
         };
         handle.wait_for_calls(2).await;
         handle.reply("cdn.example.com", Ok(allow_once()));
-        assert_eq!(bounded(sibling).await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(
+            bounded(sibling).await.unwrap(),
+            PromptOutcome::Decided(allow_once())
+        );
         assert_eq!(
             handle.calls().len(),
             2,
@@ -2394,7 +2400,10 @@ mod tests {
         };
         handle.wait_for_calls(2).await;
         handle.reply("launch.example.com", Ok(deny_once()));
-        assert_eq!(bounded(second).await.unwrap(), PromptOutcome::Decided(deny_once()));
+        assert_eq!(
+            bounded(second).await.unwrap(),
+            PromptOutcome::Decided(deny_once())
+        );
         assert_eq!(
             handle.calls().len(),
             2,
@@ -2465,7 +2474,10 @@ mod tests {
         FakeHandle::wait_parked(&coord, "api.example.com", 1).await;
 
         handle.reply("api.example.com", Ok(allow_once()));
-        assert_eq!(bounded(leader).await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(
+            bounded(leader).await.unwrap(),
+            PromptOutcome::Decided(allow_once())
+        );
         assert_eq!(
             bounded(follower).await.unwrap(),
             PromptOutcome::Decided(allow_once())
@@ -2494,8 +2506,14 @@ mod tests {
         handle.reply("a.example.com", Ok(allow_once()));
         handle.reply("b.example.com", Ok(deny_once()));
 
-        assert_eq!(bounded(a).await.unwrap(), PromptOutcome::Decided(allow_once()));
-        assert_eq!(bounded(b).await.unwrap(), PromptOutcome::Decided(deny_once()));
+        assert_eq!(
+            bounded(a).await.unwrap(),
+            PromptOutcome::Decided(allow_once())
+        );
+        assert_eq!(
+            bounded(b).await.unwrap(),
+            PromptOutcome::Decided(deny_once())
+        );
         assert_eq!(handle.calls().len(), 2);
     }
 
@@ -2571,7 +2589,10 @@ mod tests {
             handle.reply(&format!("h{i}.example.com"), Ok(deny_once()));
         }
         for l in leaders {
-            assert_eq!(bounded(l).await.unwrap(), PromptOutcome::Decided(deny_once()));
+            assert_eq!(
+                bounded(l).await.unwrap(),
+                PromptOutcome::Decided(deny_once())
+            );
         }
         assert_eq!(
             bounded(rider).await.unwrap(),
@@ -2675,7 +2696,10 @@ mod tests {
         // The leader later decides Allow; the timed-out follower is NOT
         // retroactively allowed.
         handle.reply("api.example.com", Ok(allow_once()));
-        assert_eq!(bounded(leader).await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(
+            bounded(leader).await.unwrap(),
+            PromptOutcome::Decided(allow_once())
+        );
     }
 
     // ---- leader caller-drop safety (review blocking) -------------------
@@ -2757,7 +2781,10 @@ mod tests {
         // whichever reply it pops.
         handle.reply("api.example.com", Ok(allow_once()));
         handle.reply("api.example.com", Ok(allow_once()));
-        assert_eq!(bounded(second).await.unwrap(), PromptOutcome::Decided(allow_once()));
+        assert_eq!(
+            bounded(second).await.unwrap(),
+            PromptOutcome::Decided(allow_once())
+        );
 
         // [G-4] The dropped leader's blocking dialog task was NOT
         // aborted: it is still parked, it consumed the reply meant for
@@ -3352,9 +3379,19 @@ mod tests {
     fn display_safe_crlf_pairs_spend_the_budget() {
         let body = "ab\r\n".repeat(1200);
         let out = display_safe(&body);
-        assert_eq!(out.chars().count(), 1024, "the bound counts collapsed pairs too");
-        assert!(out.starts_with("ab ab ab"), "collapsed pairs render 'a b a b...'");
-        assert!(!out.contains('\r') && !out.contains('\n'), "no raw line break survives");
+        assert_eq!(
+            out.chars().count(),
+            1024,
+            "the bound counts collapsed pairs too"
+        );
+        assert!(
+            out.starts_with("ab ab ab"),
+            "collapsed pairs render 'a b a b...'"
+        );
+        assert!(
+            !out.contains('\r') && !out.contains('\n'),
+            "no raw line break survives"
+        );
     }
 
     /// The fast-fail latch is a state machine over consultations: count
@@ -3427,7 +3464,9 @@ mod tests {
         let (tx_a, rx_a) = oneshot::channel();
         let (tx_b, rx_b) = oneshot::channel();
         let entry = Arc::new(StdMutex::new(vec![tx_a, tx_b]));
-        map.lock().await.insert("api.example.com".into(), entry.clone());
+        map.lock()
+            .await
+            .insert("api.example.com".into(), entry.clone());
 
         PromptCoordinator::finish(
             &map,
@@ -3452,5 +3491,4 @@ mod tests {
             "two parked followers, two deliveries"
         );
     }
-
 }

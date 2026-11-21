@@ -213,16 +213,6 @@ fn existing_paths_only(paths: &[String]) -> Vec<String> {
 }
 
 
-
-
-
-
-
-
-
-
-
-
 /// Is `parent` the same path as `child`, or an ancestor of it?
 ///
 /// Segment-aware, so `C:\work2` is *not* covered by `C:\work`, and comparison

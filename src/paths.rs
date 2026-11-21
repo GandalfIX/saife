@@ -76,6 +76,7 @@ pub(crate) fn path_key(path: &str) -> String {
     }
     key
 }
+
 /// Separator unification plus verbatim/device-prefix removal, so
 /// [`path_key`]'s segment pass sees one spelling per path.
 pub(crate) fn unify_path_prefix(path: &str) -> String {
@@ -95,6 +96,7 @@ pub(crate) fn unify_path_prefix(path: &str) -> String {
     }
     rest.to_string()
 }
+
 /// Split a unified path into its root (`C:`, `\\server\share`, `\`, or `""`)
 /// and the part below it.
 ///
@@ -126,11 +128,13 @@ pub(crate) fn split_path_root(path: &str) -> (String, &str) {
     }
     (String::new(), path)
 }
+
 /// One path component as Win32 compares it: trailing dots and spaces are not part
 /// of the name.
 pub(crate) fn trim_component(component: &str) -> &str {
     component.trim_end_matches(['.', ' '])
 }
+
 /// Win32's case fold, as closely as `std` approximates it: Unicode **uppercase**
 /// (`str::to_uppercase`).
 ///
@@ -153,7 +157,7 @@ pub(crate) fn trim_component(component: &str) -> &str {
 pub(crate) fn fold_case(text: &str) -> String {
     text.to_uppercase()
 }
-#[cfg(test)]
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +182,9 @@ mod tests {
             path_key(r"C:\work2"),
             "a root key must not swallow the next segment's first character"
         );
-    }    /// Path-key boundary inputs. Raw strings spell every separator unambiguously
+    }
+
+    /// Path-key boundary inputs. Raw strings spell every separator unambiguously
     /// (Win32 comparison is the ground truth the key approximates).
     #[test]
     fn the_shared_path_key_boundaries_match_win32_comparison() {
@@ -210,6 +216,4 @@ mod tests {
             (r"\\srv\share".to_string(), r"\child")
         );
     }
-
-
 }
