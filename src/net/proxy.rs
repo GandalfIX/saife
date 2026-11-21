@@ -1399,24 +1399,16 @@ where
 /// stores wall-clock times and sub-second precision adds nothing for an
 /// advisory reason's age. Pre-epoch inputs clamp to the epoch.
 pub(crate) fn rfc3339_utc(ts: std::time::SystemTime) -> String {
+    // The clock read is the only step this module owns: `duration_since` is
+    // what can fail, and a machine whose clock sits before the epoch clamps to
+    // it instead of panicking. The date-and-time rendering is the audit
+    // timestamp's own formatter, so one known-value table covers both - a
+    // second copy of the arithmetic is only a place for it to rot.
     let secs = ts
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // Civil date from days since 1970-01-01: the ONE implementation, shared
-    // with the audit timestamp (iso8601_from_unix). The module previously
-    // carried a private copy of the same Howard-Hinnant inverse, whose
-    // mutants survived every timestamp assertion - a second copy of an
-    // algorithm is only a place for verified behaviour to rot.
-    let (y, m, d) = crate::audit::civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
+    crate::audit::iso8601_from_unix(secs)
 }
 
 /// The audit-side view of a coordinator outcome: disposition, D-5

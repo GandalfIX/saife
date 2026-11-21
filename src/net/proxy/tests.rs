@@ -339,25 +339,18 @@
 
     // ---- RFC3339 formatter (D-4 `ts` field) ------------------------------
 
+    /// The clock read is the only fallible step here: a timestamp before the
+    /// epoch clamps to it instead of panicking, never rendering a negative
+    /// year. The date-and-time rendering itself is covered once, by
+    /// `audit::iso8601_from_unix_known_values` - the function this one calls.
     #[test]
-    fn rfc3339_utc_known_values() {
+    fn rfc3339_utc_clamps_a_clock_before_the_epoch() {
         use std::time::{Duration as StdDuration, UNIX_EPOCH};
-        assert_eq!(super::rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        // 2024-01-01 00:00:00 UTC == 1704067200.
-        assert_eq!(
-            super::rfc3339_utc(UNIX_EPOCH + StdDuration::from_secs(1_704_067_200)),
-            "2024-01-01T00:00:00Z"
-        );
-        // Hour/minute/second rendering.
-        assert_eq!(
-            super::rfc3339_utc(UNIX_EPOCH + StdDuration::from_secs(1_704_067_200 + 3661)),
-            "2024-01-01T01:01:01Z"
-        );
-        // Pre-epoch clamps to the epoch — never panics, never negative.
         assert_eq!(
             super::rfc3339_utc(UNIX_EPOCH - StdDuration::from_secs(5)),
             "1970-01-01T00:00:00Z"
         );
+        assert_eq!(super::rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
     }
 
     // ---- Happy Eyeballs dial (D-1, [G-12]) -------------------------------
@@ -7618,12 +7611,19 @@
     #[tokio::test]
     async fn read_body_takes_the_declared_bytes_and_a_leftover_as_its_seed() {
         use tokio::io::AsyncWriteExt;
+        use tokio::time::timeout;
         let (mut client, mut sock) = connected_pair().await;
         client.write_all(b"BODY").await.unwrap();
         let head = "POST /x HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
-        let body = read_body(&mut sock, head, b"").await;
+        // Bounded like the sibling below: a reader that keeps waiting for bytes
+        // past the declared body must fail the test, not hang the suite.
+        let body = timeout(Duration::from_secs(2), read_body(&mut sock, head, b""))
+            .await
+            .expect("the declared four bytes must be read without waiting");
         assert_eq!(body, b"BODY".to_vec(), "the declared four bytes are read");
-        let seeded = read_body(&mut sock, head, b"ABCD").await;
+        let seeded = timeout(Duration::from_secs(2), read_body(&mut sock, head, b"ABCD"))
+            .await
+            .expect("a leftover seeds the body; no read happens");
         assert_eq!(seeded, b"ABCD".to_vec(), "a leftover seeds the body, no read");
     }
 

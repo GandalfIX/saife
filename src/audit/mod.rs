@@ -598,7 +598,7 @@ fn iso8601_utc() -> String {
 /// [`iso8601_utc`] with the clock taken out: the arithmetic is the part that can
 /// be wrong, and `now()` cannot be pinned in a test. A mutant in here corrupts
 /// every audit timestamp silently, so the split is what makes it testable.
-fn iso8601_from_unix(secs: u64) -> String {
+pub(crate) fn iso8601_from_unix(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let h = rem / 3600;
